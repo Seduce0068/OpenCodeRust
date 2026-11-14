@@ -6,7 +6,8 @@ tags: [configuration, jsonc, crate]
 
 # opencode-config
 
-`opencode-config` handles config file discovery, loading, parsing, and merging. It is the configuration entrypoint for runtime behaviour.
+`opencode-config` handles config file discovery, loading, parsing, and merging.
+It is the configuration entrypoint for runtime behaviour.
 
 ## Responsibilities
 
@@ -33,8 +34,30 @@ tags: [configuration, jsonc, crate]
 - Merge behaviour should remain predictable
 - Changes to provider/mcp/agent fields should be reflected in docs
 
+## Schema compatibility
+
+The loader accepts both shapes of the top-level `permissions` list:
+
+- Legacy: `"permissions": ["read", "edit"]`
+- Current: `"permissions": [{"action": "read", "resource": ".env", "effect": "deny"}]`
+
+`permissions` is informational for this implementation; enforcement uses the
+`permission` field. Unknown top-level keys are ignored by serde, so a config
+written for a newer OpenCode schema does not block startup.
+
+The following keys are accepted but not mapped to runtime behaviour yet
+(see [MAPPING](../MAPPING.md)):
+
+- `providers` (plural) — the loader reads the legacy `provider` map
+- `mcp.servers` — the loader expects a direct `mcp.<name>` map
+- `snapshots`, `websearch`, `shell`
+
+Tests use `ConfigLoader::without_global_config()` so they do not depend on the
+machine's `~/.config/opencode`.
+
 ## Validation
 
 ```bash
 cargo check -p opencode-config
+cargo test -p opencode-config
 ```
