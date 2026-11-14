@@ -82,6 +82,13 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<HashMap<String, ProviderConfig>>,
 
+    /// Current-schema provider map (`providers`, plural).
+    ///
+    /// Normalized into `provider` by `ConfigLoader::load_all`; kept here so
+    /// that both spellings can be parsed without changing the runtime shape.
+    #[serde(rename = "providers", skip_serializing_if = "Option::is_none")]
+    pub providers: Option<HashMap<String, ProviderConfig>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<HashMap<String, McpServerConfig>>,
 
@@ -464,6 +471,21 @@ pub struct ProviderConfig {
     pub options: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm: Option<String>,
+    /// Current-schema provider package (an npm module). Normalized into `npm`
+    /// by `ConfigLoader::load_all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Current-schema provider settings such as `baseURL` / `apiKey`.
+    /// Normalized into `base_url`, `api_key`, or `options`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<HashMap<String, serde_json::Value>>,
+    /// Current-schema request headers. Normalized into `options.headers`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, serde_json::Value>>,
+    /// Current-schema compatibility flags. Normalized into
+    /// `options.compatibility`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<HashMap<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub whitelist: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -474,7 +496,7 @@ pub struct ProviderConfig {
 pub struct ModelConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "modelID", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -1115,6 +1137,10 @@ impl DeepMerge for ProviderConfig {
         merge_option_map_deep_values(&mut self.models, other.models);
         merge_option_json_map(&mut self.options, other.options);
         merge_option_replace(&mut self.npm, other.npm);
+        merge_option_replace(&mut self.package, other.package);
+        merge_option_json_map(&mut self.settings, other.settings);
+        merge_option_json_map(&mut self.headers, other.headers);
+        merge_option_json_map(&mut self.compatibility, other.compatibility);
         if !other.whitelist.is_empty() {
             self.whitelist = other.whitelist;
         }
@@ -1282,6 +1308,7 @@ impl Config {
         merge_option_deep(&mut self.mode, other.mode);
         merge_option_deep(&mut self.agent, other.agent);
         merge_option_map_deep_values(&mut self.provider, other.provider);
+        merge_option_map_deep_values(&mut self.providers, other.providers);
         merge_option_map_deep_values(&mut self.mcp, other.mcp);
         merge_option_deep(&mut self.formatter, other.formatter);
         merge_option_deep(&mut self.lsp, other.lsp);

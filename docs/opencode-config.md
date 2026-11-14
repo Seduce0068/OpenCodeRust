@@ -45,10 +45,20 @@ The loader accepts both shapes of the top-level `permissions` list:
 `permission` field. Unknown top-level keys are ignored by serde, so a config
 written for a newer OpenCode schema does not block startup.
 
+The current-schema `providers` map is normalized into the runtime `provider`
+map when `load_all` runs:
+
+- `package` → `npm`
+- `settings.baseURL` / `settings.apiKey` → `base_url` / `api_key`
+- `headers` / `compatibility` → `options.headers` / `options.compatibility`
+- `modelID` is accepted as an alias of the model `model` field
+
+A legacy `provider` entry for the same provider id wins over the normalized
+current-schema entry.
+
 The following keys are accepted but not mapped to runtime behaviour yet
 (see [MAPPING](../MAPPING.md)):
 
-- `providers` (plural) — the loader reads the legacy `provider` map
 - `mcp.servers` — the loader expects a direct `mcp.<name>` map
 - `snapshots`, `websearch`, `shell`
 
