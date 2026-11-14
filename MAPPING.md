@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-15T02:24:43+09:00"
+  at: "2026-11-15T02:38:23+09:00"
 ---
 
 ## 文書の位置付け
@@ -76,10 +76,11 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 (tools / reasoning / attachment / modalities) も runtime へ反映する。
 
 `mcp.servers` は `disabled` → `enabled` 反転、`command` (string / argv)、
-`headers` / `environment` / `oauth: false` を変換する。remote は streamable
-HTTP で接続し、config の `headers` を送信する。401 は `needs_auth`、その他は
-`failed` として扱う。per-operation の `timeout` object と `cwd`、SSE
-transport、OAuth の token exchange は未実装。
+`headers` / `environment` / `cwd` / `oauth: false` を変換する。remote は
+streamable HTTP で接続し、config の `headers` を送信する。401 は
+`needs_auth`、その他は `failed` として扱う。local は Content-Length framing
+で stdio 接続する。per-operation の `timeout` object、SSE transport、
+OAuth の token exchange は未実装。
 未マッピングのキーも parse を失敗させない。
 
 ## 命名差

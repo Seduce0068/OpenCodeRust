@@ -586,6 +586,10 @@ pub struct McpServer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<HashMap<String, String>>,
 
+    /// For local: working directory to spawn the server in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+
     /// For remote: URL of the MCP server
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -732,6 +736,8 @@ struct McpServerV2 {
     headers: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
     oauth: Option<serde_json::Value>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -756,6 +762,7 @@ impl McpServerV2 {
                 .environment
                 .map(string_map)
                 .or_else(|| self.env.map(string_map)),
+            cwd: self.cwd,
             url: self.url,
             enabled: self
                 .enabled
@@ -1379,6 +1386,7 @@ impl DeepMerge for McpServer {
             self.command = other.command;
         }
         merge_option_map_overwrite_values(&mut self.environment, other.environment);
+        merge_option_replace(&mut self.cwd, other.cwd);
         merge_option_replace(&mut self.url, other.url);
         merge_option_replace(&mut self.enabled, other.enabled);
         merge_option_replace(&mut self.timeout, other.timeout);
@@ -1836,7 +1844,8 @@ mod tests {
                         "local": {
                             "type": "local",
                             "command": ["npx", "server"],
-                            "environment": {"KEY": "value"}
+                            "environment": {"KEY": "value"},
+                            "cwd": "/tmp/project"
                         }
                     }
                 }
@@ -1880,6 +1889,7 @@ mod tests {
                         .map(String::as_str),
                     Some("value")
                 );
+                assert_eq!(server.cwd.as_deref(), Some("/tmp/project"));
                 assert_eq!(server.enabled, None);
             }
             other => panic!("expected Full, got {other:?}"),

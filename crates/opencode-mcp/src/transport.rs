@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::protocol::{JsonRpcMessage, JsonRpcRequest};
@@ -26,6 +26,8 @@ pub trait McpTransport: Send + Sync {
 pub struct StdioTransport {
     process: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
+    /// Persistent reader so buffered bytes are not lost between messages.
+    stdout: Mutex<Option<BufReader<ChildStdout>>>,
 }
 
 impl StdioTransport {
@@ -33,6 +35,7 @@ impl StdioTransport {
         command: &str,
         args: &[String],
         env: Option<Vec<(String, String)>>,
+        cwd: Option<String>,
     ) -> Result<Self, McpClientError> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -40,6 +43,10 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
 
         if let Some(env_vars) = env {
             for (key, value) in env_vars {
@@ -54,10 +61,15 @@ impl StdioTransport {
             .stdin
             .take()
             .ok_or_else(|| McpClientError::TransportError("Failed to get stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpClientError::TransportError("Failed to get stdout".to_string()))?;
 
         Ok(Self {
             process: Mutex::new(Some(child)),
             stdin: Mutex::new(Some(stdin)),
+            stdout: Mutex::new(Some(BufReader::new(stdout))),
         })
     }
 }
@@ -90,17 +102,12 @@ impl McpTransport for StdioTransport {
     }
 
     async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
-        let mut process_guard = self.process.lock().await;
-        let child = process_guard
-            .as_mut()
-            .ok_or_else(|| McpClientError::TransportError("Process not running".to_string()))?;
-
-        let stdout = child
-            .stdout
+        let mut stdout_guard = self.stdout.lock().await;
+        let reader = stdout_guard
             .as_mut()
             .ok_or_else(|| McpClientError::TransportError("No stdout".to_string()))?;
 
-        let mut reader = BufReader::new(stdout);
+        let mut content_length: Option<usize> = None;
         let mut header_line = String::new();
         loop {
             header_line.clear();
@@ -115,29 +122,29 @@ impl McpTransport for StdioTransport {
             let trimmed = header_line.trim();
 
             if trimmed.is_empty() {
-                break;
+                // End of headers: the body follows.
+                if let Some(content_length) = content_length {
+                    let mut content_buf = vec![0u8; content_length];
+                    reader.read_exact(&mut content_buf).await.map_err(|e| {
+                        McpClientError::TransportError(format!("Failed to read content: {}", e))
+                    })?;
+
+                    let content = String::from_utf8_lossy(&content_buf);
+                    let message = JsonRpcMessage::parse_json_str(&content).map_err(|e| {
+                        McpClientError::ProtocolError(format!("Failed to parse message: {}", e))
+                    })?;
+
+                    return Ok(Some(message));
+                }
+                continue;
             }
 
-            if trimmed.starts_with("Content-Length:") {
-                let content_length: usize = trimmed[15..].trim().parse().map_err(|e| {
+            if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+                content_length = Some(value.trim().parse().map_err(|e| {
                     McpClientError::ProtocolError(format!("Invalid content length: {}", e))
-                })?;
-
-                let mut content_buf = vec![0u8; content_length];
-                reader.read_exact(&mut content_buf).await.map_err(|e| {
-                    McpClientError::TransportError(format!("Failed to read content: {}", e))
-                })?;
-
-                let content = String::from_utf8_lossy(&content_buf);
-                let message = JsonRpcMessage::parse_json_str(&content).map_err(|e| {
-                    McpClientError::ProtocolError(format!("Failed to parse message: {}", e))
-                })?;
-
-                return Ok(Some(message));
+                })?);
             }
         }
-
-        Ok(None)
     }
 
     async fn close(&self) -> Result<(), McpClientError> {
@@ -149,6 +156,8 @@ impl McpTransport for StdioTransport {
         }
         let mut stdin_guard = self.stdin.lock().await;
         *stdin_guard = None;
+        let mut stdout_guard = self.stdout.lock().await;
+        *stdout_guard = None;
         Ok(())
     }
 }
@@ -400,5 +409,48 @@ impl McpTransport for SseTransport {
             handle.abort();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stdio_framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_consecutive_content_length_framed_messages() {
+        let first = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#;
+        let script = format!(
+            "printf 'Content-Length: {n}\\r\\n\\r\\n{s1}Content-Length: {n}\\r\\n\\r\\n{s2}'",
+            n = first.len(),
+            s1 = first,
+            s2 = second
+        );
+
+        let transport = StdioTransport::new("sh", &["-c".to_string(), script], None, None)
+            .await
+            .expect("spawn framing fixture");
+
+        let first_message = transport
+            .receive()
+            .await
+            .expect("first receive")
+            .expect("first message");
+        match first_message {
+            JsonRpcMessage::Response(response) => assert_eq!(response.id, 1),
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        let second_message = transport
+            .receive()
+            .await
+            .expect("second receive")
+            .expect("second message");
+        match second_message {
+            JsonRpcMessage::Response(response) => assert_eq!(response.id, 2),
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        transport.close().await.expect("close");
     }
 }
