@@ -508,6 +508,51 @@ pub struct ModelConfig {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variants: Option<HashMap<String, ModelVariantConfig>>,
+    /// Current-schema model limits (context / output token counts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<ModelLimitConfig>,
+    /// Current-schema model capabilities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ModelCapabilitiesConfig>,
+}
+
+/// Token limits of a model in the current config schema.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelLimitConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+}
+
+/// Capabilities of a model in the current config schema.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelCapabilitiesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    /// Either a boolean or an object such as `{"supported": true}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Vec<String>>,
+}
+
+impl ModelCapabilitiesConfig {
+    /// Returns the reasoning capability, accepting both `true` and
+    /// `{"supported": true}` shapes.
+    pub fn reasoning_supported(&self) -> Option<bool> {
+        match self.reasoning.as_ref()? {
+            serde_json::Value::Bool(supported) => Some(*supported),
+            serde_json::Value::Object(object) => {
+                object.get("supported").and_then(serde_json::Value::as_bool)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1275,6 +1320,25 @@ impl DeepMerge for ModelConfig {
         merge_option_replace(&mut self.api_key, other.api_key);
         merge_option_replace(&mut self.base_url, other.base_url);
         merge_option_map_deep_values(&mut self.variants, other.variants);
+        merge_option_deep(&mut self.limit, other.limit);
+        merge_option_deep(&mut self.capabilities, other.capabilities);
+    }
+}
+
+impl DeepMerge for ModelLimitConfig {
+    fn deep_merge(&mut self, other: Self) {
+        merge_option_replace(&mut self.context, other.context);
+        merge_option_replace(&mut self.output, other.output);
+    }
+}
+
+impl DeepMerge for ModelCapabilitiesConfig {
+    fn deep_merge(&mut self, other: Self) {
+        merge_option_replace(&mut self.tools, other.tools);
+        merge_option_replace(&mut self.reasoning, other.reasoning);
+        merge_option_replace(&mut self.attachment, other.attachment);
+        merge_option_replace(&mut self.input, other.input);
+        merge_option_replace(&mut self.output, other.output);
     }
 }
 
@@ -1856,5 +1920,50 @@ mod tests {
             serde_json::from_str(r#"{"mcp":{"servers":{"command":["echo"]}}}"#).unwrap();
         let mcp = config.mcp.expect("mcp");
         assert!(mcp.contains_key("servers"));
+    }
+    #[test]
+    fn parses_current_schema_model_limit_and_capabilities() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "custom": {
+                        "models": {
+                            "m": {
+                                "name": "M",
+                                "limit": {"context": 1048576, "output": 131072},
+                                "capabilities": {
+                                    "tools": true,
+                                    "reasoning": {"supported": true},
+                                    "input": ["text", "image"],
+                                    "output": ["text"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let provider = config.providers.unwrap().remove("custom").unwrap();
+        let model = provider.models.unwrap().remove("m").unwrap();
+        let limit = model.limit.expect("limit");
+        assert_eq!(limit.context, Some(1048576));
+        assert_eq!(limit.output, Some(131072));
+        let capabilities = model.capabilities.expect("capabilities");
+        assert_eq!(capabilities.tools, Some(true));
+        assert_eq!(capabilities.reasoning_supported(), Some(true));
+        assert_eq!(
+            capabilities.input,
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(capabilities.output, Some(vec!["text".to_string()]));
+    }
+
+    #[test]
+    fn reasoning_capability_accepts_boolean_shape() {
+        let capabilities: ModelCapabilitiesConfig =
+            serde_json::from_str(r#"{"reasoning": true}"#).unwrap();
+        assert_eq!(capabilities.reasoning_supported(), Some(true));
     }
 }

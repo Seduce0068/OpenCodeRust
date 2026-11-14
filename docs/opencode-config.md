@@ -51,6 +51,7 @@ map when `load_all` runs:
 - `package` → `npm`
 - `settings.baseURL` / `settings.apiKey` → `base_url` / `api_key`
 - `headers` / `compatibility` → `options.headers` / `options.compatibility`
+- `models.<id>.limit` / `capabilities` → runtime model limits and capabilities
 - `modelID` is accepted as an alias of the model `model` field
 
 A legacy `provider` entry for the same provider id wins over the normalized
