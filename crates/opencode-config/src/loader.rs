@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 pub struct ConfigLoader {
     config: Config,
     config_paths: Vec<PathBuf>,
+    /// When true, `load_global` is skipped so callers are independent of the
+    /// user's `~/.config/opencode` (used by tests and isolated runs).
+    ignore_global_config: bool,
 }
 
 impl ConfigLoader {
@@ -20,7 +23,17 @@ impl ConfigLoader {
         Self {
             config: Config::default(),
             config_paths: Vec::new(),
+            ignore_global_config: false,
         }
+    }
+
+    /// Returns a loader that does not read the user's global config.
+    ///
+    /// Use this for tests and isolated runs so results do not depend on the
+    /// contents of `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`.
+    pub fn without_global_config(mut self) -> Self {
+        self.ignore_global_config = true;
+        self
     }
 
     /// Current merged config (for tests and inspection).
@@ -61,6 +74,10 @@ impl ConfigLoader {
     }
 
     pub fn load_global(&mut self) -> Result<()> {
+        if self.ignore_global_config {
+            return Ok(());
+        }
+
         let global_config_path = get_global_config_path();
 
         for ext in &["jsonc", "json"] {

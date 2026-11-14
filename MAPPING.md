@@ -8,8 +8,8 @@ tags:
   - compatibility
   - roadmap
 verified:
-  by: opencode
-  at: "2026-10-18T14:27:00+09:00"
+  by: dsh
+  at: "2026-11-15T01:20:08+09:00"
 ---
 
 ## 文書の位置付け
@@ -57,6 +57,21 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 6. `opencode/src/acp` — Rust は外部 ACP ブリッジ起動のみ (HTTP fallback)。
 7. v2 `core` の policy / location / integration / credential /
    observability 層 — 対応 crate がない。
+
+## 設定スキーマの追随状況 (2026-11-15)
+
+現行の公式グローバル設定は `providers` (複数形)、`permissions` のルール配列、
+`mcp.servers` を持つ形式へ移行している。Rust 側の対応状況:
+
+| 項目 | 状態 |
+| --- | --- |
+| `permissions` ルール配列 | 受理済み (`PermissionsConfig`、旧 string 配列も受理) |
+| `providers` (複数形) | 未マッピング (legacy `provider` のみ) |
+| `mcp.servers` | 未マッピング (legacy 直下 `mcp.<name>` のみ) |
+| `snapshots` / `websearch` / `shell` | 未マッピング (未知キーとして無視) |
+
+未マッピングの間もこれらのキーは parse を失敗させない。provider/MCP 定義を
+Rust ランタイムで使うには変換層の追加が必要。
 
 ## 命名差
 

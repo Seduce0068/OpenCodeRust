@@ -68,7 +68,7 @@ pub struct Config {
     pub username: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub permissions: Option<Vec<String>>,
+    pub permissions: Option<PermissionsConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents: Option<HashMap<String, AgentConfig>>,
@@ -659,6 +659,49 @@ impl PermissionConfig {
     }
 }
 
+/// The top-level `permissions` list.
+///
+/// Older configs store permission names as a list of strings; newer configs
+/// store explicit `{action, resource, effect}` rules. Both forms are accepted
+/// so that a newer global config does not prevent the CLI from starting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PermissionsConfig {
+    /// Legacy form: `["read", "edit", ...]`.
+    Names(Vec<String>),
+    /// Current form: `[{"action": "read", "resource": ".env", "effect": "deny"}]`.
+    Rules(Vec<PermissionListEntry>),
+}
+
+impl PermissionsConfig {
+    /// Returns the number of entries regardless of the representation.
+    pub fn len(&self) -> usize {
+        match self {
+            PermissionsConfig::Names(entries) => entries.len(),
+            PermissionsConfig::Rules(entries) => entries.len(),
+        }
+    }
+
+    /// Returns `true` when the list has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A single entry of the list-form `permissions` config.
+///
+/// Fields are optional on input because the list is informational for this
+/// implementation; rejecting an unknown future shape would break startup.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PermissionListEntry {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effect: String,
+}
+
 /// A permission rule: either a simple action or a map of sub-keys to actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1235,6 +1278,7 @@ impl Config {
         merge_option_replace(&mut self.small_model, other.small_model);
         merge_option_replace(&mut self.default_agent, other.default_agent);
         merge_option_replace(&mut self.username, other.username);
+        merge_option_replace(&mut self.permissions, other.permissions);
         merge_option_deep(&mut self.mode, other.mode);
         merge_option_deep(&mut self.agent, other.agent);
         merge_option_map_deep_values(&mut self.provider, other.provider);
@@ -1470,5 +1514,60 @@ mod tests {
         assert_eq!(options.get("a"), Some(&serde_json::json!(1)));
         assert_eq!(options.get("b"), Some(&serde_json::json!(2)));
         assert!(agents.contains_key("research"));
+    }
+
+    #[test]
+    fn parses_legacy_permission_name_list() {
+        let config: Config = serde_json::from_str(r#"{"permissions":["read","edit"]}"#).unwrap();
+        match config.permissions.unwrap() {
+            PermissionsConfig::Names(names) => assert_eq!(names, vec!["read", "edit"]),
+            other => panic!("expected Names, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rule_list_permissions() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "permissions": [
+                    {"action": "read", "resource": ".env", "effect": "deny"},
+                    {"action": "edit", "resource": "secrets/**", "effect": "deny"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        match config.permissions.unwrap() {
+            PermissionsConfig::Rules(rules) => {
+                assert_eq!(rules.len(), 2);
+                assert_eq!(rules[0].action, "read");
+                assert_eq!(rules[0].resource, ".env");
+                assert_eq!(rules[0].effect, "deny");
+            }
+            other => panic!("expected Rules, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_permissions_with_unknown_fields() {
+        // Future entries may carry extra fields; parsing must stay tolerant.
+        let config: Config = serde_json::from_str(
+            r#"{"permissions":[{"action":"read","resource":"*","effect":"allow","priority":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.permissions.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merges_permissions_by_replacement() {
+        let mut base: Config = serde_json::from_str(r#"{"permissions":["read"]}"#).unwrap();
+        let overlay: Config = serde_json::from_str(
+            r#"{"permissions":[{"action":"edit","resource":"*","effect":"deny"}]}"#,
+        )
+        .unwrap();
+        base.merge(overlay);
+        match base.permissions.unwrap() {
+            PermissionsConfig::Rules(rules) => assert_eq!(rules[0].action, "edit"),
+            other => panic!("expected Rules, got {other:?}"),
+        }
     }
 }
