@@ -98,6 +98,7 @@ pub struct McpServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: Option<Vec<(String, String)>>,
+    pub cwd: Option<String>,
     pub timeout_ms: Option<u64>,
 }
 
@@ -234,7 +235,8 @@ impl McpClient {
     }
 
     async fn connect_stdio_inner(&self, config: McpServerConfig) -> Result<(), McpClientError> {
-        let transport = StdioTransport::new(&config.command, &config.args, config.env).await?;
+        let transport =
+            StdioTransport::new(&config.command, &config.args, config.env, config.cwd).await?;
         {
             let mut t = self.transport.lock().await;
             *t = Some(Box::new(transport));

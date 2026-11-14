@@ -2919,6 +2919,7 @@ pub struct McpConfigInput {
     pub args: Option<Vec<String>>,
     pub env: Option<HashMap<String, String>>,
     pub environment: Option<HashMap<String, String>>,
+    pub cwd: Option<String>,
     pub url: Option<String>,
     pub enabled: Option<bool>,
     pub timeout: Option<u64>,
@@ -3109,6 +3110,7 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
             command,
             args,
             env: config.env.or(config.environment),
+            cwd: config.cwd,
             timeout: config.timeout,
         }),
         enabled,
@@ -3190,6 +3192,7 @@ fn parse_runtime_from_loaded_config(
                         command,
                         args,
                         env: server.env.or(server.environment),
+                        cwd: server.cwd,
                         timeout: server.timeout,
                     }),
                     enabled,
@@ -5057,6 +5060,7 @@ mod mcp_loaded_config_tests {
         let config = full(McpServer {
             command: vec!["node".to_string(), "server.js".to_string()],
             environment: Some(HashMap::from([("KEY".to_string(), "value".to_string())])),
+            cwd: Some("/tmp/project".to_string()),
             ..Default::default()
         });
 
@@ -5070,6 +5074,7 @@ mod mcp_loaded_config_tests {
                     local.env.and_then(|env| env.get("KEY").cloned()),
                     Some("value".to_string())
                 );
+                assert_eq!(local.cwd.as_deref(), Some("/tmp/project"));
             }
             McpRuntimeConfig::Remote(_) => panic!("expected local config"),
         }

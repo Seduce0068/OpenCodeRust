@@ -10,6 +10,7 @@ pub struct LocalMcpConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
+    pub cwd: Option<String>,
     pub timeout: Option<u64>,
 }
 
@@ -195,6 +196,7 @@ impl McpOAuthManager {
                         command: local.command,
                         args: local.args,
                         env,
+                        cwd: local.cwd,
                         timeout_ms: local.timeout,
                     })
                     .await
