@@ -89,7 +89,11 @@ pub struct Config {
     #[serde(rename = "providers", skip_serializing_if = "Option::is_none")]
     pub providers: Option<HashMap<String, ProviderConfig>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_mcp_config",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mcp: Option<HashMap<String, McpServerConfig>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -517,8 +521,11 @@ pub struct ModelVariantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
-    Enabled { enabled: bool },
+    /// Full server definition. Tried first so that a complete config which
+    /// also carries `enabled` is not mistaken for a bare toggle.
     Full(Box<McpServer>),
+    /// Bare toggle for an existing server.
+    Enabled { enabled: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -588,6 +595,157 @@ pub struct McpOAuth {
     pub client_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+/// Deserializes the `mcp` field from either the legacy direct map
+/// (`mcp.<name>`) or the current wrapper (`mcp.servers.<name>`).
+fn deserialize_mcp_config<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, McpServerConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(serde::de::Error::custom("mcp config must be an object"));
+    };
+
+    if is_mcp_servers_wrapper(object) {
+        let servers = object.get("servers").cloned().unwrap_or_default();
+        let servers: HashMap<String, McpServerV2> =
+            serde_json::from_value(servers).map_err(serde::de::Error::custom)?;
+        return Ok(Some(
+            servers
+                .into_iter()
+                .map(|(name, server)| {
+                    (
+                        name,
+                        McpServerConfig::Full(Box::new(server.into_mcp_server())),
+                    )
+                })
+                .collect(),
+        ));
+    }
+
+    let parsed: HashMap<String, McpServerConfig> =
+        serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+    Ok(Some(parsed))
+}
+
+/// Detects the current-schema `mcp.servers` wrapper without misreading a
+/// legacy server that happens to be named `servers`.
+fn is_mcp_servers_wrapper(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if object.len() != 1 {
+        return false;
+    }
+    let Some(servers) = object.get("servers").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if servers.is_empty() {
+        return true;
+    }
+    servers.values().all(serde_json::Value::is_object)
+        && servers.values().any(|server| {
+            let Some(server) = server.as_object() else {
+                return false;
+            };
+            [
+                "type",
+                "url",
+                "command",
+                "disabled",
+                "environment",
+                "headers",
+            ]
+            .iter()
+            .any(|key| server.contains_key(*key))
+        })
+}
+
+/// Current-schema MCP server entry (`mcp.servers.<name>`).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct McpServerV2 {
+    #[serde(rename = "type", default)]
+    server_type: Option<String>,
+    #[serde(default)]
+    command: Option<McpCommandV2>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    environment: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    env: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    headers: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    oauth: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum McpCommandV2 {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl McpServerV2 {
+    fn into_mcp_server(self) -> McpServer {
+        let command = match self.command {
+            Some(McpCommandV2::String(command)) => vec![command],
+            Some(McpCommandV2::Array(parts)) => parts,
+            None => Vec::new(),
+        };
+
+        McpServer {
+            server_type: self.server_type,
+            command,
+            environment: self
+                .environment
+                .map(string_map)
+                .or_else(|| self.env.map(string_map)),
+            url: self.url,
+            enabled: self
+                .enabled
+                .or_else(|| self.disabled.map(|disabled| !disabled)),
+            // The current schema uses a per-operation timeout object whose
+            // units are not documented; keep the runtime default instead of
+            // guessing. Tracked in MAPPING.md.
+            timeout: None,
+            headers: self.headers.map(string_map),
+            oauth: self.oauth.and_then(oauth_config_from_value),
+            args: self.args,
+            env: None,
+            client_id: None,
+            authorization_url: None,
+        }
+    }
+}
+
+fn string_map(values: HashMap<String, serde_json::Value>) -> HashMap<String, String> {
+    values
+        .into_iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+        .collect()
+}
+
+fn oauth_config_from_value(value: serde_json::Value) -> Option<McpOAuthConfig> {
+    match value {
+        serde_json::Value::Bool(false) => Some(McpOAuthConfig::Disabled(false)),
+        // `true` means "auto-detect", which is the default (no explicit config).
+        serde_json::Value::Bool(true) => None,
+        serde_json::Value::Object(_) => serde_json::from_value(value)
+            .ok()
+            .map(McpOAuthConfig::Config),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1596,5 +1754,107 @@ mod tests {
             PermissionsConfig::Rules(rules) => assert_eq!(rules[0].action, "edit"),
             other => panic!("expected Rules, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_current_schema_mcp_servers_wrapper() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "mcp": {
+                    "servers": {
+                        "remote": {
+                            "type": "remote",
+                            "url": "https://example.com/mcp",
+                            "headers": {"Authorization": "Bearer x"},
+                            "disabled": true,
+                            "oauth": false
+                        },
+                        "local": {
+                            "type": "local",
+                            "command": ["npx", "server"],
+                            "environment": {"KEY": "value"}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mcp = config.mcp.expect("mcp");
+        assert_eq!(mcp.len(), 2);
+        assert!(!mcp.contains_key("servers"), "wrapper must be unwrapped");
+
+        match mcp.get("remote").unwrap() {
+            McpServerConfig::Full(server) => {
+                assert_eq!(server.server_type.as_deref(), Some("remote"));
+                assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+                assert_eq!(server.enabled, Some(false));
+                assert_eq!(
+                    server
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get("Authorization"))
+                        .map(String::as_str),
+                    Some("Bearer x")
+                );
+                assert!(matches!(
+                    server.oauth,
+                    Some(McpOAuthConfig::Disabled(false))
+                ));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+
+        match mcp.get("local").unwrap() {
+            McpServerConfig::Full(server) => {
+                assert_eq!(server.command, vec!["npx", "server"]);
+                assert_eq!(
+                    server
+                        .environment
+                        .as_ref()
+                        .and_then(|environment| environment.get("KEY"))
+                        .map(String::as_str),
+                    Some("value")
+                );
+                assert_eq!(server.enabled, None);
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_mcp_map_shape() {
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"x":{"command":["echo","hi"]}}}"#).unwrap();
+        let mcp = config.mcp.expect("mcp");
+        match mcp.get("x").unwrap() {
+            McpServerConfig::Full(server) => {
+                assert_eq!(server.command, vec!["echo", "hi"]);
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_mcp_config_with_enabled_flag_parses_as_full() {
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{"devtools":{"type":"local","command":["npx","server"],"enabled":true}}}"#,
+        )
+        .unwrap();
+        match config.mcp.unwrap().get("devtools").unwrap() {
+            McpServerConfig::Full(server) => {
+                assert_eq!(server.command, vec!["npx", "server"]);
+                assert_eq!(server.enabled, Some(true));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_unwrap_legacy_server_named_servers() {
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"servers":{"command":["echo"]}}}"#).unwrap();
+        let mcp = config.mcp.expect("mcp");
+        assert!(mcp.contains_key("servers"));
     }
 }

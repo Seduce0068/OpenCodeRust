@@ -56,10 +56,14 @@ map when `load_all` runs:
 A legacy `provider` entry for the same provider id wins over the normalized
 current-schema entry.
 
+The current-schema `mcp.servers` wrapper is unwrapped into the runtime `mcp`
+map: `disabled` is inverted to `enabled`, `command` accepts a string or an argv
+array, and `headers` / `environment` / `oauth: false` are carried over. The
+per-operation `timeout` object and `cwd` are not mapped yet.
+
 The following keys are accepted but not mapped to runtime behaviour yet
 (see [MAPPING](../MAPPING.md)):
 
-- `mcp.servers` — the loader expects a direct `mcp.<name>` map
 - `snapshots`, `websearch`, `shell`
 
 Tests use `ConfigLoader::without_global_config()` so they do not depend on the

@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-15T01:43:31+09:00"
+  at: "2026-11-15T01:59:17+09:00"
 ---
 
 ## 文書の位置付け
@@ -67,14 +67,18 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 | --- | --- |
 | `permissions` ルール配列 | 受理済み (`PermissionsConfig`、旧 string 配列も受理) |
 | `providers` (複数形) | マッピング済み (`provider` へ正規化) |
-| `mcp.servers` | 未マッピング (legacy 直下 `mcp.<name>` のみ) |
+| `mcp.servers` | マッピング済み (config 層で `mcp` 直下へ展開) |
 | `snapshots` / `websearch` / `shell` | 未マッピング (未知キーとして無視) |
 
 `providers` は `package` / `settings` / `headers` / `compatibility` を
 `provider` の `npm` / `base_url` / `api_key` / `options` へ変換する。
 `providers.*.models.*` の `limit` / `capabilities` は未マッピングで、既定値
-(context 128K / output 4K) を使う。未マッピングのキーも parse を失敗させない。
-`mcp.servers` を Rust ランタイムで使うには変換層の追加が必要。
+(context 128K / output 4K) を使う。
+
+`mcp.servers` は `disabled` → `enabled` 反転、`command` (string / argv)、
+`headers` / `environment` / `oauth: false` を変換する。per-operation の
+`timeout` object と `cwd`、remote の `headers` はランタイム未反映。
+未マッピングのキーも parse を失敗させない。
 
 ## 命名差
 
