@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-15T01:59:17+09:00"
+  at: "2026-11-15T02:08:36+09:00"
 ---
 
 ## 文書の位置付け
@@ -72,8 +72,8 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 
 `providers` は `package` / `settings` / `headers` / `compatibility` を
 `provider` の `npm` / `base_url` / `api_key` / `options` へ変換する。
-`providers.*.models.*` の `limit` / `capabilities` は未マッピングで、既定値
-(context 128K / output 4K) を使う。
+`providers.*.models.*` の `limit` (context / output) と `capabilities`
+(tools / reasoning / attachment / modalities) も runtime へ反映する。
 
 `mcp.servers` は `disabled` → `enabled` 反転、`command` (string / argv)、
 `headers` / `environment` / `oauth: false` を変換する。per-operation の

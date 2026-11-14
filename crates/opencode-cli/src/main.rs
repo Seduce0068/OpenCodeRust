@@ -1748,6 +1748,24 @@ fn model_to_bootstrap(id: &str, model: &opencode_config::ModelConfig) -> Bootstr
             .collect()
     });
 
+    let limit = model
+        .limit
+        .as_ref()
+        .map(|limit| opencode_provider::bootstrap::ConfigModelLimit {
+            context: limit.context,
+            output: limit.output,
+        });
+    let modalities = model.capabilities.as_ref().and_then(|capabilities| {
+        if capabilities.input.is_none() && capabilities.output.is_none() {
+            return None;
+        }
+        Some(opencode_provider::bootstrap::ConfigModalities {
+            input: capabilities.input.clone(),
+            output: capabilities.output.clone(),
+        })
+    });
+    let capabilities = model.capabilities.as_ref();
+
     BootstrapConfigModel {
         id: model.model.clone().or_else(|| Some(id.to_string())),
         name: model.name.clone(),
@@ -1759,6 +1777,11 @@ fn model_to_bootstrap(id: &str, model: &opencode_config::ModelConfig) -> Bootstr
         }),
         options: (!options.is_empty()).then_some(options),
         variants,
+        limit,
+        modalities,
+        tool_call: capabilities.and_then(|capabilities| capabilities.tools),
+        reasoning: capabilities.and_then(|capabilities| capabilities.reasoning_supported()),
+        attachment: capabilities.and_then(|capabilities| capabilities.attachment),
         ..Default::default()
     }
 }
