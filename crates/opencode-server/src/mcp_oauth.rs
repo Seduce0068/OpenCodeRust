@@ -1,5 +1,5 @@
 use chrono::Utc;
-use opencode_mcp::client::{McpClientRegistry, McpServerConfig as McpClientConfig};
+use opencode_mcp::client::{McpClientError, McpClientRegistry, McpServerConfig as McpClientConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,12 +13,15 @@ pub struct LocalMcpConfig {
     pub timeout: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RemoteMcpConfig {
     pub url: String,
     pub oauth_enabled: bool,
     pub client_id: Option<String>,
     pub authorization_url: Option<String>,
+    /// Static headers from the config (for API-key style remote servers).
+    pub headers: Option<HashMap<String, String>>,
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,8 +233,15 @@ impl McpOAuthManager {
                     }
                 }
             }
-            McpRuntimeConfig::Remote(_) => {
-                if oauth_required && oauth_status != Some(McpOAuthStatus::Authorized) {
+            McpRuntimeConfig::Remote(remote) => {
+                let has_static_headers = remote
+                    .headers
+                    .as_ref()
+                    .is_some_and(|headers| !headers.is_empty());
+                if oauth_required
+                    && !has_static_headers
+                    && oauth_status != Some(McpOAuthStatus::Authorized)
+                {
                     self.log_event(server_name, "info", "Remote MCP requires OAuth")
                         .await;
                     McpServerInfo {
@@ -244,23 +254,68 @@ impl McpOAuthManager {
                         oauth_status,
                     }
                 } else {
-                    self.log_event(
-                        server_name,
-                        "error",
-                        "Remote MCP transport is not implemented in opencode-rust-rewrite",
-                    )
-                    .await;
-                    McpServerInfo {
-                        name: server_name.to_string(),
-                        status: "failed".to_string(),
-                        tools: 0,
-                        resources: 0,
-                        error: Some(
-                            "Remote MCP transport is not implemented in opencode-rust-rewrite"
-                                .to_string(),
-                        ),
-                        oauth_required,
-                        oauth_status,
+                    if let Err(error) = self.clients.remove(server_name).await {
+                        tracing::warn!(server = server_name, %error, "failed to remove existing MCP client");
+                    }
+                    match self
+                        .clients
+                        .add_http(
+                            server_name.to_string(),
+                            remote.url.clone(),
+                            remote.headers.clone().filter(|headers| !headers.is_empty()),
+                            remote.timeout,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            let tool_count = self
+                                .clients
+                                .tool_registry()
+                                .list_for_server(server_name)
+                                .await
+                                .len();
+                            self.log_event(server_name, "info", "Connected remote MCP server")
+                                .await;
+                            McpServerInfo {
+                                name: server_name.to_string(),
+                                status: "connected".to_string(),
+                                tools: tool_count,
+                                resources: 0,
+                                error: None,
+                                oauth_required,
+                                oauth_status,
+                            }
+                        }
+                        Err(McpClientError::Unauthorized) => {
+                            self.log_event(server_name, "info", "Remote MCP requires OAuth")
+                                .await;
+                            McpServerInfo {
+                                name: server_name.to_string(),
+                                status: "needs_auth".to_string(),
+                                tools: 0,
+                                resources: 0,
+                                error: None,
+                                oauth_required: true,
+                                oauth_status,
+                            }
+                        }
+                        Err(error) => {
+                            self.log_event(
+                                server_name,
+                                "error",
+                                format!("Connect failed: {}", error),
+                            )
+                            .await;
+                            McpServerInfo {
+                                name: server_name.to_string(),
+                                status: "failed".to_string(),
+                                tools: 0,
+                                resources: 0,
+                                error: Some(error.to_string()),
+                                oauth_required,
+                                oauth_status,
+                            }
+                        }
                     }
                 }
             }
@@ -283,12 +338,10 @@ impl McpOAuthManager {
         self.log_event(server_name, "info", "Disconnect requested")
             .await;
         let managed = self.managed_server(server_name).await?;
-        if let McpRuntimeConfig::Local(_) = managed.config {
-            self.clients
-                .remove(server_name)
-                .await
-                .map_err(|e| McpOAuthError::RuntimeError(e.to_string()))?;
-        }
+        self.clients
+            .remove(server_name)
+            .await
+            .map_err(|e| McpOAuthError::RuntimeError(e.to_string()))?;
 
         let info = McpServerInfo {
             name: server_name.to_string(),
@@ -591,6 +644,7 @@ mod tests {
                     oauth_enabled: true,
                     client_id: None,
                     authorization_url: None,
+                    ..Default::default()
                 }),
                 true,
             )
@@ -615,6 +669,7 @@ mod tests {
                     oauth_enabled: true,
                     client_id: None,
                     authorization_url: Some("https://idp.example.com/oauth/authorize".to_string()),
+                    ..Default::default()
                 }),
                 true,
             )
@@ -647,6 +702,7 @@ mod tests {
                     oauth_enabled: true,
                     client_id: None,
                     authorization_url: None,
+                    ..Default::default()
                 }),
                 true,
             )
@@ -669,5 +725,151 @@ mod tests {
             .expect("remote server should exist");
         assert_eq!(status.status, "needs_auth");
         assert_eq!(status.oauth_status, None);
+    }
+    #[derive(Clone)]
+    struct MockMcpState {
+        status: axum::http::StatusCode,
+        seen_authorization: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    async fn mock_mcp_handler(
+        axum::extract::State(state): axum::extract::State<MockMcpState>,
+        headers: axum::http::HeaderMap,
+        body: String,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        state.seen_authorization.lock().await.push(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        );
+
+        if !state.status.is_success() {
+            return state.status.into_response();
+        }
+
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let id = request
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let method = request
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let result = if method == "tools/list" {
+            serde_json::json!({"tools": []})
+        } else {
+            serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "mock", "version": "0.1"}
+            })
+        };
+        (
+            [("content-type", "application/json")],
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+        )
+            .into_response()
+    }
+
+    async fn spawn_mock_mcp(
+        status: axum::http::StatusCode,
+    ) -> (String, Arc<tokio::sync::Mutex<Vec<Option<String>>>>) {
+        let seen_authorization = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let state = MockMcpState {
+            status,
+            seen_authorization: seen_authorization.clone(),
+        };
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(mock_mcp_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/mcp"), seen_authorization)
+    }
+
+    #[tokio::test]
+    async fn remote_server_connects_with_static_headers() {
+        let (url, seen_authorization) = spawn_mock_mcp(axum::http::StatusCode::OK).await;
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url,
+                    oauth_enabled: false,
+                    headers: Some(HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer test-token".to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let status = manager
+            .connect("remote")
+            .await
+            .expect("connect should return runtime status");
+        assert_eq!(status.status, "connected");
+        assert_eq!(status.tools, 0);
+
+        let seen = seen_authorization.lock().await;
+        assert!(
+            seen.iter()
+                .flatten()
+                .any(|header| header == "Bearer test-token"),
+            "Authorization header must reach the remote server: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_server_returns_needs_auth_on_401() {
+        let (url, _) = spawn_mock_mcp(axum::http::StatusCode::UNAUTHORIZED).await;
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url,
+                    oauth_enabled: false,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let status = manager.connect("remote").await.expect("connect result");
+        assert_eq!(status.status, "needs_auth");
+    }
+
+    #[tokio::test]
+    async fn remote_server_reports_connect_failure() {
+        let (url, _) = spawn_mock_mcp(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url,
+                    oauth_enabled: false,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let status = manager.connect("remote").await.expect("connect result");
+        assert_eq!(status.status, "failed");
+        assert!(status.error.is_some());
     }
 }

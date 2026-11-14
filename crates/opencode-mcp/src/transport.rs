@@ -204,6 +204,9 @@ impl McpTransport for HttpTransport {
             })?;
 
         if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(McpClientError::Unauthorized);
+            }
             return Err(McpClientError::TransportError(format!(
                 "HTTP {} from server",
                 resp.status()
@@ -371,6 +374,9 @@ impl McpTransport for SseTransport {
             .map_err(|e| McpClientError::TransportError(format!("HTTP POST failed: {}", e)))?;
 
         if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(McpClientError::Unauthorized);
+            }
             return Err(McpClientError::TransportError(format!(
                 "HTTP {} from server",
                 resp.status()

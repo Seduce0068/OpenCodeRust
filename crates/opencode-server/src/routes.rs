@@ -3096,6 +3096,8 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
                 oauth_enabled,
                 client_id: config.client_id,
                 authorization_url: config.authorization_url,
+                headers: None,
+                timeout: config.timeout,
             }),
             enabled,
         ));
@@ -3171,6 +3173,8 @@ fn parse_runtime_from_loaded_config(
                         oauth_enabled,
                         client_id: server.client_id,
                         authorization_url: server.authorization_url,
+                        headers: server.headers,
+                        timeout: server.timeout,
                     }),
                     enabled,
                 )));
