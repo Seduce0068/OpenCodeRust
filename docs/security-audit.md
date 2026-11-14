@@ -8,8 +8,8 @@ tags:
   - dependencies
   - audit
 verified:
-  by: opencode
-  at: "2026-10-18T13:49:00+09:00"
+  by: dsh
+  at: "2026-11-15T01:20:08+09:00"
 ---
 
 ## 実行手順
@@ -63,6 +63,25 @@ cargo audit --db ~/.cache/rustsec-advisory-db --no-fetch
 補足: `lru` の修正版は 0.16.3 以降のみで、ratatui 0.27 の `^0.12`
 制約では適用できない。ratatui 更新時に再評価する。
 
+## triage 記録 (2026-11-15)
+
+対象: Cargo.lock の 541 crate。2026-11-14 の CI (workflows v1) で
+新規 advisory 2 件により audit が失敗したため再トリアージした。
+
+### 対応済み (2026-11-15)
+
+- `pulldown-cmark` 0.13.5 → 0.13.6 (RUSTSEC-2026-0433、high 7.5、
+  opencode-tui 経由)。
+
+### ignore 追加
+
+- `libsqlite3-sys` 0.37.0 (RUSTSEC-2026-0459 / CVE-2026-119375、medium 6.8):
+  patched は `>= 0.39.0` だが、sqlx-sqlite 0.9.0 の依存制約が
+  `libsqlite3-sys >=0.30.1, <0.38.0` で、sqlx 0.9.0 が最新 stable
+  (2026-05-21 時点) のため互換な修正版を選択できない。攻撃条件は
+  ローカルの攻撃者が細工した DB と `-wal` を置き、プロセスがそれを
+  開くこと (AV:L / UI:P)。残余リスクとして受容し、sqlx 更新時に再評価する。
+
 ## CI ゲート
 
 共通ワークフロー `rust-gates.yml` の `audit: true` で有効化済み
@@ -71,4 +90,6 @@ cargo audit --db ~/.cache/rustsec-advisory-db --no-fetch
 
 ## 残作業
 
+- sqlx が `libsqlite3-sys >=0.39` を許容したら RUSTSEC-2026-0459 の
+  ignore を削除する。
 - ratatui / syntect / portable-pty / notify 更新時に warning を再評価。
