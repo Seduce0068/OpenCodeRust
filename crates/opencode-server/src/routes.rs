@@ -3161,10 +3161,14 @@ fn parse_runtime_from_loaded_config(
             let enabled = server.enabled.unwrap_or(true);
 
             if let Some(url) = server.url {
+                let oauth_enabled = !matches!(
+                    server.oauth.as_ref(),
+                    Some(opencode_config::McpOAuthConfig::Disabled(false))
+                );
                 return Ok(Some((
                     McpRuntimeConfig::Remote(RemoteMcpConfig {
                         url,
-                        oauth_enabled: true,
+                        oauth_enabled,
                         client_id: server.client_id,
                         authorization_url: server.authorization_url,
                     }),
@@ -3181,7 +3185,7 @@ fn parse_runtime_from_loaded_config(
                     McpRuntimeConfig::Local(LocalMcpConfig {
                         command,
                         args,
-                        env: server.env,
+                        env: server.env.or(server.environment),
                         timeout: server.timeout,
                     }),
                     enabled,
@@ -5033,4 +5037,55 @@ async fn get_auth_bridge(provider: &str) -> Result<Arc<PluginAuthBridge>> {
         .auth_bridge(provider)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("no auth plugin for provider: {}", provider)))
+}
+
+#[cfg(test)]
+mod mcp_loaded_config_tests {
+    use super::*;
+    use opencode_config::{McpOAuthConfig, McpServer, McpServerConfig};
+
+    fn full(server: McpServer) -> McpServerConfig {
+        McpServerConfig::Full(Box::new(server))
+    }
+
+    #[test]
+    fn loaded_local_config_uses_environment_field() {
+        let config = full(McpServer {
+            command: vec!["node".to_string(), "server.js".to_string()],
+            environment: Some(HashMap::from([("KEY".to_string(), "value".to_string())])),
+            ..Default::default()
+        });
+
+        let (runtime, enabled) = parse_runtime_from_loaded_config(config).unwrap().unwrap();
+        assert!(enabled);
+        match runtime {
+            McpRuntimeConfig::Local(local) => {
+                assert_eq!(local.command, "node");
+                assert_eq!(local.args, vec!["server.js"]);
+                assert_eq!(
+                    local.env.and_then(|env| env.get("KEY").cloned()),
+                    Some("value".to_string())
+                );
+            }
+            McpRuntimeConfig::Remote(_) => panic!("expected local config"),
+        }
+    }
+
+    #[test]
+    fn loaded_remote_config_honors_disabled_oauth() {
+        let config = full(McpServer {
+            url: Some("https://example.com/mcp".to_string()),
+            oauth: Some(McpOAuthConfig::Disabled(false)),
+            ..Default::default()
+        });
+
+        let (runtime, _) = parse_runtime_from_loaded_config(config).unwrap().unwrap();
+        match runtime {
+            McpRuntimeConfig::Remote(remote) => {
+                assert!(!remote.oauth_enabled);
+                assert_eq!(remote.url, "https://example.com/mcp");
+            }
+            McpRuntimeConfig::Local(_) => panic!("expected remote config"),
+        }
+    }
 }

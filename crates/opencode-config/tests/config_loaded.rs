@@ -136,8 +136,8 @@ fn tolerates_newer_schema_keys() {
     assert_eq!(config.permissions.as_ref().map(|p| p.len()), Some(2));
 
     // The current-schema `providers` map is folded into the runtime `provider`
-    // map; `mcp.servers` is still tolerated but not mapped (tracked in
-    // MAPPING.md).
+    // map, and the `mcp.servers` wrapper is unwrapped into the runtime `mcp`
+    // map.
     let custom = config
         .provider
         .as_ref()
@@ -150,6 +150,22 @@ fn tolerates_newer_schema_keys() {
     assert_eq!(custom.base_url.as_deref(), Some("https://example.com/v1"));
     assert_eq!(custom.api_key.as_deref(), Some("test"));
     assert!(config.providers.is_none());
+
+    let remote = config
+        .mcp
+        .as_ref()
+        .and_then(|servers| servers.get("remote"))
+        .expect("remote mcp server");
+    match remote {
+        opencode_config::McpServerConfig::Full(server) => {
+            assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+        }
+        other => panic!("expected Full, got {other:?}"),
+    }
+    assert!(!config
+        .mcp
+        .as_ref()
+        .is_some_and(|servers| servers.contains_key("servers")));
 }
 
 #[test]
