@@ -1,6 +1,6 @@
 use crate::schema::{
     AgentConfig, AgentConfigs, AgentMode, CommandConfig, PermissionAction, PermissionConfig,
-    PermissionRule,
+    PermissionRule, ProviderConfig,
 };
 use crate::Config;
 use anyhow::{Context, Result};
@@ -1335,6 +1335,69 @@ fn apply_post_load_transforms(config: &mut Config) {
     // Deduplicate plugins
     let plugins = std::mem::take(&mut config.plugin);
     config.plugin = deduplicate_plugins(plugins);
+
+    // Fold the current-schema `providers` map into the runtime `provider` map.
+    normalize_provider_configs(config);
+}
+
+/// Folds the current-schema `providers` map into the runtime `provider` map.
+///
+/// The legacy `provider` map wins when both spellings define the same id, so
+/// project-level overrides keep working. Connection settings that the current
+/// schema nests under `settings` are flattened into the fields consumed by the
+/// provider bootstrap (`npm`, `base_url`, `api_key`, `options`).
+fn normalize_provider_configs(config: &mut Config) {
+    let Some(current_schema_providers) = config.providers.take() else {
+        return;
+    };
+    let providers = config.provider.get_or_insert_with(HashMap::new);
+    for (id, provider) in current_schema_providers {
+        if providers.contains_key(&id) {
+            continue;
+        }
+        providers.insert(id, normalize_provider_config(provider));
+    }
+}
+
+fn normalize_provider_config(mut provider: ProviderConfig) -> ProviderConfig {
+    if provider.npm.is_none() {
+        provider.npm = provider.package.take();
+    } else {
+        provider.package = None;
+    }
+
+    if let Some(settings) = provider.settings.take() {
+        for (key, value) in settings {
+            let target = match key.as_str() {
+                "baseURL" | "baseUrl" | "base_url" | "api" => &mut provider.base_url,
+                "apiKey" | "api_key" => &mut provider.api_key,
+                _ => {
+                    provider
+                        .options
+                        .get_or_insert_with(HashMap::new)
+                        .insert(key, value);
+                    continue;
+                }
+            };
+            if target.is_none() {
+                *target = value.as_str().map(ToString::to_string);
+            }
+        }
+    }
+
+    for (key, value) in [
+        ("headers", provider.headers.take()),
+        ("compatibility", provider.compatibility.take()),
+    ] {
+        if let Some(values) = value {
+            provider.options.get_or_insert_with(HashMap::new).insert(
+                key.to_string(),
+                serde_json::Value::Object(values.into_iter().collect()),
+            );
+        }
+    }
+
+    provider
 }
 
 /// Loads config synchronously (without remote wellknown fetching).
@@ -1963,5 +2026,129 @@ theme = "dark"
             Some("anthropic/claude-3-5-sonnet")
         );
         assert_eq!(written.theme.as_deref(), Some("dark"));
+    }
+}
+
+#[cfg(test)]
+mod provider_normalization_tests {
+    use super::*;
+
+    fn current_schema_provider() -> ProviderConfig {
+        ProviderConfig {
+            name: Some("Custom".to_string()),
+            package: Some("@opencode/ai/providers/openai-compatible".to_string()),
+            settings: Some(HashMap::from([
+                (
+                    "baseURL".to_string(),
+                    serde_json::json!("https://example.com/v1"),
+                ),
+                ("apiKey".to_string(), serde_json::json!("secret")),
+                ("extra".to_string(), serde_json::json!(true)),
+            ])),
+            headers: Some(HashMap::from([(
+                "X-Test".to_string(),
+                serde_json::json!("1"),
+            )])),
+            compatibility: Some(HashMap::from([(
+                "maxTokensField".to_string(),
+                serde_json::json!("max_tokens"),
+            )])),
+            models: Some(HashMap::from([(
+                "m".to_string(),
+                crate::schema::ModelConfig {
+                    name: Some("M".to_string()),
+                    model: Some("underlying".to_string()),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maps_current_schema_provider_into_runtime_shape() {
+        let mut config = Config {
+            providers: Some(HashMap::from([(
+                "custom".to_string(),
+                current_schema_provider(),
+            )])),
+            ..Default::default()
+        };
+
+        normalize_provider_configs(&mut config);
+
+        assert!(config.providers.is_none(), "providers must be folded");
+        let provider = config
+            .provider
+            .as_ref()
+            .and_then(|map| map.get("custom"))
+            .expect("custom provider");
+        assert_eq!(
+            provider.npm.as_deref(),
+            Some("@opencode/ai/providers/openai-compatible")
+        );
+        assert_eq!(provider.base_url.as_deref(), Some("https://example.com/v1"));
+        assert_eq!(provider.api_key.as_deref(), Some("secret"));
+        let options = provider.options.as_ref().expect("options");
+        assert_eq!(options.get("extra"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            options.get("headers"),
+            Some(&serde_json::json!({"X-Test": "1"}))
+        );
+        assert_eq!(
+            options.get("compatibility"),
+            Some(&serde_json::json!({"maxTokensField": "max_tokens"}))
+        );
+        let model = provider
+            .models
+            .as_ref()
+            .and_then(|models| models.get("m"))
+            .expect("model");
+        assert_eq!(model.name.as_deref(), Some("M"));
+        assert_eq!(model.model.as_deref(), Some("underlying"));
+    }
+
+    #[test]
+    fn legacy_provider_map_wins_over_current_schema() {
+        let mut config = Config {
+            provider: Some(HashMap::from([(
+                "custom".to_string(),
+                ProviderConfig {
+                    name: Some("Legacy".to_string()),
+                    ..Default::default()
+                },
+            )])),
+            providers: Some(HashMap::from([(
+                "custom".to_string(),
+                current_schema_provider(),
+            )])),
+            ..Default::default()
+        };
+
+        normalize_provider_configs(&mut config);
+
+        let provider = config
+            .provider
+            .as_ref()
+            .and_then(|map| map.get("custom"))
+            .expect("custom provider");
+        assert_eq!(provider.name.as_deref(), Some("Legacy"));
+    }
+
+    #[test]
+    fn parses_model_id_alias() {
+        let config: Config = serde_json::from_str(
+            r#"{"provider":{"openrouter":{"models":{"free":{"name":"Free","modelID":"free-model"}}}}}"#,
+        )
+        .unwrap();
+        let model = config
+            .provider
+            .unwrap()
+            .get("openrouter")
+            .and_then(|p| p.models.as_ref())
+            .and_then(|m| m.get("free"))
+            .cloned()
+            .expect("model");
+        assert_eq!(model.model.as_deref(), Some("free-model"));
     }
 }

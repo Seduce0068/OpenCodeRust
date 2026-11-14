@@ -111,7 +111,9 @@ fn tolerates_newer_schema_keys() {
                     "name": "Custom",
                     "package": "@opencode/ai/providers/openai-compatible",
                     "settings": {"baseURL": "https://example.com/v1", "apiKey": "test"},
-                    "models": {"m": {"name": "M", "limit": {"context": 1000, "output": 100}}}
+                    "headers": {"X-Test": "1"},
+                    "compatibility": {"maxTokensField": "max_tokens"},
+                    "models": {"m": {"name": "M", "modelID": "underlying", "limit": {"context": 1000, "output": 100}}}
                 }
             },
             "mcp": {
@@ -132,9 +134,22 @@ fn tolerates_newer_schema_keys() {
 
     assert_eq!(config.model.as_deref(), Some("deepai/deepseek-v4.1-flash"));
     assert_eq!(config.permissions.as_ref().map(|p| p.len()), Some(2));
-    // `providers` and `mcp.servers` are not mapped to runtime fields yet
-    // (tracked in MAPPING.md); they must at least not fail the whole load.
-    assert!(config.provider.is_none());
+
+    // The current-schema `providers` map is folded into the runtime `provider`
+    // map; `mcp.servers` is still tolerated but not mapped (tracked in
+    // MAPPING.md).
+    let custom = config
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("custom"))
+        .expect("custom provider normalized into provider map");
+    assert_eq!(
+        custom.npm.as_deref(),
+        Some("@opencode/ai/providers/openai-compatible")
+    );
+    assert_eq!(custom.base_url.as_deref(), Some("https://example.com/v1"));
+    assert_eq!(custom.api_key.as_deref(), Some("test"));
+    assert!(config.providers.is_none());
 }
 
 #[test]

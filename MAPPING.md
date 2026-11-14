@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-15T01:20:08+09:00"
+  at: "2026-11-15T01:43:31+09:00"
 ---
 
 ## 文書の位置付け
@@ -66,12 +66,15 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 | 項目 | 状態 |
 | --- | --- |
 | `permissions` ルール配列 | 受理済み (`PermissionsConfig`、旧 string 配列も受理) |
-| `providers` (複数形) | 未マッピング (legacy `provider` のみ) |
+| `providers` (複数形) | マッピング済み (`provider` へ正規化) |
 | `mcp.servers` | 未マッピング (legacy 直下 `mcp.<name>` のみ) |
 | `snapshots` / `websearch` / `shell` | 未マッピング (未知キーとして無視) |
 
-未マッピングの間もこれらのキーは parse を失敗させない。provider/MCP 定義を
-Rust ランタイムで使うには変換層の追加が必要。
+`providers` は `package` / `settings` / `headers` / `compatibility` を
+`provider` の `npm` / `base_url` / `api_key` / `options` へ変換する。
+`providers.*.models.*` の `limit` / `capabilities` は未マッピングで、既定値
+(context 128K / output 4K) を使う。未マッピングのキーも parse を失敗させない。
+`mcp.servers` を Rust ランタイムで使うには変換層の追加が必要。
 
 ## 命名差
 
