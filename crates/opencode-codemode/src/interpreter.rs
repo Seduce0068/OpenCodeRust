@@ -28,7 +28,7 @@ use crate::limits::ToolCallBudget;
 use crate::tools::{ToolError, ToolHost};
 use crate::value::{
     check_data, is_blocked_member, ordered_keys, ErrorKind, FunctionId, MapValue, PromiseState,
-    SetValue, Value,
+    SetValue, UrlSearchParamsValue, UrlValue, Value,
 };
 
 /// Maximum nested user-function calls before the interpreter raises a
@@ -520,6 +520,9 @@ impl<'a> Interpreter<'a> {
             ("Map", Value::Builtin("Map")),
             ("Set", Value::Builtin("Set")),
             ("Date", Value::Builtin("Date")),
+            ("URL", Value::Builtin("URL")),
+            ("URLSearchParams", Value::Builtin("URLSearchParams")),
+            ("URLSearchParams", Value::Builtin("URLSearchParams")),
             ("undefined", Value::Undefined),
             ("NaN", Value::Number(f64::NAN)),
             ("Infinity", Value::Number(f64::INFINITY)),
@@ -1294,6 +1297,8 @@ impl<'a> Interpreter<'a> {
                     Value::Builtin("Map") => construct_map(arguments.first(), expression.span),
                     Value::Builtin("Set") => construct_set(arguments.first(), expression.span),
                     Value::Builtin("Date") => Ok(construct_date(&arguments)),
+                    Value::Builtin("URL") => construct_url(&arguments, expression.span),
+                    Value::Builtin("URLSearchParams") => construct_url_search_params(&arguments, expression.span),
                     Value::Builtin(name) if ErrorKind::from_name(name).is_some() => {
                         construct_error_value(name, &arguments, expression.span)
                     }
@@ -1471,6 +1476,8 @@ impl<'a> Interpreter<'a> {
                 // before Object.hasOwn, so booleans/null/arrays work too.
                 let key = match left {
                     Value::String(value) => value.clone(),
+        Value::Url(url) => url.borrow().url.to_string(),
+        Value::UrlSearchParams(_) => "[object URLSearchParams]".to_owned(),
                     Value::Number(value) => format_number(*value),
                     Value::Date(date) => format_number(date.time_ms.get()),
                     _ => to_js_string(left),
@@ -1915,6 +1922,31 @@ impl<'a> Interpreter<'a> {
                 crate::date::iso_string(crate::date::now_ms())
                     .unwrap_or_else(|| "Invalid Date".to_owned()),
             )),
+            "URL" => {
+                if arguments.is_empty() {
+                    return Err(RuntimeError::type_error(
+                        "URL constructor requires at least 1 argument.",
+                        _span,
+                    ));
+                }
+                let input = to_js_string(&argument(0));
+                let base = arguments.get(1).map(to_js_string);
+                let url = if let Some(base) = base {
+                    url::Url::parse(&base)
+                        .ok()
+                        .and_then(|base| base.join(&input).ok())
+                        .or_else(|| url::Url::parse(&input).ok())
+                } else {
+                    url::Url::parse(&input).ok()
+                };
+                match url {
+                    Some(url) => Ok(Value::Url(Rc::new(RefCell::new(UrlValue { url })))),
+                    None => Err(RuntimeError::type_error(
+                        "Invalid URL.",
+                        _span,
+                    )),
+                }
+            }
             "Map" | "Set" => Err(RuntimeError::type_error(
                 format!("Constructor {name} requires 'new'."),
                 _span,
@@ -4626,6 +4658,89 @@ impl<'a> Interpreter<'a> {
             "Date.toJSON" => Ok(crate::date::iso_string(as_date_time(receiver, span)?)
                 .map_or(Value::Null, Value::String)),
             "Date.toString" => Ok(Value::String(to_js_string(receiver))),
+            "URL.toString" | "URL.toJSON" => {
+                let url = match receiver {
+                    Value::Url(url) => url.borrow().url.to_string(),
+                    _ => to_js_string(receiver),
+                };
+                Ok(Value::String(url))
+            }
+            "URLSearchParams.get" => {
+                let params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow().params.clone(),
+                    _ => return Ok(Value::Null),
+                };
+                let name = to_js_string(&argument(0));
+                Ok(params
+                    .iter()
+                    .find(|(k, _)| k == &name)
+                    .map(|(_, v)| Value::String(v.clone()))
+                    .unwrap_or(Value::Null))
+            }
+            "URLSearchParams.getAll" => {
+                let params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow().params.clone(),
+                    _ => return Ok(Value::array(Vec::new())),
+                };
+                let name = to_js_string(&argument(0));
+                Ok(Value::array(
+                    params
+                        .iter()
+                        .filter(|(k, _)| k == &name)
+                        .map(|(_, v)| Value::String(v.clone()))
+                        .collect(),
+                ))
+            }
+            "URLSearchParams.has" => {
+                let params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow().params.clone(),
+                    _ => return Ok(Value::Boolean(false)),
+                };
+                let name = to_js_string(&argument(0));
+                Ok(Value::Boolean(params.iter().any(|(k, _)| k == &name)))
+            }
+            "URLSearchParams.set" => {
+                let mut params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow_mut(),
+                    _ => return Ok(Value::Undefined),
+                };
+                let name = to_js_string(&argument(0));
+                let value = to_js_string(&argument(1));
+                params.params.retain(|(k, _)| k != &name);
+                params.params.push((name, value));
+                Ok(Value::Undefined)
+            }
+            "URLSearchParams.append" => {
+                let mut params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow_mut(),
+                    _ => return Ok(Value::Undefined),
+                };
+                let name = to_js_string(&argument(0));
+                let value = to_js_string(&argument(1));
+                params.params.push((name, value));
+                Ok(Value::Undefined)
+            }
+            "URLSearchParams.delete" => {
+                let mut params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow_mut(),
+                    _ => return Ok(Value::Undefined),
+                };
+                let name = to_js_string(&argument(0));
+                params.params.retain(|(k, _)| k != &name);
+                Ok(Value::Undefined)
+            }
+            "URLSearchParams.toString" => {
+                let params = match receiver {
+                    Value::UrlSearchParams(p) => p.borrow().params.clone(),
+                    _ => return Ok(Value::String(String::new())),
+                };
+                let query = params
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", crate::uri::encode(k, false), crate::uri::encode(v, false)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                Ok(Value::String(query))
+            }
             "Date.toDateString"
             | "Date.toTimeString"
             | "Date.toUTCString"
@@ -5301,6 +5416,71 @@ impl<'a> Interpreter<'a> {
             ));
         }
         match object {
+            Value::Url(url) => {
+                let url = url.borrow();
+                match key {
+                    "href" => Ok(Value::String(url.url.to_string())),
+                    "protocol" => Ok(Value::String(url.url.scheme().to_string() + ":")),
+                    "host" => {
+                        let host = url.url.host_str().unwrap_or("").to_string();
+                        let port = url.url.port().map(|p| format!(":{p}")).unwrap_or_default();
+                        Ok(Value::String(format!("{host}{port}")))
+                    }
+                    "hostname" => Ok(Value::String(url.url.host_str().unwrap_or("").to_string())),
+                    "port" => Ok(Value::String(
+                        url.url.port().map(|p| p.to_string()).unwrap_or_default(),
+                    )),
+                    "pathname" => Ok(Value::String(url.url.path().to_string())),
+                    "search" => Ok(Value::String(
+                        url.url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+                    )),
+                    "hash" => Ok(Value::String(
+                        url.url.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+                    )),
+                    "origin" => Ok(Value::String(url.url.origin().ascii_serialization())),
+                    "username" => Ok(Value::String(url.url.username().to_string())),
+                    "password" => Ok(Value::String(url.url.password().unwrap_or("").to_string())),
+                    "searchParams" => {
+                        let query = url.url.query().unwrap_or("").to_string();
+                        let mut params = Vec::new();
+                        for pair in query.split('&') {
+                            if pair.is_empty() {
+                                continue;
+                            }
+                            let (key, value) = match pair.split_once('=') {
+                                Some((k, v)) => (k, v),
+                                None => (pair, ""),
+                            };
+                            let key = crate::uri::decode(key, false).unwrap_or_else(|_| key.to_string());
+                            let value = crate::uri::decode(value, false).unwrap_or_else(|_| value.to_string());
+                            params.push((key, value));
+                        }
+                        Ok(Value::UrlSearchParams(Rc::new(RefCell::new(UrlSearchParamsValue {
+                            params,
+                        }))))
+                    }
+                    _ => {
+                        if let Some(method) = url_method(key) {
+                            Ok(bound_method(object, Some(method)))
+                        } else {
+                            Ok(Value::Undefined)
+                        }
+                    }
+                }
+            }
+            Value::UrlSearchParams(params) => {
+                let params = params.borrow();
+                match key {
+                    "size" => Ok(Value::Number(params.params.len() as f64)),
+                    _ => {
+                        if let Some(method) = url_search_params_method(key) {
+                            Ok(bound_method(object, Some(method)))
+                        } else {
+                            Ok(Value::Undefined)
+                        }
+                    }
+                }
+            }
             Value::Object(map) => {
                 let value = map.borrow().get(key).cloned();
                 if let Some(value) = value {
@@ -5699,6 +5879,57 @@ fn construct_date(arguments: &[Value]) -> Value {
         }
     };
     Value::date(time_ms)
+}
+
+fn construct_url(arguments: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    if arguments.is_empty() {
+        return Err(RuntimeError::type_error(
+            "URL constructor requires at least 1 argument.",
+            span,
+        ));
+    }
+    let input = to_js_string(&arguments[0]);
+    let base = arguments.get(1).map(to_js_string);
+
+    let url = if let Some(base) = base {
+        url::Url::parse(&base)
+            .ok()
+            .and_then(|b| b.join(&input).ok())
+            .or_else(|| url::Url::parse(&input).ok())
+    } else {
+        url::Url::parse(&input).ok()
+    };
+
+    match url {
+        Some(url) => Ok(Value::Url(Rc::new(RefCell::new(UrlValue { url })))),
+        None => Err(RuntimeError::type_error("Invalid URL.", span)),
+    }
+}
+
+fn construct_url_search_params(arguments: &[Value], _span: Span) -> Result<Value, RuntimeError> {
+    let mut params = Vec::new();
+    if let Some(arg) = arguments.first() {
+        match arg {
+            Value::String(text) => {
+                for pair in text.split('&') {
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    let (key, value) = match pair.split_once('=') {
+                        Some((k, v)) => (k, v),
+                        None => (pair, ""),
+                    };
+                    let key = crate::uri::decode(key, false).unwrap_or_else(|_| key.to_string());
+                    let value = crate::uri::decode(value, false).unwrap_or_else(|_| value.to_string());
+                    params.push((key, value));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Value::UrlSearchParams(Rc::new(RefCell::new(UrlSearchParamsValue {
+        params,
+    }))))
 }
 
 fn construct_array(arguments: &[Value], span: Span) -> Result<Value, RuntimeError> {
@@ -6103,6 +6334,26 @@ fn set_method(name: &str) -> Option<&'static str> {
         "keys" => "Set.keys",
         "values" => "Set.values",
         "entries" => "Set.entries",
+        _ => return None,
+    })
+}
+
+fn url_method(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "toString" | "toJSON" => "URL.toString",
+        _ => return None,
+    })
+}
+
+fn url_search_params_method(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "get" => "URLSearchParams.get",
+        "getAll" => "URLSearchParams.getAll",
+        "has" => "URLSearchParams.has",
+        "set" => "URLSearchParams.set",
+        "append" => "URLSearchParams.append",
+        "delete" => "URLSearchParams.delete",
+        "toString" => "URLSearchParams.toString",
         _ => return None,
     })
 }
@@ -7088,11 +7339,14 @@ fn stringify_json_inner(
             }
         }
         Value::Promise(_) => Err(JsonStringifyError::UnawaitedPromise),
-        Value::Map(_) | Value::Set(_) => Ok(Some("{}".to_owned())),
+        Value::Map(_) | Value::Set(_) | Value::UrlSearchParams(_) => Ok(Some("{}".to_owned())),
         Value::Date(date) => Ok(Some(
             crate::date::iso_string(date.time_ms.get())
                 .and_then(|text| serde_json::to_string(&text).ok())
                 .unwrap_or_else(|| "null".to_owned()),
+        )),
+        Value::Url(url) => Ok(Some(
+            serde_json::to_string(&url.borrow().url.to_string()).unwrap_or_else(|_| "null".to_owned()),
         )),
         Value::Null => Ok(Some("null".to_owned())),
         Value::Boolean(value) => Ok(Some(value.to_string())),
@@ -7595,7 +7849,9 @@ fn is_truthy(value: &Value) -> bool {
         | Value::Promise(_)
         | Value::Map(_)
         | Value::Set(_)
-        | Value::Date(_) => true,
+        | Value::Date(_)
+        | Value::Url(_)
+        | Value::UrlSearchParams(_) => true,
     }
 }
 
@@ -7731,6 +7987,8 @@ fn to_number(value: &Value) -> f64 {
         }
         Value::Number(value) => *value,
         Value::String(value) => string_to_number(value),
+        Value::Url(url) => string_to_number(&url.borrow().url.to_string()),
+        Value::UrlSearchParams(_) => f64::NAN,
         Value::Array(array) => to_number(&Value::String(
             array
                 .borrow()
@@ -8269,6 +8527,8 @@ fn to_js_string_seen(value: &Value, seen: &mut Vec<usize>) -> String {
         Value::Boolean(value) => value.to_string(),
         Value::Number(value) => format_number(*value),
         Value::String(value) => value.clone(),
+        Value::Url(url) => url.borrow().url.to_string(),
+        Value::UrlSearchParams(_) => "[object URLSearchParams]".to_owned(),
         Value::Array(array) => {
             let pointer = Rc::as_ptr(array) as *const () as usize;
             if seen.contains(&pointer) {
@@ -8378,7 +8638,9 @@ fn structured_clone_value(
         | Value::Null
         | Value::Boolean(_)
         | Value::Number(_)
-        | Value::String(_) => Ok(value.clone()),
+        | Value::String(_)
+        | Value::Url(_)
+        | Value::UrlSearchParams(_) => Ok(value.clone()),
         Value::Function(_) | Value::Builtin(_) | Value::BoundMethod { .. } => Err(
             RuntimeError::type_error("DataCloneError: a function could not be cloned.", span),
         ),
@@ -8670,7 +8932,9 @@ fn type_of(value: &Value) -> &'static str {
         | Value::Promise(_)
         | Value::Map(_)
         | Value::Set(_)
-        | Value::Date(_) => "object",
+        | Value::Date(_)
+        | Value::Url(_)
+        | Value::UrlSearchParams(_) => "object",
         Value::ToolRef(path) if path.is_empty() => "object",
         Value::Function(_) | Value::Builtin(_) | Value::BoundMethod { .. } | Value::ToolRef(_) => {
             "function"
@@ -9226,6 +9490,48 @@ mod tests {
 
         let error = run(r#"return "abc".normalize("NFX");"#).expect_err("invalid form");
         assert!(matches!(error.kind(), super::RuntimeErrorKind::RangeError));
+    }
+
+    #[test]
+    fn evaluates_url_constructor_and_properties() {
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.href;"#);
+        assert_eq!(value, Value::String("https://example.com:8080/path?q=1#frag".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.protocol;"#);
+        assert_eq!(value, Value::String("https:".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.host;"#);
+        assert_eq!(value, Value::String("example.com:8080".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.hostname;"#);
+        assert_eq!(value, Value::String("example.com".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.port;"#);
+        assert_eq!(value, Value::String("8080".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.pathname;"#);
+        assert_eq!(value, Value::String("/path".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.search;"#);
+        assert_eq!(value, Value::String("?q=1".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.hash;"#);
+        assert_eq!(value, Value::String("#frag".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com:8080/path?q=1#frag"); return u.origin;"#);
+        assert_eq!(value, Value::String("https://example.com:8080".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com/path"); return u.toString();"#);
+        assert_eq!(value, Value::String("https://example.com/path".to_string()));
+
+        let value = run_value(r#"const u = new URL("https://example.com/path"); return typeof u;"#);
+        assert_eq!(value, Value::String("object".to_string()));
+    }
+
+    #[test]
+    fn evaluates_url_with_base() {
+        let value = run_value(r#"const u = new URL("/path", "https://example.com"); return u.href;"#);
+        assert_eq!(value, Value::String("https://example.com/path".to_string()));
     }
 
     #[test]
