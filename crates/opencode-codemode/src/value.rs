@@ -420,6 +420,7 @@ pub struct RegExpValue {
     pub global: bool,
     pub ignore_case: bool,
     pub multiline: bool,
+    pub sticky: bool,
     pub last_index: usize,
 }
 
