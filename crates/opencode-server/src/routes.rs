@@ -2778,7 +2778,7 @@ fn config_routes() -> Router<Arc<ServerState>> {
         .route("/providers", get(get_config_providers))
 }
 
-static CONFIG_STATE: Lazy<RwLock<AppConfig>> = Lazy::new(|| RwLock::new(AppConfig::default()));
+pub static CONFIG_STATE: Lazy<RwLock<AppConfig>> = Lazy::new(|| RwLock::new(AppConfig::default()));
 
 async fn get_config(State(_state): State<Arc<ServerState>>) -> Result<Json<AppConfig>> {
     let config = CONFIG_STATE.read().await;
