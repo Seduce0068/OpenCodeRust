@@ -861,7 +861,9 @@ fn check_data_at(
         | Value::Error(_)
         | Value::Map(_)
         | Value::Set(_)
-        | Value::Date(_) | Value::Url(_) | Value::UrlSearchParams(_) => Ok(()),
+        | Value::Date(_)
+        | Value::Url(_)
+        | Value::UrlSearchParams(_) => Ok(()),
         Value::Function(_)
         | Value::Builtin(_)
         | Value::BoundMethod { .. }
