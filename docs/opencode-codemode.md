@@ -9,7 +9,7 @@ tags:
   - crate
 verified:
   by: opencode
-  at: "2026-10-22T00:00:00+09:00"
+  at: "2026-11-15T18:09:50+09:00"
 ---
 
 ## opencode-codemode
@@ -418,7 +418,22 @@ shadowingできる。
 - 現行実装はbaseline `941e71d` に合わせている。最新 `dev` (`5be4b16`) の
   test262準拠強化、RegExp/URL/Web API、generator/for-await、iterator helpers、
   bytesなどは未追随 (一部の追加APIは個別に取り込み済み)。
-- RegExp、URL、`String.normalize`
+- RegExpは`regex` crate基盤の部分実装。`new RegExp(pattern, flags)` と
+  正規表現リテラル `/.../flags`、`test` / `exec` / `toString`、
+  `String.match` / `matchAll` / `search` を提供する。flagsは `g` / `i` /
+  `m` / `s` / `u` を受理し、`y` (sticky) はフラグ検証のみ。capture groupの
+  結果オブジェクト (`m[1]` 以降と `groups` の名前付きgroup) は未対応で、
+  `m[0]` / `index` / `input` / `groups: undefined` のみを返す。
+  `regex` crateはlookaround (`(?=...)` / `(?!...)`) をサポートしないため、
+  これらを含むpatternは`Invalid regular expression`エラーになる。
+- URLは`url` crate基盤。`new URL(input, base)` とhref/protocol/host/
+  hostname/port/pathname/search/hash/origin/username/password/searchParams
+  property、`toString` / `toJSON` を提供する。`searchParams` は呼び出しごとに
+  新しい`URLSearchParams`を返すが、owner URLへの参照を持ち、
+  `set` / `append` / `delete` の変更は`url.search`に書き戻される。
+  `URLSearchParams` は `new URLSearchParams(init)` と `get` / `getAll` /
+  `has` / `set` / `append` / `delete` / `toString` / `size` を提供する。
+- `String.normalize`
 - TypeScriptの型消去・transpile parity
 - 非同期tool実行と未await rejectionの診断
 - 同期host呼び出しを中断するtimeout

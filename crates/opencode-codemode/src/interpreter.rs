@@ -28,7 +28,7 @@ use crate::limits::ToolCallBudget;
 use crate::tools::{ToolError, ToolHost};
 use crate::value::{
     check_data, is_blocked_member, ordered_keys, ErrorKind, FunctionId, MapValue, PromiseState,
-    SetValue, UrlSearchParamsValue, UrlValue, Value,
+    RegExpValue, SetValue, UrlSearchParamsValue, UrlValue, Value,
 };
 
 /// Maximum nested user-function calls before the interpreter raises a
@@ -522,6 +522,8 @@ impl<'a> Interpreter<'a> {
             ("Date", Value::Builtin("Date")),
             ("URL", Value::Builtin("URL")),
             ("URLSearchParams", Value::Builtin("URLSearchParams")),
+            ("RegExp", Value::Builtin("RegExp")),
+            ("RegExp", Value::Builtin("RegExp")),
             ("URLSearchParams", Value::Builtin("URLSearchParams")),
             ("undefined", Value::Undefined),
             ("NaN", Value::Number(f64::NAN)),
@@ -1072,10 +1074,12 @@ impl<'a> Interpreter<'a> {
                 "BigIntLiteral",
                 expression.span(),
             )),
-            Expression::RegExpLiteral(_) => Err(RuntimeError::unsupported(
-                "RegExpLiteral",
-                expression.span(),
-            )),
+            Expression::RegExpLiteral(literal) => {
+                let pattern = literal.regex.pattern.text.as_str().to_owned();
+                let flags = literal.regex.flags.to_string();
+                let span = literal.span;
+                construct_regexp(&[Value::String(pattern), Value::String(flags)], span)
+            }
             Expression::TemplateLiteral(literal) => {
                 let mut output = String::new();
                 for (index, quasi) in literal.quasis.iter().enumerate() {
@@ -1301,6 +1305,7 @@ impl<'a> Interpreter<'a> {
                     Value::Builtin("URLSearchParams") => {
                         construct_url_search_params(&arguments, expression.span)
                     }
+                    Value::Builtin("RegExp") => construct_regexp(&arguments, expression.span),
                     Value::Builtin(name) if ErrorKind::from_name(name).is_some() => {
                         construct_error_value(name, &arguments, expression.span)
                     }
@@ -3287,6 +3292,29 @@ impl<'a> Interpreter<'a> {
         Ok(parts.join(","))
     }
 
+    /// Convert a method argument into a RegExp value. Returns `None` when the
+    /// argument is a plain string (callers fall back to string semantics).
+    fn regexp_from_argument(
+        &mut self,
+        value: &Value,
+        span: Span,
+    ) -> Result<Option<crate::value::RegExpRef>, RuntimeError> {
+        match value {
+            Value::RegExp(re) => Ok(Some(Rc::clone(re))),
+            _ => {
+                let pattern = to_js_string(value);
+                match construct_regexp(
+                    &[Value::String(pattern), Value::String(String::new())],
+                    span,
+                ) {
+                    Ok(Value::RegExp(re)) => Ok(Some(re)),
+                    Ok(_) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
     fn locale_element(&mut self, item: &Value, span: Span) -> Result<String, RuntimeError> {
         match item {
             Value::Null | Value::Undefined => Ok(String::new()),
@@ -4587,6 +4615,103 @@ impl<'a> Interpreter<'a> {
                     all,
                 )))
             }
+            "String.search" => {
+                let text = as_string(receiver, span)?;
+                let pattern = argument(0);
+                let re = self.regexp_from_argument(&pattern, span)?;
+                match re {
+                    Some(re) => {
+                        let re = re.borrow();
+                        Ok(re
+                            .regex
+                            .find(&text)
+                            .map_or(Value::Number(-1.0), |m| Value::Number(m.start() as f64)))
+                    }
+                    None => {
+                        // Plain string: indexOf
+                        let needle = to_js_string(&pattern);
+                        Ok(Value::Number(match text.find(&needle) {
+                            Some(index) => index as f64,
+                            None => -1.0,
+                        }))
+                    }
+                }
+            }
+            "String.match" => {
+                let text = as_string(receiver, span)?;
+                let pattern = argument(0);
+                let re = self.regexp_from_argument(&pattern, span)?;
+                let Some(re) = re else {
+                    // Plain string: behaves like a non-global regex match
+                    let needle = to_js_string(&pattern);
+                    return Ok(match text.find(&needle) {
+                        Some(index) => {
+                            let mut obj = indexmap::IndexMap::new();
+                            obj.insert("0".to_string(), Value::String(needle.clone()));
+                            obj.insert("index".to_string(), Value::Number(index as f64));
+                            obj.insert("input".to_string(), Value::String(text.clone()));
+                            Value::Object(Rc::new(RefCell::new(obj)))
+                        }
+                        None => Value::Null,
+                    });
+                };
+
+                let global = re.borrow().global;
+                if global {
+                    // Global: return array of all matches (no index/input props)
+                    let re = re.borrow();
+                    let mut matches = Vec::new();
+                    for m in re.regex.find_iter(&text) {
+                        matches.push(Value::String(m.as_str().to_string()));
+                    }
+                    if matches.is_empty() {
+                        return Ok(Value::Null);
+                    }
+                    Ok(Value::array(matches))
+                } else {
+                    let re = re.borrow();
+                    Ok(match re.regex.find(&text) {
+                        Some(m) => {
+                            let mut obj = indexmap::IndexMap::new();
+                            obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                            obj.insert("index".to_string(), Value::Number(m.start() as f64));
+                            obj.insert("input".to_string(), Value::String(text.clone()));
+                            // groups property (null; capture groups unsupported)
+                            obj.insert("groups".to_string(), Value::Undefined);
+                            Value::Object(Rc::new(RefCell::new(obj)))
+                        }
+                        None => Value::Null,
+                    })
+                }
+            }
+            "String.matchAll" => {
+                let text = as_string(receiver, span)?;
+                let pattern = argument(0);
+                let re = self.regexp_from_argument(&pattern, span)?;
+                let Some(re) = re else {
+                    return Err(RuntimeError::type_error(
+                        "String.prototype.matchAll requires a RegExp argument.",
+                        span,
+                    ));
+                };
+                if !re.borrow().global {
+                    return Err(RuntimeError::type_error(
+                        "String.prototype.matchAll requires a global RegExp.",
+                        span,
+                    ));
+                }
+                let re = re.borrow();
+                let mut results = Vec::new();
+                for m in re.regex.find_iter(&text) {
+                    let mut obj = indexmap::IndexMap::new();
+                    obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                    obj.insert("index".to_string(), Value::Number(m.start() as f64));
+                    obj.insert("input".to_string(), Value::String(text.clone()));
+                    obj.insert("groups".to_string(), Value::Undefined);
+                    results.push(Value::Object(Rc::new(RefCell::new(obj))));
+                }
+                Ok(Value::array(results))
+            }
             "String.toString" | "String.valueOf" => Ok(Value::String(as_string(receiver, span)?)),
             "String.concat" => {
                 let mut text = as_string(receiver, span)?;
@@ -4664,6 +4789,65 @@ impl<'a> Interpreter<'a> {
                 };
                 Ok(Value::String(url))
             }
+            "RegExp.test" => {
+                let re = match receiver {
+                    Value::RegExp(re) => re.clone(),
+                    _ => return Ok(Value::Boolean(false)),
+                };
+                let text = to_js_string(&argument(0));
+                let mut re = re.borrow_mut();
+                let result = if re.global {
+                    // Global flag: use last_index
+                    let start = re.last_index;
+                    if let Some(m) = re.regex.find_at(&text, start) {
+                        re.last_index = m.end();
+                        true
+                    } else {
+                        re.last_index = 0;
+                        false
+                    }
+                } else {
+                    re.regex.is_match(&text)
+                };
+                Ok(Value::Boolean(result))
+            }
+            "RegExp.exec" => {
+                let re = match receiver {
+                    Value::RegExp(re) => re.clone(),
+                    _ => return Ok(Value::Null),
+                };
+                let text = to_js_string(&argument(0));
+                let mut re = re.borrow_mut();
+                if re.global {
+                    let start = re.last_index;
+                    if let Some(m) = re.regex.find_at(&text, start) {
+                        re.last_index = m.end();
+                        let mut obj = indexmap::IndexMap::new();
+                        obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                        obj.insert("index".to_string(), Value::Number(m.start() as f64));
+                        obj.insert("input".to_string(), Value::String(text.clone()));
+                        Ok(Value::Object(Rc::new(RefCell::new(obj))))
+                    } else {
+                        re.last_index = 0;
+                        Ok(Value::Null)
+                    }
+                } else if let Some(m) = re.regex.find(&text) {
+                    let mut obj = indexmap::IndexMap::new();
+                    obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                    obj.insert("index".to_string(), Value::Number(m.start() as f64));
+                    obj.insert("input".to_string(), Value::String(text.clone()));
+                    Ok(Value::Object(Rc::new(RefCell::new(obj))))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "RegExp.toString" => {
+                let re = match receiver {
+                    Value::RegExp(re) => re.borrow(),
+                    _ => return Ok(Value::String("/(?:)/".to_string())),
+                };
+                Ok(Value::String(format!("/{}/{}", re.pattern, re.flags)))
+            }
             "URLSearchParams.get" => {
                 let params = match receiver {
                     Value::UrlSearchParams(p) => p.borrow().params.clone(),
@@ -4707,6 +4891,10 @@ impl<'a> Interpreter<'a> {
                 let value = to_js_string(&argument(1));
                 params.params.retain(|(k, _)| k != &name);
                 params.params.push((name, value));
+                if let Some(owner) = &params.owner {
+                    let query = params_to_query(&params.params);
+                    owner.borrow_mut().url.set_query(Some(&query));
+                }
                 Ok(Value::Undefined)
             }
             "URLSearchParams.append" => {
@@ -4717,6 +4905,10 @@ impl<'a> Interpreter<'a> {
                 let name = to_js_string(&argument(0));
                 let value = to_js_string(&argument(1));
                 params.params.push((name, value));
+                if let Some(owner) = &params.owner {
+                    let query = params_to_query(&params.params);
+                    owner.borrow_mut().url.set_query(Some(&query));
+                }
                 Ok(Value::Undefined)
             }
             "URLSearchParams.delete" => {
@@ -4726,24 +4918,17 @@ impl<'a> Interpreter<'a> {
                 };
                 let name = to_js_string(&argument(0));
                 params.params.retain(|(k, _)| k != &name);
+                if let Some(owner) = &params.owner {
+                    let query = params_to_query(&params.params);
+                    owner.borrow_mut().url.set_query(Some(&query));
+                }
                 Ok(Value::Undefined)
             }
             "URLSearchParams.toString" => {
-                let params = match receiver {
-                    Value::UrlSearchParams(p) => p.borrow().params.clone(),
-                    _ => return Ok(Value::String(String::new())),
+                let query = match receiver {
+                    Value::UrlSearchParams(p) => params_to_query(&p.borrow().params),
+                    _ => String::new(),
                 };
-                let query = params
-                    .iter()
-                    .map(|(k, v)| {
-                        format!(
-                            "{}={}",
-                            crate::uri::encode(k, false),
-                            crate::uri::encode(v, false)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("&");
                 Ok(Value::String(query))
             }
             "Date.toDateString"
@@ -5421,8 +5606,26 @@ impl<'a> Interpreter<'a> {
             ));
         }
         match object {
-            Value::Url(url) => {
-                let url = url.borrow();
+            Value::RegExp(re) => {
+                let re = re.borrow();
+                match key {
+                    "source" => Ok(Value::String(re.pattern.clone())),
+                    "flags" => Ok(Value::String(re.flags.clone())),
+                    "global" => Ok(Value::Boolean(re.global)),
+                    "ignoreCase" => Ok(Value::Boolean(re.ignore_case)),
+                    "multiline" => Ok(Value::Boolean(re.multiline)),
+                    "lastIndex" => Ok(Value::Number(re.last_index as f64)),
+                    _ => {
+                        if let Some(method) = regexp_method(key) {
+                            Ok(bound_method(object, Some(method)))
+                        } else {
+                            Ok(Value::Undefined)
+                        }
+                    }
+                }
+            }
+            Value::Url(owner) => {
+                let url = owner.borrow();
                 match key {
                     "href" => Ok(Value::String(url.url.to_string())),
                     "protocol" => Ok(Value::String(url.url.scheme().to_string() + ":")),
@@ -5466,7 +5669,10 @@ impl<'a> Interpreter<'a> {
                             params.push((key, value));
                         }
                         Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
-                            UrlSearchParamsValue { params },
+                            UrlSearchParamsValue {
+                                params,
+                                owner: Some(Rc::clone(owner)),
+                            },
                         ))))
                     }
                     _ => {
@@ -5933,8 +6139,61 @@ fn construct_url_search_params(arguments: &[Value], _span: Span) -> Result<Value
         }
     }
     Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
-        UrlSearchParamsValue { params },
+        UrlSearchParamsValue {
+            params,
+            owner: None,
+        },
     ))))
+}
+
+fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let pattern = arguments.first().map(to_js_string).unwrap_or_default();
+    let flags = arguments.get(1).map(to_js_string).unwrap_or_default();
+
+    let mut global = false;
+    let mut ignore_case = false;
+    let mut multiline = false;
+    let mut dot_all = false;
+    let mut unicode = false;
+    for ch in flags.chars() {
+        match ch {
+            'g' => global = true,
+            'i' => ignore_case = true,
+            'm' => multiline = true,
+            's' => dot_all = true,
+            'u' => unicode = true,
+            'y' => {} // sticky - not yet implemented
+            _ => {
+                return Err(RuntimeError::type_error(
+                    format!("Invalid flags supplied to RegExp constructor: {}", ch),
+                    span,
+                ))
+            }
+        }
+    }
+
+    // Build regex with flags
+    let mut builder = regex::RegexBuilder::new(&pattern);
+    builder.case_insensitive(ignore_case);
+    builder.multi_line(multiline);
+    builder.dot_matches_new_line(dot_all);
+    if unicode {
+        builder.unicode(true);
+    }
+
+    let regex = builder.build().map_err(|e| {
+        RuntimeError::type_error(format!("Invalid regular expression: {}", e), span)
+    })?;
+
+    Ok(Value::RegExp(Rc::new(RefCell::new(RegExpValue {
+        pattern,
+        flags,
+        regex,
+        global,
+        ignore_case,
+        multiline,
+        last_index: 0,
+    }))))
 }
 
 fn construct_array(arguments: &[Value], span: Span) -> Result<Value, RuntimeError> {
@@ -6020,7 +6279,7 @@ fn instance_of(left: &Value, right: &Value, span: Span) -> Result<bool, RuntimeE
         return Err(RuntimeError::type_error(
             "The right-hand side of 'instanceof' must be a constructor CodeMode knows: \
              Error (or a specific error type like TypeError), Date, Map, Set, Array, Object, \
-             or Promise.",
+             Promise, URL, URLSearchParams, or RegExp.",
             span,
         ));
     };
@@ -6033,6 +6292,7 @@ fn instance_of(left: &Value, right: &Value, span: Span) -> Result<bool, RuntimeE
     Ok(match *name {
         "Map" => matches!(left, Value::Map(_)),
         "Set" => matches!(left, Value::Set(_)),
+        "RegExp" => matches!(left, Value::RegExp(_)),
         "Date" => matches!(left, Value::Date(_)),
         "Array" => matches!(left, Value::Array(_)),
         // `Object` matches every value that JS calls an object or a function;
@@ -6055,11 +6315,13 @@ fn instance_of(left: &Value, right: &Value, span: Span) -> Result<bool, RuntimeE
         // CodeMode, so primitives never match these constructors.
         "Number" | "String" | "Boolean" => false,
         "Promise" => matches!(left, Value::Promise(_)),
+        "URL" => matches!(left, Value::Url(_)),
+        "URLSearchParams" => matches!(left, Value::UrlSearchParams(_)),
         _ => {
             return Err(RuntimeError::type_error(
                 "The right-hand side of 'instanceof' must be a constructor CodeMode knows: \
                  Error (or a specific error type like TypeError), Date, Map, Set, Array, Object, \
-                 or Promise.",
+                 Promise, URL, URLSearchParams, or RegExp.",
                 span,
             ))
         }
@@ -6268,6 +6530,9 @@ fn string_method(name: &str) -> Option<&'static str> {
         "includes" => "String.includes",
         "startsWith" => "String.startsWith",
         "endsWith" => "String.endsWith",
+        "match" => "String.match",
+        "matchAll" => "String.matchAll",
+        "search" => "String.search",
         "normalize" => "String.normalize",
         "trim" => "String.trim",
         "trimStart" => "String.trimStart",
@@ -6339,6 +6604,31 @@ fn set_method(name: &str) -> Option<&'static str> {
         "keys" => "Set.keys",
         "values" => "Set.values",
         "entries" => "Set.entries",
+        _ => return None,
+    })
+}
+
+/// Serialize params into a query string for `URLSearchParams.toString` and
+/// write-back to an owning URL.
+fn params_to_query(params: &[(String, String)]) -> String {
+    params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                crate::uri::encode(k, false),
+                crate::uri::encode(v, false)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn regexp_method(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "test" => "RegExp.test",
+        "exec" => "RegExp.exec",
+        "toString" => "RegExp.toString",
         _ => return None,
     })
 }
@@ -7298,9 +7588,11 @@ fn stringify_json_inner(
 ) -> Result<Option<String>, JsonStringifyError> {
     match value {
         Value::Undefined => Ok(None),
-        Value::Function(_) | Value::Builtin(_) | Value::BoundMethod { .. } | Value::ToolRef(_) => {
-            Err(JsonStringifyError::NonData)
-        }
+        Value::Function(_)
+        | Value::Builtin(_)
+        | Value::BoundMethod { .. }
+        | Value::ToolRef(_)
+        | Value::RegExp(_) => Err(JsonStringifyError::NonData),
         Value::Error(error) => {
             let all = [
                 ("name", error.kind.name().to_owned()),
@@ -7857,7 +8149,8 @@ fn is_truthy(value: &Value) -> bool {
         | Value::Set(_)
         | Value::Date(_)
         | Value::Url(_)
-        | Value::UrlSearchParams(_) => true,
+        | Value::UrlSearchParams(_)
+        | Value::RegExp(_) => true,
     }
 }
 
@@ -7994,6 +8287,7 @@ fn to_number(value: &Value) -> f64 {
         Value::Number(value) => *value,
         Value::String(value) => string_to_number(value),
         Value::Url(url) => string_to_number(url.borrow().url.as_str()),
+        Value::RegExp(_) => f64::NAN,
         Value::UrlSearchParams(_) => f64::NAN,
         Value::Array(array) => to_number(&Value::String(
             array
@@ -8535,6 +8829,7 @@ fn to_js_string_seen(value: &Value, seen: &mut Vec<usize>) -> String {
         Value::String(value) => value.clone(),
         Value::Url(url) => url.borrow().url.to_string(),
         Value::UrlSearchParams(_) => "[object URLSearchParams]".to_owned(),
+        Value::RegExp(re) => format!("//{}/{}", re.borrow().pattern, re.borrow().flags),
         Value::Array(array) => {
             let pointer = Rc::as_ptr(array) as *const () as usize;
             if seen.contains(&pointer) {
@@ -8646,7 +8941,8 @@ fn structured_clone_value(
         | Value::Number(_)
         | Value::String(_)
         | Value::Url(_)
-        | Value::UrlSearchParams(_) => Ok(value.clone()),
+        | Value::UrlSearchParams(_)
+        | Value::RegExp(_) => Ok(value.clone()),
         Value::Function(_) | Value::Builtin(_) | Value::BoundMethod { .. } => Err(
             RuntimeError::type_error("DataCloneError: a function could not be cloned.", span),
         ),
@@ -8940,7 +9236,8 @@ fn type_of(value: &Value) -> &'static str {
         | Value::Set(_)
         | Value::Date(_)
         | Value::Url(_)
-        | Value::UrlSearchParams(_) => "object",
+        | Value::UrlSearchParams(_)
+        | Value::RegExp(_) => "object",
         Value::ToolRef(path) if path.is_empty() => "object",
         Value::Function(_) | Value::Builtin(_) | Value::BoundMethod { .. } | Value::ToolRef(_) => {
             "function"
@@ -9561,6 +9858,110 @@ mod tests {
         let value =
             run_value(r#"const u = new URL("/path", "https://example.com"); return u.href;"#);
         assert_eq!(value, Value::String("https://example.com/path".to_string()));
+    }
+
+    #[test]
+    fn evaluates_regexp_construction_and_methods() {
+        let value = run_value(r#"const re = new RegExp("a+", "g"); return re.source;"#);
+        assert_eq!(value, Value::String("a+".to_string()));
+
+        let value = run_value(r#"const re = new RegExp("a+", "gi"); return re.flags;"#);
+        assert_eq!(value, Value::String("gi".to_string()));
+
+        let value = run_value(r#"const re = new RegExp("a+", "g"); return re.global;"#);
+        assert_eq!(value, Value::Boolean(true));
+
+        let value = run_value(r#"const re = new RegExp("a+"); return re.global;"#);
+        assert_eq!(value, Value::Boolean(false));
+
+        let value = run_value(r#"const re = new RegExp("a+"); return re.test("baaa");"#);
+        assert_eq!(value, Value::Boolean(true));
+
+        let value = run_value(r#"const re = new RegExp("a+"); return re.test("bbb");"#);
+        assert_eq!(value, Value::Boolean(false));
+
+        let value = run_value(r#"const re = new RegExp("a+"); return re.toString();"#);
+        assert_eq!(value, Value::String("/a+/".to_string()));
+
+        let value = run_value(
+            r#"const re = new RegExp("[0-9]+"); const m = re.exec("abc 123"); return m[0];"#,
+        );
+        assert_eq!(value, Value::String("123".to_string()));
+
+        let value = run_value(
+            r#"const re = new RegExp("[0-9]+"); const m = re.exec("abc 123"); return m.index;"#,
+        );
+        assert_eq!(value, Value::Number(4.0));
+
+        let value = run_value(r#"const re = new RegExp("x+"); return re.exec("abc");"#);
+        assert_eq!(value, Value::Null);
+
+        let value = run_value(r#"return /ab+c/.test("xabbc");"#);
+        assert_eq!(value, Value::Boolean(true));
+
+        let value = run_value(r#"const m = "abc 123".match(/[0-9]+/); return m[0];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        let value = run_value(r#"return "aaa".match(/a/g).length;"#);
+        assert_eq!(value, Value::Number(3.0));
+
+        let value = run_value(r#"return "hello world".search(/world/);"#);
+        assert_eq!(value, Value::Number(6.0));
+
+        let value = run_value(r#"return "hello world".search(/xyz/);"#);
+        assert_eq!(value, Value::Number(-1.0));
+
+        let value = run_value(r#"const parts = "a1b2c".matchAll(/[0-9]/g); return parts.length;"#);
+        assert_eq!(value, Value::Number(2.0));
+
+        let error = run(r#"return new RegExp("a+", "q");"#).expect_err("invalid flags");
+        assert!(error.message().contains("Invalid flags"));
+    }
+
+    #[test]
+    fn evaluates_regexp_literal_patterns_with_escapes() {
+        // Literal path: pattern text comes straight from the source
+        let value = run_value(r#"return "abc 123".match(/\d+/)[0];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        // Constructor path: JS string escape \ yields a single backslash
+        let value = run_value(r#"return "abc 123".match(new RegExp("[0-9]+"))[0];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+    }
+
+    #[test]
+    fn evaluates_regexp_constructor_escape_patterns() {
+        // JS string "\\d+" parses to the 2-char sequence backslash + d,
+        // which the regex engine reads as the digit class.
+        let value = run_value("return \"abc 123\".match(new RegExp(\"\\\\d+\"))[0];");
+        assert_eq!(value, Value::String("123".to_string()));
+    }
+
+    #[test]
+    fn url_search_params_write_back_to_owner() {
+        let value = run_value(
+            r#"const u = new URL("https://example.com/path?q=1");
+               u.searchParams.set("q", "99");
+               return u.search;"#,
+        );
+        assert_eq!(value, Value::String("?q=99".to_string()));
+
+        let value = run_value(
+            r#"const u = new URL("https://example.com/path?q=1");
+               u.searchParams.append("r", "2");
+               return u.href;"#,
+        );
+        assert_eq!(
+            value,
+            Value::String("https://example.com/path?q=1&r=2".to_string())
+        );
+
+        let value = run_value(
+            r#"const u = new URL("https://example.com/path?q=1&r=2");
+               u.searchParams.delete("q");
+               return u.search;"#,
+        );
+        assert_eq!(value, Value::String("?r=2".to_string()));
     }
 
     #[test]
