@@ -5918,24 +5918,18 @@ fn construct_url(arguments: &[Value], span: Span) -> Result<Value, RuntimeError>
 
 fn construct_url_search_params(arguments: &[Value], _span: Span) -> Result<Value, RuntimeError> {
     let mut params = Vec::new();
-    if let Some(arg) = arguments.first() {
-        match arg {
-            Value::String(text) => {
-                for pair in text.split('&') {
-                    if pair.is_empty() {
-                        continue;
-                    }
-                    let (key, value) = match pair.split_once('=') {
-                        Some((k, v)) => (k, v),
-                        None => (pair, ""),
-                    };
-                    let key = crate::uri::decode(key, false).unwrap_or_else(|_| key.to_string());
-                    let value =
-                        crate::uri::decode(value, false).unwrap_or_else(|_| value.to_string());
-                    params.push((key, value));
-                }
+    if let Some(Value::String(text)) = arguments.first() {
+        for pair in text.split('&') {
+            if pair.is_empty() {
+                continue;
             }
-            _ => {}
+            let (key, value) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""),
+            };
+            let key = crate::uri::decode(key, false).unwrap_or_else(|_| key.to_string());
+            let value = crate::uri::decode(value, false).unwrap_or_else(|_| value.to_string());
+            params.push((key, value));
         }
     }
     Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
@@ -7999,7 +7993,7 @@ fn to_number(value: &Value) -> f64 {
         }
         Value::Number(value) => *value,
         Value::String(value) => string_to_number(value),
-        Value::Url(url) => string_to_number(&url.borrow().url.to_string()),
+        Value::Url(url) => string_to_number(url.borrow().url.as_str()),
         Value::UrlSearchParams(_) => f64::NAN,
         Value::Array(array) => to_number(&Value::String(
             array
