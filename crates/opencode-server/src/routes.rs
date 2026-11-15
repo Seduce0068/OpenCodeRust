@@ -2926,6 +2926,7 @@ pub struct McpConfigInput {
     pub url: Option<String>,
     pub enabled: Option<bool>,
     pub timeout: Option<McpTimeoutConfig>,
+    pub protocol: Option<String>,
     pub oauth: Option<serde_json::Value>,
     pub client_id: Option<String>,
     pub authorization_url: Option<String>,
@@ -3138,6 +3139,7 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
                 headers: None,
                 timeouts,
                 oauth: None,
+                protocol: config.protocol.clone(),
             }),
             enabled,
         ));
@@ -3151,6 +3153,7 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
             env: config.env.or(config.environment),
             cwd: config.cwd,
             timeouts,
+            protocol: config.protocol.clone(),
         }),
         enabled,
     ))
@@ -3219,6 +3222,7 @@ fn parse_runtime_from_loaded_config(
                         headers: server.headers,
                         timeouts,
                         oauth: remote_oauth_settings(server.oauth.as_ref()),
+                        protocol: server.protocol.map(|p| p.revision().to_string()),
                     }),
                     enabled,
                 )));
@@ -3236,6 +3240,7 @@ fn parse_runtime_from_loaded_config(
                         env: server.env.or(server.environment),
                         cwd: server.cwd,
                         timeouts,
+                        protocol: server.protocol.map(|p| p.revision().to_string()),
                     }),
                     enabled,
                 )));

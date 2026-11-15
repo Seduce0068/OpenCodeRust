@@ -133,6 +133,7 @@ pub struct McpServerConfig {
     pub env: Option<Vec<(String, String)>>,
     pub cwd: Option<String>,
     pub timeouts: McpTimeouts,
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +162,7 @@ pub struct McpClient {
     initialized: RwLock<bool>,
     capabilities: RwLock<Option<ServerCapabilities>>,
     tool_registry: Arc<McpToolRegistry>,
+    protocol_version: String,
     startup_timeout_ms: u64,
     catalog_timeout_ms: u64,
     execution_timeout_ms: u64,
@@ -182,6 +184,7 @@ impl McpClient {
             initialized: RwLock::new(false),
             capabilities: RwLock::new(None),
             tool_registry,
+            protocol_version: "2025-11-25".to_string(),
             startup_timeout_ms: DEFAULT_STARTUP_MS,
             catalog_timeout_ms: DEFAULT_CATALOG_MS,
             execution_timeout_ms: DEFAULT_EXECUTION_MS,
@@ -201,6 +204,12 @@ impl McpClient {
         self.startup_timeout_ms = timeouts.startup_ms;
         self.catalog_timeout_ms = timeouts.catalog_ms;
         self.execution_timeout_ms = timeouts.execution_ms;
+        self
+    }
+
+    /// Sets the MCP protocol revision to negotiate during `initialize`.
+    pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
+        self.protocol_version = version.into();
         self
     }
 
@@ -567,7 +576,11 @@ impl McpClient {
     }
 
     async fn initialize(&self) -> Result<(), McpClientError> {
-        let params = serde_json::to_value(InitializeParams::default())
+        let params = InitializeParams {
+            protocol_version: self.protocol_version.clone(),
+            ..InitializeParams::default()
+        };
+        let params = serde_json::to_value(params)
             .map_err(|e| McpClientError::ProtocolError(e.to_string()))?;
 
         let response = tokio::time::timeout(
@@ -850,6 +863,9 @@ impl McpClientRegistry {
 
         let mut client_impl =
             McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(config.timeouts);
+        if let Some(protocol) = config.protocol.as_ref() {
+            client_impl = client_impl.with_protocol_version(protocol.clone());
+        }
         if let Some(bus) = &self.bus {
             client_impl = client_impl.with_bus(bus.clone());
         }
@@ -884,6 +900,7 @@ impl McpClientRegistry {
         url: String,
         headers: Option<HashMap<String, String>>,
         timeouts: McpTimeouts,
+        protocol: Option<String>,
     ) -> Result<Arc<McpClient>, McpClientError> {
         self.connection_configs.write().await.insert(
             name.clone(),
@@ -897,6 +914,9 @@ impl McpClientRegistry {
 
         let mut client_impl =
             McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(timeouts);
+        if let Some(protocol) = protocol {
+            client_impl = client_impl.with_protocol_version(protocol);
+        }
         if let Some(manager) = self.oauth_manager.read().await.as_ref() {
             client_impl = client_impl.with_oauth_manager(manager.clone()).await;
         }
@@ -928,6 +948,7 @@ impl McpClientRegistry {
         url: String,
         headers: Option<HashMap<String, String>>,
         timeouts: McpTimeouts,
+        protocol: Option<String>,
     ) -> Result<Arc<McpClient>, McpClientError> {
         self.connection_configs.write().await.insert(
             name.clone(),
@@ -941,6 +962,9 @@ impl McpClientRegistry {
 
         let mut client_impl =
             McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(timeouts);
+        if let Some(protocol) = protocol {
+            client_impl = client_impl.with_protocol_version(protocol);
+        }
         if let Some(manager) = self.oauth_manager.read().await.as_ref() {
             client_impl = client_impl.with_oauth_manager(manager.clone()).await;
         }
@@ -1034,14 +1058,17 @@ impl McpClientRegistry {
                 headers,
                 timeouts,
             } => {
-                self.add_http(name.to_string(), url, headers, timeouts)
+                self.add_http(name.to_string(), url, headers, timeouts, None)
                     .await
             }
             RegistryConnectionConfig::Sse {
                 url,
                 headers,
                 timeouts,
-            } => self.add_sse(name.to_string(), url, headers, timeouts).await,
+            } => {
+                self.add_sse(name.to_string(), url, headers, timeouts, None)
+                    .await
+            }
         }
     }
 }
