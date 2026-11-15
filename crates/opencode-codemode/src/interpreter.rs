@@ -4670,14 +4670,53 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::array(matches))
                 } else {
                     let re = re.borrow();
-                    Ok(match re.regex.find(&text) {
-                        Some(m) => {
+                    Ok(match re.regex.captures(&text) {
+                        Some(caps) => {
+                            let m = caps.get(0).unwrap();
                             let mut obj = indexmap::IndexMap::new();
                             obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                            for i in 1..caps.len() {
+                                match caps.get(i) {
+                                    Some(cm) => {
+                                        obj.insert(
+                                            i.to_string(),
+                                            Value::String(cm.as_str().to_string()),
+                                        );
+                                    }
+                                    None => {
+                                        obj.insert(i.to_string(), Value::Undefined);
+                                    }
+                                }
+                            }
                             obj.insert("index".to_string(), Value::Number(m.start() as f64));
                             obj.insert("input".to_string(), Value::String(text.clone()));
-                            // groups property (null; capture groups unsupported)
-                            obj.insert("groups".to_string(), Value::Undefined);
+                            let names: Vec<Option<&str>> = re.regex.capture_names().collect();
+                            let mut groups = indexmap::IndexMap::new();
+                            let mut has_named = false;
+                            for (i, name) in names.iter().enumerate() {
+                                if let Some(name) = name {
+                                    has_named = true;
+                                    match caps.get(i) {
+                                        Some(cm) => {
+                                            groups.insert(
+                                                name.to_string(),
+                                                Value::String(cm.as_str().to_string()),
+                                            );
+                                        }
+                                        None => {
+                                            groups.insert(name.to_string(), Value::Null);
+                                        }
+                                    }
+                                }
+                            }
+                            if has_named {
+                                obj.insert(
+                                    "groups".to_string(),
+                                    Value::Object(Rc::new(RefCell::new(groups))),
+                                );
+                            } else {
+                                obj.insert("groups".to_string(), Value::Undefined);
+                            }
                             Value::Object(Rc::new(RefCell::new(obj)))
                         }
                         None => Value::Null,
@@ -4702,12 +4741,49 @@ impl<'a> Interpreter<'a> {
                 }
                 let re = re.borrow();
                 let mut results = Vec::new();
-                for m in re.regex.find_iter(&text) {
+                for caps in re.regex.captures_iter(&text) {
+                    let m = caps.get(0).unwrap();
                     let mut obj = indexmap::IndexMap::new();
                     obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                    for i in 1..caps.len() {
+                        match caps.get(i) {
+                            Some(cm) => {
+                                obj.insert(i.to_string(), Value::String(cm.as_str().to_string()));
+                            }
+                            None => {
+                                obj.insert(i.to_string(), Value::Undefined);
+                            }
+                        }
+                    }
                     obj.insert("index".to_string(), Value::Number(m.start() as f64));
                     obj.insert("input".to_string(), Value::String(text.clone()));
-                    obj.insert("groups".to_string(), Value::Undefined);
+                    let names: Vec<Option<&str>> = re.regex.capture_names().collect();
+                    let mut groups = indexmap::IndexMap::new();
+                    let mut has_named = false;
+                    for (i, name) in names.iter().enumerate() {
+                        if let Some(name) = name {
+                            has_named = true;
+                            match caps.get(i) {
+                                Some(cm) => {
+                                    groups.insert(
+                                        name.to_string(),
+                                        Value::String(cm.as_str().to_string()),
+                                    );
+                                }
+                                None => {
+                                    groups.insert(name.to_string(), Value::Null);
+                                }
+                            }
+                        }
+                    }
+                    if has_named {
+                        obj.insert(
+                            "groups".to_string(),
+                            Value::Object(Rc::new(RefCell::new(groups))),
+                        );
+                    } else {
+                        obj.insert("groups".to_string(), Value::Undefined);
+                    }
                     results.push(Value::Object(Rc::new(RefCell::new(obj))));
                 }
                 Ok(Value::array(results))
@@ -4796,12 +4872,17 @@ impl<'a> Interpreter<'a> {
                 };
                 let text = to_js_string(&argument(0));
                 let mut re = re.borrow_mut();
-                let result = if re.global {
-                    // Global flag: use last_index
+                let result = if re.global || re.sticky {
+                    // Global/sticky flag: use last_index
                     let start = re.last_index;
                     if let Some(m) = re.regex.find_at(&text, start) {
-                        re.last_index = m.end();
-                        true
+                        if re.sticky && m.start() != start {
+                            re.last_index = 0;
+                            false
+                        } else {
+                            re.last_index = m.end();
+                            true
+                        }
                     } else {
                         re.last_index = 0;
                         false
@@ -4818,27 +4899,88 @@ impl<'a> Interpreter<'a> {
                 };
                 let text = to_js_string(&argument(0));
                 let mut re = re.borrow_mut();
-                if re.global {
-                    let start = re.last_index;
-                    if let Some(m) = re.regex.find_at(&text, start) {
-                        re.last_index = m.end();
-                        let mut obj = indexmap::IndexMap::new();
-                        obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
-                        obj.insert("index".to_string(), Value::Number(m.start() as f64));
-                        obj.insert("input".to_string(), Value::String(text.clone()));
-                        Ok(Value::Object(Rc::new(RefCell::new(obj))))
+                let sticky = re.sticky;
+                let global = re.global;
+                let start = re.last_index;
+
+                // Determine the search start and whether we require an exact anchor.
+                let caps = if global || sticky {
+                    // For sticky, the match must start exactly at last_index.
+                    if let Some(caps) = re.regex.captures_at(&text, start) {
+                        if sticky && caps.get(0).map(|m| m.start()) != Some(start) {
+                            re.last_index = 0;
+                            None
+                        } else {
+                            Some(caps)
+                        }
                     } else {
                         re.last_index = 0;
+                        None
+                    }
+                } else {
+                    re.regex.captures(&text)
+                };
+
+                match caps {
+                    Some(caps) => {
+                        let m = caps.get(0).unwrap();
+                        if global || sticky {
+                            re.last_index = m.end();
+                        }
+                        let mut obj = indexmap::IndexMap::new();
+                        obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
+                        // Capture groups (1..)
+                        for i in 1..caps.len() {
+                            match caps.get(i) {
+                                Some(cm) => {
+                                    obj.insert(
+                                        i.to_string(),
+                                        Value::String(cm.as_str().to_string()),
+                                    );
+                                }
+                                None => {
+                                    obj.insert(i.to_string(), Value::Undefined);
+                                }
+                            }
+                        }
+                        obj.insert("index".to_string(), Value::Number(m.start() as f64));
+                        obj.insert("input".to_string(), Value::String(text.clone()));
+                        // Named groups
+                        let names: Vec<Option<&str>> = re.regex.capture_names().collect();
+                        let mut groups = indexmap::IndexMap::new();
+                        let mut has_named = false;
+                        for (i, name) in names.iter().enumerate() {
+                            if let Some(name) = name {
+                                has_named = true;
+                                match caps.get(i) {
+                                    Some(cm) => {
+                                        groups.insert(
+                                            name.to_string(),
+                                            Value::String(cm.as_str().to_string()),
+                                        );
+                                    }
+                                    None => {
+                                        groups.insert(name.to_string(), Value::Null);
+                                    }
+                                }
+                            }
+                        }
+                        if has_named {
+                            obj.insert(
+                                "groups".to_string(),
+                                Value::Object(Rc::new(RefCell::new(groups))),
+                            );
+                        } else {
+                            obj.insert("groups".to_string(), Value::Undefined);
+                        }
+                        Ok(Value::Object(Rc::new(RefCell::new(obj))))
+                    }
+                    None => {
+                        if global || sticky {
+                            re.last_index = 0;
+                        }
                         Ok(Value::Null)
                     }
-                } else if let Some(m) = re.regex.find(&text) {
-                    let mut obj = indexmap::IndexMap::new();
-                    obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
-                    obj.insert("index".to_string(), Value::Number(m.start() as f64));
-                    obj.insert("input".to_string(), Value::String(text.clone()));
-                    Ok(Value::Object(Rc::new(RefCell::new(obj))))
-                } else {
-                    Ok(Value::Null)
                 }
             }
             "RegExp.toString" => {
@@ -5963,6 +6105,14 @@ impl<'a> Interpreter<'a> {
                 map.borrow_mut().insert(key.to_owned(), value);
                 Ok(())
             }
+            Value::RegExp(re) if key == "lastIndex" => {
+                let num = match value {
+                    Value::Number(n) => n as usize,
+                    _ => 0,
+                };
+                re.borrow_mut().last_index = num;
+                Ok(())
+            }
             Value::Array(array) => match key.parse::<usize>() {
                 Ok(index) => {
                     let target = Rc::as_ptr(array) as *const () as usize;
@@ -6155,6 +6305,7 @@ fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeErr
     let mut multiline = false;
     let mut dot_all = false;
     let mut unicode = false;
+    let mut sticky = false;
     for ch in flags.chars() {
         match ch {
             'g' => global = true,
@@ -6162,7 +6313,7 @@ fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeErr
             'm' => multiline = true,
             's' => dot_all = true,
             'u' => unicode = true,
-            'y' => {} // sticky - not yet implemented
+            'y' => sticky = true,
             _ => {
                 return Err(RuntimeError::type_error(
                     format!("Invalid flags supplied to RegExp constructor: {}", ch),
@@ -6192,6 +6343,7 @@ fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeErr
         global,
         ignore_case,
         multiline,
+        sticky,
         last_index: 0,
     }))))
 }
@@ -9962,6 +10114,41 @@ mod tests {
                return u.search;"#,
         );
         assert_eq!(value, Value::String("?r=2".to_string()));
+    }
+
+    #[test]
+    fn evaluates_regexp_capture_groups() {
+        let value = run_value(r#"const m = "abc 123".match(/(\d+)/); return m[1];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        let value = run_value(r#"const m = "a12b".match(/(\d)(\d)/); return m[1] + "," + m[2];"#);
+        assert_eq!(value, Value::String("1,2".to_string()));
+
+        let value = run_value(r#"const m = "hello".match(/(x)/); return m;"#);
+        assert_eq!(value, Value::Null);
+
+        let value =
+            run_value(r#"const m = "abc 123".match(/(?<num>[0-9]+)/); return m.groups.num;"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        let value = run_value(r#"const re = /(\d+)/; const m = re.exec("abc 123"); return m[1];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        let value = run_value(r#"const parts = "a1b2".matchAll(/(\d)/g); return parts[0][1];"#);
+        assert_eq!(value, Value::String("1".to_string()));
+    }
+
+    #[test]
+    fn evaluates_regexp_sticky_flag() {
+        let value = run_value(
+            r#"const re = new RegExp("a", "y"); re.lastIndex = 1; return re.test("ba");"#,
+        );
+        assert_eq!(value, Value::Boolean(true));
+
+        let value = run_value(
+            r#"const re = new RegExp("a", "y"); re.lastIndex = 0; return re.test("ba");"#,
+        );
+        assert_eq!(value, Value::Boolean(false));
     }
 
     #[test]
