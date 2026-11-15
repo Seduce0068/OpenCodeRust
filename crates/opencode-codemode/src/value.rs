@@ -197,6 +197,11 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
                 v.hash(state);
             }
         }
+        Value::RegExp(value) => {
+            22u8.hash(state);
+            value.borrow().pattern.hash(state);
+            value.borrow().flags.hash(state);
+        }
         Value::Array(value) => {
             5u8.hash(state);
             (Rc::as_ptr(value) as *const () as usize).hash(state);
@@ -405,15 +410,30 @@ pub struct DateValue {
 pub type DateRef = Rc<DateValue>;
 pub type UrlRef = Rc<RefCell<UrlValue>>;
 pub type UrlSearchParamsRef = Rc<RefCell<UrlSearchParamsValue>>;
+pub type RegExpRef = Rc<RefCell<RegExpValue>>;
+
+#[derive(Debug, Clone)]
+pub struct RegExpValue {
+    pub pattern: String,
+    pub flags: String,
+    pub regex: regex::Regex,
+    pub global: bool,
+    pub ignore_case: bool,
+    pub multiline: bool,
+    pub last_index: usize,
+}
 
 #[derive(Debug)]
 pub struct UrlValue {
     pub url: url::Url,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UrlSearchParamsValue {
     pub params: Vec<(String, String)>,
+    /// Owning [`UrlValue`] when these params came from `url.searchParams`.
+    /// Mutations are written back to the owner's query string.
+    pub owner: Option<UrlRef>,
 }
 
 /// A value inside the confined interpreter.
@@ -457,6 +477,8 @@ pub enum Value {
     Url(UrlRef),
     /// JavaScript `URLSearchParams`.
     UrlSearchParams(UrlSearchParamsRef),
+    /// JavaScript `RegExp`.
+    RegExp(RegExpRef),
     /// Native method bound to a receiver, such as `array.map`.
     BoundMethod {
         /// Receiver value the method operates on.
@@ -682,6 +704,18 @@ impl Value {
             Self::String(value) => JsonValue::String(value.clone()),
             Self::Url(value) => JsonValue::String(value.borrow().url.to_string()),
             Self::UrlSearchParams(_) => JsonValue::Object(Default::default()),
+            Self::RegExp(value) => JsonValue::Object({
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "source".to_string(),
+                    serde_json::Value::String(value.borrow().pattern.clone()),
+                );
+                map.insert(
+                    "flags".to_string(),
+                    serde_json::Value::String(value.borrow().flags.clone()),
+                );
+                map
+            }),
             Self::Array(array) => {
                 let identity = Rc::as_ptr(array) as *const () as usize;
                 if ancestors.contains(&identity) || ancestors.len() >= MAX_JSON_DEPTH {
@@ -820,6 +854,10 @@ impl Display for Value {
             Self::String(value) => write!(formatter, "{value:?}"),
             Self::Url(value) => write!(formatter, "{}", value.borrow().url),
             Self::UrlSearchParams(_) => write!(formatter, "[object URLSearchParams]"),
+            Self::RegExp(re) => {
+                let re = re.borrow();
+                write!(formatter, "/{}/{}", re.pattern, re.flags)
+            }
             Self::Array(_) | Self::Object(_) => write!(formatter, "{}", self.to_json()),
             Self::Function(_) | Self::Builtin(_) | Self::BoundMethod { .. } => {
                 formatter.write_str("[Function]")
@@ -880,7 +918,8 @@ fn check_data_at(
         | Value::Set(_)
         | Value::Date(_)
         | Value::Url(_)
-        | Value::UrlSearchParams(_) => Ok(()),
+        | Value::UrlSearchParams(_)
+        | Value::RegExp(_) => Ok(()),
         Value::Function(_)
         | Value::Builtin(_)
         | Value::BoundMethod { .. }
