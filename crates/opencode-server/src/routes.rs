@@ -26,7 +26,7 @@ use tokio_stream::{
 
 use crate::mcp_oauth::{
     LocalMcpConfig, McpOAuthError, McpOAuthManager, McpRuntimeConfig,
-    McpServerInfo as McpServerInfoStruct, McpServerLogEntry, RemoteMcpConfig,
+    McpServerInfo as McpServerInfoStruct, McpServerLogEntry, RemoteMcpConfig, RemoteOAuthSettings,
 };
 use crate::oauth::ProviderAuth;
 use crate::pty::{PtyManager, PtySession as PtySessionStruct, PtySubscription};
@@ -2971,6 +2971,10 @@ async fn start_mcp_auth(Path(name): Path<String>) -> Result<Json<serde_json::Val
 #[derive(Debug, Deserialize)]
 pub struct McpAuthCallbackRequest {
     pub code: String,
+    /// CSRF state returned by the authorization server. Optional for
+    /// compatibility with callers that only forward the code.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 async fn mcp_auth_callback(
@@ -2980,7 +2984,7 @@ async fn mcp_auth_callback(
     let manager = get_mcp_oauth_manager();
     ensure_mcp_server_registered(manager, &name).await?;
     let server_info = manager
-        .handle_callback(&name, &req.code)
+        .handle_callback(&name, &req.code, req.state.as_deref())
         .await
         .map_err(mcp_error_to_api_error)?;
 
@@ -3085,6 +3089,22 @@ fn mcp_error_to_api_error(error: McpOAuthError) -> ApiError {
     }
 }
 
+/// Converts the config `oauth` object into the runtime settings.
+fn remote_oauth_settings(
+    oauth: Option<&opencode_config::McpOAuthConfig>,
+) -> Option<RemoteOAuthSettings> {
+    match oauth {
+        Some(opencode_config::McpOAuthConfig::Config(config)) => Some(RemoteOAuthSettings {
+            client_secret: config.client_secret.clone(),
+            scope: config.scope.clone(),
+            callback_port: config.callback_port,
+            redirect_uri: config.redirect_uri.clone(),
+            auth_server_metadata_url: config.auth_server_metadata_url.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Resolves effective MCP timeouts from the global `mcp.timeout` defaults and
 /// a server's own `timeout` override (see the OpenCode MCP schema).
 fn mcp_timeouts(
@@ -3117,6 +3137,7 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
                 authorization_url: config.authorization_url,
                 headers: None,
                 timeouts,
+                oauth: None,
             }),
             enabled,
         ));
@@ -3197,6 +3218,7 @@ fn parse_runtime_from_loaded_config(
                         authorization_url: server.authorization_url,
                         headers: server.headers,
                         timeouts,
+                        oauth: remote_oauth_settings(server.oauth.as_ref()),
                     }),
                     enabled,
                 )));

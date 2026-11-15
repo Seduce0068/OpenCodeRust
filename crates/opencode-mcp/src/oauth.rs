@@ -47,7 +47,7 @@ struct PendingAuth {
 pub struct McpOAuthManager {
     mcp_name: String,
     server_url: String,
-    config: McpOAuthConfig,
+    config: RwLock<McpOAuthConfig>,
     pending: RwLock<Option<PendingAuth>>,
 }
 
@@ -74,14 +74,168 @@ impl McpOAuthManager {
         Self {
             mcp_name,
             server_url,
-            config,
+            config: RwLock::new(config),
             pending: RwLock::new(None),
         }
     }
 
     /// Validate config and return parsed URL components.
+    /// Resolves the endpoints, preferring the effective ones discovered at
+    /// startup over the static configuration.
+    pub async fn set_endpoints(&self, auth_url: &str, token_url: &str) {
+        let mut config = self.config.write().await;
+        config.auth_url = auth_url.to_string();
+        config.token_url = token_url.to_string();
+    }
+
+    /// Ensures `auth_url` / `token_url` are populated, discovering them when
+    /// they are not configured.
+    pub async fn ensure_endpoints(&self) -> Result<(), OAuthError> {
+        {
+            let config = self.config.read().await;
+            if !config.auth_url.is_empty() && !config.token_url.is_empty() {
+                return Ok(());
+            }
+        }
+
+        let (explicit_auth, explicit_token) = {
+            let config = self.config.read().await;
+            (
+                (!config.auth_url.is_empty()).then(|| config.auth_url.clone()),
+                (!config.token_url.is_empty()).then(|| config.token_url.clone()),
+            )
+        };
+
+        let endpoints = crate::discovery::discover_endpoints(
+            &self.server_url,
+            explicit_auth.as_deref(),
+            explicit_token.as_deref(),
+        )
+        .await
+        .map_err(|e| OAuthError::Config(format!("endpoint discovery failed: {e}")))?;
+
+        let mut config = self.config.write().await;
+        if config.auth_url.is_empty() {
+            config.auth_url = endpoints.authorization_endpoint;
+        }
+        if config.token_url.is_empty() {
+            config.token_url = endpoints.token_endpoint;
+        }
+        if config.scopes.is_empty() {
+            config.scopes = endpoints.scopes;
+        }
+        Ok(())
+    }
+
+    /// Prepares the client for an authorization-code flow: discovers endpoints
+    /// and, when no `client_id` is configured, registers a client dynamically
+    /// (RFC 7591).
+    ///
+    /// The MCP authorization spec requires a pre-registered client, a Client ID
+    /// Metadata Document, or dynamic registration. Only the first and last are
+    /// implemented here; without either, the flow fails rather than guessing.
+    pub async fn prepare(&self) -> Result<(), OAuthError> {
+        let (needs_endpoints, needs_client, redirect_uri, scopes) = {
+            let config = self.config.read().await;
+            (
+                config.auth_url.is_empty() || config.token_url.is_empty(),
+                config.client_id.is_none(),
+                config.redirect_uri.clone(),
+                config.scopes.clone(),
+            )
+        };
+
+        let mut registration_endpoint = None;
+        if needs_endpoints || needs_client {
+            let (explicit_auth, explicit_token) = {
+                let config = self.config.read().await;
+                (
+                    (!config.auth_url.is_empty()).then(|| config.auth_url.clone()),
+                    (!config.token_url.is_empty()).then(|| config.token_url.clone()),
+                )
+            };
+
+            let endpoints = crate::discovery::discover_endpoints(
+                &self.server_url,
+                explicit_auth.as_deref(),
+                explicit_token.as_deref(),
+            )
+            .await
+            .map_err(|e| OAuthError::Config(format!("endpoint discovery failed: {e}")))?;
+
+            {
+                let mut config = self.config.write().await;
+                if config.auth_url.is_empty() {
+                    config.auth_url = endpoints.authorization_endpoint.clone();
+                }
+                if config.token_url.is_empty() {
+                    config.token_url = endpoints.token_endpoint.clone();
+                }
+                if config.scopes.is_empty() {
+                    config.scopes = endpoints.scopes.clone();
+                }
+            }
+            registration_endpoint = endpoints.registration_endpoint;
+
+            // Persist endpoints so a restart can resume the flow.
+            let (auth_url, token_url) = {
+                let config = self.config.read().await;
+                (config.auth_url.clone(), config.token_url.clone())
+            };
+            crate::auth::update_endpoints(
+                &self.mcp_name,
+                &auth_url,
+                &token_url,
+                Some(&self.server_url),
+            )
+            .await
+            .map_err(OAuthError::Storage)?;
+        }
+
+        if needs_client {
+            let registration_endpoint = registration_endpoint.ok_or_else(|| {
+                OAuthError::Config(
+                    "no client_id configured and the authorization server does not support \
+                     dynamic client registration"
+                        .into(),
+                )
+            })?;
+
+            let registered =
+                crate::discovery::register_client(&registration_endpoint, &redirect_uri, &scopes)
+                    .await
+                    .map_err(|e| {
+                        OAuthError::Config(format!("dynamic client registration failed: {e}"))
+                    })?;
+
+            {
+                let mut config = self.config.write().await;
+                config.client_id = Some(registered.client_id.clone());
+                if registered.client_secret.is_some() {
+                    config.client_secret = registered.client_secret.clone();
+                }
+            }
+
+            crate::auth::update_client_info(
+                &self.mcp_name,
+                crate::auth::OAuthClientInfo {
+                    client_id: registered.client_id,
+                    client_secret: registered.client_secret,
+                    client_id_issued_at: None,
+                    client_secret_expires_at: None,
+                },
+                Some(&self.server_url),
+            )
+            .await
+            .map_err(OAuthError::Storage)?;
+        }
+
+        Ok(())
+    }
+
     fn parsed_config(
         &self,
+        config: &McpOAuthConfig,
     ) -> Result<
         (
             ClientId,
@@ -92,21 +246,19 @@ impl McpOAuthManager {
         ),
         OAuthError,
     > {
-        let client_id = self
-            .config
+        let client_id = config
             .client_id
             .as_deref()
             .ok_or_else(|| OAuthError::Config("client_id is required".into()))?;
 
-        let auth_url = AuthUrl::new(self.config.auth_url.clone())
+        let auth_url = AuthUrl::new(config.auth_url.clone())
             .map_err(|e| OAuthError::Config(format!("invalid auth_url: {e}")))?;
-        let token_url = TokenUrl::new(self.config.token_url.clone())
+        let token_url = TokenUrl::new(config.token_url.clone())
             .map_err(|e| OAuthError::Config(format!("invalid token_url: {e}")))?;
-        let redirect_url = RedirectUrl::new(self.config.redirect_uri.clone())
+        let redirect_url = RedirectUrl::new(config.redirect_uri.clone())
             .map_err(|e| OAuthError::Config(format!("invalid redirect_uri: {e}")))?;
 
-        let secret = self
-            .config
+        let secret = config
             .client_secret
             .as_ref()
             .map(|s| ClientSecret::new(s.clone()));
@@ -125,7 +277,9 @@ impl McpOAuthManager {
     /// and CSRF state are persisted both in-memory and on disk so that
     /// `finish_auth` can complete the exchange even after a process restart.
     pub async fn start_auth(&self) -> Result<String, OAuthError> {
-        let (client_id, client_secret, auth_url, token_url, redirect_url) = self.parsed_config()?;
+        let config = self.config.read().await.clone();
+        let (client_id, client_secret, auth_url, token_url, redirect_url) =
+            self.parsed_config(&config)?;
 
         let mut client = oauth2::basic::BasicClient::new(client_id)
             .set_auth_uri(auth_url)
@@ -139,7 +293,7 @@ impl McpOAuthManager {
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
         let mut auth_request = client.authorize_url(CsrfToken::new_random);
-        for scope in &self.config.scopes {
+        for scope in &config.scopes {
             auth_request = auth_request.add_scope(Scope::new(scope.clone()));
         }
 
@@ -187,7 +341,9 @@ impl McpOAuthManager {
             return Err(OAuthError::StateMismatch);
         }
 
-        let (client_id, client_secret, auth_url, token_url, redirect_url) = self.parsed_config()?;
+        let config = self.config.read().await.clone();
+        let (client_id, client_secret, auth_url, token_url, redirect_url) =
+            self.parsed_config(&config)?;
 
         let mut client = oauth2::basic::BasicClient::new(client_id)
             .set_auth_uri(auth_url)
@@ -228,7 +384,9 @@ impl McpOAuthManager {
         let tokens = entry.tokens.ok_or(OAuthError::NoRefreshToken)?;
         let refresh = tokens.refresh_token.ok_or(OAuthError::NoRefreshToken)?;
 
-        let (client_id, client_secret, auth_url, token_url, redirect_url) = self.parsed_config()?;
+        let config = self.config.read().await.clone();
+        let (client_id, client_secret, auth_url, token_url, redirect_url) =
+            self.parsed_config(&config)?;
 
         let mut client = oauth2::basic::BasicClient::new(client_id)
             .set_auth_uri(auth_url)
