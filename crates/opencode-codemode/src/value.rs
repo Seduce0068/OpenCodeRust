@@ -186,6 +186,17 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
             4u8.hash(state);
             value.hash(state);
         }
+        Value::Url(value) => {
+            20u8.hash(state);
+            value.borrow().url.as_str().hash(state);
+        }
+        Value::UrlSearchParams(value) => {
+            21u8.hash(state);
+            for (k, v) in &value.borrow().params {
+                k.hash(state);
+                v.hash(state);
+            }
+        }
         Value::Array(value) => {
             5u8.hash(state);
             (Rc::as_ptr(value) as *const () as usize).hash(state);
@@ -392,6 +403,18 @@ pub struct DateValue {
 
 /// Shared reference to a date.
 pub type DateRef = Rc<DateValue>;
+pub type UrlRef = Rc<RefCell<UrlValue>>;
+pub type UrlSearchParamsRef = Rc<RefCell<UrlSearchParamsValue>>;
+
+#[derive(Debug)]
+pub struct UrlValue {
+    pub url: url::Url,
+}
+
+#[derive(Debug, Clone)]
+pub struct UrlSearchParamsValue {
+    pub params: Vec<(String, String)>,
+}
 
 /// A value inside the confined interpreter.
 ///
@@ -430,6 +453,10 @@ pub enum Value {
     Set(SetRef),
     /// JavaScript `Date`.
     Date(DateRef),
+    /// JavaScript `URL`.
+    Url(UrlRef),
+    /// JavaScript `URLSearchParams`.
+    UrlSearchParams(UrlSearchParamsRef),
     /// Native method bound to a receiver, such as `array.map`.
     BoundMethod {
         /// Receiver value the method operates on.
@@ -653,6 +680,8 @@ impl Value {
             }
             Self::Number(_) => JsonValue::Null,
             Self::String(value) => JsonValue::String(value.clone()),
+            Self::Url(value) => JsonValue::String(value.borrow().url.to_string()),
+            Self::UrlSearchParams(_) => JsonValue::Object(Default::default()),
             Self::Array(array) => {
                 let identity = Rc::as_ptr(array) as *const () as usize;
                 if ancestors.contains(&identity) || ancestors.len() >= MAX_JSON_DEPTH {
@@ -772,6 +801,8 @@ impl Display for Value {
             Self::Boolean(value) => write!(formatter, "{value}"),
             Self::Number(value) => write!(formatter, "{value}"),
             Self::String(value) => write!(formatter, "{value:?}"),
+            Self::Url(value) => write!(formatter, "{}", value.borrow().url),
+            Self::UrlSearchParams(_) => write!(formatter, "[object URLSearchParams]"),
             Self::Array(_) | Self::Object(_) => write!(formatter, "{}", self.to_json()),
             Self::Function(_) | Self::Builtin(_) | Self::BoundMethod { .. } => {
                 formatter.write_str("[Function]")
@@ -830,7 +861,7 @@ fn check_data_at(
         | Value::Error(_)
         | Value::Map(_)
         | Value::Set(_)
-        | Value::Date(_) => Ok(()),
+        | Value::Date(_) | Value::Url(_) | Value::UrlSearchParams(_) => Ok(()),
         Value::Function(_)
         | Value::Builtin(_)
         | Value::BoundMethod { .. }
