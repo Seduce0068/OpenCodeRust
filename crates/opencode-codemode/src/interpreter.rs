@@ -5764,8 +5764,8 @@ fn instance_of(left: &Value, right: &Value, span: Span) -> Result<bool, RuntimeE
     let Value::Builtin(name) = right else {
         return Err(RuntimeError::type_error(
             "The right-hand side of 'instanceof' must be a constructor CodeMode knows: \
-             Error (or a specific error type like TypeError), Date, RegExp, Map, Set, URL, \
-             URLSearchParams, Array, Object, or Promise.",
+             Error (or a specific error type like TypeError), Date, Map, Set, Array, Object, \
+             or Promise.",
             span,
         ));
     };
@@ -5803,8 +5803,8 @@ fn instance_of(left: &Value, right: &Value, span: Span) -> Result<bool, RuntimeE
         _ => {
             return Err(RuntimeError::type_error(
                 "The right-hand side of 'instanceof' must be a constructor CodeMode knows: \
-                 Error (or a specific error type like TypeError), Date, RegExp, Map, Set, URL, \
-                 URLSearchParams, Array, Object, or Promise.",
+                 Error (or a specific error type like TypeError), Date, Map, Set, Array, Object, \
+                 or Promise.",
                 span,
             ))
         }
