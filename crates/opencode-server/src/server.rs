@@ -425,8 +425,16 @@ impl ServerState {
 
         // Load config and convert providers to bootstrap format
         let cwd = std::env::current_dir().unwrap_or_default();
-        let bootstrap_config = match load_config(&cwd) {
-            Ok(config) => {
+        let loaded_config = load_config(&cwd).ok();
+        if let Some(config) = loaded_config.as_ref() {
+            // Keep the shared CONFIG_STATE in sync with the loaded config so
+            // routes that read it (model resolution, /config) see the same
+            // values as the provider bootstrap.
+            let mut guard = crate::routes::CONFIG_STATE.write().await;
+            *guard = config.clone();
+        }
+        let bootstrap_config = match loaded_config {
+            Some(config) => {
                 let providers = convert_config_providers_for_bootstrap(&config);
                 bootstrap_config_from_raw(
                     providers,
@@ -436,8 +444,8 @@ impl ServerState {
                     config.small_model.clone(),
                 )
             }
-            Err(error) => {
-                tracing::warn!(%error, "failed to load config for provider bootstrap, using defaults");
+            None => {
+                tracing::warn!("failed to load config for provider bootstrap, using defaults");
                 opencode_provider::BootstrapConfig::default()
             }
         };
