@@ -4404,6 +4404,25 @@ impl<'a> Interpreter<'a> {
             )),
             "String.toUpperCase" => Ok(Value::String(as_string(receiver, span)?.to_uppercase())),
             "String.toLowerCase" => Ok(Value::String(as_string(receiver, span)?.to_lowercase())),
+            "String.normalize" => {
+                use unicode_normalization::UnicodeNormalization;
+                let text = as_string(receiver, span)?;
+                let form = optional_string_arg(0)?.unwrap_or_else(|| "NFC".to_string());
+                let normalized = match form.as_str() {
+                    "NFC" => text.nfc().collect::<String>(),
+                    "NFD" => text.nfd().collect::<String>(),
+                    "NFKC" => text.nfkc().collect::<String>(),
+                    "NFKD" => text.nfkd().collect::<String>(),
+                    _ => {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorKind::RangeError,
+                            format!("The normalization form should be one of NFC, NFD, NFKC, NFKD. Got: {form}"),
+                            span,
+                        ))
+                    }
+                };
+                Ok(Value::String(normalized))
+            }
             "String.localeCompare" => {
                 let text = as_string(receiver, span)?;
                 let other = string_arg(0)?;
@@ -6013,6 +6032,7 @@ fn string_method(name: &str) -> Option<&'static str> {
         "includes" => "String.includes",
         "startsWith" => "String.startsWith",
         "endsWith" => "String.endsWith",
+        "normalize" => "String.normalize",
         "trim" => "String.trim",
         "trimStart" => "String.trimStart",
         "trimEnd" => "String.trimEnd",
@@ -9191,6 +9211,21 @@ mod tests {
         let error = run("return Promise();").expect_err("Promise namespace is not callable");
         assert_eq!(error.kind(), super::RuntimeErrorKind::ExecutionFailure);
         assert!(error.message().contains("Only tools are callable"));
+    }
+
+    #[test]
+    fn evaluates_string_normalize() {
+        let value = run_value(r#"return "á".normalize("NFC");"#);
+        assert_eq!(value, Value::String("á".to_string()));
+
+        let value = run_value(r#"return "á".normalize("NFD");"#);
+        assert_eq!(value, Value::String("á".to_string()));
+
+        let value = run_value(r#"return "á".normalize();"#);
+        assert_eq!(value, Value::String("á".to_string()));
+
+        let error = run(r#"return "abc".normalize("NFX");"#).expect_err("invalid form");
+        assert!(matches!(error.kind(), super::RuntimeErrorKind::RangeError));
     }
 
     #[test]
