@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-15T02:38:23+09:00"
+  at: "2026-11-15T02:54:28+09:00"
 ---
 
 ## 文書の位置付け
@@ -68,6 +68,7 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 | `permissions` ルール配列 | 受理済み (`PermissionsConfig`、旧 string 配列も受理) |
 | `providers` (複数形) | マッピング済み (`provider` へ正規化) |
 | `mcp.servers` | マッピング済み (config 層で `mcp` 直下へ展開) |
+| `mcp.timeout` (グローバル既定) | 受理済み (`McpConfig::timeout`) |
 | `snapshots` / `websearch` / `shell` | 未マッピング (未知キーとして無視) |
 
 `providers` は `package` / `settings` / `headers` / `compatibility` を
@@ -79,8 +80,13 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 `headers` / `environment` / `cwd` / `oauth: false` を変換する。remote は
 streamable HTTP で接続し、config の `headers` を送信する。401 は
 `needs_auth`、その他は `failed` として扱う。local は Content-Length framing
-で stdio 接続する。per-operation の `timeout` object、SSE transport、
-OAuth の token exchange は未実装。
+で stdio 接続する。`timeout` (integer ms、または
+`{startup, catalog, execution}` ms) は startup / catalog / execution の
+各操作タイムアウトへ反映する。既定は公式仕様どおり startup 30s /
+catalog 30s / execution 12h で、グローバル `mcp.timeout` を既定とし
+server の `timeout` がキー単位で上書きする。
+SSE transport、OAuth の token exchange、`codemode` / `protocol` / `pool`
+は未実装。
 未マッピングのキーも parse を失敗させない。
 
 ## 命名差

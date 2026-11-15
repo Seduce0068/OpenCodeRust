@@ -154,6 +154,7 @@ fn tolerates_newer_schema_keys() {
     let remote = config
         .mcp
         .as_ref()
+        .and_then(|mcp| mcp.servers.as_ref())
         .and_then(|servers| servers.get("remote"))
         .expect("remote mcp server");
     match remote {
@@ -165,6 +166,7 @@ fn tolerates_newer_schema_keys() {
     assert!(!config
         .mcp
         .as_ref()
+        .and_then(|mcp| mcp.servers.as_ref())
         .is_some_and(|servers| servers.contains_key("servers")));
 }
 
@@ -179,4 +181,56 @@ fn ignores_real_global_config_when_disabled() {
     let mut loader = ConfigLoader::new().without_global_config();
     let config = loader.load_all(&dir).unwrap();
     assert_eq!(config.model.as_deref(), Some("project/model"));
+}
+
+#[test]
+fn reads_global_mcp_timeout_and_server_overrides() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    write_config(
+        &dir,
+        r#"{
+            "mcp": {
+                "timeout": {"startup": 45000, "catalog": 30000, "execution": 600000},
+                "servers": {
+                    "slow": {
+                        "type": "remote",
+                        "url": "https://example.com/mcp",
+                        "timeout": {"catalog": 60000}
+                    },
+                    "plain": {
+                        "type": "local",
+                        "command": ["npx", "server"]
+                    }
+                }
+            }
+        }"#,
+        "opencode.jsonc",
+    );
+
+    let mut loader = ConfigLoader::new().without_global_config();
+    let config = loader.load_all(&dir).unwrap();
+
+    let section = config.mcp.expect("mcp");
+    let global = section.timeout.as_ref().expect("global mcp.timeout");
+    assert_eq!(global.per_operation(), (45000, 30000, 600000));
+
+    let mcp = section.servers.expect("servers");
+    let slow = match mcp.get("slow").unwrap() {
+        opencode_config::McpServerConfig::Full(server) => server,
+        other => panic!("expected Full, got {other:?}"),
+    };
+    let (startup, catalog, execution) =
+        opencode_config::McpTimeoutConfig::resolve(Some(global), slow.timeout.as_ref());
+    assert_eq!((startup, catalog, execution), (45000, 60000, 600000));
+
+    let plain = match mcp.get("plain").unwrap() {
+        opencode_config::McpServerConfig::Full(server) => server,
+        other => panic!("expected Full, got {other:?}"),
+    };
+    assert!(plain.timeout.is_none());
+    let (startup, catalog, execution) =
+        opencode_config::McpTimeoutConfig::resolve(Some(global), plain.timeout.as_ref());
+    assert_eq!((startup, catalog, execution), (45000, 30000, 600000));
+    assert!(!mcp.contains_key("timeout"), "timeout is not a server");
 }

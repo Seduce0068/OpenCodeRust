@@ -33,7 +33,10 @@ use crate::pty::{PtyManager, PtySession as PtySessionStruct, PtySubscription};
 use crate::worktree::{self, WorktreeInfo as WorktreeInfoStruct};
 use crate::{ApiError, Result, ServerState};
 use opencode_agent::{AgentInfo as AgentConfigInfo, AgentMode, AgentRegistry, BuiltinAgent};
-use opencode_config::{load_config, Config as AppConfig, McpServerConfig as LoadedMcpServerConfig};
+use opencode_config::{
+    load_config, Config as AppConfig, McpServerConfig as LoadedMcpServerConfig, McpTimeoutConfig,
+};
+use opencode_mcp::client::McpTimeouts;
 use opencode_plugin::subprocess::{PluginAuthBridge, PluginLoader, PluginSubprocessError};
 use opencode_provider::{
     temperature_for_model, top_p_for_model, AuthInfo, AuthMethodType, ModelsData, ModelsDevInfo,
@@ -2922,7 +2925,7 @@ pub struct McpConfigInput {
     pub cwd: Option<String>,
     pub url: Option<String>,
     pub enabled: Option<bool>,
-    pub timeout: Option<u64>,
+    pub timeout: Option<McpTimeoutConfig>,
     pub oauth: Option<serde_json::Value>,
     pub client_id: Option<String>,
     pub authorization_url: Option<String>,
@@ -3082,8 +3085,23 @@ fn mcp_error_to_api_error(error: McpOAuthError) -> ApiError {
     }
 }
 
+/// Resolves effective MCP timeouts from the global `mcp.timeout` defaults and
+/// a server's own `timeout` override (see the OpenCode MCP schema).
+fn mcp_timeouts(
+    global: Option<&McpTimeoutConfig>,
+    server: Option<&McpTimeoutConfig>,
+) -> McpTimeouts {
+    let (startup, catalog, execution) = McpTimeoutConfig::resolve(global, server);
+    McpTimeouts {
+        startup_ms: startup,
+        catalog_ms: catalog,
+        execution_ms: execution,
+    }
+}
+
 fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfig, bool)> {
     let enabled = config.enabled.unwrap_or(true);
+    let timeouts = mcp_timeouts(None, config.timeout.as_ref());
     let is_remote = matches!(config.server_type.as_deref(), Some("remote")) || config.url.is_some();
 
     if is_remote {
@@ -3098,7 +3116,7 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
                 client_id: config.client_id,
                 authorization_url: config.authorization_url,
                 headers: None,
-                timeout: config.timeout,
+                timeouts,
             }),
             enabled,
         ));
@@ -3111,7 +3129,7 @@ fn parse_runtime_from_request(config: McpConfigInput) -> Result<(McpRuntimeConfi
             args,
             env: config.env.or(config.environment),
             cwd: config.cwd,
-            timeout: config.timeout,
+            timeouts,
         }),
         enabled,
     ))
@@ -3158,11 +3176,13 @@ fn parse_command_and_args(
 
 fn parse_runtime_from_loaded_config(
     config: LoadedMcpServerConfig,
+    global_timeout: Option<&McpTimeoutConfig>,
 ) -> Result<Option<(McpRuntimeConfig, bool)>> {
     match config {
         LoadedMcpServerConfig::Enabled { .. } => Ok(None),
         LoadedMcpServerConfig::Full(server) => {
             let enabled = server.enabled.unwrap_or(true);
+            let timeouts = mcp_timeouts(global_timeout, server.timeout.as_ref());
 
             if let Some(url) = server.url {
                 let oauth_enabled = !matches!(
@@ -3176,7 +3196,7 @@ fn parse_runtime_from_loaded_config(
                         client_id: server.client_id,
                         authorization_url: server.authorization_url,
                         headers: server.headers,
-                        timeout: server.timeout,
+                        timeouts,
                     }),
                     enabled,
                 )));
@@ -3193,7 +3213,7 @@ fn parse_runtime_from_loaded_config(
                         args,
                         env: server.env.or(server.environment),
                         cwd: server.cwd,
-                        timeout: server.timeout,
+                        timeouts,
                     }),
                     enabled,
                 )));
@@ -3210,15 +3230,21 @@ async fn sync_mcp_from_disk(manager: &McpOAuthManager) -> Result<()> {
     let config = load_config(&cwd)
         .map_err(|e| ApiError::BadRequest(format!("Failed to load config: {}", e)))?;
 
-    let Some(mcp_map) = config.mcp else {
+    let Some(section) = config.mcp else {
         return Ok(());
     };
+    let Some(mcp_map) = section.servers else {
+        return Ok(());
+    };
+    let global_timeout = section.timeout.clone();
 
     for (name, server_config) in mcp_map {
         if manager.has_server(&name).await {
             continue;
         }
-        if let Some((runtime, enabled)) = parse_runtime_from_loaded_config(server_config)? {
+        if let Some((runtime, enabled)) =
+            parse_runtime_from_loaded_config(server_config, global_timeout.as_ref())?
+        {
             manager.add_server(name, runtime, enabled).await;
         }
     }
@@ -5049,7 +5075,9 @@ async fn get_auth_bridge(provider: &str) -> Result<Arc<PluginAuthBridge>> {
 #[cfg(test)]
 mod mcp_loaded_config_tests {
     use super::*;
-    use opencode_config::{McpOAuthConfig, McpServer, McpServerConfig};
+    use opencode_config::{
+        McpOAuthConfig, McpPerOperationTimeout, McpServer, McpServerConfig, McpTimeoutConfig,
+    };
 
     fn full(server: McpServer) -> McpServerConfig {
         McpServerConfig::Full(Box::new(server))
@@ -5061,10 +5089,17 @@ mod mcp_loaded_config_tests {
             command: vec!["node".to_string(), "server.js".to_string()],
             environment: Some(HashMap::from([("KEY".to_string(), "value".to_string())])),
             cwd: Some("/tmp/project".to_string()),
+            timeout: Some(McpTimeoutConfig::PerOperation(McpPerOperationTimeout {
+                startup: Some(120),
+                catalog: Some(340),
+                execution: Some(560),
+            })),
             ..Default::default()
         });
 
-        let (runtime, enabled) = parse_runtime_from_loaded_config(config).unwrap().unwrap();
+        let (runtime, enabled) = parse_runtime_from_loaded_config(config, None)
+            .unwrap()
+            .unwrap();
         assert!(enabled);
         match runtime {
             McpRuntimeConfig::Local(local) => {
@@ -5075,6 +5110,9 @@ mod mcp_loaded_config_tests {
                     Some("value".to_string())
                 );
                 assert_eq!(local.cwd.as_deref(), Some("/tmp/project"));
+                assert_eq!(local.timeouts.startup_ms, 120);
+                assert_eq!(local.timeouts.catalog_ms, 340);
+                assert_eq!(local.timeouts.execution_ms, 560);
             }
             McpRuntimeConfig::Remote(_) => panic!("expected local config"),
         }
@@ -5088,7 +5126,9 @@ mod mcp_loaded_config_tests {
             ..Default::default()
         });
 
-        let (runtime, _) = parse_runtime_from_loaded_config(config).unwrap().unwrap();
+        let (runtime, _) = parse_runtime_from_loaded_config(config, None)
+            .unwrap()
+            .unwrap();
         match runtime {
             McpRuntimeConfig::Remote(remote) => {
                 assert!(!remote.oauth_enabled);
