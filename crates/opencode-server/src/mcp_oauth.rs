@@ -1,5 +1,7 @@
 use chrono::Utc;
-use opencode_mcp::client::{McpClientError, McpClientRegistry, McpServerConfig as McpClientConfig};
+use opencode_mcp::client::{
+    McpClientError, McpClientRegistry, McpServerConfig as McpClientConfig, McpTimeouts,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +13,7 @@ pub struct LocalMcpConfig {
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub cwd: Option<String>,
-    pub timeout: Option<u64>,
+    pub timeouts: McpTimeouts,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -22,7 +24,7 @@ pub struct RemoteMcpConfig {
     pub authorization_url: Option<String>,
     /// Static headers from the config (for API-key style remote servers).
     pub headers: Option<HashMap<String, String>>,
-    pub timeout: Option<u64>,
+    pub timeouts: McpTimeouts,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +199,7 @@ impl McpOAuthManager {
                         args: local.args,
                         env,
                         cwd: local.cwd,
-                        timeout_ms: local.timeout,
+                        timeouts: local.timeouts,
                     })
                     .await
                 {
@@ -265,7 +267,7 @@ impl McpOAuthManager {
                             server_name.to_string(),
                             remote.url.clone(),
                             remote.headers.clone().filter(|headers| !headers.is_empty()),
-                            remote.timeout,
+                            remote.timeouts,
                         )
                         .await
                     {
@@ -873,5 +875,30 @@ mod tests {
         let status = manager.connect("remote").await.expect("connect result");
         assert_eq!(status.status, "failed");
         assert!(status.error.is_some());
+    }
+    #[tokio::test]
+    async fn remote_server_honors_configured_timeouts() {
+        let (url, _) = spawn_mock_mcp(axum::http::StatusCode::OK).await;
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url,
+                    oauth_enabled: false,
+                    headers: None,
+                    timeouts: McpTimeouts {
+                        startup_ms: 7000,
+                        catalog_ms: 8000,
+                        execution_ms: 9000,
+                    },
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let status = manager.connect("remote").await.expect("connect result");
+        assert_eq!(status.status, "connected");
     }
 }

@@ -89,12 +89,8 @@ pub struct Config {
     #[serde(rename = "providers", skip_serializing_if = "Option::is_none")]
     pub providers: Option<HashMap<String, ProviderConfig>>,
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_mcp_config",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub mcp: Option<HashMap<String, McpServerConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formatter: Option<FormatterConfig>,
@@ -598,7 +594,7 @@ pub struct McpServer {
     pub enabled: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u64>,
+    pub timeout: Option<McpTimeoutConfig>,
 
     /// For remote: headers to send
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -617,6 +613,90 @@ pub struct McpServer {
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_url: Option<String>,
+}
+
+/// MCP request timeout.
+///
+/// The legacy schema uses a single integer in milliseconds; the current
+/// schema uses a per-operation object (`startup` / `catalog` / `execution`,
+/// also in milliseconds).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpTimeoutConfig {
+    Millis(u64),
+    PerOperation(McpPerOperationTimeout),
+}
+
+/// Default MCP `startup` timeout in ms (transport connect + initialize).
+pub const DEFAULT_MCP_STARTUP_MS: u64 = 30_000;
+/// Default MCP `catalog` timeout in ms (tools/prompts/resources listing).
+pub const DEFAULT_MCP_CATALOG_MS: u64 = 30_000;
+/// Default MCP `execution` timeout in ms (tool calls). 12 hours.
+pub const DEFAULT_MCP_EXECUTION_MS: u64 = 43_200_000;
+
+impl Default for McpTimeoutConfig {
+    fn default() -> Self {
+        McpTimeoutConfig::PerOperation(McpPerOperationTimeout::default())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpPerOperationTimeout {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<u64>,
+}
+
+impl McpTimeoutConfig {
+    /// The explicitly configured values, before defaults are applied.
+    pub(crate) fn explicit(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        match self {
+            McpTimeoutConfig::Millis(millis) => (Some(*millis), Some(*millis), Some(*millis)),
+            McpTimeoutConfig::PerOperation(timeout) => {
+                (timeout.startup, timeout.catalog, timeout.execution)
+            }
+        }
+    }
+
+    /// Returns `(startup, catalog, execution)` in milliseconds, applying the
+    /// documented defaults (30s / 30s / 12h) to unset values.
+    pub fn per_operation(&self) -> (u64, u64, u64) {
+        let (startup, catalog, execution) = self.explicit();
+        (
+            startup.unwrap_or(DEFAULT_MCP_STARTUP_MS),
+            catalog.unwrap_or(DEFAULT_MCP_CATALOG_MS),
+            execution.unwrap_or(DEFAULT_MCP_EXECUTION_MS),
+        )
+    }
+
+    /// Resolves the effective timeouts for one server.
+    ///
+    /// Per the OpenCode schema, the global `mcp.timeout` provides defaults and
+    /// a server's own `timeout` overrides matching keys. Anything still unset
+    /// falls back to the documented defaults.
+    pub fn resolve(global: Option<&Self>, server: Option<&Self>) -> (u64, u64, u64) {
+        let mut effective = (None, None, None);
+        for layer in [global, server].into_iter().flatten() {
+            let (startup, catalog, execution) = layer.explicit();
+            if startup.is_some() {
+                effective.0 = startup;
+            }
+            if catalog.is_some() {
+                effective.1 = catalog;
+            }
+            if execution.is_some() {
+                effective.2 = execution;
+            }
+        }
+        (
+            effective.0.unwrap_or(DEFAULT_MCP_STARTUP_MS),
+            effective.1.unwrap_or(DEFAULT_MCP_CATALOG_MS),
+            effective.2.unwrap_or(DEFAULT_MCP_EXECUTION_MS),
+        )
+    }
 }
 
 /// OAuth configuration for remote MCP servers.
@@ -646,27 +726,59 @@ pub struct McpOAuth {
     pub scope: Option<String>,
 }
 
-/// Deserializes the `mcp` field from either the legacy direct map
-/// (`mcp.<name>`) or the current wrapper (`mcp.servers.<name>`).
-fn deserialize_mcp_config<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashMap<String, McpServerConfig>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    let Some(object) = value.as_object() else {
-        return Err(serde::de::Error::custom("mcp config must be an object"));
-    };
+/// The `mcp` configuration section.
+///
+/// The current schema keeps servers under `servers` with global request
+/// timeouts in a sibling `timeout` object; the legacy shape places servers
+/// directly under `mcp`. Both are accepted on read, and the current shape is
+/// written back.
+#[derive(Debug, Clone, Default)]
+pub struct McpConfig {
+    pub timeout: Option<McpTimeoutConfig>,
+    pub servers: Option<HashMap<String, McpServerConfig>>,
+}
 
-    if is_mcp_servers_wrapper(object) {
-        let servers = object.get("servers").cloned().unwrap_or_default();
-        let servers: HashMap<String, McpServerV2> =
-            serde_json::from_value(servers).map_err(serde::de::Error::custom)?;
-        return Ok(Some(
-            servers
+impl Serialize for McpConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(timeout) = &self.timeout {
+            map.serialize_entry("timeout", timeout)?;
+        }
+        if let Some(servers) = &self.servers {
+            map.serialize_entry("servers", servers)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for McpConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object() else {
+            return Err(serde::de::Error::custom("mcp config must be an object"));
+        };
+
+        // `mcp.timeout` is a global default object in the current schema, but
+        // a legacy config may legitimately define a server named `timeout`.
+        // Only treat the value as the global timeout when it is not a server.
+        let timeout = object
+            .get("timeout")
+            .filter(|value| !looks_like_mcp_server(value))
+            .and_then(|timeout| serde_json::from_value::<McpTimeoutConfig>(timeout.clone()).ok());
+
+        if is_mcp_servers_wrapper(object) {
+            let servers = object.get("servers").cloned().unwrap_or_default();
+            let servers: HashMap<String, McpServerV2> =
+                serde_json::from_value(servers).map_err(serde::de::Error::custom)?;
+            let servers = servers
                 .into_iter()
                 .map(|(name, server)| {
                     (
@@ -674,24 +786,54 @@ where
                         McpServerConfig::Full(Box::new(server.into_mcp_server())),
                     )
                 })
-                .collect(),
-        ));
-    }
+                .collect();
+            return Ok(McpConfig {
+                timeout,
+                servers: Some(servers),
+            });
+        }
 
-    let parsed: HashMap<String, McpServerConfig> =
-        serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-    Ok(Some(parsed))
+        // Legacy shape: servers are the object entries. `timeout` is removed
+        // only when it was recognized as the global default above.
+        let mut legacy = object.clone();
+        if timeout.is_some() {
+            legacy.remove("timeout");
+        }
+        let servers: HashMap<String, McpServerConfig> =
+            serde_json::from_value(serde_json::Value::Object(legacy))
+                .map_err(serde::de::Error::custom)?;
+        Ok(McpConfig {
+            timeout,
+            servers: Some(servers),
+        })
+    }
+}
+
+/// True when a value looks like an MCP server entry rather than a timeout
+/// object, so that a legacy server named `timeout` is not swallowed.
+fn looks_like_mcp_server(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["type", "command", "url", "enabled", "disabled"]
+        .iter()
+        .any(|key| object.contains_key(*key))
 }
 
 /// Detects the current-schema `mcp.servers` wrapper without misreading a
 /// legacy server that happens to be named `servers`.
 fn is_mcp_servers_wrapper(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    if object.len() != 1 {
-        return false;
-    }
     let Some(servers) = object.get("servers").and_then(serde_json::Value::as_object) else {
         return false;
     };
+    // The current schema may add siblings such as `mcp.timeout`; they are not
+    // servers. Any other sibling means this is a legacy direct map.
+    let has_only_known_siblings = object
+        .keys()
+        .all(|key| key == "servers" || key == "timeout");
+    if !has_only_known_siblings {
+        return false;
+    }
     if servers.is_empty() {
         return true;
     }
@@ -738,6 +880,8 @@ struct McpServerV2 {
     oauth: Option<serde_json::Value>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    timeout: Option<McpTimeoutConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -767,10 +911,7 @@ impl McpServerV2 {
             enabled: self
                 .enabled
                 .or_else(|| self.disabled.map(|disabled| !disabled)),
-            // The current schema uses a per-operation timeout object whose
-            // units are not documented; keep the runtime default instead of
-            // guessing. Tracked in MAPPING.md.
-            timeout: None,
+            timeout: self.timeout,
             headers: self.headers.map(string_map),
             oauth: self.oauth.and_then(oauth_config_from_value),
             args: self.args,
@@ -778,6 +919,13 @@ impl McpServerV2 {
             client_id: None,
             authorization_url: None,
         }
+    }
+}
+
+impl DeepMerge for McpConfig {
+    fn deep_merge(&mut self, other: Self) {
+        merge_option_map_deep_values(&mut self.servers, other.servers);
+        merge_option_deep(&mut self.timeout, other.timeout);
     }
 }
 
@@ -1389,7 +1537,7 @@ impl DeepMerge for McpServer {
         merge_option_replace(&mut self.cwd, other.cwd);
         merge_option_replace(&mut self.url, other.url);
         merge_option_replace(&mut self.enabled, other.enabled);
-        merge_option_replace(&mut self.timeout, other.timeout);
+        merge_option_deep(&mut self.timeout, other.timeout);
         merge_option_map_overwrite_values(&mut self.headers, other.headers);
         merge_option_replace(&mut self.oauth, other.oauth);
         // Legacy fields
@@ -1399,6 +1547,44 @@ impl DeepMerge for McpServer {
         merge_option_map_overwrite_values(&mut self.env, other.env);
         merge_option_replace(&mut self.client_id, other.client_id);
         merge_option_replace(&mut self.authorization_url, other.authorization_url);
+    }
+}
+
+impl DeepMerge for McpTimeoutConfig {
+    fn deep_merge(&mut self, other: Self) {
+        // Merge per key so that a config that only overrides e.g. `execution`
+        // keeps the `startup` / `catalog` values from a lower-precedence file.
+        if let (McpTimeoutConfig::Millis(target), McpTimeoutConfig::Millis(source)) =
+            (&mut *self, &other)
+        {
+            *target = *source;
+            return;
+        }
+
+        let (mut startup, mut catalog, mut execution) = self.explicit();
+        let (source_startup, source_catalog, source_execution) = other.explicit();
+        if source_startup.is_some() {
+            startup = source_startup;
+        }
+        if source_catalog.is_some() {
+            catalog = source_catalog;
+        }
+        if source_execution.is_some() {
+            execution = source_execution;
+        }
+        *self = McpTimeoutConfig::PerOperation(McpPerOperationTimeout {
+            startup,
+            catalog,
+            execution,
+        });
+    }
+}
+
+impl DeepMerge for McpPerOperationTimeout {
+    fn deep_merge(&mut self, other: Self) {
+        merge_option_replace(&mut self.startup, other.startup);
+        merge_option_replace(&mut self.catalog, other.catalog);
+        merge_option_replace(&mut self.execution, other.execution);
     }
 }
 
@@ -1539,7 +1725,7 @@ impl Config {
         merge_option_deep(&mut self.agent, other.agent);
         merge_option_map_deep_values(&mut self.provider, other.provider);
         merge_option_map_deep_values(&mut self.providers, other.providers);
-        merge_option_map_deep_values(&mut self.mcp, other.mcp);
+        merge_option_deep(&mut self.mcp, other.mcp);
         merge_option_deep(&mut self.formatter, other.formatter);
         merge_option_deep(&mut self.lsp, other.lsp);
         merge_option_replace(&mut self.layout, other.layout);
@@ -1688,35 +1874,44 @@ mod tests {
     #[test]
     fn mcp_enabled_flag_overlay_keeps_existing_full_server_fields() {
         let mut base = Config {
-            mcp: Some(HashMap::from([(
-                "repo".to_string(),
-                McpServerConfig::Full(Box::new(McpServer {
-                    command: vec!["node".to_string(), "mcp.js".to_string()],
-                    timeout: Some(3000),
-                    ..Default::default()
-                })),
-            )])),
+            mcp: Some(McpConfig {
+                timeout: None,
+                servers: Some(HashMap::from([(
+                    "repo".to_string(),
+                    McpServerConfig::Full(Box::new(McpServer {
+                        command: vec!["node".to_string(), "mcp.js".to_string()],
+                        timeout: Some(McpTimeoutConfig::Millis(3000)),
+                        ..Default::default()
+                    })),
+                )])),
+            }),
             ..Default::default()
         };
 
         let overlay = Config {
-            mcp: Some(HashMap::from([(
-                "repo".to_string(),
-                McpServerConfig::Enabled { enabled: false },
-            )])),
+            mcp: Some(McpConfig {
+                timeout: None,
+                servers: Some(HashMap::from([(
+                    "repo".to_string(),
+                    McpServerConfig::Enabled { enabled: false },
+                )])),
+            }),
             ..Default::default()
         };
 
         base.merge(overlay);
 
-        let server = base.mcp.unwrap().remove("repo").unwrap();
+        let server = base.mcp.unwrap().servers.unwrap().remove("repo").unwrap();
         match server {
             McpServerConfig::Full(server) => {
                 assert_eq!(
                     server.command,
                     vec!["node".to_string(), "mcp.js".to_string()]
                 );
-                assert_eq!(server.timeout, Some(3000));
+                assert_eq!(
+                    server.timeout.expect("timeout").per_operation(),
+                    (3000, 3000, 3000)
+                );
                 assert_eq!(server.enabled, Some(false));
             }
             McpServerConfig::Enabled { .. } => panic!("expected full MCP server config"),
@@ -1853,7 +2048,7 @@ mod tests {
         )
         .unwrap();
 
-        let mcp = config.mcp.expect("mcp");
+        let mcp = config.mcp.expect("mcp").servers.expect("servers");
         assert_eq!(mcp.len(), 2);
         assert!(!mcp.contains_key("servers"), "wrapper must be unwrapped");
 
@@ -1900,7 +2095,7 @@ mod tests {
     fn keeps_legacy_mcp_map_shape() {
         let config: Config =
             serde_json::from_str(r#"{"mcp":{"x":{"command":["echo","hi"]}}}"#).unwrap();
-        let mcp = config.mcp.expect("mcp");
+        let mcp = config.mcp.expect("mcp").servers.expect("servers");
         match mcp.get("x").unwrap() {
             McpServerConfig::Full(server) => {
                 assert_eq!(server.command, vec!["echo", "hi"]);
@@ -1915,7 +2110,14 @@ mod tests {
             r#"{"mcp":{"devtools":{"type":"local","command":["npx","server"],"enabled":true}}}"#,
         )
         .unwrap();
-        match config.mcp.unwrap().get("devtools").unwrap() {
+        match config
+            .mcp
+            .unwrap()
+            .servers
+            .unwrap()
+            .get("devtools")
+            .unwrap()
+        {
             McpServerConfig::Full(server) => {
                 assert_eq!(server.command, vec!["npx", "server"]);
                 assert_eq!(server.enabled, Some(true));
@@ -1928,7 +2130,7 @@ mod tests {
     fn does_not_unwrap_legacy_server_named_servers() {
         let config: Config =
             serde_json::from_str(r#"{"mcp":{"servers":{"command":["echo"]}}}"#).unwrap();
-        let mcp = config.mcp.expect("mcp");
+        let mcp = config.mcp.expect("mcp").servers.expect("servers");
         assert!(mcp.contains_key("servers"));
     }
     #[test]
@@ -1975,5 +2177,144 @@ mod tests {
         let capabilities: ModelCapabilitiesConfig =
             serde_json::from_str(r#"{"reasoning": true}"#).unwrap();
         assert_eq!(capabilities.reasoning_supported(), Some(true));
+    }
+    #[test]
+    fn resolves_timeouts_from_global_defaults_and_server_overrides() {
+        use super::{DEFAULT_MCP_CATALOG_MS, DEFAULT_MCP_EXECUTION_MS, DEFAULT_MCP_STARTUP_MS};
+
+        let global: McpTimeoutConfig =
+            serde_json::from_str(r#"{"startup":45000,"catalog":30000,"execution":600000}"#)
+                .unwrap();
+        let server: McpTimeoutConfig = serde_json::from_str(r#"{"catalog":60000}"#).unwrap();
+
+        // No config at all -> documented defaults.
+        assert_eq!(
+            McpTimeoutConfig::resolve(None, None),
+            (
+                DEFAULT_MCP_STARTUP_MS,
+                DEFAULT_MCP_CATALOG_MS,
+                DEFAULT_MCP_EXECUTION_MS
+            )
+        );
+        // Global only.
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&global), None),
+            (45000, 30000, 600000)
+        );
+        // Server override replaces only the matching key.
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&global), Some(&server)),
+            (45000, 60000, 600000)
+        );
+        // Server-only config still defaults the untouched keys.
+        assert_eq!(
+            McpTimeoutConfig::resolve(None, Some(&server)),
+            (DEFAULT_MCP_STARTUP_MS, 60000, DEFAULT_MCP_EXECUTION_MS)
+        );
+    }
+
+    #[test]
+    fn merges_timeouts_per_key_across_files() {
+        let mut base: Config = serde_json::from_str(
+            r#"{"mcp":{"servers":{"x":{"command":["a"],"timeout":{"startup":1000,"catalog":2000}}}}}"#,
+        )
+        .unwrap();
+        let overlay: Config = serde_json::from_str(
+            r#"{"mcp":{"servers":{"x":{"command":["a"],"timeout":{"catalog":9000}}}}}"#,
+        )
+        .unwrap();
+        base.merge(overlay);
+
+        let server = match base.mcp.unwrap().servers.unwrap().remove("x").unwrap() {
+            McpServerConfig::Full(server) => server,
+            other => panic!("expected Full, got {other:?}"),
+        };
+        let timeout = server.timeout.expect("timeout");
+        assert_eq!(
+            timeout.per_operation(),
+            (1000, 9000, DEFAULT_MCP_EXECUTION_MS)
+        );
+    }
+
+    #[test]
+    fn parses_mcp_timeout_integer_and_per_operation_forms() {
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"a":{"command":["x"],"timeout":2500}}}"#).unwrap();
+        let mut mcp = config.mcp.expect("mcp").servers.expect("servers");
+        let server = match mcp.remove("a").expect("server") {
+            McpServerConfig::Full(server) => server,
+            other => panic!("expected Full, got {other:?}"),
+        };
+        assert_eq!(
+            server.timeout.expect("timeout").per_operation(),
+            (2500, 2500, 2500)
+        );
+
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{"servers":{"a":{"command":["x"],"timeout":{"startup":100,"execution":900}}}}}"#,
+        )
+        .unwrap();
+        let mut mcp = config.mcp.expect("mcp").servers.expect("servers");
+        let server = match mcp.remove("a").expect("server") {
+            McpServerConfig::Full(server) => server,
+            other => panic!("expected Full, got {other:?}"),
+        };
+        assert_eq!(
+            server.timeout.expect("timeout").per_operation(),
+            (100, DEFAULT_MCP_CATALOG_MS, 900)
+        );
+    }
+
+    #[test]
+    fn legacy_server_named_timeout_is_kept_as_server() {
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"timeout":{"command":["run-timeout-server"]}}}"#)
+                .unwrap();
+        let section = config.mcp.expect("mcp");
+        assert!(
+            section.timeout.is_none(),
+            "server is not the global timeout"
+        );
+        let servers = section.servers.expect("servers");
+        assert!(servers.contains_key("timeout"));
+    }
+
+    #[test]
+    fn global_timeout_only_section_still_parses() {
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"timeout":{"startup":45000}}}"#).unwrap();
+        let section = config.mcp.expect("mcp");
+        assert_eq!(section.timeout.expect("timeout").per_operation().0, 45000);
+    }
+
+    #[test]
+    fn mcp_config_round_trips_through_serde() {
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{"timeout":{"startup":45000,"execution":600000},"servers":{"a":{"type":"local","command":["x"]}}}}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json["mcp"].get("timeout").is_some());
+        assert!(json["mcp"].get("servers").is_some());
+
+        let reloaded: Config = serde_json::from_value(json).unwrap();
+        let section = reloaded.mcp.expect("mcp");
+        assert_eq!(
+            section.timeout.expect("timeout").per_operation(),
+            (45000, DEFAULT_MCP_CATALOG_MS, 600000)
+        );
+        assert!(section.servers.expect("servers").contains_key("a"));
+    }
+
+    #[test]
+    fn mcp_wrapper_with_global_timeout_sibling_is_unwrapped() {
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{"timeout":{"startup":1000},"servers":{"a":{"command":["x"]}}}}"#,
+        )
+        .unwrap();
+        let mcp = config.mcp.expect("mcp").servers.expect("servers");
+        assert!(mcp.contains_key("a"));
+        assert!(!mcp.contains_key("servers"));
+        assert!(!mcp.contains_key("timeout"));
     }
 }

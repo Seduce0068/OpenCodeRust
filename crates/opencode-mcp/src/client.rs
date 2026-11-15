@@ -92,6 +92,39 @@ pub enum McpClientError {
 // McpServerConfig
 // ---------------------------------------------------------------------------
 
+/// Per-operation request timeouts for an MCP server, in milliseconds.
+#[derive(Debug, Clone, Copy)]
+pub struct McpTimeouts {
+    pub startup_ms: u64,
+    pub catalog_ms: u64,
+    pub execution_ms: u64,
+}
+
+impl Default for McpTimeouts {
+    fn default() -> Self {
+        Self {
+            startup_ms: DEFAULT_STARTUP_MS,
+            catalog_ms: DEFAULT_CATALOG_MS,
+            execution_ms: DEFAULT_EXECUTION_MS,
+        }
+    }
+}
+
+/// Documented MCP defaults: startup 30s, catalog 30s, execution 12h.
+pub const DEFAULT_STARTUP_MS: u64 = 30_000;
+pub const DEFAULT_CATALOG_MS: u64 = 30_000;
+pub const DEFAULT_EXECUTION_MS: u64 = 43_200_000;
+
+impl McpTimeouts {
+    pub fn uniform(millis: u64) -> Self {
+        Self {
+            startup_ms: millis,
+            catalog_ms: millis,
+            execution_ms: millis,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
     pub name: String,
@@ -99,7 +132,7 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub env: Option<Vec<(String, String)>>,
     pub cwd: Option<String>,
-    pub timeout_ms: Option<u64>,
+    pub timeouts: McpTimeouts,
 }
 
 #[derive(Debug, Clone)]
@@ -108,12 +141,12 @@ enum RegistryConnectionConfig {
     Http {
         url: String,
         headers: Option<HashMap<String, String>>,
-        timeout_ms: Option<u64>,
+        timeouts: McpTimeouts,
     },
     Sse {
         url: String,
         headers: Option<HashMap<String, String>>,
-        timeout_ms: Option<u64>,
+        timeouts: McpTimeouts,
     },
 }
 
@@ -128,7 +161,9 @@ pub struct McpClient {
     initialized: RwLock<bool>,
     capabilities: RwLock<Option<ServerCapabilities>>,
     tool_registry: Arc<McpToolRegistry>,
-    timeout_ms: u64,
+    startup_timeout_ms: u64,
+    catalog_timeout_ms: u64,
+    execution_timeout_ms: u64,
     status: RwLock<McpStatus>,
     oauth_manager: RwLock<Option<Arc<McpOAuthManager>>>,
     bus: Option<Arc<Bus>>,
@@ -147,7 +182,9 @@ impl McpClient {
             initialized: RwLock::new(false),
             capabilities: RwLock::new(None),
             tool_registry,
-            timeout_ms: 30000,
+            startup_timeout_ms: DEFAULT_STARTUP_MS,
+            catalog_timeout_ms: DEFAULT_CATALOG_MS,
+            execution_timeout_ms: DEFAULT_EXECUTION_MS,
             status: RwLock::new(McpStatus::Disabled),
             oauth_manager: RwLock::new(None),
             bus: None,
@@ -155,8 +192,15 @@ impl McpClient {
         }
     }
 
-    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
-        self.timeout_ms = timeout_ms;
+    /// Applies one timeout to every operation (legacy convenience).
+    pub fn with_timeout(self, timeout_ms: u64) -> Self {
+        self.with_timeouts(McpTimeouts::uniform(timeout_ms))
+    }
+
+    pub fn with_timeouts(mut self, timeouts: McpTimeouts) -> Self {
+        self.startup_timeout_ms = timeouts.startup_ms;
+        self.catalog_timeout_ms = timeouts.catalog_ms;
+        self.execution_timeout_ms = timeouts.execution_ms;
         self
     }
 
@@ -463,7 +507,12 @@ impl McpClient {
         let params = serde_json::to_value(InitializeParams::default())
             .map_err(|e| McpClientError::ProtocolError(e.to_string()))?;
 
-        let response = self.send_request("initialize", Some(params)).await?;
+        let response = tokio::time::timeout(
+            Duration::from_millis(self.startup_timeout_ms),
+            self.send_request("initialize", Some(params)),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)??;
 
         let result: InitializeResult = response
             .result
@@ -479,9 +528,11 @@ impl McpClient {
             *caps = Some(result.capabilities);
         }
 
-        self.send_request("notifications/initialized", None)
-            .await
-            .ok();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(self.startup_timeout_ms),
+            self.send_request("notifications/initialized", None),
+        )
+        .await;
 
         {
             let mut init = self.initialized.write().await;
@@ -544,7 +595,12 @@ impl McpClient {
     }
 
     async fn load_tools(&self) -> Result<(), McpClientError> {
-        let response = self.send_request("tools/list", None).await?;
+        let response = tokio::time::timeout(
+            Duration::from_millis(self.catalog_timeout_ms),
+            self.send_request("tools/list", None),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)??;
 
         let result: ListToolsResult = response
             .result
@@ -577,7 +633,11 @@ impl McpClient {
             .map_err(|e| McpClientError::ProtocolError(e.to_string()))?;
 
         let response = self
-            .send_request_with_progress_timeout("tools/call", Some(params_value), self.timeout_ms)
+            .send_request_with_progress_timeout(
+                "tools/call",
+                Some(params_value),
+                self.execution_timeout_ms,
+            )
             .await?;
 
         // After tool call, check if tools changed notification was received
@@ -721,11 +781,8 @@ impl McpClientRegistry {
         );
         self.log_event(&name, "Connecting via stdio").await;
 
-        let timeout = config.timeout_ms;
-        let mut client_impl = McpClient::new(name.clone(), self.tool_registry.clone());
-        if let Some(timeout_ms) = timeout {
-            client_impl = client_impl.with_timeout(timeout_ms);
-        }
+        let mut client_impl =
+            McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(config.timeouts);
         if let Some(bus) = &self.bus {
             client_impl = client_impl.with_bus(bus.clone());
         }
@@ -752,22 +809,20 @@ impl McpClientRegistry {
         name: String,
         url: String,
         headers: Option<HashMap<String, String>>,
-        timeout_ms: Option<u64>,
+        timeouts: McpTimeouts,
     ) -> Result<Arc<McpClient>, McpClientError> {
         self.connection_configs.write().await.insert(
             name.clone(),
             RegistryConnectionConfig::Http {
                 url: url.clone(),
                 headers: headers.clone(),
-                timeout_ms,
+                timeouts,
             },
         );
         self.log_event(&name, "Connecting via http").await;
 
-        let mut client_impl = McpClient::new(name.clone(), self.tool_registry.clone());
-        if let Some(t) = timeout_ms {
-            client_impl = client_impl.with_timeout(t);
-        }
+        let mut client_impl =
+            McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(timeouts);
         if let Some(bus) = &self.bus {
             client_impl = client_impl.with_bus(bus.clone());
         }
@@ -795,22 +850,20 @@ impl McpClientRegistry {
         name: String,
         url: String,
         headers: Option<HashMap<String, String>>,
-        timeout_ms: Option<u64>,
+        timeouts: McpTimeouts,
     ) -> Result<Arc<McpClient>, McpClientError> {
         self.connection_configs.write().await.insert(
             name.clone(),
             RegistryConnectionConfig::Sse {
                 url: url.clone(),
                 headers: headers.clone(),
-                timeout_ms,
+                timeouts,
             },
         );
         self.log_event(&name, "Connecting via sse").await;
 
-        let mut client_impl = McpClient::new(name.clone(), self.tool_registry.clone());
-        if let Some(t) = timeout_ms {
-            client_impl = client_impl.with_timeout(t);
-        }
+        let mut client_impl =
+            McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(timeouts);
         if let Some(bus) = &self.bus {
             client_impl = client_impl.with_bus(bus.clone());
         }
@@ -899,19 +952,16 @@ impl McpClientRegistry {
             RegistryConnectionConfig::Http {
                 url,
                 headers,
-                timeout_ms,
+                timeouts,
             } => {
-                self.add_http(name.to_string(), url, headers, timeout_ms)
+                self.add_http(name.to_string(), url, headers, timeouts)
                     .await
             }
             RegistryConnectionConfig::Sse {
                 url,
                 headers,
-                timeout_ms,
-            } => {
-                self.add_sse(name.to_string(), url, headers, timeout_ms)
-                    .await
-            }
+                timeouts,
+            } => self.add_sse(name.to_string(), url, headers, timeouts).await,
         }
     }
 }
@@ -1064,5 +1114,42 @@ mod tests {
         let tools = tool_registry.list_for_server("server-a").await;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "fresh");
+    }
+    struct HangingTransport;
+
+    #[async_trait]
+    impl McpTransport for HangingTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            std::future::pending().await
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_uses_startup_timeout() {
+        let tool_registry = Arc::new(McpToolRegistry::new());
+        let client =
+            McpClient::new("test-server".to_string(), tool_registry).with_timeouts(McpTimeouts {
+                startup_ms: 20,
+                catalog_ms: 200,
+                execution_ms: 200,
+            });
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Box::new(HangingTransport));
+        }
+
+        let error = client
+            .initialize()
+            .await
+            .expect_err("initialize must time out");
+        assert!(matches!(error, McpClientError::Timeout));
     }
 }

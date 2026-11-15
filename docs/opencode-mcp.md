@@ -6,7 +6,8 @@ tags: [mcp, oauth, integration, crate]
 
 # opencode-mcp
 
-`opencode-mcp` implements the MCP (Model Context Protocol) client stack, with support for multiple transports and OAuth.
+`opencode-mcp` implements the MCP (Model Context Protocol) client stack,
+with support for multiple transports and OAuth.
 
 ## Responsibilities
 
@@ -36,8 +37,25 @@ tags: [mcp, oauth, integration, crate]
 - Server `/mcp/*` routes
 - Tool/session dynamic tool extension
 
+## Timeouts
+
+`McpTimeouts` holds per-operation timeouts in milliseconds:
+
+- `startup_ms` – transport connect and `initialize` handshake (default 30s)
+- `catalog_ms` – `tools/list` discovery (default 30s)
+- `execution_ms` – `tools/call` (default 12h)
+
+The defaults follow the OpenCode MCP schema; see
+[MCP servers](https://opencode.ai/docs/mcp-servers/) for the reference
+behaviour. `McpConfig::timeout` (the global `mcp.timeout`) and a server's own
+`timeout` are resolved per key by `McpTimeoutConfig::resolve`.
+
+`McpClient::with_timeouts` applies them; `with_timeout(ms)` sets all three.
+A timeout surfaces as `McpClientError::Timeout`.
+
 ## Validation
 
 ```bash
 cargo check -p opencode-mcp
+cargo test -p opencode-mcp
 ```

@@ -52,10 +52,18 @@ map when `load_all` runs:
 - `settings.baseURL` / `settings.apiKey` → `base_url` / `api_key`
 - `headers` / `compatibility` → `options.headers` / `options.compatibility`
 - `models.<id>.limit` / `capabilities` → runtime model limits and capabilities
+- `mcp.<name>.timeout` (integer ms or `{startup, catalog, execution}`) →
+  per-operation MCP timeouts; the global `mcp.timeout` supplies defaults and
+  a server overrides matching keys (30s / 30s / 12h when unset)
 - `modelID` is accepted as an alias of the model `model` field
 
 A legacy `provider` entry for the same provider id wins over the normalized
 current-schema entry.
+
+The `mcp` section is parsed as one object (`McpConfig`): servers come from
+`mcp.servers` (or directly under `mcp` in the legacy shape) and the global
+request defaults from the sibling `mcp.timeout`. Both are written back in the
+current shape, so a config round-trips without losing either.
 
 The current-schema `mcp.servers` wrapper is unwrapped into the runtime `mcp`
 map: `disabled` is inverted to `enabled`, `command` accepts a string or an argv

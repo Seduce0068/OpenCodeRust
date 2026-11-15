@@ -501,6 +501,7 @@ fn parse_jsonc(content: &str) -> Result<Config> {
     let parsed = parse_to_serde_value::<Option<serde_json::Value>>(content, &parse_options)
         .with_context(|| "Failed to parse JSONC")?
         .context("Config content is empty")?;
+
     serde_json::from_value(parsed).with_context(|| "Failed to parse config JSON")
 }
 
@@ -1732,6 +1733,45 @@ mod tests {
         let input = format!(r#"{{"api_key": "{{file:{}}}"}}"#, secret_path.display());
         let result = resolve_file_references(&input, &temp.path).unwrap();
         assert!(result.contains("absolute-secret"));
+    }
+
+    #[test]
+    fn update_config_round_trips_mcp_timeout_and_servers() {
+        let temp = TestDir::new("opencode_config_mcp_roundtrip");
+
+        let patch: Config = serde_json::from_str(
+            r#"{
+                "mcp": {
+                    "timeout": {"startup": 45000, "execution": 600000},
+                    "servers": {
+                        "srv": {"type": "local", "command": ["node", "s.js"]}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        update_config(&temp.path, &patch).unwrap();
+
+        let content = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
+        // The global timeout must be written as a sibling of `servers`, not as
+        // a bare entry that would be re-read as a server named `timeout`.
+        let raw: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let mcp = raw.get("mcp").expect("mcp object");
+        assert!(mcp.get("timeout").is_some(), "mcp.timeout must be written");
+        assert!(mcp.get("servers").is_some(), "mcp.servers must be written");
+        assert!(mcp.get("srv").is_none(), "legacy shape must not be used");
+
+        let reloaded: Config = serde_json::from_str(&content).unwrap();
+        let mcp = reloaded.mcp.expect("mcp");
+        assert_eq!(
+            mcp.timeout.expect("timeout").per_operation(),
+            (45000, 30000, 600000)
+        );
+        let servers = mcp.servers.expect("servers");
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("srv"));
+        assert!(!servers.contains_key("timeout"));
     }
 
     #[test]
