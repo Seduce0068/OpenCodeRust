@@ -409,7 +409,7 @@ impl CustomLoader for AzureCognitiveServicesLoader {
 
 /// Amazon Bedrock custom loader - the most complex loader.
 /// Handles region resolution, AWS credential chain, cross-region model prefixing.
-struct AmazonBedrockLoader;
+pub struct AmazonBedrockLoader;
 
 impl AmazonBedrockLoader {
     fn provider_option_string(state: Option<&ProviderState>, keys: &[&str]) -> Option<String> {
@@ -430,8 +430,8 @@ impl AmazonBedrockLoader {
 
     /// Apply cross-region model ID prefixing based on region.
     /// Returns the (possibly prefixed) model ID.
-    // TODO: Wire for Bedrock cross-region routing
-    #[allow(dead_code)]
+    /// Apply cross-region model ID prefixing based on region.
+    /// Wired into the Bedrock provider's chat and chat_stream methods.
     pub fn prefix_model_id(model_id: &str, region: &str) -> String {
         // Skip if model already has a cross-region inference profile prefix
         let cross_region_prefixes = ["global.", "us.", "eu.", "jp.", "apac.", "au."];
