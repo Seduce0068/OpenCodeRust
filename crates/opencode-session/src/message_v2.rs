@@ -747,8 +747,6 @@ fn supports_media_in_tool_results(api_npm: &str, api_id: &str) -> bool {
 }
 
 /// Extract the base64 payload from a `data:` URL, stripping the prefix.
-// TODO: Wire for file attachment support
-#[allow(dead_code)]
 fn extract_base64_data(url: &str) -> &str {
     if let Some(comma_idx) = url.find(',') {
         &url[comma_idx + 1..]
@@ -795,6 +793,7 @@ fn tool_output_to_content_parts(
             && supports_media
             && att.url.starts_with("data:")
             && att.url.contains(',')
+            && !extract_base64_data(&att.url).is_empty()
         {
             inline_parts.push(ContentPart {
                 content_type: "image_url".to_string(),
