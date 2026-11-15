@@ -324,8 +324,10 @@ impl McpClient {
         url: String,
         headers: Option<HashMap<String, String>>,
     ) -> Result<(), McpClientError> {
-        // If we have an OAuth manager, try to inject the bearer token.
-        let mut merged_headers = headers.unwrap_or_default();
+        let base_headers = headers.unwrap_or_default();
+
+        // First attempt: inject the current token (refreshing it if expired).
+        let mut merged_headers = base_headers.clone();
         if let Some(mgr) = self.oauth_manager.read().await.as_ref() {
             match mgr.get_token().await {
                 Ok(Some(token)) => {
@@ -341,14 +343,41 @@ impl McpClient {
             }
         }
 
-        let transport = HttpTransport::new(url, Some(merged_headers));
+        let transport = HttpTransport::new(url.clone(), Some(merged_headers));
         {
             let mut t = self.transport.lock().await;
             *t = Some(Box::new(transport));
         }
-        self.initialize().await?;
-        self.load_tools().await?;
-        Ok(())
+        match self.initialize().await {
+            Ok(()) => {
+                self.load_tools().await?;
+                Ok(())
+            }
+            Err(McpClientError::Unauthorized) => {
+                // The server rejected the token. Try refreshing it once if an
+                // OAuth manager is available, then retry the whole handshake.
+                let mgr = self.oauth_manager.read().await.clone();
+                if let Some(mgr) = mgr {
+                    if mgr.refresh_token().await.is_ok() {
+                        if let Ok(Some(token)) = mgr.get_token().await {
+                            let mut retry_headers = base_headers.clone();
+                            retry_headers
+                                .insert("Authorization".to_string(), format!("Bearer {token}"));
+                            let transport = HttpTransport::new(url.clone(), Some(retry_headers));
+                            {
+                                let mut t = self.transport.lock().await;
+                                *t = Some(Box::new(transport));
+                            }
+                            self.initialize().await?;
+                            self.load_tools().await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(McpClientError::Unauthorized)
+            }
+            Err(error) => Err(error),
+        }
     }
     pub async fn connect_sse(
         &self,
@@ -379,7 +408,9 @@ impl McpClient {
         url: String,
         headers: Option<HashMap<String, String>>,
     ) -> Result<(), McpClientError> {
-        let mut merged_headers = headers.unwrap_or_default();
+        let base_headers = headers.unwrap_or_default();
+
+        let mut merged_headers = base_headers.clone();
         if let Some(mgr) = self.oauth_manager.read().await.as_ref() {
             match mgr.get_token().await {
                 Ok(Some(token)) => {
@@ -390,15 +421,41 @@ impl McpClient {
             }
         }
 
-        let transport = SseTransport::new(url, Some(merged_headers));
+        let transport = SseTransport::new(url.clone(), Some(merged_headers));
         transport.connect().await?;
         {
             let mut t = self.transport.lock().await;
             *t = Some(Box::new(transport));
         }
-        self.initialize().await?;
-        self.load_tools().await?;
-        Ok(())
+        match self.initialize().await {
+            Ok(()) => {
+                self.load_tools().await?;
+                Ok(())
+            }
+            Err(McpClientError::Unauthorized) => {
+                let mgr = self.oauth_manager.read().await.clone();
+                if let Some(mgr) = mgr {
+                    if mgr.refresh_token().await.is_ok() {
+                        if let Ok(Some(token)) = mgr.get_token().await {
+                            let mut retry_headers = base_headers.clone();
+                            retry_headers
+                                .insert("Authorization".to_string(), format!("Bearer {token}"));
+                            let transport = SseTransport::new(url.clone(), Some(retry_headers));
+                            transport.connect().await?;
+                            {
+                                let mut t = self.transport.lock().await;
+                                *t = Some(Box::new(transport));
+                            }
+                            self.initialize().await?;
+                            self.load_tools().await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(McpClientError::Unauthorized)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     // -- Internal helpers ----------------------------------------------------
