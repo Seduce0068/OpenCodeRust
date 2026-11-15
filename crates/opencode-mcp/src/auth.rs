@@ -47,9 +47,24 @@ pub struct AuthEntry {
     /// The server URL these credentials belong to – invalidated on URL change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
+    /// Discovered authorization endpoint; persisted so a restart keeps working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    /// Discovered token endpoint; persisted so a restart keeps working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_url: Option<String>,
 }
 /// Resolve the path to the auth JSON file.
 fn auth_file_path() -> PathBuf {
+    // `OPENCODE_MCP_AUTH_FILE` lets tests and embedded callers redirect the
+    // credential store away from the user's real data directory.
+    if let Ok(path) = std::env::var("OPENCODE_MCP_AUTH_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("opencode");
@@ -123,6 +138,19 @@ pub async fn update_tokens(
 ) -> Result<(), std::io::Error> {
     let mut entry = get(mcp_name).await.unwrap_or_default();
     entry.tokens = Some(tokens);
+    set(mcp_name, entry, server_url).await
+}
+
+/// Store the discovered authorization/token endpoints for a server.
+pub async fn update_endpoints(
+    mcp_name: &str,
+    auth_url: &str,
+    token_url: &str,
+    server_url: Option<&str>,
+) -> Result<(), std::io::Error> {
+    let mut entry = get(mcp_name).await.unwrap_or_default();
+    entry.auth_url = Some(auth_url.to_string());
+    entry.token_url = Some(token_url.to_string());
     set(mcp_name, entry, server_url).await
 }
 

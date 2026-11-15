@@ -209,6 +209,12 @@ impl McpClient {
         self
     }
 
+    /// Builder form of [`McpClient::set_oauth_manager`].
+    pub async fn with_oauth_manager(mut self, manager: Arc<McpOAuthManager>) -> Self {
+        self.oauth_manager = RwLock::new(Some(manager));
+        self
+    }
+
     /// Attach an OAuth manager for token-based auth on HTTP/SSE transports.
     pub async fn set_oauth_manager(&self, manager: Arc<McpOAuthManager>) {
         let mut guard = self.oauth_manager.write().await;
@@ -716,6 +722,9 @@ pub struct McpClientRegistry {
     statuses: RwLock<HashMap<String, McpStatus>>,
     connection_configs: RwLock<HashMap<String, RegistryConnectionConfig>>,
     logs: RwLock<HashMap<String, Vec<String>>>,
+    /// OAuth manager attached to HTTP/SSE clients so requests carry a bearer
+    /// token obtained through the authorization-code flow.
+    oauth_manager: RwLock<Option<Arc<McpOAuthManager>>>,
 }
 impl McpClientRegistry {
     pub fn new() -> Self {
@@ -726,6 +735,7 @@ impl McpClientRegistry {
             statuses: RwLock::new(HashMap::new()),
             connection_configs: RwLock::new(HashMap::new()),
             logs: RwLock::new(HashMap::new()),
+            oauth_manager: RwLock::new(None),
         }
     }
 
@@ -804,6 +814,13 @@ impl McpClientRegistry {
             }
         }
     }
+    /// Attaches an OAuth manager so HTTP/SSE connections can send a bearer
+    /// token obtained through the authorization-code flow.
+    pub async fn set_oauth_manager(&self, manager: Arc<McpOAuthManager>) {
+        let mut guard = self.oauth_manager.write().await;
+        *guard = Some(manager);
+    }
+
     pub async fn add_http(
         &self,
         name: String,
@@ -823,6 +840,9 @@ impl McpClientRegistry {
 
         let mut client_impl =
             McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(timeouts);
+        if let Some(manager) = self.oauth_manager.read().await.as_ref() {
+            client_impl = client_impl.with_oauth_manager(manager.clone()).await;
+        }
         if let Some(bus) = &self.bus {
             client_impl = client_impl.with_bus(bus.clone());
         }
@@ -864,6 +884,9 @@ impl McpClientRegistry {
 
         let mut client_impl =
             McpClient::new(name.clone(), self.tool_registry.clone()).with_timeouts(timeouts);
+        if let Some(manager) = self.oauth_manager.read().await.as_ref() {
+            client_impl = client_impl.with_oauth_manager(manager.clone()).await;
+        }
         if let Some(bus) = &self.bus {
             client_impl = client_impl.with_bus(bus.clone());
         }

@@ -2,6 +2,7 @@ use chrono::Utc;
 use opencode_mcp::client::{
     McpClientError, McpClientRegistry, McpServerConfig as McpClientConfig, McpTimeouts,
 };
+use opencode_mcp::oauth::{McpOAuthConfig as RealOAuthConfig, McpOAuthManager as RealOAuthManager};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +26,18 @@ pub struct RemoteMcpConfig {
     /// Static headers from the config (for API-key style remote servers).
     pub headers: Option<HashMap<String, String>>,
     pub timeouts: McpTimeouts,
+    /// OAuth client settings from the config (`mcp.servers.<name>.oauth`).
+    pub oauth: Option<RemoteOAuthSettings>,
+}
+
+/// OAuth client settings declared in the MCP server configuration.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteOAuthSettings {
+    pub client_secret: Option<String>,
+    pub scope: Option<String>,
+    pub callback_port: Option<u16>,
+    pub redirect_uri: Option<String>,
+    pub auth_server_metadata_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +57,9 @@ impl McpRuntimeConfig {
         )
     }
 }
+
+/// Default loopback redirect used when the config does not set one.
+pub const DEFAULT_MCP_OAUTH_REDIRECT: &str = "http://127.0.0.1:19876/mcp/oauth/callback";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpOAuthState {
@@ -91,6 +107,9 @@ pub struct McpOAuthManager {
     statuses: Arc<RwLock<HashMap<String, McpServerInfo>>>,
     logs: Arc<RwLock<HashMap<String, Vec<McpServerLogEntry>>>>,
     clients: Arc<McpClientRegistry>,
+    /// One real OAuth client per server, used for the authorization-code
+    /// exchange and token refresh.
+    oauth_clients: Arc<RwLock<HashMap<String, Arc<RealOAuthManager>>>>,
 }
 
 impl McpOAuthManager {
@@ -101,7 +120,70 @@ impl McpOAuthManager {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             logs: Arc::new(RwLock::new(HashMap::new())),
             clients: Arc::new(McpClientRegistry::new()),
+            oauth_clients: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Returns (creating if needed) the real OAuth client for a server.
+    async fn oauth_client_for(
+        &self,
+        server_name: &str,
+    ) -> Result<Arc<RealOAuthManager>, McpOAuthError> {
+        if let Some(existing) = self.oauth_clients.read().await.get(server_name) {
+            return Ok(existing.clone());
+        }
+
+        let managed = self.managed_server(server_name).await?;
+        let remote = match &managed.config {
+            McpRuntimeConfig::Remote(remote) => remote,
+            McpRuntimeConfig::Local(_) => {
+                return Err(McpOAuthError::OAuthNotSupported(server_name.to_string()));
+            }
+        };
+
+        let settings = remote.oauth.clone().unwrap_or_default();
+        let redirect_uri = settings
+            .redirect_uri
+            .clone()
+            .or_else(|| {
+                settings
+                    .callback_port
+                    .map(|port| format!("http://127.0.0.1:{port}/mcp/oauth/callback"))
+            })
+            .unwrap_or_else(|| DEFAULT_MCP_OAUTH_REDIRECT.to_string());
+
+        let config = RealOAuthConfig {
+            client_id: remote.client_id.clone(),
+            client_secret: settings.client_secret.clone(),
+            auth_url: remote.authorization_url.clone().unwrap_or_default(),
+            token_url: String::new(),
+            scopes: settings
+                .scope
+                .as_deref()
+                .map(|scope| scope.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default(),
+            redirect_uri,
+        };
+
+        let manager = Arc::new(RealOAuthManager::new(
+            server_name.to_string(),
+            remote.url.clone(),
+            config,
+        ));
+
+        // Discovery plus dynamic client registration: fills the auth/token
+        // endpoints when unset and registers a client when no client_id is
+        // configured.
+        manager
+            .prepare()
+            .await
+            .map_err(|e| McpOAuthError::OAuthFailed(e.to_string()))?;
+
+        self.oauth_clients
+            .write()
+            .await
+            .insert(server_name.to_string(), manager.clone());
+        Ok(manager)
     }
 
     async fn log_event(
@@ -387,16 +469,18 @@ impl McpOAuthManager {
             return Err(McpOAuthError::OAuthInProgress);
         }
 
-        let authorization_url = remote
-            .authorization_url
-            .unwrap_or_else(|| format!("{}/oauth/authorize", remote.url.trim_end_matches('/')));
+        // Build the real authorization URL via the OAuth client so the PKCE
+        // verifier stored with it can complete the exchange on callback.
+        let oauth_client = self.oauth_client_for(server_name).await?;
+        let authorization_url = oauth_client
+            .start_auth()
+            .await
+            .map_err(|e| McpOAuthError::OAuthFailed(e.to_string()))?;
 
         let state = McpOAuthState {
             server_name: server_name.to_string(),
             authorization_url,
-            client_id: remote
-                .client_id
-                .or_else(|| Some(format!("mcp_client_{}", server_name))),
+            client_id: remote.client_id.clone(),
             status: McpOAuthStatus::Pending,
         };
 
@@ -431,15 +515,43 @@ impl McpOAuthManager {
     pub async fn handle_callback(
         &self,
         server_name: &str,
-        _code: &str,
+        code: &str,
+        returned_state: Option<&str>,
     ) -> Result<McpServerInfo, McpOAuthError> {
         self.managed_server(server_name).await?;
 
+        {
+            let states = self.oauth_states.read().await;
+            states
+                .get(server_name)
+                .ok_or_else(|| McpOAuthError::OAuthFailed("No pending OAuth flow".to_string()))?;
+        }
+
+        // Exchange the authorization code for tokens. This validates the CSRF
+        // state and persists the access/refresh tokens.
+        let oauth_client = self.oauth_client_for(server_name).await?;
+        let expected_state = opencode_mcp::auth::get_oauth_state(server_name).await;
+        let state = returned_state
+            .map(str::to_string)
+            .or(expected_state)
+            .ok_or_else(|| McpOAuthError::OAuthFailed("No pending OAuth state".to_string()))?;
+
+        oauth_client
+            .finish_auth(code, &state)
+            .await
+            .map_err(|e| McpOAuthError::OAuthFailed(e.to_string()))?;
+
+        // Only mark authorized once real tokens are stored.
+        if !oauth_client.has_stored_tokens().await {
+            return Err(McpOAuthError::OAuthFailed(
+                "token exchange did not store credentials".to_string(),
+            ));
+        }
+
         let mut states = self.oauth_states.write().await;
-        let state = states
-            .get_mut(server_name)
-            .ok_or_else(|| McpOAuthError::OAuthFailed("No pending OAuth flow".to_string()))?;
-        state.status = McpOAuthStatus::Authorized;
+        if let Some(state) = states.get_mut(server_name) {
+            state.status = McpOAuthStatus::Authorized;
+        }
         drop(states);
         self.log_event(server_name, "info", "OAuth callback completed")
             .await;
@@ -527,6 +639,15 @@ impl McpOAuthManager {
             .await
             .remove(server_name)
             .is_some();
+
+        // Logging out must actually delete the stored credentials, otherwise a
+        // later connect would silently reuse the old tokens. Delete from disk
+        // regardless of whether this process holds a cached client.
+        self.oauth_clients.write().await.remove(server_name);
+        if let Err(error) = opencode_mcp::auth::remove(server_name).await {
+            tracing::warn!(server = server_name, %error, "failed to delete stored MCP OAuth credentials");
+        }
+
         self.log_event(server_name, "info", "OAuth state removed")
             .await;
 
@@ -662,41 +783,15 @@ mod tests {
         assert_eq!(status.oauth_status, None);
     }
 
-    #[tokio::test]
-    async fn oauth_callback_marks_remote_server_authorized() {
-        let manager = McpOAuthManager::new();
-        manager
-            .add_server(
-                "remote".to_string(),
-                McpRuntimeConfig::Remote(RemoteMcpConfig {
-                    url: "https://example.com/mcp".to_string(),
-                    oauth_enabled: true,
-                    client_id: None,
-                    authorization_url: Some("https://idp.example.com/oauth/authorize".to_string()),
-                    ..Default::default()
-                }),
-                true,
-            )
-            .await;
-
-        let oauth_state = manager
-            .start_oauth("remote")
-            .await
-            .expect("oauth should start");
-        assert_eq!(
-            oauth_state.authorization_url,
-            "https://idp.example.com/oauth/authorize"
-        );
-
-        let status = manager
-            .handle_callback("remote", "oauth-code")
-            .await
-            .expect("callback should update oauth state");
-        assert_eq!(status.oauth_status, Some(McpOAuthStatus::Authorized));
-    }
-
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn remove_oauth_reverts_status_to_needs_auth() {
+        // `remove_oauth` deletes persisted credentials, so it touches the same
+        // process-global store as the OAuth flow tests.
+        let _guard = auth_store_lock();
+        let auth_file = temp_auth_file("logout");
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
         let manager = McpOAuthManager::new();
         manager
             .add_server(
@@ -712,14 +807,20 @@ mod tests {
             )
             .await;
 
-        manager
-            .start_oauth("remote")
-            .await
-            .expect("oauth should start");
-        manager
-            .handle_callback("remote", "oauth-code")
-            .await
-            .expect("callback should authorize");
+        // Seed an authorized state directly: the point of this test is the
+        // removal behaviour, not the exchange.
+        {
+            let mut states = manager.oauth_states.write().await;
+            states.insert(
+                "remote".to_string(),
+                McpOAuthState {
+                    server_name: "remote".to_string(),
+                    authorization_url: "https://idp.example.com/authorize".to_string(),
+                    client_id: None,
+                    status: McpOAuthStatus::Authorized,
+                },
+            );
+        }
 
         assert!(manager.remove_oauth("remote").await);
 
@@ -729,11 +830,109 @@ mod tests {
             .expect("remote server should exist");
         assert_eq!(status.status, "needs_auth");
         assert_eq!(status.oauth_status, None);
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
     }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn logout_deletes_persisted_credentials() {
+        let _guard = auth_store_lock();
+        let auth_file = temp_auth_file("logout-delete");
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let server_url = "https://example.com/mcp";
+        opencode_mcp::auth::update_tokens(
+            "remote",
+            opencode_mcp::auth::OAuthTokens {
+                access_token: "secret-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scope: None,
+            },
+            Some(server_url),
+        )
+        .await
+        .expect("store tokens");
+        assert!(
+            opencode_mcp::auth::get_for_url("remote", server_url)
+                .await
+                .is_some_and(|entry| entry.tokens.is_some()),
+            "precondition: credentials are stored"
+        );
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: server_url.to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        manager.remove_oauth("remote").await;
+
+        // Logging out must remove the credentials from disk, not just from
+        // memory, or a later connect would silently reuse them.
+        let remaining = opencode_mcp::auth::get_for_url("remote", server_url).await;
+        assert!(
+            remaining.and_then(|entry| entry.tokens).is_none(),
+            "credentials must be deleted on logout"
+        );
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
     #[derive(Clone)]
     struct MockMcpState {
         status: axum::http::StatusCode,
         seen_authorization: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+        /// When set, the mock also publishes RFC 9728 protected-resource
+        /// metadata naming this authorization server issuer.
+        authorization_server: Option<String>,
+    }
+
+    /// Serializes tests that redirect the process-global MCP credential store.
+    ///
+    /// `OPENCODE_MCP_AUTH_FILE` is shared by the whole test binary, so tests
+    /// that set it must not run concurrently with each other.
+    fn auth_store_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns a temp path for a test-scoped MCP credential store.
+    fn temp_auth_file(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "opencode-mcp-auth-{tag}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    /// Serves the RFC 9728 protected-resource metadata document.
+    async fn mock_protected_resource_metadata(
+        axum::extract::State(state): axum::extract::State<MockMcpState>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        match state.authorization_server {
+            Some(issuer) => axum::Json(serde_json::json!({
+                "resource": issuer,
+                "authorization_servers": [issuer],
+            }))
+            .into_response(),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
     }
 
     async fn mock_mcp_handler(
@@ -782,13 +981,31 @@ mod tests {
     async fn spawn_mock_mcp(
         status: axum::http::StatusCode,
     ) -> (String, Arc<tokio::sync::Mutex<Vec<Option<String>>>>) {
+        spawn_mock_mcp_with_auth(status, None).await
+    }
+
+    /// Spawns a mock MCP server. When `authorization_server` is set, the server
+    /// also publishes protected-resource metadata for discovery.
+    async fn spawn_mock_mcp_with_auth(
+        status: axum::http::StatusCode,
+        authorization_server: Option<String>,
+    ) -> (String, Arc<tokio::sync::Mutex<Vec<Option<String>>>>) {
         let seen_authorization = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let state = MockMcpState {
             status,
             seen_authorization: seen_authorization.clone(),
+            authorization_server,
         };
         let app = axum::Router::new()
             .route("/mcp", axum::routing::post(mock_mcp_handler))
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                axum::routing::get(mock_protected_resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource",
+                axum::routing::get(mock_protected_resource_metadata),
+            )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -900,5 +1117,231 @@ mod tests {
 
         let status = manager.connect("remote").await.expect("connect result");
         assert_eq!(status.status, "connected");
+    }
+    /// Mock authorization server: publishes RFC 9728 resource metadata, RFC
+    /// 8414 authorization-server metadata, and exchanges an authorization code
+    /// for a token.
+    async fn spawn_mock_authorization_server() -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use axum::response::IntoResponse;
+
+        let seen_requests: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        #[derive(Clone)]
+        struct AuthState {
+            pub issuer: String,
+            pub seen: Arc<tokio::sync::Mutex<Vec<String>>>,
+        }
+
+        async fn resource_metadata(
+            axum::extract::State(state): axum::extract::State<AuthState>,
+        ) -> axum::response::Response {
+            state
+                .seen
+                .lock()
+                .await
+                .push("resource-metadata".to_string());
+            axum::Json(serde_json::json!({
+                "resource": state.issuer,
+                "authorization_servers": [state.issuer],
+            }))
+            .into_response()
+        }
+
+        async fn authorization_server_metadata(
+            axum::extract::State(state): axum::extract::State<AuthState>,
+        ) -> axum::response::Response {
+            state
+                .seen
+                .lock()
+                .await
+                .push("authorization-server-metadata".to_string());
+            axum::Json(serde_json::json!({
+                "issuer": state.issuer,
+                "authorization_endpoint": format!("{}/authorize", state.issuer),
+                "token_endpoint": format!("{}/token", state.issuer),
+                "registration_endpoint": format!("{}/register", state.issuer),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+            .into_response()
+        }
+
+        async fn register(
+            axum::extract::State(state): axum::extract::State<AuthState>,
+            body: String,
+        ) -> axum::response::Response {
+            state.seen.lock().await.push("register".to_string());
+            let _ = body;
+            axum::Json(serde_json::json!({
+                "client_id": "dynamic-client-id",
+                "client_secret": "dynamic-client-secret",
+            }))
+            .into_response()
+        }
+
+        async fn token(
+            axum::extract::State(state): axum::extract::State<AuthState>,
+            body: String,
+        ) -> axum::response::Response {
+            state.seen.lock().await.push("token".to_string());
+            // Reject unless the caller presents the authorization code and a
+            // PKCE verifier, which is what the client must send.
+            if !body.contains("code=oauth-code") || !body.contains("code_verifier=") {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": "invalid_request"})),
+                )
+                    .into_response();
+            }
+            axum::Json(serde_json::json!({
+                "access_token": "access-token-123",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "refresh-token-123",
+            }))
+            .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock auth server");
+        let addr = listener.local_addr().expect("mock auth addr");
+        let issuer = format!("http://{addr}");
+
+        let state = AuthState {
+            issuer: issuer.clone(),
+            seen: seen_requests.clone(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                axum::routing::get(resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource",
+                axum::routing::get(resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(authorization_server_metadata),
+            )
+            .route("/register", axum::routing::post(register))
+            .route("/token", axum::routing::post(token))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (issuer, seen_requests)
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn oauth_flow_discovers_endpoints_and_stores_tokens() {
+        let auth_file = temp_auth_file("flow");
+        let _guard = auth_store_lock();
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let (issuer, seen) = spawn_mock_authorization_server().await;
+        // The MCP server publishes the protected-resource metadata that names
+        // the authorization server, which is where discovery starts.
+        let (mcp_url, _) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer.clone())).await;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: mcp_url,
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let oauth_client = manager
+            .oauth_client_for("remote")
+            .await
+            .expect("oauth client with discovery");
+        assert!(
+            seen.lock()
+                .await
+                .iter()
+                .any(|request| request == "authorization-server-metadata"),
+            "discovery must fetch authorization-server metadata"
+        );
+
+        // No credentials yet, so the server must not look authorized.
+        assert!(!oauth_client.has_stored_tokens().await);
+
+        let state = manager.start_oauth("remote").await.expect("start oauth");
+        assert!(
+            state.authorization_url.contains("/authorize"),
+            "authorization URL must come from discovery: {}",
+            state.authorization_url
+        );
+
+        let stored_state = opencode_mcp::auth::get_oauth_state("remote")
+            .await
+            .expect("persisted csrf state");
+
+        let status = manager
+            .handle_callback("remote", "oauth-code", Some(&stored_state))
+            .await
+            .expect("callback exchanges the code");
+        assert_eq!(status.oauth_status, Some(McpOAuthStatus::Authorized));
+        assert!(
+            oauth_client.has_stored_tokens().await,
+            "tokens must be stored after the exchange"
+        );
+        assert!(seen.lock().await.iter().any(|request| request == "token"));
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn callback_without_stored_tokens_fails() {
+        let auth_file = temp_auth_file("negative");
+        let _guard = auth_store_lock();
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let (issuer, _) = spawn_mock_authorization_server().await;
+        let (mcp_url, _) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer.clone())).await;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: mcp_url,
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        manager.start_oauth("remote").await.expect("start oauth");
+        let stored_state = opencode_mcp::auth::get_oauth_state("remote")
+            .await
+            .expect("csrf state");
+
+        // A wrong code is rejected by the authorization server, so the server
+        // must not be reported as authorized.
+        let result = manager
+            .handle_callback("remote", "wrong-code", Some(&stored_state))
+            .await;
+        assert!(result.is_err(), "invalid code must not authorize");
+        let status = manager.get_server("remote").await.expect("remote server");
+        assert_ne!(status.oauth_status, Some(McpOAuthStatus::Authorized));
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
     }
 }

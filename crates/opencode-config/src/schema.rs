@@ -724,6 +724,30 @@ pub struct McpOAuth {
     pub client_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Local callback port; shorthand for `redirect_uri` when only the port
+    /// differs from the default.
+    #[serde(
+        rename = "callbackPort",
+        alias = "callback_port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub callback_port: Option<u16>,
+    /// Pre-registered loopback URI whose path and port reach the local
+    /// callback listener.
+    #[serde(
+        rename = "redirectUri",
+        alias = "redirect_uri",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub redirect_uri: Option<String>,
+    /// Authorization server metadata URL, set when the MCP server does not
+    /// publish protected resource metadata naming its authorization server.
+    #[serde(
+        rename = "authServerMetadataUrl",
+        alias = "auth_server_metadata_url",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_server_metadata_url: Option<String>,
 }
 
 /// The `mcp` configuration section.
