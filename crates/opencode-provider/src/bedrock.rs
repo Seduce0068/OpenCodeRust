@@ -308,7 +308,7 @@ impl Provider for BedrockProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let endpoint = self.get_endpoint();
-        let model_id = request.model.clone();
+        let model_id = crate::bootstrap::AmazonBedrockLoader::prefix_model_id(&request.model, &self.config.region);
         let model_id_encoded = urlencoding::encode(&model_id);
 
         let bedrock_request = self.convert_request(request);
@@ -350,7 +350,7 @@ impl Provider for BedrockProvider {
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<StreamResult, ProviderError> {
         let endpoint = self.get_endpoint();
-        let model_id = request.model.clone();
+        let model_id = crate::bootstrap::AmazonBedrockLoader::prefix_model_id(&request.model, &self.config.region);
         let model_id_encoded = urlencoding::encode(&model_id);
 
         let bedrock_request = self.convert_request(request);
