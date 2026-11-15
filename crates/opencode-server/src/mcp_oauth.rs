@@ -15,6 +15,7 @@ pub struct LocalMcpConfig {
     pub env: Option<HashMap<String, String>>,
     pub cwd: Option<String>,
     pub timeouts: McpTimeouts,
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -28,6 +29,7 @@ pub struct RemoteMcpConfig {
     pub timeouts: McpTimeouts,
     /// OAuth client settings from the config (`mcp.servers.<name>.oauth`).
     pub oauth: Option<RemoteOAuthSettings>,
+    pub protocol: Option<String>,
 }
 
 /// OAuth client settings declared in the MCP server configuration.
@@ -282,6 +284,7 @@ impl McpOAuthManager {
                         env,
                         cwd: local.cwd,
                         timeouts: local.timeouts,
+                        protocol: local.protocol,
                     })
                     .await
                 {
@@ -350,6 +353,7 @@ impl McpOAuthManager {
                             remote.url.clone(),
                             remote.headers.clone().filter(|headers| !headers.is_empty()),
                             remote.timeouts,
+                            remote.protocol.clone(),
                         )
                         .await
                     {

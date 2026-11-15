@@ -569,6 +569,30 @@ pub enum McpServerConfig {
     Enabled { enabled: bool },
 }
 
+/// MCP protocol version negotiation mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpProtocol {
+    /// Speak up to protocol revision 2025-11-25 (default).
+    #[default]
+    Legacy,
+    /// Probe for 2026-07-28 and fall back to legacy.
+    Auto,
+    /// Require protocol revision 2026-07-28.
+    #[serde(rename = "2026-07-28")]
+    V20260728,
+}
+
+impl McpProtocol {
+    /// The protocol revision string to send in `initialize`.
+    pub fn revision(&self) -> &'static str {
+        match self {
+            McpProtocol::Legacy | McpProtocol::Auto => "2025-11-25",
+            McpProtocol::V20260728 => "2026-07-28",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpServer {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -595,6 +619,9 @@ pub struct McpServer {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<McpTimeoutConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<McpProtocol>,
 
     /// For remote: headers to send
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -906,6 +933,8 @@ struct McpServerV2 {
     cwd: Option<String>,
     #[serde(default)]
     timeout: Option<McpTimeoutConfig>,
+    #[serde(default)]
+    protocol: Option<McpProtocol>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -936,6 +965,7 @@ impl McpServerV2 {
                 .enabled
                 .or_else(|| self.disabled.map(|disabled| !disabled)),
             timeout: self.timeout,
+            protocol: self.protocol,
             headers: self.headers.map(string_map),
             oauth: self.oauth.and_then(oauth_config_from_value),
             args: self.args,
@@ -1562,6 +1592,7 @@ impl DeepMerge for McpServer {
         merge_option_replace(&mut self.url, other.url);
         merge_option_replace(&mut self.enabled, other.enabled);
         merge_option_deep(&mut self.timeout, other.timeout);
+        merge_option_replace(&mut self.protocol, other.protocol);
         merge_option_map_overwrite_values(&mut self.headers, other.headers);
         merge_option_replace(&mut self.oauth, other.oauth);
         // Legacy fields
