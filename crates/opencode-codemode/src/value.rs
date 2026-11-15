@@ -416,7 +416,7 @@ pub type RegExpRef = Rc<RefCell<RegExpValue>>;
 pub struct RegExpValue {
     pub pattern: String,
     pub flags: String,
-    pub regex: regex::Regex,
+    pub regex: fancy_regex::Regex,
     pub global: bool,
     pub ignore_case: bool,
     pub multiline: bool,

@@ -4622,10 +4622,11 @@ impl<'a> Interpreter<'a> {
                 match re {
                     Some(re) => {
                         let re = re.borrow();
-                        Ok(re
-                            .regex
-                            .find(&text)
-                            .map_or(Value::Number(-1.0), |m| Value::Number(m.start() as f64)))
+                        let index = match re.regex.find(&text) {
+                            Ok(Some(m)) => m.start() as f64,
+                            _ => -1.0,
+                        };
+                        Ok(Value::Number(index))
                     }
                     None => {
                         // Plain string: indexOf
@@ -4662,7 +4663,10 @@ impl<'a> Interpreter<'a> {
                     let re = re.borrow();
                     let mut matches = Vec::new();
                     for m in re.regex.find_iter(&text) {
-                        matches.push(Value::String(m.as_str().to_string()));
+                        match m {
+                            Ok(m) => matches.push(Value::String(m.as_str().to_string())),
+                            Err(_) => break,
+                        }
                     }
                     if matches.is_empty() {
                         return Ok(Value::Null);
@@ -4671,7 +4675,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     let re = re.borrow();
                     Ok(match re.regex.captures(&text) {
-                        Some(caps) => {
+                        Ok(Some(caps)) => {
                             let m = caps.get(0).unwrap();
                             let mut obj = indexmap::IndexMap::new();
                             obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
@@ -4719,7 +4723,7 @@ impl<'a> Interpreter<'a> {
                             }
                             Value::Object(Rc::new(RefCell::new(obj)))
                         }
-                        None => Value::Null,
+                        _ => Value::Null,
                     })
                 }
             }
@@ -4742,6 +4746,7 @@ impl<'a> Interpreter<'a> {
                 let re = re.borrow();
                 let mut results = Vec::new();
                 for caps in re.regex.captures_iter(&text) {
+                    let Ok(caps) = caps else { break };
                     let m = caps.get(0).unwrap();
                     let mut obj = indexmap::IndexMap::new();
                     obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
@@ -4873,22 +4878,26 @@ impl<'a> Interpreter<'a> {
                 let text = to_js_string(&argument(0));
                 let mut re = re.borrow_mut();
                 let result = if re.global || re.sticky {
-                    // Global/sticky flag: use last_index
+                    // Global/sticky flag: start scanning at last_index
                     let start = re.last_index;
-                    if let Some(m) = re.regex.find_at(&text, start) {
-                        if re.sticky && m.start() != start {
+                    match re.regex.captures_from_pos(&text, start) {
+                        Ok(Some(caps)) => {
+                            let m = caps.get(0).unwrap();
+                            if re.sticky && m.start() != start {
+                                re.last_index = 0;
+                                false
+                            } else {
+                                re.last_index = m.end();
+                                true
+                            }
+                        }
+                        _ => {
                             re.last_index = 0;
                             false
-                        } else {
-                            re.last_index = m.end();
-                            true
                         }
-                    } else {
-                        re.last_index = 0;
-                        false
                     }
                 } else {
-                    re.regex.is_match(&text)
+                    re.regex.is_match(&text).unwrap_or(false)
                 };
                 Ok(Value::Boolean(result))
             }
@@ -4906,19 +4915,22 @@ impl<'a> Interpreter<'a> {
                 // Determine the search start and whether we require an exact anchor.
                 let caps = if global || sticky {
                     // For sticky, the match must start exactly at last_index.
-                    if let Some(caps) = re.regex.captures_at(&text, start) {
-                        if sticky && caps.get(0).map(|m| m.start()) != Some(start) {
+                    match re.regex.captures_from_pos(&text, start) {
+                        Ok(Some(caps)) => {
+                            if sticky && caps.get(0).map(|m| m.start()) != Some(start) {
+                                re.last_index = 0;
+                                None
+                            } else {
+                                Some(caps)
+                            }
+                        }
+                        _ => {
                             re.last_index = 0;
                             None
-                        } else {
-                            Some(caps)
                         }
-                    } else {
-                        re.last_index = 0;
-                        None
                     }
                 } else {
-                    re.regex.captures(&text)
+                    re.regex.captures(&text).ok().flatten()
                 };
 
                 match caps {
@@ -6323,13 +6335,13 @@ fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeErr
         }
     }
 
-    // Build regex with flags
-    let mut builder = regex::RegexBuilder::new(&pattern);
+    // Build regex with flags using fancy-regex for lookaround support
+    let mut builder = fancy_regex::RegexBuilder::new(&pattern);
     builder.case_insensitive(ignore_case);
     builder.multi_line(multiline);
     builder.dot_matches_new_line(dot_all);
     if unicode {
-        builder.unicode(true);
+        builder.unicode_mode(true);
     }
 
     let regex = builder.build().map_err(|e| {
@@ -10136,6 +10148,32 @@ mod tests {
 
         let value = run_value(r#"const parts = "a1b2".matchAll(/(\d)/g); return parts[0][1];"#);
         assert_eq!(value, Value::String("1".to_string()));
+    }
+
+    #[test]
+    fn evaluates_regexp_lookaround_and_backreferences() {
+        // Positive lookahead
+        let value = run_value(r#"return "abc 123 def".match(/([0-9]+)(?= def)/)[1];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        // Negative lookahead
+        let value = run_value(r#"return "abc 123".match(/([0-9]+)(?! x)/)[1];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        // Lookbehind
+        let value = run_value(r#"return "abc 123".match(/(?<=abc )([0-9]+)/)[1];"#);
+        assert_eq!(value, Value::String("123".to_string()));
+
+        // Backreference
+        let value = run_value(r#"return "aabb".match(/(\w)\1/)[0];"#);
+        assert_eq!(value, Value::String("aa".to_string()));
+
+        // Lookahead in test
+        let value = run_value(r#"return /[0-9]+(?= def)/.test("abc 123 def");"#);
+        assert_eq!(value, Value::Boolean(true));
+
+        let value = run_value(r#"return /[0-9]+(?= xyz)/.test("abc 123 def");"#);
+        assert_eq!(value, Value::Boolean(false));
     }
 
     #[test]
