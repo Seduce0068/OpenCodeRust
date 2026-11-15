@@ -760,10 +760,9 @@ impl PartialEq for Value {
 }
 
 /// A value crossing the data boundary violated the plain-data contract.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataError {
     /// The value nested deeper than [`MAX_VALUE_DEPTH`].
-    #[error("{label} exceeds the maximum value depth of {max}.")]
     DepthExceeded {
         /// Diagnostic label for the value.
         label: String,
@@ -771,7 +770,6 @@ pub enum DataError {
         max: usize,
     },
     /// The object contained a blocked member name.
-    #[error("{label} contains blocked property '{property}'.")]
     BlockedProperty {
         /// Diagnostic label for the value.
         label: String,
@@ -779,18 +777,37 @@ pub enum DataError {
         property: String,
     },
     /// The value contained a runtime-only value such as a function.
-    #[error("{label} must contain data only.")]
     NonData {
         /// Diagnostic label for the value.
         label: String,
     },
     /// The value contains a cycle that cannot cross the boundary.
-    #[error("{label} contains a circular value.")]
     Circular {
         /// Diagnostic label for the value.
         label: String,
     },
 }
+
+impl std::fmt::Display for DataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataError::DepthExceeded { label, max } => {
+                write!(f, "{label} exceeds the maximum value depth of {max}.")
+            }
+            DataError::BlockedProperty { label, property } => {
+                write!(f, "{label} contains blocked property '{property}'.")
+            }
+            DataError::NonData { label } => {
+                write!(f, "{label} must contain data only.")
+            }
+            DataError::Circular { label } => {
+                write!(f, "{label} contains a circular value.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DataError {}
 
 impl Display for Value {
     /// Renders the value in a JSON-like debug form for diagnostics.

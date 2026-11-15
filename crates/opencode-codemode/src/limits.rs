@@ -51,10 +51,9 @@ impl ExecutionLimits {
 }
 
 /// A limit configuration rejected at construction time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitError {
     /// The named limit was below its minimum.
-    #[error("{name} must be a safe integer greater than or equal to {minimum}.")]
     Invalid {
         /// Limit name as exposed to callers.
         name: &'static str,
@@ -62,12 +61,26 @@ pub enum LimitError {
         minimum: usize,
     },
     /// The tool-call budget was exhausted.
-    #[error("Execution exceeded its tool-call limit of {limit}.")]
     ToolCallLimitExceeded {
         /// Configured maximum.
         limit: usize,
     },
 }
+
+impl std::fmt::Display for LimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LimitError::Invalid { name, minimum } => {
+                write!(f, "{name} must be a safe integer greater than or equal to {minimum}.")
+            }
+            LimitError::ToolCallLimitExceeded { limit } => {
+                write!(f, "Execution exceeded its tool-call limit of {limit}.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LimitError {}
 
 /// Tracks admitted tool calls against an optional budget.
 #[derive(Debug, Clone)]
