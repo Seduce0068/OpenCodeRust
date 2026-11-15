@@ -2790,8 +2790,17 @@ async fn patch_config(
     Json(patch): Json<AppConfig>,
 ) -> Result<Json<AppConfig>> {
     let mut config = CONFIG_STATE.write().await;
-    config.merge(patch);
+    config.merge(patch.clone());
     let updated = config.clone();
+    drop(config);
+
+    // Persist the merged config to the project directory so changes survive
+    // a server restart. Failures are logged but do not abort the request.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Err(error) = opencode_config::update_config(&cwd, &patch) {
+        tracing::warn!(%error, "failed to persist patched config");
+    }
+
     state.broadcast(
         &serde_json::json!({
             "type": "config.updated",
