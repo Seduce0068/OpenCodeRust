@@ -71,7 +71,10 @@ impl std::fmt::Display for LimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LimitError::Invalid { name, minimum } => {
-                write!(f, "{name} must be a safe integer greater than or equal to {minimum}.")
+                write!(
+                    f,
+                    "{name} must be a safe integer greater than or equal to {minimum}."
+                )
             }
             LimitError::ToolCallLimitExceeded { limit } => {
                 write!(f, "Execution exceeded its tool-call limit of {limit}.")
