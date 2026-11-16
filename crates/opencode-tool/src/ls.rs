@@ -293,3 +293,110 @@ impl Tool for LsTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opencode-ls-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
+    #[test]
+    fn has_glob_meta_detects_pattern_chars() {
+        assert!(has_glob_meta("*.rs"));
+        assert!(has_glob_meta("src/?.ts"));
+        assert!(has_glob_meta("[ab].txt"));
+        assert!(!has_glob_meta("node_modules"));
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = LsTool::new();
+        assert_eq!(tool.id(), "ls");
+        assert_eq!(tool.parameters()["required"][0], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn execute_lists_files_and_dirs() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("README.md"), "readme").unwrap();
+        std::fs::write(dir.join("src").join("main.rs"), "fn main() {}").unwrap();
+
+        let result = LsTool::new()
+            .execute(serde_json::json!({}), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["count"], 2);
+        assert!(result.output.contains("README.md"));
+        assert!(result.output.contains("main.rs"));
+        assert!(result.output.contains("src/"));
+        assert!(!result.truncated);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_respects_custom_ignore() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("keep.rs"), "keep").unwrap();
+        std::fs::write(dir.join("skip.log"), "skip").unwrap();
+
+        let result = LsTool::new()
+            .execute(serde_json::json!({ "ignore": ["*.log"] }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["count"], 1);
+        assert!(result.output.contains("keep.rs"));
+        assert!(!result.output.contains("skip.log"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_missing_directory() {
+        let dir = temp_dir();
+        let missing = dir.join("missing");
+        let error = LsTool::new()
+            .execute(
+                serde_json::json!({ "path": missing.to_string_lossy() }),
+                context(&dir),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::FileNotFound(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_file_path() {
+        let dir = temp_dir();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let error = LsTool::new()
+            .execute(
+                serde_json::json!({ "path": file.to_string_lossy() }),
+                context(&dir),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::ExecutionError(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
