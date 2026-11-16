@@ -747,3 +747,71 @@ impl ToolError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_request_builder() {
+        let request = PermissionRequest::new("bash")
+            .with_pattern("ls *")
+            .with_patterns(vec!["git status".to_owned()])
+            .with_metadata("reason", serde_json::json!("test"))
+            .with_always("ls")
+            .always_allow();
+
+        assert_eq!(request.permission, "bash");
+        assert_eq!(request.patterns, vec!["git status"]);
+        assert_eq!(request.metadata["reason"], "test");
+        assert_eq!(request.always, vec!["ls", "*"]);
+    }
+
+    #[test]
+    fn tool_result_simple_and_metadata() {
+        let result =
+            ToolResult::simple("title", "output").with_metadata("count", serde_json::json!(2));
+
+        assert_eq!(result.title, "title");
+        assert_eq!(result.output, "output");
+        assert!(!result.truncated);
+        assert_eq!(result.metadata["count"], 2);
+    }
+
+    #[test]
+    fn tool_context_defaults() {
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned());
+        assert_eq!(ctx.session_id, "s");
+        assert_eq!(ctx.message_id, "m");
+        assert_eq!(ctx.directory, "/work");
+        assert_eq!(ctx.worktree, "/work");
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn tool_context_with_agent() {
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned())
+            .with_agent("plan".to_owned());
+        assert_eq!(ctx.agent, "plan");
+    }
+
+    #[test]
+    fn is_external_path_checks_project_root() {
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned());
+        assert!(!ctx.is_external_path("src/main.rs"));
+        assert!(ctx.is_external_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn tool_error_with_suggestions() {
+        let suggestions = vec!["a.rs".to_owned(), "b.rs".to_owned()];
+        let error = ToolError::with_suggestions("missing", &suggestions);
+        let message = error.to_string();
+        assert!(message.contains("missing"));
+        assert!(message.contains("a.rs"));
+        assert!(message.contains("b.rs"));
+
+        let plain = ToolError::with_suggestions("missing", &[]);
+        assert_eq!(plain.to_string(), "File not found: missing");
+    }
+}
