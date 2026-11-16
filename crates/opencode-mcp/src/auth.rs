@@ -220,3 +220,58 @@ pub fn is_token_expired(entry: &AuthEntry) -> Option<bool> {
         None => Some(false),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(tokens: Option<OAuthTokens>) -> AuthEntry {
+        AuthEntry {
+            tokens,
+            client_info: None,
+            code_verifier: None,
+            oauth_state: None,
+            server_url: None,
+            auth_url: None,
+            token_url: None,
+        }
+    }
+
+    #[test]
+    fn no_tokens_returns_none() {
+        assert_eq!(is_token_expired(&entry(None)), None);
+    }
+
+    #[test]
+    fn tokens_without_expiry_are_not_expired() {
+        let tokens = OAuthTokens {
+            access_token: "token".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            scope: None,
+        };
+        assert_eq!(is_token_expired(&entry(Some(tokens))), Some(false));
+    }
+
+    #[test]
+    fn tokens_with_past_expiry_are_expired() {
+        let tokens = OAuthTokens {
+            access_token: "token".to_owned(),
+            refresh_token: None,
+            expires_at: Some(1.0),
+            scope: None,
+        };
+        assert_eq!(is_token_expired(&entry(Some(tokens))), Some(true));
+    }
+
+    #[test]
+    fn tokens_with_future_expiry_are_valid() {
+        let tokens = OAuthTokens {
+            access_token: "token".to_owned(),
+            refresh_token: None,
+            expires_at: Some(9_999_999_999.0),
+            scope: None,
+        };
+        assert_eq!(is_token_expired(&entry(Some(tokens))), Some(false));
+    }
+}
