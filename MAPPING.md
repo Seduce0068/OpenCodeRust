@@ -9,14 +9,15 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-15T02:54:28+09:00"
+  at: "2026-11-16T22:50:20+09:00"
 ---
 
 ## 文書の位置付け
 
 upstream checkout (`github.com/anomalyco/opencode` @ `941e71d`、2026-08-10)
 に対する 2026-10-18 時点の対応調査である。掲載した対応と欠落は checkout の
-path で確認した事実に基づく。旧版の初期計画 (specs/ 前提) は git 履歴を
+path で確認した事実に基づく。Rust 側の実装状況は workspace とテストにより
+2026-11-16 時点で再確認した。旧版の初期計画 (specs/ 前提) は git 履歴を
 参照。フェーズ計画は [ALIGNMENT.md](ALIGNMENT.md)。
 
 ## upstream の構造前提
@@ -47,8 +48,10 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 
 1. `codemode` — parser基盤、対応構文検査、値境界、実行制限、同期評価器、
    stdlib (Date/Map/Set含む)、同期tool境界、期限監視、実行API
-   (`opencode-codemode`)。RegExp/URL、非同期実行、host呼び出しを
-   中断するtimeoutは未実装。
+   (`opencode-codemode`)。非同期実行と host呼び出しを中断する timeout は
+   未実装。RegExp (`fancy-regex` による lookaround 対応)、URL /
+   URLSearchParams、`String.normalize` は実装済み
+   (2026-11-16 時点、commit `bf8c62a` ほか)。
 2. `protocol` / `client` / `httpapi-codegen` — 権威 HTTP 契約と生成
    client 層が未分化 (Rust は `opencode-server` の routes が唯一の面)。
 3. `sdk` / `sdk-next` — JS SDK がない。
@@ -85,8 +88,8 @@ streamable HTTP で接続し、config の `headers` を送信する。401 は
 各操作タイムアウトへ反映する。既定は公式仕様どおり startup 30s /
 catalog 30s / execution 12h で、グローバル `mcp.timeout` を既定とし
 server の `timeout` がキー単位で上書きする。
-SSE transport、OAuth の token exchange、`codemode` / `protocol` / `pool`
-は未実装。
+SSE transport、OAuth の token exchange、MCP オプションの `codemode` /
+`protocol` / `pool` は未実装。
 未マッピングのキーも parse を失敗させない。
 
 ## 命名差
