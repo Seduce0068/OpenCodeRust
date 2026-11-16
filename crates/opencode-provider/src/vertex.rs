@@ -497,3 +497,32 @@ fn parse_vertex_sse(data: &str) -> Option<StreamEvent> {
 
     Some(StreamEvent::TextDelta(text))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sse_text_delta() {
+        let event = parse_vertex_sse(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hello"}],"role":"model"}}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, StreamEvent::TextDelta(t) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_sse_empty_and_done() {
+        assert!(parse_vertex_sse("").is_none());
+        assert!(parse_vertex_sse("[DONE]").is_none());
+        assert!(parse_vertex_sse("not json").is_none());
+    }
+
+    #[test]
+    fn parse_sse_non_text_part_is_none() {
+        let event = parse_vertex_sse(
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{}}}],"role":"model"}}]}"#,
+        );
+        assert!(event.is_none());
+    }
+}

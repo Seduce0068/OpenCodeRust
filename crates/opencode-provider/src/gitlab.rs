@@ -344,3 +344,26 @@ fn parse_gitlab_sse(data: &str) -> Option<StreamEvent> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sse_text_delta() {
+        let event =
+            parse_gitlab_sse(r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}"#)
+                .unwrap();
+        assert!(matches!(event, StreamEvent::TextDelta(t) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_sse_empty_and_tool_calls() {
+        assert!(parse_gitlab_sse("").is_none());
+        assert!(parse_gitlab_sse("not json").is_none());
+
+        let done =
+            parse_gitlab_sse(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#).unwrap();
+        assert!(matches!(done, StreamEvent::Done));
+    }
+}
