@@ -428,3 +428,48 @@ fn create_diff(filepath: &str, old_content: &str, new_content: &str) -> String {
 fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = EditTool::default();
+        assert_eq!(tool.id(), "edit");
+        assert_eq!(tool.parameters()["required"][0], "file_path");
+    }
+
+    #[test]
+    fn normalize_line_endings_replaces_crlf() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\nc"), "a\nb\nc");
+        assert_eq!(normalize_line_endings("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn create_diff_identical_content() {
+        let diff = create_diff("a.rs", "a\nb", "a\nb");
+        assert_eq!(diff, "--- a.rs\n+++ a.rs\n");
+    }
+
+    #[test]
+    fn create_diff_replacement() {
+        let diff = create_diff("a.rs", "old\nkeep", "new\nkeep");
+        assert!(diff.contains("-old\n"));
+        assert!(diff.contains("+new\n"));
+        assert!(!diff.contains("-keep"));
+    }
+
+    #[test]
+    fn create_diff_added_lines() {
+        let diff = create_diff("a.rs", "a", "a\nb");
+        assert_eq!(diff, "--- a.rs\n+++ a.rs\n+b\n");
+    }
+
+    #[test]
+    fn create_diff_removed_lines() {
+        let diff = create_diff("a.rs", "a\nb", "a");
+        assert!(!diff.contains("-a\n"));
+        assert!(diff.contains("-b\n"));
+    }
+}
