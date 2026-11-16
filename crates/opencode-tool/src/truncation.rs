@@ -149,4 +149,60 @@ mod tests {
         assert!(result.truncated_lines <= MAX_LINES);
         assert!(result.saved_to.is_some());
     }
+
+    #[tokio::test]
+    async fn test_truncation_by_bytes() {
+        let content = "x".repeat(MAX_BYTES + 1000);
+        let dir = tempdir().unwrap();
+
+        let result = Truncate::output(&content, dir.path()).await.unwrap();
+
+        assert!(result.truncated);
+        assert!(result.truncated_bytes <= MAX_BYTES);
+        let saved = std::fs::read_to_string(result.saved_to.unwrap()).unwrap();
+        assert!(saved.starts_with("... [truncated]\n"));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_only_old_txt_files() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempdir().unwrap();
+        let old_txt = dir.path().join("old.txt");
+        let new_txt = dir.path().join("new.txt");
+        let old_md = dir.path().join("old.md");
+        std::fs::write(&old_txt, "old").unwrap();
+        std::fs::write(&new_txt, "new").unwrap();
+        std::fs::write(&old_md, "old").unwrap();
+
+        let old_time =
+            SystemTime::now() - Duration::from_secs((CLEANUP_RETENTION_DAYS + 1) * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_txt)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old_md)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        let deleted = Truncate::cleanup(dir.path()).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(!old_txt.exists());
+        assert!(new_txt.exists());
+        assert!(old_md.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_missing_directory() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        assert_eq!(Truncate::cleanup(&missing).await.unwrap(), 0);
+    }
 }
