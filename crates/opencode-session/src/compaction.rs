@@ -1509,4 +1509,36 @@ mod tests {
         };
         assert_eq!(prompt, "custom compaction prompt");
     }
+
+    #[test]
+    fn hook_payload_string_form() {
+        let (prompt, context) = parse_compaction_hook_payload(&serde_json::json!("  custom  "));
+        assert_eq!(prompt.as_deref(), Some("custom"));
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn hook_payload_context_array_filters_empty() {
+        let (_, context) = parse_compaction_hook_payload(&serde_json::json!({
+            "prompt": " p ",
+            "context": [" one ", "  ", "two"]
+        }));
+        assert_eq!(context, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn hook_payload_context_string() {
+        let (_, context) = parse_compaction_hook_payload(&serde_json::json!({
+            "context": "  only  "
+        }));
+        assert_eq!(context, vec!["only"]);
+    }
+
+    #[test]
+    fn hook_payload_empty_prompt_is_none() {
+        let (prompt, _) = parse_compaction_hook_payload(&serde_json::json!({
+            "prompt": "   "
+        }));
+        assert!(prompt.is_none());
+    }
 }
