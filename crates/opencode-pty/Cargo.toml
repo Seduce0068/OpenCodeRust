@@ -7,5 +7,3 @@ edition = "2021"
 portable-pty = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
-tokio-util = { workspace = true, features = ["compat"] }
