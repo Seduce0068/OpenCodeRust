@@ -160,6 +160,7 @@ cargo fmt
 cargo check
 cargo clippy --workspace --all-targets
 cargo nextest run --workspace
+cargo check --workspace --all-targets --all-features
 ```
 
 Minimal check (typical):
