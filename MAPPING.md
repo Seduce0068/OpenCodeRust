@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-16T22:50:20+09:00"
+  at: "2026-11-16T23:51:46+09:00"
 ---
 
 ## 文書の位置付け
@@ -23,8 +23,13 @@ path で確認した事実に基づく。Rust 側の実装状況は workspace �
 ## upstream の構造前提
 
 upstream は v1 monolith (`packages/opencode/src/*`) と v2 engine
-(`packages/core/src/*`) の二層で、`packages/` は 32 ディレクトリ。
-Rust 側の crate 分割は v1 の subsystem 構成と概ね 1:1 で対応する。
+(`packages/core/src/*`) の二層で、`packages/` は 32 ディレクトリ
+(baseline `941e71d` 時点)。Rust 側の crate 分割は v1 の subsystem 構成と
+概ね 1:1 で対応する。
+
+2026-11-16 に `dev` の `packages/` を確認したところ 34 ディレクトリで、
+`ai` / `app` / `data` / `desktop` / `identity` などが追加されている。
+これらとの対応調査は未実施。
 
 ## 対応 (高確度)
 
