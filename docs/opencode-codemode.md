@@ -9,7 +9,7 @@ tags:
   - crate
 verified:
   by: opencode
-  at: "2026-11-16T23:17:05+09:00"
+  at: "2026-11-16T23:54:49+09:00"
 ---
 
 ## opencode-codemode
@@ -463,7 +463,6 @@ shadowingできる。
 - Rustの `String` はlone surrogateを保持できないため、`String.fromCharCode(0xD800)` /
   `String.fromCodePoint(0xD800)`、サロゲートを分割するindex操作や
   `split("")` / `replaceAll("")` の境界はJavaScriptと一致しない
-- `Number.toString(radix)` の非整数値はbase 10表記にフォールバックする
 - `Error` は `name` / `message` を持つbranded valueで、upstreamのplain object
   のように任意propertyを追加・変更できない
 - upstream parity test suiteの完全移植 (依存不要な差分コーパスは実装済み)
