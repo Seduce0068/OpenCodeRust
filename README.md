@@ -6,9 +6,11 @@ tags: [project, rust, opencode]
 
 # OpenCodeRust
 
-**A Rust implementation of OpenCode**
+A Rust implementation of OpenCode
 
-OpenCodeRust is the Rust implementation and evolution of OpenCode. It provides a full CLI/TUI/Server workflow for local AI coding agents, session management, tool invocation, MCP/LSP integration, and plugin extensions.
+OpenCodeRust is the Rust implementation and evolution of OpenCode. It provides
+a full CLI/TUI/Server workflow for local AI coding agents, session management,
+tool invocation, MCP/LSP integration, and plugin extensions.
 
 ## Current status
 
@@ -22,7 +24,8 @@ OpenCodeRust is the Rust implementation and evolution of OpenCode. It provides a
 - **Tool system:** Built-in read/write/edit, shell, patch, and related tools
 - **Model support:** Multiple providers, agent mode switching
 - **Extensibility:** Plugin bridge (including TS plugins), MCP, LSP
-- **Terminal:** Improved layout, collapsible sidebar, syntax highlighting, path completion
+- **Terminal:** Improved layout, collapsible sidebar, syntax highlighting,
+  path completion
 
 ## Quick start
 
