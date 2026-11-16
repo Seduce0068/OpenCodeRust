@@ -191,3 +191,70 @@ fn parse_sse_response(text: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = CodeSearchTool;
+        assert_eq!(tool.id(), "codesearch");
+        assert!(tool.description().contains("Exa Code API"));
+        let schema = tool.parameters();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"][0], "query");
+        assert_eq!(schema["properties"]["tokensNum"]["default"], 5000);
+    }
+
+    #[test]
+    fn default_tokens_is_five_thousand() {
+        assert_eq!(default_tokens(), 5000);
+    }
+
+    #[test]
+    fn params_apply_default_tokens() {
+        let params: CodeSearchParams =
+            serde_json::from_value(serde_json::json!({ "query": "react hooks" })).unwrap();
+        assert_eq!(params.query, "react hooks");
+        assert_eq!(params.tokens_num, 5000);
+    }
+
+    #[test]
+    fn params_accept_tokens_num_alias() {
+        let params: CodeSearchParams = serde_json::from_value(serde_json::json!({
+            "query": "react hooks",
+            "tokensNum": 1000
+        }))
+        .unwrap();
+        assert_eq!(params.tokens_num, 1000);
+    }
+
+    #[test]
+    fn parse_sse_extracts_text_content() {
+        let text = "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"snippet\"}]}}\n\n";
+        assert_eq!(parse_sse_response(text).as_deref(), Some("snippet"));
+    }
+
+    #[test]
+    fn parse_sse_ignores_non_text_content() {
+        let text = "data: {\"result\":{\"content\":[{\"type\":\"image\",\"text\":\"x\"}]}}";
+        assert!(parse_sse_response(text).is_none());
+    }
+
+    #[test]
+    fn parse_sse_ignores_malformed_json() {
+        assert!(parse_sse_response("data: not-json").is_none());
+    }
+
+    #[test]
+    fn parse_sse_ignores_missing_result() {
+        assert!(parse_sse_response("data: {}").is_none());
+    }
+
+    #[test]
+    fn parse_sse_ignores_empty_content() {
+        let text = "data: {\"result\":{\"content\":[]}}";
+        assert!(parse_sse_response(text).is_none());
+    }
+}
