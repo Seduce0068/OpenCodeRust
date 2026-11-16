@@ -5,8 +5,11 @@ use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvalidParams {
+    #[serde(alias = "toolName")]
     pub tool_name: String,
+    #[serde(alias = "errorMessage")]
     pub error_message: String,
+    #[serde(alias = "receivedArgs")]
     pub received_args: Option<serde_json::Value>,
 }
 
@@ -111,6 +114,20 @@ mod tests {
         assert_eq!(result.metadata["tool_name"], "bogus");
         assert_eq!(result.metadata["error_message"], "unknown tool");
         assert!(!result.truncated);
+    }
+
+    #[tokio::test]
+    async fn execute_accepts_schema_camel_case_fields() {
+        let args = serde_json::json!({
+            "toolName": "bogus",
+            "errorMessage": "unknown tool",
+            "receivedArgs": { "x": 1 }
+        });
+        let result = InvalidTool.execute(args, context()).await.unwrap();
+
+        assert_eq!(result.title, "Invalid Tool: bogus");
+        assert_eq!(result.metadata["tool_name"], "bogus");
+        assert_eq!(result.metadata["error_message"], "unknown tool");
     }
 
     #[tokio::test]
