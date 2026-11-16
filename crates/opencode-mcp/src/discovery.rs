@@ -341,4 +341,18 @@ mod tests {
             Err(DiscoveryError::Url(_))
         ));
     }
+
+    #[test]
+    fn well_known_url_root_ignores_path() {
+        let url = well_known_url_root("https://host/a/b?x=1#frag", ".well-known/x").unwrap();
+        assert_eq!(url, "https://host/.well-known/x");
+    }
+
+    #[test]
+    fn well_known_url_strips_query_and_fragment() {
+        let url = well_known_url("https://host/path?x=1#frag", ".well-known/x").unwrap();
+        assert!(!url.contains('?'));
+        assert!(!url.contains('#'));
+        assert!(url.contains("/path"));
+    }
 }
