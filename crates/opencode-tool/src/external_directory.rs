@@ -131,4 +131,70 @@ mod tests {
         let pattern = make_glob_pattern("/home/user/external");
         assert_eq!(pattern, "/home/user/external/*");
     }
+
+    fn context(asks: &std::sync::Arc<std::sync::Mutex<Vec<PermissionRequest>>>) -> ToolContext {
+        let asks = asks.clone();
+        ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned()).with_ask(
+            move |request| {
+                let asks = asks.clone();
+                async move {
+                    asks.lock().unwrap().push(request);
+                    Ok(())
+                }
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn no_target_returns_ok() {
+        let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert_external_directory(&context(&asks), None, ExternalDirectoryOptions::default())
+            .await
+            .unwrap();
+        assert!(asks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bypass_skips_permission() {
+        let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = ExternalDirectoryOptions {
+            bypass: true,
+            ..Default::default()
+        };
+        assert_external_directory(&context(&asks), Some("/etc/passwd"), options)
+            .await
+            .unwrap();
+        assert!(asks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn within_project_skips_permission() {
+        let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert_external_directory(
+            &context(&asks),
+            Some("/work/src/main.rs"),
+            ExternalDirectoryOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(asks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_file_requests_permission() {
+        let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert_external_directory(
+            &context(&asks),
+            Some("/etc/passwd"),
+            ExternalDirectoryOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let asks = asks.lock().unwrap();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].permission, "external_directory");
+        assert_eq!(asks[0].patterns[0], "/etc/*");
+        assert_eq!(asks[0].metadata["filepath"], "/etc/passwd");
+    }
 }
