@@ -9,7 +9,7 @@ tags:
   - crate
 verified:
   by: opencode
-  at: "2026-11-16T22:52:11+09:00"
+  at: "2026-11-16T23:17:05+09:00"
 ---
 
 ## opencode-codemode
@@ -385,6 +385,9 @@ shadowingできる。
   `ToolError` 次第で `ToolFailure` になる。
 - 引数は深さ32、循環、関数、禁止メンバーを拒否する。検証はcallの記録より
   先に行うため、拒否された呼び出しは `maxToolCalls` を消費しない。
+- 引数は `Vec<JsonValue>` としてhostへ渡り、複数引数を許す
+  (例: `tools.math.add(2, 3)`)。upstreamは引数を単一input objectへ
+  正規化し、複数個なら `InvalidToolInput` を返すため、この点は差分になる。
 - 結果は同じ境界を通す。hostの失敗は `message` と任意の `data` を持つ
   objectとしてthrowし、`try`/`catch` で捕捉できる。結果がdata境界に
   違反した場合は `InvalidToolOutput` の診断になる。
@@ -453,7 +456,10 @@ shadowingできる。
   objectとして描画される (upstreamはopaque reference扱い)。
 - `localeCompare` はhost ICUではなくコードポイント順で比較する
 - `$codemode.search` のdiscovery toolとcatalog/instructions APIは未実装
-- tool definition/schemaの検証 (`InvalidToolInput`) は未実装
+- tool definition/schemaの検証 (`InvalidToolInput`) は未実装。Rustの
+  `ToolHost::invoke` は複数引数を許す契約のため、upstreamの単一input
+  object正規化を導入すると既存のtool呼び出しが回帰する
+  (Tool boundary 参照)。
 - Rustの `String` はlone surrogateを保持できないため、`String.fromCharCode(0xD800)` /
   `String.fromCodePoint(0xD800)`、サロゲートを分割するindex操作や
   `split("")` / `replaceAll("")` の境界はJavaScriptと一致しない
