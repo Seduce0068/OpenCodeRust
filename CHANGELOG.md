@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T06:12:50+09:00"
+  at: "2026-11-17T06:23:46+09:00"
 ---
 
 # Changelog
@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   models / invalid / codesearch / websearch / todo / glob / grep / ls / batch /
   read / status / apply_patch / bash / edit / multiedit / write / webfetch /
   lsp / plan / tool / external_directory / registry / question / task / skill /
-  message_v2 / message / schema / transform / bootstrap / responses)、
-  テスト総数 594 → 793 件
+  message_v2 / message / schema / transform / bootstrap / responses / openai /
+  anthropic / batch)、テスト総数 594 → 803 件
 
 ### Changed
 
@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 34.07% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 34.14% を計測
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (44MB バイナリ、
   脆弱性 0、依存は最新)
 
