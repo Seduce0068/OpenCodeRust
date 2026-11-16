@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T03:34:31+09:00"
+  at: "2026-11-17T03:54:47+09:00"
 ---
 
 # Changelog
@@ -22,10 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backreference、sticky flag)、URL / URLSearchParams、`String.normalize`
 - ADR-0006 (CodeMode 非同期実行の保留)、ADR-0007 (`missing_docs` 一括対応の保留)、
   ADR-0008 (テストカバレッジの baseline と改善方針)
-- 未カバー分岐の単体テスト 127 件 (truncation / arity / retry / revert / error /
+- 未カバー分岐の単体テスト 143 件 (truncation / arity / retry / revert / error /
   models / invalid / codesearch / websearch / todo / glob / grep / ls / batch /
-  read / status / apply_patch / bash / edit / multiedit / write)、
-  テスト総数 594 → 721 件
+  read / status / apply_patch / bash / edit / multiedit / write / webfetch /
+  lsp / plan)、テスト総数 594 → 737 件
 
 ### Changed
 
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 33.48% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 33.62% を計測
 
 ### Fixed
 
