@@ -336,3 +336,69 @@ impl Tool for BatchTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            "/tmp".to_owned(),
+        )
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = BatchTool;
+        assert_eq!(tool.id(), "batch");
+        assert_eq!(tool.parameters()["required"][0], "toolCalls");
+        assert_eq!(tool.parameters()["properties"]["toolCalls"]["maxItems"], 25);
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_empty_calls() {
+        let error = BatchTool
+            .execute(serde_json::json!({ "tool_calls": [] }), context())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::ValidationError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_requires_registry() {
+        let args = serde_json::json!({
+            "tool_calls": [{ "tool": "ls", "parameters": {} }]
+        });
+        let error = BatchTool.execute(args, context()).await.unwrap_err();
+        assert!(matches!(error, ToolError::ExecutionError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_missing_calls() {
+        let error = BatchTool
+            .execute(serde_json::json!({}), context())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn batch_result_skips_none_fields() {
+        let result = BatchResult {
+            tool: "x".to_owned(),
+            success: true,
+            output: None,
+            title: None,
+            error: None,
+            metadata: None,
+            attachment: None,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["tool"], "x");
+        assert_eq!(value["success"], true);
+        assert!(value.get("error").is_none());
+        assert!(value.get("output").is_none());
+    }
+}
