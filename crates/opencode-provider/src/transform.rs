@@ -1996,4 +1996,45 @@ mod tests {
         // amazon -> bedrock via SLUG_OVERRIDES
         assert!(result.contains_key("bedrock"));
     }
+
+    #[test]
+    fn extract_reasoning_from_response_with_thinking_tags() {
+        let (reasoning, rest) =
+            extract_reasoning_from_response("before <thinking> step1\nstep2 </thinking> after");
+        assert_eq!(reasoning.as_deref(), Some("step1\nstep2"));
+        assert_eq!(rest, "beforeafter");
+    }
+
+    #[test]
+    fn extract_reasoning_from_response_without_tags() {
+        let (reasoning, rest) = extract_reasoning_from_response("plain answer");
+        assert!(reasoning.is_none());
+        assert_eq!(rest, "plain answer");
+    }
+
+    #[test]
+    fn mime_to_modality_mapping() {
+        assert_eq!(mime_to_modality("image/png"), Some(Modality::Image));
+        assert_eq!(mime_to_modality("audio/mpeg"), Some(Modality::Audio));
+        assert_eq!(mime_to_modality("video/mp4"), Some(Modality::Video));
+        assert_eq!(mime_to_modality("application/pdf"), Some(Modality::Pdf));
+        assert!(mime_to_modality("text/plain").is_none());
+    }
+
+    #[test]
+    fn normalize_tool_call_id_replaces_invalid_chars() {
+        assert_eq!(normalize_tool_call_id("call-1", true), "call-1");
+        assert_eq!(normalize_tool_call_id("call.1", true), "call_1");
+        assert_eq!(normalize_tool_call_id("call-1", false), "call_1");
+    }
+
+    #[test]
+    fn temperature_top_p_top_k_by_model() {
+        assert_eq!(temperature_for_model("qwen-max"), Some(0.55));
+        assert_eq!(temperature_for_model("claude-3"), None);
+        assert_eq!(temperature_for_model("gemini-pro"), Some(1.0));
+        assert_eq!(top_p_for_model("gemini-pro"), Some(0.95));
+        assert_eq!(top_k_for_model("gemini-pro"), Some(64));
+        assert!(top_k_for_model("unknown-model").is_none());
+    }
 }
