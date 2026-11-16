@@ -52,3 +52,40 @@ pub fn center_text(text: &str, width: usize) -> String {
 pub fn highlight_text<'a>(text: &'a str, color: ratatui::style::Color) -> Span<'a> {
     Span::styled(text, ratatui::style::Style::default().fg(color))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_short_text_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_text_with_ellipsis() {
+        assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_handles_wide_chars() {
+        // Each CJK char has display width 2; one fits before the "..." (2+3=5).
+        assert_eq!(truncate("日本語テスト", 5), "日...");
+    }
+
+    #[test]
+    fn pad_left_and_right() {
+        assert_eq!(pad_left("ab", 5), "   ab");
+        assert_eq!(pad_right("ab", 5), "ab   ");
+        assert_eq!(pad_left("abcdef", 3), "abcdef");
+        assert_eq!(pad_right("abcdef", 3), "abcdef");
+    }
+
+    #[test]
+    fn center_text_pads_left_only() {
+        assert_eq!(center_text("ab", 6), "  ab");
+        assert_eq!(center_text("abc", 6), " abc");
+        assert_eq!(center_text("abcdef", 3), "abcdef");
+    }
+}
