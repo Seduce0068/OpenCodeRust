@@ -159,6 +159,7 @@ The complete 22-crate map and major execution paths are documented in
 cargo fmt
 cargo check
 cargo clippy --workspace --all-targets
+cargo nextest run --workspace
 ```
 
 Minimal check (typical):
