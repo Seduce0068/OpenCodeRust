@@ -5579,3 +5579,53 @@ async fn handle_github_command(action: GithubCommands) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn command_name_and_about() {
+        let cmd = Cli::command();
+        assert_eq!(cmd.get_name(), "opencoderust");
+        assert!(cmd.get_about().is_some());
+    }
+
+    #[test]
+    fn parses_no_subcommand() {
+        let cli = Cli::try_parse_from(["opencoderust"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_version_subcommand() {
+        let cli = Cli::try_parse_from(["opencoderust", "version"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Version)));
+    }
+
+    #[test]
+    fn parses_run_with_message() {
+        // `trailing_var_arg` means options must precede the message.
+        let cli =
+            Cli::try_parse_from(["opencoderust", "run", "--model", "gpt-5", "Check this repo"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Run { message, model, .. }) => {
+                assert_eq!(message, vec!["Check this repo"]);
+                assert_eq!(model.as_deref(), Some("gpt-5"));
+            }
+            _ => panic!("expected Run variant"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_subcommand() {
+        assert!(Cli::try_parse_from(["opencoderust", "unknown-cmd"]).is_err());
+    }
+}
