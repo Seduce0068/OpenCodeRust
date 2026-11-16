@@ -357,3 +357,108 @@ async fn get_lsp_diagnostics_impl(
 
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-write-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = WriteTool::new();
+        assert_eq!(tool.id(), "write");
+        assert_eq!(tool.parameters()["required"][0], "file_path");
+        assert_eq!(tool.parameters()["required"][1], "content");
+    }
+
+    #[test]
+    fn create_diff_for_new_file() {
+        let diff = create_diff("a.rs", "", "hello");
+        assert!(diff.starts_with("--- a.rs\n+++ a.rs\n"));
+        assert!(diff.contains("+hello\n"));
+    }
+
+    #[tokio::test]
+    async fn execute_creates_new_file() {
+        let dir = temp_dir();
+        let nested = dir.join("sub").join("a.txt");
+
+        let result = WriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": nested.to_string_lossy(),
+                    "content": "hello\nworld"
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "hello\nworld");
+        assert_eq!(result.metadata["bytes"], 11);
+        assert_eq!(result.metadata["lines"], 2);
+        assert_eq!(result.metadata["exists"], false);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_overwrites_existing_file() {
+        let dir = temp_dir();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let result = WriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "content": "new"
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(result.metadata["exists"], true);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_requires_file_path() {
+        let dir = temp_dir();
+        let error = WriteTool::new()
+            .execute(serde_json::json!({ "content": "x" }), context(&dir))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_requires_content() {
+        let dir = temp_dir();
+        let error = WriteTool::new()
+            .execute(serde_json::json!({ "file_path": "a.txt" }), context(&dir))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
