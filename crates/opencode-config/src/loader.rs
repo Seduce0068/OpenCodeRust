@@ -2191,4 +2191,44 @@ mod provider_normalization_tests {
             .expect("model");
         assert_eq!(model.model.as_deref(), Some("free-model"));
     }
+
+    #[test]
+    fn get_plugin_name_from_npm_and_file() {
+        assert_eq!(get_plugin_name("@scope/pkg@1.2.3"), "@scope/pkg");
+        assert_eq!(get_plugin_name("plain-plugin"), "plain-plugin");
+        assert_eq!(get_plugin_name("file:///tmp/my-plugin.js"), "my-plugin");
+    }
+
+    #[test]
+    fn deduplicate_plugins_keeps_last_winning_order() {
+        let plugins = vec!["pkg@1".to_owned(), "other@1".to_owned(), "pkg@2".to_owned()];
+        assert_eq!(
+            deduplicate_plugins(plugins),
+            vec!["other@1".to_owned(), "pkg@2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn split_frontmatter_with_delimiters() {
+        let content = "---\nname: test\n---\nbody text";
+        let (frontmatter, body) = split_frontmatter(content);
+        assert_eq!(frontmatter.as_deref(), Some("name: test"));
+        assert_eq!(body, "\nbody text");
+    }
+
+    #[test]
+    fn split_frontmatter_without_delimiters() {
+        let content = "just body";
+        let (frontmatter, body) = split_frontmatter(content);
+        assert!(frontmatter.is_none());
+        assert_eq!(body, "just body");
+    }
+
+    #[test]
+    fn substitute_env_vars_replaces_pattern() {
+        std::env::set_var("OPENCODE_TEST_ENV_VAR", "resolved-value");
+        let result = substitute_env_vars("prefix:{env:OPENCODE_TEST_ENV_VAR}:suffix");
+        assert_eq!(result, "prefix:resolved-value:suffix");
+        std::env::remove_var("OPENCODE_TEST_ENV_VAR");
+    }
 }
