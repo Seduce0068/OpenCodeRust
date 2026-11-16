@@ -72,3 +72,52 @@ impl Tool for InvalidTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            "/tmp".to_owned(),
+        )
+    }
+
+    #[test]
+    fn identity_and_parameters() {
+        let tool = InvalidTool;
+        assert_eq!(tool.id(), "invalid");
+        assert!(tool.description().contains("invalid"));
+        let schema = tool.parameters();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"][0], "toolName");
+        assert_eq!(schema["required"][1], "errorMessage");
+    }
+
+    #[tokio::test]
+    async fn execute_formats_output_and_metadata() {
+        let args = serde_json::json!({
+            "tool_name": "bogus",
+            "error_message": "unknown tool",
+            "received_args": { "x": 1 }
+        });
+        let result = InvalidTool.execute(args, context()).await.unwrap();
+
+        assert!(result.output.contains("bogus"));
+        assert!(result.output.contains("unknown tool"));
+        assert_eq!(result.title, "Invalid Tool: bogus");
+        assert_eq!(result.metadata["tool_name"], "bogus");
+        assert_eq!(result.metadata["error_message"], "unknown tool");
+        assert!(!result.truncated);
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_missing_required_fields() {
+        let args = serde_json::json!({ "tool_name": "bogus" });
+        let error = InvalidTool.execute(args, context()).await.unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+}
