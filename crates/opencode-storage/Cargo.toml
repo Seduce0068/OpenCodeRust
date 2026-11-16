@@ -15,6 +15,3 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 opencode-types = { path = "../opencode-types" }
-
-[dev-dependencies]
-tempfile = { workspace = true }
