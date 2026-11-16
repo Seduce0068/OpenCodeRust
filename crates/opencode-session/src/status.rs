@@ -216,4 +216,47 @@ mod tests {
         mgr.set_busy("ses_123").await;
         assert!(mgr.is_busy("ses_123").await);
     }
+
+    #[test]
+    fn status_serde_tag_roundtrip() {
+        for status in [
+            SessionStatusInfo::Idle,
+            SessionStatusInfo::Busy,
+            SessionStatusInfo::Retry {
+                attempt: 1,
+                message: "wait".to_owned(),
+                next: 42,
+            },
+        ] {
+            let json = serde_json::to_value(&status).unwrap();
+            let decoded: SessionStatusInfo = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_manager_is_empty() {
+        let mgr = SessionStatusManager::default();
+        assert!(mgr.list().await.is_empty());
+        assert!(!mgr.is_busy("ses_123").await);
+    }
+
+    #[tokio::test]
+    async fn idle_publishes_deprecated_event() {
+        let bus = Arc::new(Bus::new());
+        let mut rx = bus.subscribe_channel();
+        let mgr = SessionStatusManager::with_bus(bus);
+
+        mgr.set_busy("ses_123").await;
+        mgr.set_idle("ses_123").await;
+
+        let mut idle_seen = false;
+        while let Ok(event) = rx.try_recv() {
+            if event.event_type == SESSION_IDLE_EVENT.event_type {
+                idle_seen = true;
+                assert_eq!(event.properties["sessionID"], "ses_123");
+            }
+        }
+        assert!(idle_seen);
+    }
 }
