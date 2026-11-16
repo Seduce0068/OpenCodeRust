@@ -253,3 +253,84 @@ pub async fn create_default_registry() -> ToolRegistry {
 
     registry
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "test".to_owned(),
+            description: "original".to_owned(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    #[test]
+    fn hook_payload_object_accepts_three_shapes() {
+        assert!(hook_payload_object(&serde_json::json!({ "output": { "title": "x" } })).is_some());
+        assert!(hook_payload_object(&serde_json::json!({ "title": "x" })).is_some());
+        assert!(hook_payload_object(&serde_json::json!({ "data": { "title": "x" } })).is_some());
+        assert!(hook_payload_object(&serde_json::json!("text")).is_none());
+    }
+
+    #[test]
+    fn apply_definition_payload_updates_description_and_parameters() {
+        let mut s = schema();
+        apply_tool_definition_payload(
+            &mut s,
+            &serde_json::json!({
+                "description": "updated",
+                "parameters": { "type": "object", "required": ["x"] }
+            }),
+        );
+        assert_eq!(s.description, "updated");
+        assert_eq!(s.parameters["required"][0], "x");
+    }
+
+    #[test]
+    fn apply_definition_payload_ignores_non_object() {
+        let mut s = schema();
+        apply_tool_definition_payload(&mut s, &serde_json::json!("text"));
+        assert_eq!(s.description, "original");
+    }
+
+    #[test]
+    fn apply_before_payload_replaces_args() {
+        let mut args = serde_json::json!({ "old": 1 });
+        apply_tool_before_payload(&mut args, &serde_json::json!({ "args": { "new": 2 } }));
+        assert_eq!(args["new"], 2);
+        assert!(args.get("old").is_none());
+    }
+
+    #[test]
+    fn apply_after_payload_updates_title_output_metadata() {
+        let mut result = ToolResult::simple("old", "old output");
+        apply_tool_after_payload(
+            &mut result,
+            &serde_json::json!({
+                "title": "new",
+                "output": 42,
+                "metadata": { "count": 1 }
+            }),
+        );
+        assert_eq!(result.title, "new");
+        assert_eq!(result.output, "42");
+        assert_eq!(result.metadata["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn default_registry_contains_expected_tools() {
+        let registry = create_default_registry().await;
+        let names: Vec<String> = registry
+            .list_schemas()
+            .await
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"read".to_owned()));
+        assert!(names.contains(&"write".to_owned()));
+        assert!(names.contains(&"batch".to_owned()));
+        assert!(names.contains(&"invalid".to_owned()));
+    }
+}
