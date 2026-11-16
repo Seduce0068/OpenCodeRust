@@ -6,7 +6,8 @@ tags: [agent, execution, crate]
 
 # opencode-agent
 
-`opencode-agent` handles agent definition, registration, execution orchestration, and message handling.
+`opencode-agent` handles agent definition, registration, execution
+orchestration, and message handling.
 
 ## Responsibilities
 
@@ -27,7 +28,8 @@ tags: [agent, execution, crate]
 
 ## Development notes
 
-- Define clear mode boundaries (responsibilities, tool scope, prompts) before adding new agents
+- Define clear mode boundaries (responsibilities, tool scope, prompts) before
+  adding new agents
 - Executor changes should consider streaming output and interrupt behaviour
 
 ## Validation
