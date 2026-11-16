@@ -347,3 +347,37 @@ fn parse_vercel_sse(data: &str) -> Option<StreamEvent> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sse_text_delta() {
+        let event =
+            parse_vercel_sse(r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}"#)
+                .unwrap();
+        assert!(matches!(event, StreamEvent::TextDelta(t) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_sse_empty_content_is_none() {
+        let event =
+            parse_vercel_sse(r#"{"choices":[{"delta":{"content":""},"finish_reason":null}]}"#);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_sse_tool_calls_is_done() {
+        let event =
+            parse_vercel_sse(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#).unwrap();
+        assert!(matches!(event, StreamEvent::Done));
+    }
+
+    #[test]
+    fn parse_sse_invalid_or_empty_is_none() {
+        assert!(parse_vercel_sse("").is_none());
+        assert!(parse_vercel_sse("not json").is_none());
+        assert!(parse_vercel_sse(r#"{"choices":[]}"#).is_none());
+    }
+}

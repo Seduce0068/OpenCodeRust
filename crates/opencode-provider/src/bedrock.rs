@@ -520,3 +520,33 @@ fn parse_bedrock_stream(text: &str) -> Result<StreamEvent, ProviderError> {
 
     Ok(StreamEvent::TextDelta(String::new()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_known_vectors() {
+        // "abc" -> SHA-256 known vector
+        let digest = sha256(b"abc");
+        assert_eq!(
+            digest
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha256_empty_input() {
+        let digest = sha256(b"");
+        assert_eq!(
+            digest
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+}
