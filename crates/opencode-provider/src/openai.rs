@@ -1246,4 +1246,41 @@ mod tests {
             Some(StreamEvent::ToolCallDelta { id, input }) if id == "tool-call-0" && input == "{\"cmd\":\"ls\"}"
         ));
     }
+
+    #[test]
+    fn reasoning_effort_supported_models() {
+        assert_eq!(openai_reasoning_effort("o3", Some("high")), Some("high"));
+        assert_eq!(
+            openai_reasoning_effort("gpt-5", Some("minimal")),
+            Some("minimal")
+        );
+        assert_eq!(
+            openai_reasoning_effort("codex-mini", Some("xhigh")),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_unsupported_or_invalid() {
+        assert_eq!(openai_reasoning_effort("gpt-4", Some("high")), None);
+        assert_eq!(openai_reasoning_effort("o3", Some("invalid")), None);
+        assert_eq!(openai_reasoning_effort("o3", None), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_with_fallback_uses_primary_on_success() {
+        let result: Result<u32, ProviderError> =
+            resolve_with_fallback(async { Ok(1) }, |_| async { Ok(2) }).await;
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_with_fallback_uses_fallback_on_error() {
+        let result: Result<u32, ProviderError> = resolve_with_fallback(
+            async { Err(ProviderError::api_error_with_status("primary failed", 500)) },
+            |_| async { Ok(2) },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 2);
+    }
 }
