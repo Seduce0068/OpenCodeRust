@@ -257,3 +257,128 @@ impl Tool for GrepTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opencode-grep-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = GrepTool::new();
+        assert_eq!(tool.id(), "grep");
+        assert!(tool.description().contains("regular expressions"));
+        assert_eq!(tool.parameters()["required"][0], "pattern");
+    }
+
+    #[tokio::test]
+    async fn execute_finds_matching_lines() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.rs"), "hello world\nnothing\nhello again\n").unwrap();
+
+        let result = GrepTool::new()
+            .execute(serde_json::json!({ "pattern": "hello" }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.title, "grep 'hello'");
+        assert_eq!(result.metadata["matches"], 2);
+        assert!(result.output.contains("Line 1: hello world"));
+        assert!(result.output.contains("Line 3: hello again"));
+        assert!(!result.truncated);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_no_matches() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "nothing here").unwrap();
+
+        let result = GrepTool::new()
+            .execute(serde_json::json!({ "pattern": "hello" }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output, "No matches found for pattern 'hello'");
+        assert_eq!(result.metadata["matches"], 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_ignore_case() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "HELLO world").unwrap();
+
+        let result = GrepTool::new()
+            .execute(
+                serde_json::json!({ "pattern": "hello", "ignore_case": true }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["matches"], 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_glob_filter() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.rs"), "hello").unwrap();
+        std::fs::write(dir.join("b.txt"), "hello").unwrap();
+
+        let result = GrepTool::new()
+            .execute(
+                serde_json::json!({ "pattern": "hello", "glob": "*.rs" }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["matches"], 1);
+        assert!(result.output.contains("a.rs"));
+        assert!(!result.output.contains("b.txt"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_regex() {
+        let dir = temp_dir();
+        let error = GrepTool::new()
+            .execute(serde_json::json!({ "pattern": "[" }), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_requires_pattern() {
+        let dir = temp_dir();
+        let error = GrepTool::new()
+            .execute(serde_json::json!({}), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
