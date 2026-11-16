@@ -1116,3 +1116,71 @@ pub fn to_model_messages(input: &[MessageWithParts], model: &ModelContext) -> Ve
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_part_roundtrip_and_id() {
+        let json = serde_json::json!({
+            "type": "text",
+            "id": "prt_1",
+            "session_id": "ses_1",
+            "message_id": "msg_1",
+            "text": "hello"
+        });
+        let part: Part = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(part.id(), Some("prt_1"));
+        assert_eq!(serde_json::to_value(part).unwrap(), json);
+    }
+
+    #[test]
+    fn snapshot_and_patch_parts_report_id() {
+        let snapshot: Part = serde_json::from_value(serde_json::json!({
+            "type": "snapshot",
+            "id": "prt_snap",
+            "session_id": "ses_1",
+            "message_id": "msg_1",
+            "snapshot": "abc"
+        }))
+        .unwrap();
+        assert_eq!(snapshot.id(), Some("prt_snap"));
+
+        let patch: Part = serde_json::from_value(serde_json::json!({
+            "type": "patch",
+            "id": "prt_patch",
+            "session_id": "ses_1",
+            "message_id": "msg_1",
+            "hash": "def",
+            "files": ["a.rs"]
+        }))
+        .unwrap();
+        assert_eq!(patch.id(), Some("prt_patch"));
+    }
+
+    #[test]
+    fn part_type_tag_is_preserved() {
+        let part: Part = serde_json::from_value(serde_json::json!({
+            "type": "text",
+            "id": "prt_2",
+            "session_id": "ses_1",
+            "message_id": "msg_1",
+            "text": "x"
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(part).unwrap()["type"], "text");
+    }
+
+    #[test]
+    fn user_time_and_model_ref_deserialize() {
+        let time: UserTime = serde_json::from_value(serde_json::json!({ "created": 123 })).unwrap();
+        assert_eq!(time.created, 123);
+
+        let model: ModelRef =
+            serde_json::from_value(serde_json::json!({ "model_id": "m", "provider_id": "p" }))
+                .unwrap();
+        assert_eq!(model.model_id, "m");
+        assert_eq!(model.provider_id, "p");
+    }
+}
