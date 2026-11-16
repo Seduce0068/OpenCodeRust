@@ -363,3 +363,52 @@ pub fn unrevert(session_id: &str, manager: &mut SessionManager) -> Result<Option
 pub fn cleanup(session_id: &str, revert: &RevertInfo, manager: &mut SessionManager) -> Result<()> {
     RevertManager::default().cleanup(session_id, revert, manager)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_line_changes_identical() {
+        assert_eq!(count_line_changes("a\nb", "a\nb"), (0, 0));
+    }
+
+    #[test]
+    fn count_line_changes_old_empty() {
+        assert_eq!(count_line_changes("", "a\nb\nc"), (3, 0));
+    }
+
+    #[test]
+    fn count_line_changes_new_empty() {
+        assert_eq!(count_line_changes("a\nb", ""), (0, 2));
+    }
+
+    #[test]
+    fn count_line_changes_single_replacement() {
+        assert_eq!(count_line_changes("old\nkeep", "new\nkeep"), (1, 1));
+    }
+
+    #[test]
+    fn count_line_changes_append() {
+        assert_eq!(count_line_changes("a\n", "a\nb\n"), (1, 0));
+    }
+
+    #[test]
+    fn count_line_changes_delete() {
+        assert_eq!(count_line_changes("a\nb\n", "a\n"), (0, 1));
+    }
+
+    #[test]
+    fn lcs_length_handles_swapped_arguments() {
+        let a = ["a", "b", "c"];
+        let b = ["a", "c", "d"];
+        assert_eq!(lcs_length(&a, &b), 2);
+        assert_eq!(lcs_length(&b, &a), 2);
+    }
+
+    #[test]
+    fn lcs_length_empty_input() {
+        assert_eq!(lcs_length(&[], &["a"]), 0);
+        assert_eq!(lcs_length(&["a"], &[]), 0);
+    }
+}
