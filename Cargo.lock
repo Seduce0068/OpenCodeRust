@@ -2412,14 +2412,10 @@ name = "opencode-command"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "glob",
  "opencode-plugin",
- "regex",
  "serde",
  "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
