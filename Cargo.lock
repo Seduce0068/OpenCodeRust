@@ -2527,11 +2527,8 @@ dependencies = [
 name = "opencode-permission"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "dirs",
- "glob",
  "lazy_static",
- "opencode-core",
  "opencode-plugin",
  "serde",
  "serde_json",
