@@ -448,3 +448,53 @@ fn process_command_node(node: tree_sitter::Node, source: &[u8], result: &mut Par
         result.always.insert(format!("{} *", prefix.join(" ")));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = BashTool;
+        assert_eq!(tool.id(), "bash");
+        assert_eq!(tool.parameters()["required"][0], "command");
+        assert_eq!(tool.parameters()["required"][1], "description");
+    }
+
+    #[test]
+    fn parse_simple_command() {
+        let parsed = parse_bash_command("ls -la /tmp");
+        assert!(parsed.patterns.contains("ls -la /tmp"));
+        assert!(parsed.always.contains("ls *"));
+    }
+
+    #[test]
+    fn parse_pipeline_extracts_both_commands() {
+        let parsed = parse_bash_command("echo hello | grep hello");
+        assert!(parsed.patterns.contains("echo hello"));
+        assert!(parsed.patterns.contains("grep hello"));
+    }
+
+    #[test]
+    fn parse_variable_assignment_falls_back_to_full_command() {
+        let parsed = parse_bash_command("FOO=bar");
+        assert!(parsed.patterns.contains("FOO=bar"));
+    }
+
+    #[test]
+    fn parse_empty_command_has_no_patterns() {
+        let parsed = parse_bash_command("");
+        assert!(parsed.patterns.is_empty());
+        assert!(parsed.always.is_empty());
+    }
+
+    #[test]
+    fn parse_cd_collects_directory() {
+        let parsed = parse_bash_command("cd /tmp/project");
+        assert!(parsed
+            .directories
+            .iter()
+            .any(|d| d.contains("/tmp/project")));
+        assert!(parsed.patterns.contains("cd /tmp/project"));
+    }
+}
