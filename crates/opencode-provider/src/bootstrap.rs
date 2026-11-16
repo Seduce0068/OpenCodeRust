@@ -2949,4 +2949,42 @@ mod tests {
         assert!(variants.contains_key("custom"));
         assert!(variants.contains_key("low"));
     }
+
+    #[test]
+    fn is_gpt5_or_later_detects_version() {
+        assert!(is_gpt5_or_later("gpt-5"));
+        assert!(is_gpt5_or_later("gpt-6-preview"));
+        assert!(!is_gpt5_or_later("gpt-4"));
+        assert!(!is_gpt5_or_later("claude-3"));
+    }
+
+    #[test]
+    fn copilot_responses_api_excludes_gpt5_mini() {
+        assert!(should_use_copilot_responses_api("gpt-5"));
+        assert!(!should_use_copilot_responses_api("gpt-5-mini"));
+        assert!(!should_use_copilot_responses_api("gpt-4"));
+    }
+
+    #[test]
+    fn parse_model_splits_provider_and_model() {
+        let parsed = parse_model("anthropic/claude-3");
+        assert_eq!(parsed.provider_id, "anthropic");
+        assert_eq!(parsed.model_id, "claude-3");
+
+        let bare = parse_model("default-provider");
+        assert_eq!(bare.provider_id, "default-provider");
+        assert!(bare.model_id.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_match_finds_substring_candidates() {
+        let options = vec![
+            "gpt-5".to_owned(),
+            "gpt-4".to_owned(),
+            "claude-3".to_owned(),
+        ];
+        let matches = fuzzy_match("gpt", &options, 2);
+        assert_eq!(matches, vec!["gpt-5", "gpt-4"]);
+        assert!(fuzzy_match("xyz", &options, 5).is_empty());
+    }
 }
