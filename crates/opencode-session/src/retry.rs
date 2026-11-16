@@ -150,3 +150,122 @@ impl RetryState {
         delay(self.attempt, error_info)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn info(headers: Option<HashMap<String, String>>) -> ApiErrorInfo {
+        ApiErrorInfo {
+            message: "error".to_owned(),
+            is_retryable: true,
+            response_headers: headers,
+            response_body: None,
+        }
+    }
+
+    #[test]
+    fn delay_without_headers_uses_exponential_backoff() {
+        assert_eq!(delay(1, None), 2_000);
+        assert_eq!(delay(2, None), 4_000);
+        assert_eq!(delay(3, None), 8_000);
+    }
+
+    #[test]
+    fn delay_without_headers_is_capped() {
+        assert_eq!(delay(10, None), RETRY_MAX_DELAY_NO_HEADERS);
+    }
+
+    #[test]
+    fn delay_retry_after_ms_header_takes_precedence() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after-ms".to_owned(), "1500".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), 1_500);
+    }
+
+    #[test]
+    fn delay_retry_after_seconds_header_is_converted() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_owned(), "2.5".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), 2_500);
+    }
+
+    #[test]
+    fn delay_invalid_header_falls_back_to_backoff() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_owned(), "not-a-number".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000);
+    }
+
+    #[test]
+    fn retryable_context_overflow_returns_none() {
+        let error = crate::MessageError::ContextOverflowError {
+            message: "x".to_owned(),
+            response_body: None,
+        };
+        assert!(retryable(&error).is_none());
+    }
+
+    #[test]
+    fn retryable_non_retryable_api_error_returns_none() {
+        let error = crate::MessageError::ApiError {
+            message: "fail".to_owned(),
+            status_code: None,
+            is_retryable: false,
+            response_headers: None,
+            response_body: None,
+            metadata: None,
+        };
+        assert!(retryable(&error).is_none());
+    }
+
+    #[test]
+    fn retryable_free_usage_limit_returns_hint() {
+        let error = crate::MessageError::ApiError {
+            message: "limit".to_owned(),
+            status_code: None,
+            is_retryable: true,
+            response_headers: None,
+            response_body: Some("FreeUsageLimitError".to_owned()),
+            metadata: None,
+        };
+        assert_eq!(
+            retryable(&error).as_deref(),
+            Some("Free usage exceeded, add credits https://opencode.ai/zen")
+        );
+    }
+
+    #[test]
+    fn retryable_overloaded_message_is_normalized() {
+        let error = crate::MessageError::ApiError {
+            message: "Provider Overloaded now".to_owned(),
+            status_code: None,
+            is_retryable: true,
+            response_headers: None,
+            response_body: None,
+            metadata: None,
+        };
+        assert_eq!(retryable(&error).as_deref(), Some("Provider is overloaded"));
+    }
+
+    #[test]
+    fn retryable_unknown_json_rate_limit() {
+        let message = r#"{"type":"error","error":{"type":"too_many_requests"}}"#;
+        let error = crate::MessageError::Unknown {
+            message: message.to_owned(),
+        };
+        assert_eq!(retryable(&error).as_deref(), Some("Too Many Requests"));
+    }
+
+    #[test]
+    fn retry_state_tracks_attempts() {
+        let mut state = RetryState::new(2);
+        assert!(state.should_retry());
+        state.increment("first".to_owned());
+        assert!(state.should_retry());
+        state.increment("second".to_owned());
+        assert!(!state.should_retry());
+        assert_eq!(state.last_error.as_deref(), Some("second"));
+    }
+}
