@@ -25,7 +25,10 @@ cargo build --workspace
 cargo test --workspace
 
 # Full check (format + lint + build + test)
-cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --workspace && cargo test --workspace
+cargo fmt --all --check && \
+  cargo clippy --workspace --all-targets -- -D warnings && \
+  cargo build --workspace && \
+  cargo test --workspace
 ```
 
 ## LSP (rust-analyzer)
@@ -41,7 +44,7 @@ No additional config needed - uses `Cargo.toml` and `rustfmt.toml`.
 ## Configuration Files
 
 | File | Purpose |
-|------|---------|
+| --- | --- |
 | `rustfmt.toml` | Formatter rules |
 | `Cargo.toml` | Workspace lints (`warnings = "deny"`, `clippy::all = "deny"`) |
 | `.github/workflows/ci.yml` | CI pipeline (if exists) |
@@ -49,10 +52,12 @@ No additional config needed - uses `Cargo.toml` and `rustfmt.toml`.
 ## Automated Workflow
 
 ### On File Save (via LSP)
+
 1. `rust-analyzer` provides diagnostics
 2. `rustfmt` formats on save (if editor configured)
 
 ### Before Commit
+
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -60,7 +65,9 @@ cargo test --workspace
 ```
 
 ### CI Pipeline
+
 Run on every PR:
+
 - Format check
 - Clippy with deny warnings
 - Build all targets
@@ -83,11 +90,13 @@ Run on every PR:
 ## Usage
 
 **Format all code:**
+
 ```bash
 ./scripts/fix-all.sh
 ```
 
 **Verify everything passes:**
+
 ```bash
 ./scripts/check-all.sh
 ```
