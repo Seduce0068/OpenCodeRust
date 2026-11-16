@@ -7,14 +7,12 @@ license.workspace = true
 
 [dependencies]
 opencode-core = { path = "../opencode-core" }
-opencode-types = { path = "../opencode-types" }
 opencode-storage = { path = "../opencode-storage" }
 opencode-provider = { path = "../opencode-provider" }
 opencode-tool = { path = "../opencode-tool" }
 opencode-mcp = { path = "../opencode-mcp" }
 opencode-lsp = { path = "../opencode-lsp" }
 opencode-plugin = { path = "../opencode-plugin" }
-opencode-agent = { path = "../opencode-agent" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
