@@ -9,10 +9,10 @@ tags:
   - tooling
 generated:
   by: agent
-  at: "2026-11-17T01:37:51+09:00"
+  at: "2026-11-17T02:01:31+09:00"
 reviewed:
   by: agent
-  at: "2026-11-17T01:37:51+09:00"
+  at: "2026-11-17T02:01:31+09:00"
 ---
 
 ## ADR-0008: テストカバレッジの現状と段階的改善方針
@@ -31,20 +31,23 @@ AGENTS.md セクション7は「重要パスは 80% 以上目標」を要求す�
 `opencode-tui` の UI コンポーネント (`session.rs` 0/742、
 `components/dialogs/*` の多くが 0/) が未計測の大きな割合を占める。
 再計測では 31.37% (13,394/42,696) で、軽微な変動があった。
-テスト追加後は 31.42% (13,417/42,696) に向上した。
-クレート別に集計した結果は次のとおりである。
+テスト追加後は 31.42% (13,417/42,696)、さらに 32.09% (13,700/42,696) に
+向上した。クレート別に集計した結果は次のとおりである。
 
-| クレート | カバレッジ |
-| --- | --- |
-| `opencode-codemode` | 77.37% (5,300/6,850) |
-| `opencode-session` | 46.27% (2,077/4,489) |
-| `opencode-tool` | 19.39% (621/3,203) |
-| `opencode-tui` | 8.38% (873/10,421) |
-| `opencode-cli` | 0.00% (0/2,522) |
+| クレート | カバレッジ | 前回比 |
+| --- | --- | --- |
+| `opencode-codemode` | 77.37% (5,300/6,850) | ±0 |
+| `opencode-permission` | 85.97% (331/385) | +37.92pt |
+| `opencode-session` | 47.72% (2,142/4,489) | +1.45pt |
+| `opencode-provider` | 26.39% (1,521/5,764) | +1.01pt |
+| `opencode-tool` | 20.04% (642/3,203) | +0.65pt |
+| `opencode-tui` | 8.38% (873/10,421) | ±0 |
+| `opencode-cli` | 0.00% (0/2,522) | ±0 |
 
-重要パスのうち codemode は 80% に近いが、session / tool は未達である。
+permission は 80% 目標を達成した。codemode は 80% に近く、
+session / tool は依然として未達である。
 
-テスト件数自体は 594 件で、`cargo test --workspace --all-targets` と
+テスト件数自体は 632 件で、`cargo test --workspace --all-targets` と
 `cargo nextest run --workspace` の両方が green である。
 
 ### Decision
@@ -70,9 +73,10 @@ AGENTS.md セクション7は「重要パスは 80% 以上目標」を要求す�
 - `cargo tarpaulin --workspace` は実行可能だが、カバレッジゲートは導入しない。
 - 既存の `cargo check` / `clippy` / `test` / `nextest` のゲートは変更しない。
 - 次回のカバレッジ改善時に、本 ADR の baseline (初回 31.40%、
-  再計測 31.37%、テスト追加後 31.42%) と比較する。
-- `opencode-tool/src/truncation.rs` は 3 テスト追加で 58/58 行 (100%) に
-  到達した。同様の未カバー分岐のテスト追加を他モジュールへ展開する。
+  再計測 31.37%、テスト追加後 31.42% → 32.09%) と比較する。
+- 段階的なテスト追加の結果、`opencode-tool/src/truncation.rs` は
+  58/58 行 (100%) に到達し、`opencode-permission` は 85.97% となった。
+  未カバー分岐のテスト追加を重要パス (session / tool) へ継続する。
 
 ### Links
 
