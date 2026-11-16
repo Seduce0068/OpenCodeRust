@@ -9,7 +9,7 @@ tags:
   - audit
 verified:
   by: dsh
-  at: "2026-11-15T01:20:08+09:00"
+  at: "2026-11-16T23:00:01+09:00"
 ---
 
 ## 実行手順
@@ -81,6 +81,20 @@ cargo audit --db ~/.cache/rustsec-advisory-db --no-fetch
   (2026-05-21 時点) のため互換な修正版を選択できない。攻撃条件は
   ローカルの攻撃者が細工した DB と `-wal` を置き、プロセスがそれを
   開くこと (AV:L / UI:P)。残余リスクとして受容し、sqlx 更新時に再評価する。
+
+## triage 記録 (2026-11-16)
+
+`cargo audit` を実行 (advisory DB 1509 件、Cargo.lock 544 crate)。
+脆弱性 0 件、allowed warning 1 件 (unmaintained)。
+
+| crate | advisory | 依存元 | 状況 |
+| --- | --- | --- | --- |
+| `bincode` 1.3.3 | RUSTSEC-2025-0141 | syntect 5.3.0 | 更新待ち |
+
+`.cargo/audit.toml` の ignore は 2 件 (rsa / libsqlite3-sys) で変更なし。
+2026-10-18 の表に記載した `lru` / `serial` / `instant` / `paste` は今回の
+出力に含まれなかった。解消理由 (advisory DB 更新または依存バージョン変更)
+は未確認。
 
 ## CI ゲート
 
