@@ -2372,4 +2372,45 @@ mod tests {
         assert!(!mcp.contains_key("servers"));
         assert!(!mcp.contains_key("timeout"));
     }
+
+    #[test]
+    fn looks_like_mcp_server_detects_known_keys() {
+        assert!(looks_like_mcp_server(
+            &serde_json::json!({ "command": ["x"] })
+        ));
+        assert!(looks_like_mcp_server(
+            &serde_json::json!({ "url": "http://x" })
+        ));
+        assert!(!looks_like_mcp_server(
+            &serde_json::json!({ "startup": 1000 })
+        ));
+        assert!(!looks_like_mcp_server(&serde_json::json!("text")));
+    }
+
+    #[test]
+    fn string_map_keeps_only_string_values() {
+        let mut values = HashMap::new();
+        values.insert("a".to_owned(), serde_json::json!("x"));
+        values.insert("b".to_owned(), serde_json::json!(42));
+        let map = string_map(values);
+        assert_eq!(map.get("a").map(String::as_str), Some("x"));
+        assert!(!map.contains_key("b"));
+    }
+
+    #[test]
+    fn merge_option_replace_only_overwrites_when_source_present() {
+        let mut target = Some("old".to_owned());
+        merge_option_replace(&mut target, Some("new".to_owned()));
+        assert_eq!(target.as_deref(), Some("new"));
+
+        merge_option_replace(&mut target, None);
+        assert_eq!(target.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn append_unique_keep_order_deduplicates() {
+        let mut target = vec!["a".to_owned(), "b".to_owned()];
+        append_unique_keep_order(&mut target, vec!["b".to_owned(), "c".to_owned()]);
+        assert_eq!(target, vec!["a", "b", "c"]);
+    }
 }
