@@ -325,4 +325,62 @@ mod tests {
         let result = Ripgrep::tree(".", Some(10)).unwrap();
         assert!(!result.is_empty());
     }
+
+    fn tree_node(name: &str, children: BTreeMap<String, TreeNode>) -> TreeNode {
+        TreeNode {
+            name: name.to_owned(),
+            children,
+        }
+    }
+
+    #[test]
+    fn count_nodes_empty_tree() {
+        assert_eq!(count_nodes(&BTreeMap::new()), 0);
+    }
+
+    #[test]
+    fn count_nodes_nested_tree() {
+        let mut root = BTreeMap::new();
+        let mut child = BTreeMap::new();
+        child.insert("leaf".to_owned(), tree_node("leaf", BTreeMap::new()));
+        root.insert("dir".to_owned(), tree_node("dir", child));
+        root.insert("top".to_owned(), tree_node("top", BTreeMap::new()));
+        assert_eq!(count_nodes(&root), 3);
+    }
+
+    #[test]
+    fn glob_match_plain_suffix() {
+        assert!(glob_match::glob_match(
+            "src/main.rs",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+        assert!(!glob_match::glob_match(
+            "src/main.rs",
+            std::path::Path::new("/work/src/lib.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_with_wildcards() {
+        assert!(glob_match::glob_match(
+            "*.rs",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+        assert!(glob_match::glob_match(
+            "src/*.rs",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+        assert!(!glob_match::glob_match(
+            "src/*.rs",
+            std::path::Path::new("/work/src/nested/main.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_strips_leading_dot_slash() {
+        assert!(glob_match::glob_match(
+            "./src/main.rs",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+    }
 }
