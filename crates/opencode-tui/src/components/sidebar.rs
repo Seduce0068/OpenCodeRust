@@ -652,3 +652,54 @@ fn format_number(value: u64) -> String {
     }
     out.chars().rev().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contains_point_checks_bounds() {
+        let area = Some(Rect::new(10, 5, 20, 10));
+        assert!(contains_point(area, 10, 5));
+        assert!(contains_point(area, 29, 14));
+        assert!(!contains_point(area, 30, 14));
+        assert!(!contains_point(area, 10, 15));
+        assert!(!contains_point(None, 0, 0));
+    }
+
+    #[test]
+    fn truncate_text_by_chars() {
+        assert_eq!(truncate_text("hello", 10), "hello");
+        assert_eq!(truncate_text("hello world", 5), "hell…");
+        assert_eq!(truncate_text("hello", 0), "");
+    }
+
+    #[test]
+    fn split_path_segments_unix_and_windows() {
+        assert_eq!(
+            split_path_segments("src/main.rs"),
+            ("src/".to_string(), "main.rs".to_string())
+        );
+        assert_eq!(
+            split_path_segments("/main.rs"),
+            ("/".to_string(), "main.rs".to_string())
+        );
+        assert_eq!(
+            split_path_segments("C:\\src\\main.rs"),
+            ("C:\\src\\".to_string(), "main.rs".to_string())
+        );
+        assert_eq!(
+            split_path_segments("main.rs"),
+            (String::new(), "main.rs".to_string())
+        );
+        assert_eq!(split_path_segments(""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn format_number_groups_thousands() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1_234_567), "1,234,567");
+    }
+}
