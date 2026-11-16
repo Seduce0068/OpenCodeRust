@@ -430,3 +430,114 @@ fn format_lsp_placeholder(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            "/tmp".to_owned(),
+        )
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = LspTool;
+        assert_eq!(tool.id(), "lsp");
+        assert_eq!(tool.parameters()["required"][0], "operation");
+        assert_eq!(tool.parameters()["required"][1], "filePath");
+    }
+
+    #[test]
+    fn params_use_camel_case() {
+        let params: LspParams = serde_json::from_value(serde_json::json!({
+            "operation": "rename",
+            "filePath": "src/main.rs",
+            "line": 3,
+            "character": 5,
+            "newName": "renamed"
+        }))
+        .unwrap();
+        assert!(matches!(params.operation, LspOperation::Rename));
+        assert_eq!(params.file_path, "src/main.rs");
+        assert_eq!(params.line, Some(3));
+        assert_eq!(params.character, Some(5));
+        assert_eq!(params.new_name.as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn all_operations_deserialize() {
+        let operations = [
+            "goToDefinition",
+            "findReferences",
+            "hover",
+            "documentSymbol",
+            "workspaceSymbol",
+            "goToImplementation",
+            "typeDefinition",
+            "rename",
+            "diagnostics",
+            "prepareCallHierarchy",
+            "incomingCalls",
+            "outgoingCalls",
+        ];
+        for op in operations {
+            let json = serde_json::json!({ "operation": op, "filePath": "a.rs" });
+            serde_json::from_value::<LspParams>(json)
+                .unwrap_or_else(|e| panic!("failed to deserialize {}: {}", op, e));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_missing_file() {
+        let args = serde_json::json!({
+            "operation": "hover",
+            "filePath": "/nonexistent/lsp-file.rs"
+        });
+        let error = LspTool.execute(args, context()).await.unwrap_err();
+        assert!(matches!(error, ToolError::FileNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_params() {
+        let error = LspTool
+            .execute(serde_json::json!({}), context())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[cfg(not(feature = "lsp"))]
+    #[tokio::test]
+    async fn execute_returns_placeholder_without_lsp_feature() {
+        let dir = std::env::temp_dir().join(format!("opencode-lsp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let ctx = ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            dir.to_string_lossy().to_string(),
+        );
+
+        let result = LspTool
+            .execute(
+                serde_json::json!({
+                    "operation": "hover",
+                    "filePath": file.to_string_lossy(),
+                    "line": 1,
+                    "character": 1
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.output.contains("LSP hover"));
+        assert!(result.output.contains("Enable 'lsp' feature"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
