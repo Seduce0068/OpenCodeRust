@@ -248,3 +248,80 @@ impl Default for WebSearchTool {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = WebSearchTool::new();
+        assert_eq!(tool.id(), "websearch");
+        assert!(tool.description().contains("Exa"));
+        let schema = tool.parameters();
+        assert_eq!(schema["required"][0], "query");
+        assert_eq!(schema["properties"]["numResults"]["default"], 8);
+    }
+
+    #[test]
+    fn default_num_results_is_eight() {
+        assert_eq!(default_num_results(), 8);
+    }
+
+    #[test]
+    fn input_applies_defaults() {
+        let input: WebSearchInput =
+            serde_json::from_value(serde_json::json!({ "query": "rust" })).unwrap();
+        assert_eq!(input.query, "rust");
+        assert_eq!(input.num_results, 8);
+        assert!(input.livecrawl.is_none());
+        assert!(input.search_type.is_none());
+        assert!(input.context_max_characters.is_none());
+    }
+
+    #[test]
+    fn input_accepts_camel_case_aliases() {
+        let input: WebSearchInput = serde_json::from_value(serde_json::json!({
+            "query": "rust",
+            "numResults": 3,
+            "contextMaxCharacters": 1234,
+            "type": "fast",
+            "livecrawl": "preferred"
+        }))
+        .unwrap();
+        assert_eq!(input.num_results, 3);
+        assert_eq!(input.context_max_characters, Some(1234));
+        assert_eq!(input.search_type.as_deref(), Some("fast"));
+        assert_eq!(input.livecrawl.as_deref(), Some("preferred"));
+    }
+
+    #[test]
+    fn input_accepts_snake_case_aliases() {
+        let input: WebSearchInput = serde_json::from_value(serde_json::json!({
+            "query": "rust",
+            "num_results": 5,
+            "context_max_characters": 999
+        }))
+        .unwrap();
+        assert_eq!(input.num_results, 5);
+        assert_eq!(input.context_max_characters, Some(999));
+    }
+
+    #[test]
+    fn parse_sse_extracts_first_text() {
+        let text = "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"result one\"},{\"type\":\"text\",\"text\":\"result two\"}]}}";
+        assert_eq!(parse_sse_response(text).as_deref(), Some("result one"));
+    }
+
+    #[test]
+    fn parse_sse_ignores_malformed_data() {
+        assert!(parse_sse_response("data: not-json").is_none());
+        assert!(parse_sse_response("data: {}").is_none());
+    }
+
+    #[test]
+    fn parse_sse_ignores_empty_content() {
+        let text = "data: {\"result\":{\"content\":[]}}";
+        assert!(parse_sse_response(text).is_none());
+    }
+}
