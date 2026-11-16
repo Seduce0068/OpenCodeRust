@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T00:47:15+09:00"
+  at: "2026-11-17T02:10:32+09:00"
 ---
 
 # Changelog
@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opencode-codemode`: RegExp (`fancy-regex` による lookaround、capture group、
   backreference、sticky flag)、URL / URLSearchParams、`String.normalize`
-- ADR-0006 (CodeMode 非同期実行の保留)、ADR-0007 (`missing_docs` 一括対応の保留)
+- ADR-0006 (CodeMode 非同期実行の保留)、ADR-0007 (`missing_docs` 一括対応の保留)、
+  ADR-0008 (テストカバレッジの baseline と改善方針)
+- 未カバー分岐の単体テスト 42 件 (truncation / arity / retry / revert / error /
+  models / invalid)、テスト総数 594 → 636 件
 
 ### Changed
 
@@ -34,12 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 32.09% を計測
 
 ### Fixed
 
 - `opencode-session`: rustdoc の HTML タグ解釈警告 (`Vec<PartInput>`)
 - `opencode-cli`: クレートドキュメントの欠落
 - 全 Markdown の markdownlint 違反 (検出時 126 件) を解消
+- `opencode-tool`: InvalidTool のスキーマ (camelCase) とデシリアライズ
+  (snake_case) の不整合を serde alias で解消
 
 ## [0.1.0]
 
