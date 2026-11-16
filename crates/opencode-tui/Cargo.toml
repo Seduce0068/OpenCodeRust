@@ -7,21 +7,11 @@ license.workspace = true
 
 [dependencies]
 # Workspace dependencies
-opencode-core = { path = "../opencode-core" }
-opencode-util = { path = "../opencode-util" }
-opencode-config = { path = "../opencode-config" }
-opencode-provider = { path = "../opencode-provider" }
-opencode-session = { path = "../opencode-session" }
-opencode-agent = { path = "../opencode-agent" }
-opencode-tool = { path = "../opencode-tool" }
-opencode-mcp = { path = "../opencode-mcp" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
 parking_lot = { workspace = true }
 chrono = { workspace = true }
 once_cell = { workspace = true }
@@ -35,7 +25,6 @@ nucleo-matcher = { workspace = true }
 similar = { workspace = true }
 
 # Additional dependencies
-tokio-stream = { workspace = true }
 futures = { workspace = true }
 unicode-width = "0.2"
 uuid = { workspace = true }
