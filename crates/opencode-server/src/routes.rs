@@ -5174,3 +5174,50 @@ mod mcp_loaded_config_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[test]
+    fn role_names() {
+        use opencode_session::MessageRole;
+        assert_eq!(message_role_name(&MessageRole::User), "user");
+        assert_eq!(message_role_name(&MessageRole::Assistant), "assistant");
+        assert_eq!(message_role_name(&MessageRole::System), "system");
+        assert_eq!(message_role_name(&MessageRole::Tool), "tool");
+    }
+
+    #[test]
+    fn max_tokens_by_variant() {
+        assert_eq!(max_tokens_for_variant(9999, None), 9999);
+        assert_eq!(max_tokens_for_variant(9999, Some("low")), 2048);
+        assert_eq!(max_tokens_for_variant(9999, Some("HIGH")), 8192);
+        assert_eq!(max_tokens_for_variant(9999, Some("xhigh")), 16384);
+        assert_eq!(max_tokens_for_variant(9999, Some("unknown")), 9999);
+    }
+
+    #[test]
+    fn tui_command_mapping() {
+        assert_eq!(map_tui_command("session_new"), "session.new");
+        assert_eq!(map_tui_command("messages_page_up"), "session.page.up");
+        assert_eq!(map_tui_command("unknown"), "unknown");
+    }
+
+    #[test]
+    fn text_from_parts_joins_text() {
+        use crate::TextPartInput;
+        let parts = vec![
+            TextPartInput {
+                part_type: Some("text".to_owned()),
+                text: Some("hello ".to_owned()),
+            },
+            TextPartInput {
+                part_type: Some("text".to_owned()),
+                text: Some("world".to_owned()),
+            },
+        ];
+        assert_eq!(text_from_parts(&parts), "hello  world");
+        assert_eq!(text_from_parts(&[]), "");
+    }
+}
