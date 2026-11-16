@@ -28,6 +28,7 @@ This documentation set describes the current **OpenCodeRust** codebase
 - [ADR-0003: プロンプト経路へのツール・システムプロンプト注入](adr/adr-0003-prompt-injection.md)
 - [ADR-0004: Durable session input queue](adr/adr-0004-durable-session-input-queue.md)
 - [ADR-0005: 質問フロー（question tool / question.prompt）の配線](adr/adr-0005-question-flow.md)
+- [ADR-0006: CodeMode の非同期実行保留と段階的移植方針](adr/adr-0006-codemode-async-deferred.md)
 
 ## Module documentation
 
