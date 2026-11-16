@@ -11,7 +11,7 @@ tags:
   - auth
 ---
 
-# ADR-0001: HTTP認証必須化とCORS強化
+## ADR-0001: HTTP認証必須化とCORS強化
 
 ## Context
 
@@ -24,20 +24,24 @@ OpenCodeRust サーバモード（`opencoderust serve`）はローカル開発�
 ## Decision
 
 ### 1. Bearer トークン認証必須化
+
 - 起動時に 32 バイト乱数トークン生成、ログ出力
 - `Authorization: Bearer <token>` ヘッダー必須
 - 環境変数 `OPENCODE_NO_AUTH=1` で明示的に無効化可能（開発用のみ）
 
 ### 2. CORS 厳格化（Origin 完全一致）
+
 - スキーム・ホスト・ポート完全一致必須
 - 許可オリジン:
-  - `http://localhost:<port>` / `https://localhost:<port>` / `http://127.0.0.1:<port>` / `https://[::1]:<port>`
+  - `http://localhost:<port>` / `https://localhost:<port>` /
+    `http://127.0.0.1:<port>` / `https://[::1]:<port>`
   - `tauri://localhost` / `http://tauri.localhost` / `https://tauri.localhost`
   - `https://opencode.ai` / `https://www.opencode.ai`
   - 設定追加分（完全一致）
 - `http://localhost.attacker.com` 等のサブドメイン攻撃を遮断
 
 ### 3. 許可メソッド・ヘッダー明示
+
 - Methods: `GET, POST, PUT, PATCH, DELETE`
 - Headers: `Authorization, Content-Type, Accept`
 
