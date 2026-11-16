@@ -10,6 +10,9 @@ const DISALLOWED_TOOLS: &[&str] = &["batch"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchParams {
+    /// The published schema uses `toolCalls`; keep `tool_calls` as an alias for
+    /// callers that use the Rust field name directly.
+    #[serde(rename = "toolCalls", alias = "tool_calls")]
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -364,6 +367,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::ValidationError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_accepts_schema_camel_case_calls() {
+        // The published schema requires "toolCalls"; calling with the schema's
+        // key must be accepted (it previously failed as InvalidArguments).
+        let error = BatchTool
+            .execute(serde_json::json!({ "toolCalls": [] }), context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::ValidationError(_)),
+            "schema-shaped call should reach validation, got {:?}",
+            error
+        );
     }
 
     #[tokio::test]
