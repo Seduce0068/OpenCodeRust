@@ -9,7 +9,7 @@ tags:
   - audit
 verified:
   by: dsh
-  at: "2026-11-16T23:12:47+09:00"
+  at: "2026-11-16T23:15:44+09:00"
 ---
 
 ## 実行手順
@@ -109,7 +109,10 @@ cargo audit --db ~/.cache/rustsec-advisory-db --no-fetch
 
 `Cargo.lock` では `windows-sys` 0.61.2 → 0.52.0 へのダウングレードが
 5 箇所に入った (更新 dependency の制約によるものと推測、根拠未確認)。
-Linux ビルドとテストには影響しないが、Windows ターゲットのビルドは未確認。
+Linux ビルドとテストには影響しない。Windows ターゲットのクロスチェックは
+`x86_64-pc-windows-msvc` で試行したが、`ring 0.17.14` のビルドが MSVC の
+`lib.exe` と Windows SDK ヘッダ (`assert.h`) 不在で失敗し、検証できなかった。
+ダウングレードの Windows 側への影響は未確認のまま。
 
 検証: `cargo check --all-targets`、`cargo clippy --workspace --all-targets
 -- -D warnings`、`cargo test --workspace` (591 passed)、`cargo audit`、
