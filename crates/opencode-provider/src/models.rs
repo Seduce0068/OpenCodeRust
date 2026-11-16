@@ -254,3 +254,89 @@ pub fn supports_function_calling(model_id: &str) -> bool {
 
     !lower.contains("embedding") && !lower.contains("whisper") && !lower.contains("tts")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_model_limits_are_stable() {
+        assert_eq!(default_model_limits(), (4096, 128000));
+    }
+
+    #[test]
+    fn context_limit_gpt4_variants() {
+        assert_eq!(get_model_context_limit("gpt-4-32k"), 32768);
+        assert_eq!(get_model_context_limit("gpt-4-turbo"), 128000);
+        assert_eq!(get_model_context_limit("gpt-4"), 8192);
+        assert_eq!(get_model_context_limit("GPT-4-32K"), 32768);
+    }
+
+    #[test]
+    fn context_limit_other_families() {
+        assert_eq!(get_model_context_limit("claude-3-opus"), 200000);
+        assert_eq!(get_model_context_limit("claude-2"), 100000);
+        assert_eq!(get_model_context_limit("gemini-pro"), 1_000_000);
+        assert_eq!(get_model_context_limit("gemini"), 32000);
+        assert_eq!(get_model_context_limit("llama-3"), 128000);
+    }
+
+    #[test]
+    fn context_limit_unknown_defaults() {
+        assert_eq!(get_model_context_limit("unknown-model"), 128000);
+    }
+
+    #[test]
+    fn vision_support_by_model_name() {
+        assert!(supports_vision("gpt-4"));
+        assert!(supports_vision("claude-3-opus"));
+        assert!(supports_vision("gemini-pro"));
+        assert!(supports_vision("qwen-vl"));
+        assert!(supports_vision("my-vision-model"));
+        assert!(!supports_vision("llama-3"));
+    }
+
+    #[test]
+    fn function_calling_excludes_audio_and_embedding() {
+        assert!(supports_function_calling("gpt-4"));
+        assert!(!supports_function_calling("text-embedding-ada"));
+        assert!(!supports_function_calling("whisper-1"));
+        assert!(!supports_function_calling("TTS-1"));
+    }
+
+    #[tokio::test]
+    async fn registry_loads_from_local_cache() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-models-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("models.json");
+        let json = serde_json::json!({
+            "anthropic": {
+                "name": "Anthropic",
+                "env": ["ANTHROPIC_API_KEY"],
+                "id": "anthropic",
+                "models": {
+                    "claude-3": {
+                        "id": "claude-3",
+                        "name": "Claude 3",
+                        "limit": { "context": 200000, "output": 4096 }
+                    }
+                }
+            }
+        });
+        std::fs::write(&cache, json.to_string()).unwrap();
+        let registry = ModelsRegistry::new(cache);
+
+        let provider = registry.get_provider("anthropic").await.unwrap();
+        assert_eq!(provider.name, "Anthropic");
+        assert_eq!(provider.models.len(), 1);
+        let model = registry.get_model("anthropic", "claude-3").await.unwrap();
+        assert_eq!(model.limit.context, 200000);
+        assert_eq!(
+            registry.list_models_for_provider("anthropic").await.len(),
+            1
+        );
+        assert!(registry.get_provider("missing").await.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
