@@ -9,7 +9,7 @@ tags:
   - compatibility
 verified:
   by: dsh
-  at: "2026-11-16T22:50:20+09:00"
+  at: "2026-11-17T06:36:56+09:00"
 ---
 
 ## 目標
@@ -27,7 +27,7 @@ verified:
 
 ## 移行フェーズの現況
 
-下表は 2026-11-15 時点で workspace とテストにより確認した範囲。
+下表は 2026-11-17 時点で workspace とテストにより確認した範囲。
 
 | フェーズ | 状態 |
 | --- | --- |
@@ -44,8 +44,9 @@ verified:
   snapshot の非同一 transaction、単一 process 前提) は
   [DESIGN_RUNNER.md](DESIGN_RUNNER.md) に記録。
 - Phase 3: `opencode-agent` / `opencode-tool` は実装・テスト済み
-  (workspace テスト 591 件 green、2026-11-16 実行)。差分照合の初版は
-  [MAPPING.md](MAPPING.md) に記録済み。未移植機能の実装が残作業。
+  (workspace テスト 813 件 green、2026-11-17 実行、カバレッジ 34.14%)。
+  差分照合の初版は [MAPPING.md](MAPPING.md) に記録済み。未移植機能の
+  実装が残作業。
 
 ## 直近の更新 (2026-11-15)
 
@@ -85,6 +86,18 @@ verified:
 残作業は SSE transport、OAuth の token exchange、MCP オプションの
 `codemode` / `protocol` / `pool`、codemode の非同期実行と timeout など
 ([MAPPING.md](MAPPING.md) の欠落領域)。
+
+## 直近の更新 (2026-11-17)
+
+品質基盤の整備と未カバー領域のテスト追加を行った。
+
+- 未使用依存 66 件を削除し、`cargo machete` の検出はゼロ。
+- 全 feature (`--all-features`) で check / clippy / test が成功。
+- ツールのスキーマと引数名を横断監査し、`InvalidTool` と `BatchTool` の
+  不整合を serde alias / rename で解消。
+- ワークスペースのテストは 813 件 green、カバレッジは 34.14%
+  ([ADR-0008](docs/adr/adr-0008-coverage-baseline.md) に推移を記録)。
+- リリースビルド、`cargo audit`、`cargo outdated` を再検証済み。
 
 ## 参照元
 
