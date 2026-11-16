@@ -178,7 +178,7 @@ impl TryFrom<serde_json::Value> for PartInput {
 }
 
 impl PartInput {
-    /// Parse a JSON array of parts into a Vec<PartInput>, skipping invalid entries.
+    /// Parse a JSON array of parts into a `Vec<PartInput>`, skipping invalid entries.
     pub fn parse_array(value: &serde_json::Value) -> Vec<PartInput> {
         match value.as_array() {
             Some(arr) => arr
