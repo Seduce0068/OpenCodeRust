@@ -2342,11 +2342,8 @@ dependencies = [
 name = "opencode-agent"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "futures",
  "opencode-config",
- "opencode-core",
  "opencode-permission",
  "opencode-plugin",
  "opencode-provider",
@@ -2355,7 +2352,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
  "uuid",
 ]
 
