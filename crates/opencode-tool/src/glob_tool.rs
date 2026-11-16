@@ -153,3 +153,88 @@ impl Tool for GlobTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opencode-glob-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = GlobTool::new();
+        assert_eq!(tool.id(), "glob");
+        assert!(tool.description().contains("glob patterns"));
+        assert_eq!(tool.parameters()["required"][0], "pattern");
+    }
+
+    #[tokio::test]
+    async fn execute_finds_matching_files() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.join("b.txt"), "text").unwrap();
+
+        let result = GlobTool::new()
+            .execute(serde_json::json!({ "pattern": "*.rs" }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.title, "glob '*.rs'");
+        assert_eq!(result.metadata["count"], 1);
+        assert!(result.output.contains("a.rs"));
+        assert!(!result.output.contains("b.txt"));
+        assert!(!result.truncated);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_no_matches() {
+        let dir = temp_dir();
+        let result = GlobTool::new()
+            .execute(serde_json::json!({ "pattern": "*.rs" }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output, "No files matching pattern '*.rs' found");
+        assert_eq!(result.metadata["count"], 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_pattern() {
+        let dir = temp_dir();
+        let error = GlobTool::new()
+            .execute(serde_json::json!({ "pattern": "[" }), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_requires_pattern() {
+        let dir = temp_dir();
+        let error = GlobTool::new()
+            .execute(serde_json::json!({}), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
