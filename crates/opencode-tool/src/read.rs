@@ -542,3 +542,57 @@ async fn find_instruction_file(dir: &Path) -> Option<PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = ReadTool::new();
+        assert_eq!(tool.id(), "read");
+        assert_eq!(tool.parameters()["required"][0], "file_path");
+    }
+
+    #[test]
+    fn detect_mime_by_extension() {
+        assert_eq!(detect_mime(Path::new("a.png")), "image/png");
+        assert_eq!(detect_mime(Path::new("a.JPG")), "image/jpeg");
+        assert_eq!(detect_mime(Path::new("a.pdf")), "application/pdf");
+        assert_eq!(detect_mime(Path::new("a.md")), "text/markdown");
+        assert_eq!(
+            detect_mime(Path::new("a.unknown")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn is_image_mime_excludes_svg() {
+        assert!(is_image_mime("image/png"));
+        assert!(!is_image_mime("image/svg+xml"));
+        assert!(!is_image_mime("text/plain"));
+    }
+
+    #[test]
+    fn is_binary_detects_nul_bytes() {
+        assert!(is_binary(&[0x00, 0x01]));
+        assert!(!is_binary(b"plain text"));
+    }
+
+    #[test]
+    fn is_binary_empty_is_text() {
+        assert!(!is_binary(&[]));
+    }
+
+    #[test]
+    fn is_binary_detects_mostly_non_printable() {
+        let bytes: Vec<u8> = (0..100).map(|_| 1u8).collect();
+        assert!(is_binary(&bytes));
+    }
+
+    #[test]
+    fn with_directory_sets_base() {
+        let tool = ReadTool::with_directory("/tmp");
+        assert_eq!(tool.directory, PathBuf::from("/tmp"));
+    }
+}
