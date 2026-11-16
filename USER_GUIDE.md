@@ -9,7 +9,8 @@ verified:
 
 # USER GUIDE - OpenCodeRust
 
-This guide is for day-to-day users. It covers startup, common commands, configuration, and troubleshooting.  
+This guide is for day-to-day users. It covers startup, common commands,
+configuration, and troubleshooting.
 The project is named `OpenCodeRust`. The CLI command is `opencoderust`.
 
 **Use this project's `opencoderust` binary.** From the
@@ -148,11 +149,13 @@ Global config default:
 
 - `~/.config/opencode/opencode.jsonc` (or `.json`)
 
-Recommendation: Start with a minimal project-level config, then add provider/mcp/agent/lsp as needed.
+Recommendation: Start with a minimal project-level config, then add
+provider/mcp/agent/lsp as needed.
 
 ## 5. Using Claude (Anthropic) and testing a coding session
 
-Claude is supported via the **anthropic** provider. You can run interactive coding in the TUI or a one-off task with `run`.
+Claude is supported via the **anthropic** provider. You can run interactive
+coding in the TUI or a one-off task with `run`.
 
 ### 5.1 Set your API key
 
@@ -204,7 +207,8 @@ Or with default model from config:
 ./target/debug/opencoderust tui
 ```
 
-In the TUI you can type prompts, use slash commands, and let the agent edit files and run tools.
+In the TUI you can type prompts, use slash commands, and let the agent edit
+files and run tools.
 
 **Single task (no TUI):**
 
@@ -215,7 +219,8 @@ In the TUI you can type prompts, use slash commands, and let the agent edit file
 With a specific model:
 
 ```bash
-./target/debug/opencoderust run -m anthropic/claude-sonnet-4-20250514 "Review this repo for security issues"
+./target/debug/opencoderust run -m anthropic/claude-sonnet-4-20250514 \
+  "Review this repo for security issues"
 ```
 
 ### 5.4 Useful model IDs (Anthropic)
