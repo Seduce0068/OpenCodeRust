@@ -380,4 +380,29 @@ mod tests {
             .output
             .contains("task_id: task_existing_42 (for resuming to continue this task if needed)"));
     }
+
+    #[test]
+    fn parse_model_ref_with_none() {
+        let parsed = parse_model_ref(None);
+        assert_eq!(parsed.model_id, "default");
+        assert_eq!(parsed.provider_id, "default");
+    }
+
+    #[test]
+    fn parse_model_ref_with_colon_and_slash() {
+        let colon = parse_model_ref(Some("provider:model"));
+        assert_eq!(colon.provider_id, "provider");
+        assert_eq!(colon.model_id, "model");
+
+        let slash = parse_model_ref(Some("provider/model"));
+        assert_eq!(slash.provider_id, "provider");
+        assert_eq!(slash.model_id, "model");
+    }
+
+    #[test]
+    fn parse_model_ref_bare_defaults_provider() {
+        let parsed = parse_model_ref(Some("gpt-4"));
+        assert_eq!(parsed.model_id, "gpt-4");
+        assert_eq!(parsed.provider_id, "default");
+    }
 }
