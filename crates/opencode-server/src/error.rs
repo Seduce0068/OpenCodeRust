@@ -65,3 +65,91 @@ impl IntoResponse for ApiError {
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn assert_response(
+        error: ApiError,
+        expected_status: StatusCode,
+        expected_type: &str,
+        expected_message: &str,
+    ) {
+        let response = error.into_response();
+        assert_eq!(response.status(), expected_status);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], expected_type);
+        assert_eq!(body["error"]["message"], expected_message);
+    }
+
+    #[tokio::test]
+    async fn session_not_found_maps_to_404() {
+        assert_response(
+            ApiError::SessionNotFound("abc".to_owned()),
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "Session not found: abc",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn not_found_maps_to_404() {
+        assert_response(
+            ApiError::NotFound("missing".to_owned()),
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "missing",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bad_request_maps_to_400() {
+        assert_response(
+            ApiError::BadRequest("bad".to_owned()),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "bad",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provider_error_maps_to_502() {
+        assert_response(
+            ApiError::ProviderError("down".to_owned()),
+            StatusCode::BAD_GATEWAY,
+            "provider_error",
+            "Provider error: down",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_request_maps_to_400() {
+        assert_response(
+            ApiError::InvalidRequest("oops".to_owned()),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Invalid request: oops",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn internal_error_maps_to_500() {
+        assert_response(
+            ApiError::InternalError("boom".to_owned()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Internal error: boom",
+        )
+        .await;
+    }
+}
