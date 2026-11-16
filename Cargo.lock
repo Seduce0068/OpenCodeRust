@@ -2785,17 +2785,10 @@ dependencies = [
 name = "opencode-util"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "glob",
- "notify",
- "opencode-core",
  "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
  "tokio",
- "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "walkdir",
