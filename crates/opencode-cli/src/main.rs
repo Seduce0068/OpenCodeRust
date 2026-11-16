@@ -1,3 +1,7 @@
+//! `opencoderust` CLI entrypoint.
+//!
+//! Provides TUI, single-run, server, and management subcommands.
+
 #![allow(
     clippy::too_many_arguments,
     clippy::manual_find,
