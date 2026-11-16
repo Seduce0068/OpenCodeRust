@@ -240,3 +240,44 @@ fn get_plan_path(ctx: &ToolContext) -> PathBuf {
         .join(".opencode")
         .join(PLAN_FILE)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            "/work/tree".to_owned(),
+        )
+    }
+
+    #[test]
+    fn plan_enter_identity_and_schema() {
+        let tool = PlanEnterTool;
+        assert_eq!(tool.id(), "plan_enter");
+        assert_eq!(tool.parameters()["type"], "object");
+    }
+
+    #[test]
+    fn plan_exit_identity_and_schema() {
+        let tool = PlanExitTool;
+        assert_eq!(tool.id(), "plan_exit");
+        assert_eq!(tool.parameters()["type"], "object");
+    }
+
+    #[test]
+    fn get_plan_path_uses_worktree() {
+        assert_eq!(
+            get_plan_path(&context()),
+            PathBuf::from("/work/tree/.opencode/PLAN.md")
+        );
+    }
+
+    #[test]
+    fn empty_params_deserialize() {
+        let _: PlanEnterParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        let _: PlanExitParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    }
+}
