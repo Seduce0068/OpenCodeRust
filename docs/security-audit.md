@@ -9,7 +9,7 @@ tags:
   - audit
 verified:
   by: dsh
-  at: "2026-11-16T23:00:01+09:00"
+  at: "2026-11-16T23:12:47+09:00"
 ---
 
 ## 実行手順
@@ -18,6 +18,7 @@ verified:
 
 ```bash
 cargo audit
+cargo outdated --workspace
 ```
 
 `.cargo/audit.toml` の ignore は根拠付きで管理する。
@@ -95,6 +96,24 @@ cargo audit --db ~/.cache/rustsec-advisory-db --no-fetch
 2026-10-18 の表に記載した `lru` / `serial` / `instant` / `paste` は今回の
 出力に含まれなかった。解消理由 (advisory DB 更新または依存バージョン変更)
 は未確認。
+
+### 依存更新 (2026-11-16)
+
+`cargo outdated --workspace` で検出した 5 件を更新した。
+
+- `notify` 8.2.1 → 8.2.2
+- `toml` 1.1.8 → 1.2.1
+- `serde_spanned` 1.1.2 → 1.1.3
+- `toml_datetime` 1.1.2 → 1.1.3
+- `toml_writer` 1.1.3 → 1.2.0
+
+`Cargo.lock` では `windows-sys` 0.61.2 → 0.52.0 へのダウングレードが
+5 箇所に入った (更新 dependency の制約によるものと推測、根拠未確認)。
+Linux ビルドとテストには影響しないが、Windows ターゲットのビルドは未確認。
+
+検証: `cargo check --all-targets`、`cargo clippy --workspace --all-targets
+-- -D warnings`、`cargo test --workspace` (591 passed)、`cargo audit`、
+`cargo outdated --workspace` (up to date) すべて成功。
 
 ## CI ゲート
 
