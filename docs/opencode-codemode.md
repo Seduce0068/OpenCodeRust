@@ -9,7 +9,7 @@ tags:
   - crate
 verified:
   by: opencode
-  at: "2026-11-15T18:09:50+09:00"
+  at: "2026-11-16T22:52:11+09:00"
 ---
 
 ## opencode-codemode
@@ -17,7 +17,8 @@ verified:
 `opencode-codemode` は upstream CodeMode の制限付きinterpreterを移植する
 ためのcrateである。Oxc parser による構文解析と構文診断、対応構文の静的検査、
 データ値境界、実行制限、同期評価器、stdlibの一部、同期のtool境界を提供する。
-非同期実行と実時間timeoutは未実装である。
+wall-clock timeoutは文・block境界で機能するが、真の非同期実行と同期host
+呼び出しを中断するtimeoutは未実装である。
 
 ## Parser boundary
 
@@ -102,7 +103,8 @@ upstreamは未対応構文を評価到達時に拒否する。`inspect_support` 
   Rustの評価frameがJavaScriptより大きいための固定上限である。
 - `new` は `Error`、`TypeError`、`RangeError`、`SyntaxError`、
   `ReferenceError`、`EvalError`、`URIError`、`AggregateError` のconstructorと
-  `Object` / `Array` / `Map` / `Set` / `Date` を許可する。
+  `Object` / `Array` / `Map` / `Set` / `Date` / `RegExp` / `URL` /
+  `URLSearchParams` を許可する。
   `Error(...)` は `new` なしでも同じ値を作り、`Map` / `Set` / `Date` は
   `new` なしでは `TypeError` にする。`Object(...)` は `new` なしでも動き、
   object/array/Error/Map/Set/Date/Promise/callableは同一値を返し、引数なし・
@@ -121,8 +123,8 @@ upstreamは未対応構文を評価到達時に拒否する。`inspect_support` 
   `name`、`message` の順に列挙する。
   `Object.keys` は `["name", "message"]` を返し、spreadするとbrandを失う。
 - 捕捉された実行時失敗は対応するbrandのError値になる。
-- 未対応: regexp/bigint literal、`void`/`delete`、Error/Map/Set/Date以外の
-  `new`。
+- 未対応: bigint literal、`void`/`delete`、Error/Map/Set/Date/RegExp/URL/
+  URLSearchParams以外の `new`。
 - 緩い等価 (`==`) はToPrimitiveを使い、Dateは時刻値、その他のobjectは
   文字列化で比較する。object同士は参照同一性で判定する。
 - `+` はToPrimitive、関係比較と `==` はDateを時刻値として扱う。
@@ -295,7 +297,8 @@ shadowingできる。
   receiverをそのまま返し、非空で長さ上限を超える場合は `RangeError` に
   する。trim系はBOM
   (U+FEFF) も除去し、`<` / `>` の文字列比較はUTF-16 code unit順になる。
-  `normalize` とRegExp依存のmatch系は未実装。
+  `normalize` とRegExp依存のmatch系 (`match` / `matchAll` / `search`) は
+  実装済み (2026-11-16)。
 - `Number` instance methods: toFixed、toPrecision、toExponential、toString
   (radix 2..36)、toLocaleString、valueOf。`toLocaleString` はen-US相当の
   3桁区切り・最大3小数 (`∞`、`-0`) を返し、locale/optionsは無視する。
@@ -351,6 +354,24 @@ shadowingできる。
 文字列のindexはUTF-16 code unitではなくUnicode scalar値で数える。
 `toUpperCase` / `toLowerCase` はRustのUnicode変換を使う。callbackを取る
 配列methodは反復開始時に要素をsnapshotする。
+
+### RegExp / URL (2026-11-16 追加)
+
+`fancy-regex` `0.19` 基盤のRegExpと`url` crate基盤のURL / URLSearchParamsを
+提供する。これらはbaseline `941e71d` 以降のupstreamから個別に取り込んだ拡張である。
+
+- RegExp: `new RegExp(pattern, flags)` と正規表現リテラル `/.../flags`、
+  `test` / `exec` / `toString`、`String.match` / `matchAll` / `search`。
+  flagsは `g` / `i` / `m` / `s` / `u` / `y` (sticky) を受理し、lookaround
+  (`(?=...)` / `(?!...)` / `(?<=...)` / `(?<!...)`) とbackreferenceに対応する。
+  capture groupは `m[1]` 以降と名前付きgroupの `m.groups` に公開する。
+- URL: `new URL(input, base)` とhref/protocol/host/hostname/port/pathname/
+  search/hash/origin/username/password/searchParams property、
+  `toString` / `toJSON`。`searchParams` は呼び出しごとに新しい
+  `URLSearchParams` を返すがowner URLへの参照を持ち、`set` / `append` /
+  `delete` の変更は`url.search`に書き戻される。`URLSearchParams` は
+  `new URLSearchParams(init)` と `get` / `getAll` / `has` / `set` / `append` /
+  `delete` / `toString` / `size` を提供する。
 
 ## Tool boundary
 
@@ -416,24 +437,9 @@ shadowingできる。
 ## 未実装
 
 - 現行実装はbaseline `941e71d` に合わせている。最新 `dev` (`5be4b16`) の
-  test262準拠強化、RegExp/URL/Web API、generator/for-await、iterator helpers、
-  bytesなどは未追随 (一部の追加APIは個別に取り込み済み)。
-- RegExpは`regex` crate基盤の部分実装。`new RegExp(pattern, flags)` と
-  正規表現リテラル `/.../flags`、`test` / `exec` / `toString`、
-  `String.match` / `matchAll` / `search` を提供する。flagsは `g` / `i` /
-  `m` / `s` / `u` を受理し、`y` (sticky) はフラグ検証のみ。capture groupの
-  結果オブジェクト (`m[1]` 以降と `groups` の名前付きgroup) は未対応で、
-  `m[0]` / `index` / `input` / `groups: undefined` のみを返す。
-  `regex` crateはlookaround (`(?=...)` / `(?!...)`) をサポートしないため、
-  これらを含むpatternは`Invalid regular expression`エラーになる。
-- URLは`url` crate基盤。`new URL(input, base)` とhref/protocol/host/
-  hostname/port/pathname/search/hash/origin/username/password/searchParams
-  property、`toString` / `toJSON` を提供する。`searchParams` は呼び出しごとに
-  新しい`URLSearchParams`を返すが、owner URLへの参照を持ち、
-  `set` / `append` / `delete` の変更は`url.search`に書き戻される。
-  `URLSearchParams` は `new URLSearchParams(init)` と `get` / `getAll` /
-  `has` / `set` / `append` / `delete` / `toString` / `size` を提供する。
-- `String.normalize`
+  test262準拠強化、generator/for-await、iterator helpers、bytesなどは未追随。
+  RegExp / URL / Web API の一部と `String.normalize` は個別に取り込み済み
+  (Stdlib baselineの「RegExp / URL」参照)。
 - TypeScriptの型消去・transpile parity
 - 非同期tool実行と未await rejectionの診断
 - 同期host呼び出しを中断するtimeout
