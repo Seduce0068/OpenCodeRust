@@ -253,3 +253,58 @@ impl Default for TodoWriteTool {
         Self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(content: &str, status: &str, priority: &str) -> TodoItemData {
+        TodoItemData {
+            content: content.to_owned(),
+            status: status.to_owned(),
+            priority: priority.to_owned(),
+        }
+    }
+
+    #[test]
+    fn read_identity_and_schema() {
+        let tool = TodoReadTool;
+        assert_eq!(tool.id(), "todoread");
+        assert!(tool.description().contains("todo list"));
+        assert_eq!(tool.parameters()["type"], "object");
+    }
+
+    #[test]
+    fn write_identity_and_schema() {
+        let tool = TodoWriteTool;
+        assert_eq!(tool.id(), "todowrite");
+        assert_eq!(tool.parameters()["required"][0], "todos");
+    }
+
+    #[test]
+    fn format_empty_todos() {
+        assert_eq!(format_todos_from_data(&[]), "No todos in the list.");
+    }
+
+    #[test]
+    fn format_single_todo_with_priority() {
+        let output = format_todos_from_data(&[item("write docs", "pending", "high")]);
+        assert!(output.contains("# Todo List"));
+        assert!(output.contains("⬜ todo_0 [high]"));
+        assert!(output.contains("write docs"));
+        assert!(output.ends_with("Summary: 1 pending, 0 in progress, 0 completed"));
+    }
+
+    #[test]
+    fn format_mixed_statuses_summary() {
+        let todos = vec![
+            item("a", "pending", ""),
+            item("b", "in_progress", "medium"),
+            item("c", "completed", ""),
+        ];
+        let output = format_todos_from_data(&todos);
+        assert!(output.contains("🔄 todo_1 [medium]"));
+        assert!(output.contains("✅ todo_2"));
+        assert!(output.ends_with("Summary: 1 pending, 1 in progress, 1 completed"));
+    }
+}
