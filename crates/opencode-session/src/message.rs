@@ -262,3 +262,65 @@ impl SessionMessage {
             .join("")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_message_has_one_text_part() {
+        let msg = SessionMessage::user("ses_1", "hello");
+        assert_eq!(msg.session_id, "ses_1");
+        assert_eq!(msg.role, MessageRole::User);
+        assert_eq!(msg.parts.len(), 1);
+        assert_eq!(msg.get_text(), "hello");
+        assert!(msg.id.starts_with("msg_"));
+    }
+
+    #[test]
+    fn assistant_message_starts_empty() {
+        let msg = SessionMessage::assistant("ses_1");
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert!(msg.parts.is_empty());
+    }
+
+    #[test]
+    fn add_text_and_reasoning_are_collected_by_getters() {
+        let mut msg = SessionMessage::assistant("ses_1");
+        msg.add_text("hello ");
+        msg.add_reasoning("thinking");
+        msg.add_text("world");
+
+        assert_eq!(msg.get_text(), "hello world");
+        assert_eq!(msg.get_reasoning(), "thinking");
+        assert_eq!(msg.parts.len(), 3);
+    }
+
+    #[test]
+    fn add_tool_call_and_result() {
+        let mut msg = SessionMessage::assistant("ses_1");
+        msg.add_tool_call("call_1", "bash", serde_json::json!({ "command": "ls" }));
+        msg.add_tool_result("call_1", "output", false);
+
+        assert_eq!(msg.parts.len(), 2);
+        assert_eq!(msg.get_text(), "");
+    }
+
+    #[test]
+    fn add_file_agent_and_subtask() {
+        let mut msg = SessionMessage::assistant("ses_1");
+        msg.add_file("https://example.com/a.png", "a.png", "image/png");
+        msg.add_agent("build");
+        msg.add_subtask("task_1", "investigate");
+
+        assert_eq!(msg.parts.len(), 3);
+    }
+
+    #[test]
+    fn part_ids_are_unique() {
+        let mut msg = SessionMessage::assistant("ses_1");
+        msg.add_text("a");
+        msg.add_text("b");
+        assert_ne!(msg.parts[0].id, msg.parts[1].id);
+    }
+}
