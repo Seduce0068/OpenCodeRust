@@ -334,3 +334,87 @@ fn convert_response(response: AnthropicResponse) -> ChatResponse {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Content;
+
+    fn thinking_budget(variant: Option<&str>, max_tokens: u64) -> Option<u64> {
+        anthropic_thinking_config(variant, max_tokens)
+            .map(|AnthropicThinking::Enabled { budget_tokens }| budget_tokens)
+    }
+
+    #[test]
+    fn thinking_config_budgets_by_variant() {
+        assert_eq!(thinking_budget(Some("low"), 32000), Some(4_000));
+        assert_eq!(thinking_budget(Some("medium"), 32000), Some(8_000));
+        assert_eq!(thinking_budget(Some("high"), 32000), Some(16_000));
+        assert_eq!(thinking_budget(Some("xhigh"), 32000), Some(31_999));
+    }
+
+    #[test]
+    fn thinking_config_clamps_to_max_tokens() {
+        assert_eq!(thinking_budget(Some("high"), 5000), Some(4999));
+        assert_eq!(thinking_budget(Some("low"), 1), None);
+    }
+
+    #[test]
+    fn thinking_config_rejects_unknown_variant() {
+        assert_eq!(thinking_budget(Some("invalid"), 32000), None);
+        assert_eq!(thinking_budget(None, 32000), None);
+    }
+
+    #[test]
+    fn convert_response_joins_text_and_maps_usage() {
+        let response = AnthropicResponse {
+            id: "msg_1".to_owned(),
+            model: "claude-3".to_owned(),
+            content: vec![
+                AnthropicResponseContent {
+                    _content_type: "text".to_owned(),
+                    text: Some("hello ".to_owned()),
+                },
+                AnthropicResponseContent {
+                    _content_type: "text".to_owned(),
+                    text: Some("world".to_owned()),
+                },
+            ],
+            usage: AnthropicResponseUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        };
+
+        let result = convert_response(response);
+        assert_eq!(result.id, "msg_1");
+        assert_eq!(result.model, "claude-3");
+        assert_eq!(result.choices.len(), 1);
+        assert_eq!(result.choices[0].finish_reason.as_deref(), Some("stop"));
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn convert_response_ignores_non_text_content() {
+        let response = AnthropicResponse {
+            id: "msg_2".to_owned(),
+            model: "claude-3".to_owned(),
+            content: vec![AnthropicResponseContent {
+                _content_type: "tool_use".to_owned(),
+                text: None,
+            }],
+            usage: AnthropicResponseUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        };
+        let result = convert_response(response);
+        assert!(matches!(
+            result.choices[0].message.content,
+            Content::Text(ref text) if text.is_empty()
+        ));
+    }
+}
