@@ -859,3 +859,51 @@ impl Default for ApplyPatchTool {
         Self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = ApplyPatchTool;
+        assert_eq!(tool.id(), "apply_patch");
+        assert_eq!(tool.parameters()["required"][0], "patchText");
+    }
+
+    #[test]
+    fn parse_add_file_patch() {
+        let text = "*** Begin Patch\n*** Begin File: src/new.rs\n+fn main() {}\n*** End File\n*** End Patch";
+        let patches = parse_model_patch(text).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "src/new.rs");
+        assert!(patches[0].operation.is_add());
+    }
+
+    #[test]
+    fn parse_delete_file_patch() {
+        let text = "*** Begin Patch\n*** Delete File: old.rs\n*** End Patch";
+        let patches = parse_model_patch(text).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert!(matches!(patches[0].operation, PatchOperation::Delete));
+    }
+
+    #[test]
+    fn parse_empty_patch() {
+        let patches = parse_model_patch("*** Begin Patch\n*** End Patch").unwrap();
+        assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn patch_operation_is_add_only_for_add() {
+        assert!(PatchOperation::Add.is_add());
+        assert!(!PatchOperation::Update.is_add());
+        assert!(!PatchOperation::Delete.is_add());
+        assert!(!PatchOperation::Move {
+            move_path: "x".to_owned()
+        }
+        .is_add());
+    }
+}
