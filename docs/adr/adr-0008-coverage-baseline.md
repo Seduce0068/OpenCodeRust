@@ -9,10 +9,10 @@ tags:
   - tooling
 generated:
   by: agent
-  at: "2026-11-17T01:21:57+09:00"
+  at: "2026-11-17T01:37:51+09:00"
 reviewed:
   by: agent
-  at: "2026-11-17T01:21:57+09:00"
+  at: "2026-11-17T01:37:51+09:00"
 ---
 
 ## ADR-0008: テストカバレッジの現状と段階的改善方針
@@ -31,6 +31,7 @@ AGENTS.md セクション7は「重要パスは 80% 以上目標」を要求す�
 `opencode-tui` の UI コンポーネント (`session.rs` 0/742、
 `components/dialogs/*` の多くが 0/) が未計測の大きな割合を占める。
 再計測では 31.37% (13,394/42,696) で、軽微な変動があった。
+テスト追加後は 31.42% (13,417/42,696) に向上した。
 クレート別に集計した結果は次のとおりである。
 
 | クレート | カバレッジ |
@@ -43,7 +44,7 @@ AGENTS.md セクション7は「重要パスは 80% 以上目標」を要求す�
 
 重要パスのうち codemode は 80% に近いが、session / tool は未達である。
 
-テスト件数自体は 591 件で、`cargo test --workspace --all-targets` と
+テスト件数自体は 594 件で、`cargo test --workspace --all-targets` と
 `cargo nextest run --workspace` の両方が green である。
 
 ### Decision
@@ -69,7 +70,9 @@ AGENTS.md セクション7は「重要パスは 80% 以上目標」を要求す�
 - `cargo tarpaulin --workspace` は実行可能だが、カバレッジゲートは導入しない。
 - 既存の `cargo check` / `clippy` / `test` / `nextest` のゲートは変更しない。
 - 次回のカバレッジ改善時に、本 ADR の baseline (初回 31.40%、
-  再計測 31.37%) と比較する。
+  再計測 31.37%、テスト追加後 31.42%) と比較する。
+- `opencode-tool/src/truncation.rs` は 3 テスト追加で 58/58 行 (100%) に
+  到達した。同様の未カバー分岐のテスト追加を他モジュールへ展開する。
 
 ### Links
 
