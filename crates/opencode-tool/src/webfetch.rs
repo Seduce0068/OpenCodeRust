@@ -375,3 +375,55 @@ impl Default for WebFetchTool {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = WebFetchTool::new();
+        assert_eq!(tool.id(), "webfetch");
+        assert_eq!(tool.parameters()["required"][0], "url");
+    }
+
+    #[test]
+    fn default_format_is_markdown() {
+        assert_eq!(default_format(), "markdown");
+    }
+
+    #[test]
+    fn input_applies_defaults() {
+        let input: WebFetchInput =
+            serde_json::from_value(serde_json::json!({ "url": "https://example.com" })).unwrap();
+        assert_eq!(input.url, "https://example.com");
+        assert_eq!(input.format, "markdown");
+        assert!(input.timeout.is_none());
+    }
+
+    #[test]
+    fn input_accepts_explicit_options() {
+        let input: WebFetchInput = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com",
+            "format": "text",
+            "timeout": 10
+        }))
+        .unwrap();
+        assert_eq!(input.format, "text");
+        assert_eq!(input.timeout, Some(10));
+    }
+
+    #[test]
+    fn strip_html_removes_tags() {
+        assert_eq!(
+            strip_html("<p>hello <b>world</b></p>").trim(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn convert_html_to_markdown_delegates_to_strip_html() {
+        let html = "<div>text</div>";
+        assert_eq!(convert_html_to_markdown(html), strip_html(html));
+    }
+}
