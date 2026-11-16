@@ -6,7 +6,8 @@ tags: [tui, terminal, crate]
 
 # opencode-tui
 
-`opencode-tui` provides the terminal UI: home screen, session view, input, sidebar, dialogs, shortcuts, and theme system.
+`opencode-tui` provides the terminal UI: home screen, session view, input,
+sidebar, dialogs, shortcuts, and theme system.
 
 ## Branding and display
 

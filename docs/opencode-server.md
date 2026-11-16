@@ -6,7 +6,8 @@ tags: [server, api, session, crate]
 
 # opencode-server
 
-`opencode-server` provides HTTP/SSE/WebSocket APIs and bridges CLI, TUI, and external systems.
+`opencode-server` provides HTTP/SSE/WebSocket APIs and bridges CLI, TUI, and
+external systems.
 
 ## Responsibilities
 

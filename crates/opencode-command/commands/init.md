@@ -8,7 +8,8 @@ Initialize OpenCode in the current project. This will:
 
 ## Steps
 
-1. First, explore the project structure to understand what kind of project this is:
+1. First, explore the project structure to understand what kind of project this
+   is:
    - Check for `package.json` (Node.js/JavaScript)
    - Check for `Cargo.toml` (Rust)
    - Check for `pyproject.toml` or `requirements.txt` (Python)

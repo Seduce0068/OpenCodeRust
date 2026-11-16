@@ -6,7 +6,8 @@ tags: [lsp, code-intelligence, crate]
 
 # opencode-lsp
 
-`opencode-lsp` provides Language Server Protocol client support for code intelligence and editing assistance.
+`opencode-lsp` provides Language Server Protocol client support for code
+intelligence and editing assistance.
 
 ## Responsibilities
 

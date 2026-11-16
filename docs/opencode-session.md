@@ -6,7 +6,9 @@ tags: [session, prompt, crate]
 
 # opencode-session
 
-`opencode-session` is the session engine core: message flow, state machine, retries, compaction, summarization, and rollback, plus system prompt construction.
+`opencode-session` is the session engine core: message flow, state machine,
+retries, compaction, summarization, and rollback, plus system prompt
+construction.
 
 ## Responsibilities
 

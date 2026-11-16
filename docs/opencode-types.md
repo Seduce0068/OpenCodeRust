@@ -6,7 +6,8 @@ tags: [types, serialization, crate]
 
 # opencode-types
 
-`opencode-types` defines shared data structures across crates to reduce duplication and serialization drift.
+`opencode-types` defines shared data structures across crates to reduce
+duplication and serialization drift.
 
 ## Responsibilities
 

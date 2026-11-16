@@ -6,7 +6,8 @@ tags: [command, slash-command, crate]
 
 # opencode-command
 
-`opencode-command` implements the slash command system, supporting built-in commands, file-based commands, MCP commands, and skill commands.
+`opencode-command` implements the slash command system, supporting built-in
+commands, file-based commands, MCP commands, and skill commands.
 
 ## Responsibilities
 
