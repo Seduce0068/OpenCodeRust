@@ -973,4 +973,41 @@ mod tests {
         let clients = registry.list().await;
         assert!(clients.is_empty());
     }
+
+    #[test]
+    fn path_uri_roundtrip() {
+        let path = Path::new("/tmp/project/src/main.rs");
+        let uri = path_to_uri(path).unwrap();
+        assert_eq!(uri_to_path(&uri), path);
+    }
+
+    #[test]
+    fn detect_language_c_family() {
+        assert_eq!(detect_language(Path::new("a.cpp")), "cpp");
+        assert_eq!(detect_language(Path::new("a.cc")), "cpp");
+        assert_eq!(detect_language(Path::new("a.hpp")), "cpp");
+        assert_eq!(detect_language(Path::new("a.c")), "c");
+    }
+
+    #[test]
+    fn detect_language_config_and_docs() {
+        assert_eq!(detect_language(Path::new("Cargo.toml")), "toml");
+        assert_eq!(detect_language(Path::new("a.yaml")), "yaml");
+        assert_eq!(detect_language(Path::new("a.yml")), "yaml");
+        assert_eq!(detect_language(Path::new("README.md")), "markdown");
+        assert_eq!(detect_language(Path::new("a.json")), "json");
+    }
+
+    #[test]
+    fn detect_language_unknown_is_plaintext() {
+        assert_eq!(detect_language(Path::new("file.unknown")), "plaintext");
+        assert_eq!(detect_language(Path::new("LICENSE")), "plaintext");
+    }
+
+    #[test]
+    fn uri_to_path_invalid_uri_is_empty() {
+        use std::str::FromStr;
+        let uri = lsp_types::Uri::from_str("not-a-uri").unwrap();
+        assert_eq!(uri_to_path(&uri), PathBuf::new());
+    }
 }
