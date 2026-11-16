@@ -12,11 +12,12 @@ tags:
   - system-prompt
 ---
 
-# ADR-0003: プロンプト経路へのツール・システムプロンプト注入
+## ADR-0003: プロンプト経路へのツール・システムプロンプト注入
 
 ## Context
 
 `session_prompt` エンドポイントで以下が未実装だった：
+
 - エージェント設定に基づくシステムプロンプト生成
 - 利用可能ツール定義のプロバイダへの注入
 - `AgentParams`（max_tokens/temperature/top_p）のエージェント設定反映
@@ -25,15 +26,19 @@ tags:
 ## Decision
 
 ### 1. システムプロンプト生成（`routes.rs:session_prompt`）
+
 ```rust
 // AgentRegistry から設定適用済みエージェント取得
 let agent_registry = AgentRegistry::from_config(&config);
 let agent_info = agent_registry.get(agent_name).cloned().unwrap_or_else(|| AgentInfo::from_builtin(BuiltinAgent::Build));
 
 // 3層構成で結合
-let provider_specific = SystemPrompt::for_model(&model_id);      // anthropic/gemini/gpt-5 等
+let provider_specific = SystemPrompt::for_model(&model_id);
+// anthropic/gemini/gpt-5 等
 let agent_specific = agent_info.system_prompt.unwrap_or_default(); // エージェント固有
-let environment = SystemPrompt::environment(&EnvironmentContext::from_current(...)); // 作業環境
+let environment =
+    SystemPrompt::environment(&EnvironmentContext::from_current(...));
+// 作業環境
 
 let system_prompt = if agent_specific.is_empty() {
     format!("{}\n\n{}", provider_specific, environment)
@@ -43,14 +48,18 @@ let system_prompt = if agent_specific.is_empty() {
 ```
 
 ### 2. ツール定義注入
+
 ```rust
 let tool_registry = create_default_registry().await;
 let tool_definitions = tool_registry.list_schemas().await;
-let tools: Vec<ToolDefinition> = tool_definitions.into_iter().map(|t| ToolDefinition {
-    name: t.name,
-    description: Some(t.description),
-    parameters: t.parameters,
-}).collect();
+let tools: Vec<ToolDefinition> = tool_definitions
+    .into_iter()
+    .map(|t| ToolDefinition {
+        name: t.name,
+        description: Some(t.description),
+        parameters: t.parameters,
+    })
+    .collect();
 
 // 2経路で渡す（互換性・将来拡張）
 input.tools = Some(tools.iter().map(|t| (t.name.clone(), true)).collect());
@@ -59,6 +68,7 @@ prompt_runner.prompt_with_update_hook(..., tools, ...)
 ```
 
 ### 3. AgentParams 反映
+
 ```rust
 let agent_params = AgentParams {
     max_tokens: agent_info.max_tokens,
@@ -68,6 +78,7 @@ let agent_params = AgentParams {
 ```
 
 ### 4. variant 伝播
+
 ```rust
 input.variant = task_variant.clone(); // リクエストの variant をそのまま伝播
 ```
