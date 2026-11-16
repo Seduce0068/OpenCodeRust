@@ -302,4 +302,41 @@ mod tests {
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
     }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = QuestionTool::new();
+        assert_eq!(tool.id(), "question");
+        assert_eq!(tool.parameters()["required"][0], "questions");
+    }
+
+    #[test]
+    fn input_deserializes_question_definition() {
+        let input: QuestionInput = serde_json::from_value(question_args()).unwrap();
+        assert_eq!(input.questions.len(), 1);
+        assert_eq!(input.questions[0].header.as_deref(), Some("Plan Mode"));
+        assert!(!input.questions[0].multiple);
+        assert_eq!(input.questions[0].options[0].label, "Yes");
+    }
+
+    #[test]
+    fn input_allows_question_without_options() {
+        let input: QuestionInput = serde_json::from_value(serde_json::json!({
+            "questions": [{ "question": "Your name?" }]
+        }))
+        .unwrap();
+        assert!(input.questions[0].options.is_empty());
+        assert!(input.questions[0].header.is_none());
+        assert!(!input.questions[0].multiple);
+    }
+
+    #[test]
+    fn response_serializes_as_answers_array() {
+        let response = QuestionResponse {
+            answers: vec![vec!["Yes".to_owned()], vec!["a".to_owned(), "b".to_owned()]],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["answers"][0][0], "Yes");
+        assert_eq!(json["answers"][1][1], "b");
+    }
 }
