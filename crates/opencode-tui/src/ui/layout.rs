@@ -67,3 +67,61 @@ pub fn sidebar_right(area: Rect, width: u16) -> (Rect, Rect) {
         .split(area);
     (layout[0], layout[1])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area() -> Rect {
+        Rect::new(0, 0, 100, 50)
+    }
+
+    #[test]
+    fn horizontal_split_respects_lengths() {
+        let parts = horizontal_split(area(), vec![Constraint::Length(20), Constraint::Min(0)]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].width, 20);
+        assert_eq!(parts[1].width, 80);
+        assert_eq!(parts[0].x, 0);
+        assert_eq!(parts[1].x, 20);
+    }
+
+    #[test]
+    fn vertical_split_respects_lengths() {
+        let parts = vertical_split(area(), vec![Constraint::Length(10), Constraint::Min(0)]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].height, 10);
+        assert_eq!(parts[1].height, 40);
+        assert_eq!(parts[1].y, 10);
+    }
+
+    #[test]
+    fn header_and_footer_are_at_edges() {
+        assert_eq!(header(area(), 5).y, 0);
+        assert_eq!(header(area(), 5).height, 5);
+
+        let foot = footer(area(), 5);
+        assert_eq!(foot.y, 45);
+        assert_eq!(foot.height, 5);
+    }
+
+    #[test]
+    fn sidebars_take_requested_width() {
+        let (left, main) = sidebar_left(area(), 30);
+        assert_eq!(left.width, 30);
+        assert_eq!(main.x, 30);
+
+        let (main_right, right) = sidebar_right(area(), 30);
+        assert_eq!(right.width, 30);
+        assert_eq!(main_right.width, 70);
+    }
+
+    #[test]
+    fn centered_is_inside_area() {
+        let popup = centered(area(), 40, 20);
+        assert_eq!(popup.width, 40);
+        assert_eq!(popup.height, 20);
+        assert!(popup.x + popup.width <= 100);
+        assert!(popup.y + popup.height <= 50);
+    }
+}
