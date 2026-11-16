@@ -196,3 +196,62 @@ pub fn prune_worktrees(repo_path: &Path) -> Result<(), WorktreeError> {
     run_git(&["worktree", "prune"], repo_path)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-worktree-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn is_git_repo_false_for_plain_dir() {
+        let dir = temp_dir();
+        assert!(!is_git_repo(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn is_git_repo_true_for_git_dir() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        assert!(is_git_repo(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn is_git_repo_true_for_current_workspace() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(is_git_repo(root));
+    }
+
+    #[test]
+    fn list_worktrees_rejects_non_repo() {
+        let dir = temp_dir();
+        assert!(matches!(
+            list_worktrees(&dir),
+            Err(WorktreeError::NotGitRepo)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn run_git_returns_trimmed_stdout() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], root).unwrap();
+        assert!(!branch.is_empty());
+        assert!(!branch.contains('\n'));
+    }
+}
