@@ -2622,4 +2622,75 @@ mod runtime_tests {
 
         unregister_custom_fetch_proxy("test-provider-stream");
     }
+
+    #[test]
+    fn responses_model_config_reasoning_models() {
+        let gpt5 = get_responses_model_config("gpt-5");
+        assert!(gpt5.is_reasoning_model);
+        assert_eq!(gpt5.system_message_mode, SystemMessageMode::Developer);
+
+        let o1mini = get_responses_model_config("o1-mini");
+        assert!(o1mini.is_reasoning_model);
+        assert_eq!(o1mini.system_message_mode, SystemMessageMode::Remove);
+    }
+
+    #[test]
+    fn responses_model_config_non_reasoning_models() {
+        let chat = get_responses_model_config("gpt-5-chat");
+        assert!(!chat.is_reasoning_model);
+        assert_eq!(chat.system_message_mode, SystemMessageMode::System);
+
+        let plain = get_responses_model_config("gpt-4o");
+        assert!(!plain.is_reasoning_model);
+    }
+
+    #[test]
+    fn responses_model_config_flex_and_priority() {
+        let gpt5 = get_responses_model_config("gpt-5");
+        assert!(gpt5.supports_flex_processing);
+        assert!(gpt5.supports_priority_processing);
+
+        let nano = get_responses_model_config("gpt-5-nano");
+        assert!(!nano.supports_priority_processing);
+    }
+
+    #[test]
+    fn map_response_finish_reasons() {
+        assert_eq!(
+            map_openai_response_finish_reason(None, false),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            map_openai_response_finish_reason(None, true),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            map_openai_response_finish_reason(Some("max_output_tokens"), false),
+            FinishReason::Length
+        );
+        assert_eq!(
+            map_openai_response_finish_reason(Some("content_filter"), false),
+            FinishReason::ContentFilter
+        );
+    }
+
+    #[test]
+    fn map_compatible_finish_reasons() {
+        assert_eq!(
+            map_openai_compatible_finish_reason(Some("stop")),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            map_openai_compatible_finish_reason(Some("tool_calls")),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            map_openai_compatible_finish_reason(Some("unknown")),
+            FinishReason::Unknown
+        );
+        assert_eq!(
+            map_openai_compatible_finish_reason(None),
+            FinishReason::Unknown
+        );
+    }
 }
