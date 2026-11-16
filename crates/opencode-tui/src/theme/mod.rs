@@ -663,3 +663,48 @@ impl Styles {
         Style::default().add_modifier(Modifier::REVERSED)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_nibble_accepts_digits_and_lowercase() {
+        assert_eq!(parse_hex_nibble(b'0'), Some(0));
+        assert_eq!(parse_hex_nibble(b'9'), Some(9));
+        assert_eq!(parse_hex_nibble(b'a'), Some(10));
+        assert_eq!(parse_hex_nibble(b'f'), Some(15));
+        assert_eq!(parse_hex_nibble(b'g'), None);
+    }
+
+    #[test]
+    fn parse_hex_byte_combines_nibbles() {
+        assert_eq!(parse_hex_byte(b'f', b'f'), Some(255));
+        assert_eq!(parse_hex_byte(b'1', b'0'), Some(16));
+        assert_eq!(parse_hex_byte(b'0', b'z'), None);
+    }
+
+    #[test]
+    fn parse_color_literal_transparent_and_none() {
+        assert_eq!(parse_color_literal("transparent"), Some(Color::Reset));
+        assert_eq!(parse_color_literal("NONE"), Some(Color::Reset));
+    }
+
+    #[test]
+    fn parse_color_literal_hex_forms() {
+        assert_eq!(parse_color_literal("#fff"), Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(parse_color_literal("#ff0000"), Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(parse_color_literal("#0000"), Some(Color::Reset));
+        assert_eq!(parse_color_literal("#ff000000"), Some(Color::Reset));
+        assert_eq!(parse_color_literal("#12"), None);
+        assert_eq!(parse_color_literal("red"), None);
+    }
+
+    #[test]
+    fn ansi_to_color_basic_palette() {
+        assert_eq!(ansi_to_color(0), Color::Rgb(0, 0, 0));
+        assert_eq!(ansi_to_color(1), Color::Rgb(128, 0, 0));
+        assert_eq!(ansi_to_color(7), Color::Rgb(192, 192, 192));
+        assert_eq!(ansi_to_color(15), Color::Rgb(255, 255, 255));
+    }
+}
