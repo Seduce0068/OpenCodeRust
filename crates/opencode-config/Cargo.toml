@@ -6,11 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-opencode-core = { path = "../opencode-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 dirs = { workspace = true }
 jsonc-parser = { version = "0.34.0", features = ["serde"] }
 regex = { workspace = true }
