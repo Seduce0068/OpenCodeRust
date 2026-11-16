@@ -163,3 +163,57 @@ lazy_static::lazy_static! {
         m
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_tokens_return_empty_prefix() {
+        assert!(BashArity::prefix(&[]).is_empty());
+    }
+
+    #[test]
+    fn unknown_command_falls_back_to_first_token() {
+        assert_eq!(
+            BashArity::prefix(&tokens(&["foobar", "arg"])),
+            tokens(&["foobar"])
+        );
+    }
+
+    #[test]
+    fn single_token_command_returns_one_token() {
+        assert_eq!(
+            BashArity::prefix(&tokens(&["ls", "-la", "/tmp"])),
+            tokens(&["ls"])
+        );
+    }
+
+    #[test]
+    fn longest_known_prefix_wins() {
+        assert_eq!(
+            BashArity::prefix(&tokens(&["npm", "run", "build", "--", "x"])),
+            tokens(&["npm", "run", "build"])
+        );
+    }
+
+    #[test]
+    fn two_token_command_without_subcommand() {
+        assert_eq!(
+            BashArity::prefix(&tokens(&["git", "status"])),
+            tokens(&["git", "status"])
+        );
+    }
+
+    #[test]
+    fn three_token_subcommand_prefix() {
+        assert_eq!(
+            BashArity::prefix(&tokens(&["docker", "compose", "up", "-d"])),
+            tokens(&["docker", "compose", "up"])
+        );
+    }
+}
