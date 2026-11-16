@@ -9,7 +9,7 @@ tags:
   - audit
 verified:
   by: dsh
-  at: "2026-11-16T23:15:44+09:00"
+  at: "2026-11-16T23:57:32+09:00"
 ---
 
 ## 実行手順
@@ -123,6 +123,20 @@ Linux ビルドとテストには影響しない。Windows ターゲットのク
 共通ワークフロー `rust-gates.yml` の `audit: true` で有効化済み
 (2026-10-18、workflows v1)。OpenCodeRust の `.github/workflows/ci.yml`
 が opt-in している。
+
+## 未使用依存の検出 (2026-11-16)
+
+`cargo install cargo-machete --locked` で `cargo-machete v0.10.1` を導入し、
+`cargo machete --with-metadata` を実行した。
+
+多数の候補が検出された (例: `opencode-util` の `anyhow` / `notify` / `serde`
+/ `serde_json` / `thiserror` / `tracing`、`opencode-tui` の 11 件、
+`opencode-mcp` の 9 件など)。`Cargo.lock` への変更はない。
+
+false positive の可能性 (derive マクロ、re-export、条件付きコンパイル) が
+あるため、本セッションでは依存削除を行わない。削除前に各クレートの
+ソースで直接使用を確認し、`cargo check --all-targets` と
+`cargo test --workspace` で検証する。
 
 ## 残作業
 
