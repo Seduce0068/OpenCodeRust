@@ -9,7 +9,7 @@ tags:
   - compatibility
 verified:
   by: dsh
-  at: "2026-11-15T09:50:01+09:00"
+  at: "2026-11-16T22:50:20+09:00"
 ---
 
 ## 目標
@@ -44,7 +44,7 @@ verified:
   snapshot の非同一 transaction、単一 process 前提) は
   [DESIGN_RUNNER.md](DESIGN_RUNNER.md) に記録。
 - Phase 3: `opencode-agent` / `opencode-tool` は実装・テスト済み
-  (workspace テスト 576 件 green、2026-11-15 実行)。差分照合の初版は
+  (workspace テスト 591 件 green、2026-11-16 実行)。差分照合の初版は
   [MAPPING.md](MAPPING.md) に記録済み。未移植機能の実装が残作業。
 
 ## 直近の更新 (2026-11-15)
@@ -70,8 +70,20 @@ verified:
 - CI: アカウント移転に伴い共通ワークフロー参照を `Seduce0068/workflows` へ
   更新。
 
-残作業は SSE transport、OAuth の token exchange、`codemode` / `protocol` /
-`pool` の MCP オプション、codemode の未実装群
+## 直近の更新 (2026-11-16)
+
+`opencode-codemode` の JS 相互運用を拡充した。
+
+- RegExp を実装。`fancy-regex` へ切り替えて lookaround に対応し、
+  キャプチャグループと sticky flag (`y`) を扱えるようにした
+  (commit `59ae249`、`2860366`、`bf8c62a`)。
+- URL / URLSearchParams と `String.prototype.normalize` を実装
+  (commit `3ddf1b4`、`b651722`)。
+- workspace テストは 591 件 green、`cargo check --all-targets` も成功
+  (2026-11-16 実行)。
+
+残作業は SSE transport、OAuth の token exchange、MCP オプションの
+`codemode` / `protocol` / `pool`、codemode の非同期実行と timeout など
 ([MAPPING.md](MAPPING.md) の欠落領域)。
 
 ## 参照元
