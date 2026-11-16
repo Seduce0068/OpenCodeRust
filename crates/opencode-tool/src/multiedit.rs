@@ -193,3 +193,142 @@ impl Default for MultiEditTool {
         Self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-multiedit-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
+    fn edit(file: &str, old: &str, new: &str, replace_all: bool) -> serde_json::Value {
+        serde_json::json!({
+            "file_path": file,
+            "edits": [{ "old_string": old, "new_string": new, "replace_all": replace_all }]
+        })
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = MultiEditTool;
+        assert_eq!(tool.id(), "multiedit");
+        assert_eq!(tool.parameters()["required"][0], "edits");
+    }
+
+    #[tokio::test]
+    async fn execute_replaces_first_occurrence() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "a a").unwrap();
+
+        let result = MultiEditTool
+            .execute(
+                serde_json::json!({ "edits": [edit("a.txt", "a", "b", false)] }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "b a");
+        assert!(result.output.contains("1 edit(s) across 1 file(s)"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_replace_all() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "a a").unwrap();
+
+        MultiEditTool
+            .execute(
+                serde_json::json!({ "edits": [edit("a.txt", "a", "b", true)] }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "b b");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_multiple_files() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+
+        let result = MultiEditTool
+            .execute(
+                serde_json::json!({ "edits": [
+                    edit("a.txt", "x", "1", false),
+                    edit("b.txt", "x", "2", false)
+                ] }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "1");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "2");
+        assert!(result.output.contains("across 2 file(s)"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_file_not_found() {
+        let dir = temp_dir();
+        let error = MultiEditTool
+            .execute(
+                serde_json::json!({ "edits": [edit("missing.txt", "a", "b", false)] }),
+                context(&dir),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::FileNotFound(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_missing_old_string() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "abc").unwrap();
+
+        let error = MultiEditTool
+            .execute(
+                serde_json::json!({ "edits": [edit("a.txt", "zzz", "b", false)] }),
+                context(&dir),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::ExecutionError(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_no_edits() {
+        let dir = temp_dir();
+        let result = MultiEditTool
+            .execute(serde_json::json!({ "edits": [] }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output, "No edits applied.");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
