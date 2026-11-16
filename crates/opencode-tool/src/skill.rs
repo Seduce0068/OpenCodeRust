@@ -437,4 +437,71 @@ custom content
         assert!(names.contains(&"local-skill".to_string()));
         assert!(names.contains(&"custom-skill".to_string()));
     }
+
+    #[test]
+    fn parse_frontmatter_value_reads_quoted_and_plain() {
+        let frontmatter = "name: plain\ndescription: \"quoted value\"\n# comment: ignored\n";
+        assert_eq!(
+            parse_frontmatter_value(frontmatter, "name").as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            parse_frontmatter_value(frontmatter, "description").as_deref(),
+            Some("quoted value")
+        );
+        assert!(parse_frontmatter_value(frontmatter, "missing").is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_value_reads_single_quotes() {
+        let frontmatter = "name: 'single'\n";
+        assert_eq!(
+            parse_frontmatter_value(frontmatter, "name").as_deref(),
+            Some("single")
+        );
+    }
+
+    #[test]
+    fn resolve_skill_path_handles_absolute_and_relative() {
+        let base = Path::new("/work/project");
+        assert_eq!(
+            resolve_skill_path(base, "/opt/skills"),
+            PathBuf::from("/opt/skills")
+        );
+        assert_eq!(
+            resolve_skill_path(base, "skills/local"),
+            base.join("skills/local")
+        );
+    }
+
+    #[test]
+    fn discover_skills_sorts_by_name() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for name in ["zeta", "alpha"] {
+            let path = root.join(".opencode/skills").join(name).join("SKILL.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                format!("---\nname: {}\ndescription: d\n---\nbody\n", name),
+            )
+            .unwrap();
+        }
+
+        let names: Vec<String> = discover_skills(root).into_iter().map(|s| s.name).collect();
+        // Global skills from the home directory are also included, so only
+        // assert that our two local skills are present in sorted order.
+        let local: Vec<&String> = names
+            .iter()
+            .filter(|n| *n == "alpha" || *n == "zeta")
+            .collect();
+        assert_eq!(local, vec![&"alpha".to_string(), &"zeta".to_string()]);
+    }
+
+    #[test]
+    fn identity_and_schema() {
+        let tool = SkillTool;
+        assert_eq!(tool.id(), "skill");
+        assert_eq!(tool.parameters()["type"], "object");
+    }
 }
