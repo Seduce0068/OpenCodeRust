@@ -2464,12 +2464,9 @@ dependencies = [
 name = "opencode-grep"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "opencode-core",
  "regex",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "walkdir",
 ]
 
