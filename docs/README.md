@@ -31,6 +31,7 @@ This documentation set describes the current **OpenCodeRust** codebase
 - [ADR-0005: 質問フロー（question tool / question.prompt）の配線](adr/adr-0005-question-flow.md)
 - [ADR-0006: CodeMode の非同期実行保留と段階的移植方針](adr/adr-0006-codemode-async-deferred.md)
 - [ADR-0007: 公開APIドキュメント (missing_docs) の一括対応保留](adr/adr-0007-missing-docs-deferred.md)
+- [ADR-0008: テストカバレッジの現状と段階的改善方針](adr/adr-0008-coverage-baseline.md)
 
 ## Module documentation
 

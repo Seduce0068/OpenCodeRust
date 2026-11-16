@@ -1,0 +1,65 @@
+---
+type: ADR
+title: テストカバレッジの現状と段階的改善方針
+description: workspace 全体のカバレッジを計測し、80% 目標への現実的な対応方針を記録する。
+status: Accepted
+tags:
+  - testing
+  - coverage
+  - tooling
+generated:
+  by: agent
+  at: "2026-11-17T01:12:00+09:00"
+reviewed:
+  by: agent
+  at: "2026-11-17T01:12:00+09:00"
+---
+
+## ADR-0008: テストカバレッジの現状と段階的改善方針
+
+### Status
+
+Accepted (self-reviewed).
+
+### Context
+
+AGENTS.md セクション7は「重要パスは 80% 以上目標」を要求する。2026-11-17 に
+推奨ツール `cargo-tarpaulin v0.37.6` を導入し、
+`cargo tarpaulin --workspace --timeout 300 --out Stdout` を実行した。
+
+結果は **31.40% coverage (13,407 / 42,696 lines)** である。出力では
+`opencode-tui` の UI コンポーネント (`session.rs` 0/742、
+`components/dialogs/*` の多くが 0/) が未計測の大きな割合を占める。
+クレート別・重要パス別の内訳は今回の計測では集計していない。
+
+テスト件数自体は 591 件で、`cargo test --workspace --all-targets` と
+`cargo nextest run --workspace` の両方が green である。
+
+### Decision
+
+全体平均での 80% 達成を目標としない。以下の方針を採る。
+
+- カバレッジは現状を baseline として記録し、CI のゲートには追加しない。
+- 改善対象は重要パス (session / tool / codemode のコアロジック) に絞り、
+  クレート別の内訳を先に集計する。
+- UI コンポーネントの描画パスは、单元テストではなく
+  component の状態遷移テストで扱う。
+
+### Alternatives
+
+1. **全体平均 80% を目指す**: TUI の画面描画パスはテスト環境依存が強く、
+   費用対効果が低い。不採用。
+2. **目標を下げて現状維持を正式化**: AGENTS.md セクション7の方針を
+   変更することになり、本 ADR のスコープ外。不採用。
+3. **baseline 記録 + 重要パス優先の段階的改善**: 採用。
+
+### Consequences
+
+- `cargo tarpaulin --workspace` は実行可能だが、カバレッジゲートは導入しない。
+- 既存の `cargo check` / `clippy` / `test` / `nextest` のゲートは変更しない。
+- 次回のカバレッジ改善時に、本 ADR の baseline (31.40%) と比較する。
+
+### Links
+
+- [AGENTS.md](../../AGENTS.md)
+- [ADR-0007: missing_docs の一括対応保留](adr-0007-missing-docs-deferred.md)
