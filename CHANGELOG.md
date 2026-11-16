@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T05:52:51+09:00"
+  at: "2026-11-17T06:12:50+09:00"
 ---
 
 # Changelog
@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 全 Markdown の markdownlint 違反 (検出時 126 件) を解消
 - `opencode-tool`: InvalidTool のスキーマ (camelCase) とデシリアライズ
   (snake_case) の不整合を serde alias で解消
+- `opencode-tool`: BatchTool のスキーマ (`toolCalls`) とデシリアライズ
+  (`tool_calls`) の不整合を serde rename + alias で解消。全ツールの
+  スキーマ/引数名を横断監査し、不整合はこの 2 件のみであることを確認
 
 ## [0.1.0]
 
