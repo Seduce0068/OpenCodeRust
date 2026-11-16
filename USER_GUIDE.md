@@ -4,7 +4,7 @@ description: OpenCodeRust の利用者向けセットアップと操作ガイド
 tags: [user-guide, setup, usage]
 verified:
   by: opencode
-  at: "2026-10-18T11:19:00+09:00"
+  at: "2026-11-17T00:52:50+09:00"
 ---
 
 # USER GUIDE - OpenCodeRust
@@ -59,6 +59,10 @@ cargo run -p opencode-cli -- serve --port 3000 --hostname 127.0.0.1
 
 Run these from the **OpenCodeRust repo root**; use
 `./target/debug/opencoderust` or `cargo run -p opencode-cli --`.
+
+To check the version, use the `version` subcommand:
+`./target/release/opencoderust version` prints `OpenCode 0.1.0`.
+There is no `--version` flag.
 
 ### 2.1 Session management
 
