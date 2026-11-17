@@ -1886,6 +1886,23 @@ impl SessionPrompt {
         Ok(messages)
     }
 
+    /// Wrap untrusted tool-result content in a `<system-reminder>` block before
+    /// it is sent to the model (M-12). This is the single choke point shared by
+    /// every tool-result path (shell_exec, execute_tool_calls, aborted calls and
+    /// results restored from storage), so applying it here keeps all tool
+    /// results consistent without touching the persisted message content.
+    ///
+    /// Content that already carries a `<system-reminder>` block is left as-is to
+    /// avoid double wrapping — e.g. the Read tool appends its own AGENTS.md
+    /// reminder, and MCP/AGENTS.md text parts are wrapped on their own.
+    fn wrap_untrusted_tool_result(content: &str) -> String {
+        if content.contains("<system-reminder>") {
+            content.to_string()
+        } else {
+            SystemPrompt::system_reminder(content)
+        }
+    }
+
     fn parts_to_content(parts: &[crate::MessagePart]) -> Content {
         let has_parts = parts
             .iter()
@@ -1943,7 +1960,7 @@ impl SessionPrompt {
                     tool_use: None,
                     tool_result: Some(opencode_provider::ToolResult {
                         tool_use_id: tool_call_id.clone(),
-                        content: content.clone(),
+                        content: Self::wrap_untrusted_tool_result(content),
                         is_error: Some(*is_error),
                     }),
                     cache_control: None,
@@ -4782,5 +4799,47 @@ mod tests {
             3,
             "All three pending calls should be aborted"
         );
+    }
+
+    #[test]
+    fn tool_results_are_wrapped_in_system_reminder_for_prompt() {
+        let mut msg = SessionMessage::assistant("ses_test");
+        msg.add_tool_result("call_1", "raw tool output", false);
+
+        let Content::Parts(parts) = SessionPrompt::parts_to_content(&msg.parts) else {
+            panic!("expected multi-part content");
+        };
+        let tool_content = parts
+            .iter()
+            .find_map(|p| p.tool_result.as_ref())
+            .expect("expected a tool result part")
+            .content
+            .clone();
+
+        assert!(tool_content.starts_with("<system-reminder>"));
+        assert!(tool_content.ends_with("</system-reminder>"));
+        assert!(tool_content.contains("raw tool output"));
+    }
+
+    #[test]
+    fn already_wrapped_tool_results_are_not_double_wrapped() {
+        let inner = SystemPrompt::system_reminder("AGENTS.md instructions");
+        let payload = format!("<path>file.rs</path>\n<content>x</content>\n\n{}", inner);
+
+        let mut msg = SessionMessage::assistant("ses_test");
+        msg.add_tool_result("call_1", &payload, false);
+
+        let Content::Parts(parts) = SessionPrompt::parts_to_content(&msg.parts) else {
+            panic!("expected multi-part content");
+        };
+        let tool_content = parts
+            .iter()
+            .find_map(|p| p.tool_result.as_ref())
+            .expect("expected a tool result part")
+            .content
+            .clone();
+
+        assert_eq!(tool_content, payload);
+        assert_eq!(tool_content.matches("<system-reminder>").count(), 1);
     }
 }

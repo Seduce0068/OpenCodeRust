@@ -3,7 +3,7 @@
   "model": "anthropic/claude-3-5-sonnet-20241022",
   "provider": {
     "anthropic": {
-      "api_key": "YOUR_ANTHROPIC_API_KEY_OR_USE_ENV_VAR"
+      "api_key": "{env:ANTHROPIC_API_KEY}"
     },
     "google": {
       "name": "Google AI",
