@@ -2,7 +2,7 @@
 type: ADR
 title: OpenCodeRust - Rust再実装プロジェクト憲章
 status: Approved
-date: 2026-01-15
+date: "2026-01-15T00:00:00+09:00"
 deciders:
   - OpenCodeRust Team
 tags:

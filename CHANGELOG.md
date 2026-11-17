@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T05:03:44+09:00"
+  at: "2026-11-18T05:39:08+09:00"
 ---
 
 # Changelog
@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.72% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.70% を計測
+  （前回 36.72% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -133,6 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   と best-effort 契約を明記 (M-19)
 - `opencode-server`: `/experimental/*` 4 エンドポイントを 501 Not Implemented へ変更し、
   未実装の `accepted` レスポンスを廃止 (M-06)
+- `opencode.jsonc`: npx 実行時依存 2 件を Exact バージョン固定 (H-04 一部。
+  残る 2 件は公式 npm にパッケージ自体が存在しないため据え置き、報告済み)
+- `opencode-session`: `SessionOps` が静的ディスパッチ専用であることを doc comment
+  に明記し、Future Send の扱いを記録 (M-18)
+- docs: ADR 4 件の date に RFC3339 オフセットを付与、`TERMUX_BUILD.md` の
+  verified を by/at 構造へ修正 (M-33)
 
 ## [0.1.0]
 

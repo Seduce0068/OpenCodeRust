@@ -2,7 +2,7 @@
 type: ADR
 title: HTTP認証必須化とCORS強化
 status: Approved
-date: 2026-01-10
+date: "2026-01-10T00:00:00+09:00"
 deciders:
   - OpenCodeRust Team
 tags:

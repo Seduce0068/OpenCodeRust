@@ -2,7 +2,7 @@
 type: ADR
 title: ツール実行権限フローの配線
 status: Approved
-date: 2026-01-12
+date: "2026-01-12T00:00:00+09:00"
 deciders:
   - OpenCodeRust Team
 tags:

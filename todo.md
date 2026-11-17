@@ -30,9 +30,11 @@ status: current
   - `loader.rs:334-349` が未指定 npm spec に `*`、`:268-313` で install 実行、
     plugin-host.ts:403 が検証なし import、`$` ヘルパ／認証ヘッダ渡し fetch／Deno `--allow-all`。
     厳密バージョン＋lockfile＋`--ignore-scripts`、許可リスト化と信頼モデル ADR 化
-- [ ] **[H-04]** MCP 実行時依存（`npx -y`）のバージョン固定・完全性検証欠如
-  - `opencode.jsonc:99-145` の 4 件が未固定、`transport.rs:40` がそのまま実行、cargo audit は
-    Rust のみ。Exact バージョン固定＋lockfile＋CI の npm スキャン対象化
+- [ ] **[H-04]** MCP 実行時依存の完全性検証（2 件は固定済み、残りに絞る）
+  - `chrome-devtools-mcp` / `tavily-mcp` は Exact 固定済み。未対応は
+    `@modelcontextprotocol/server-devtools` と `server-playwright` が公式 npm で
+    404（パッケージ不在）のため固定不能。代替（`@playwright/mcp` 等）の選定、
+    lockfile 生成、CI npm スキャン対象化）
 - [ ] **[H-07]** マイグレーションの経路統一（version/原子性は対応済み、残りに絞る）
   - `database.rs` は user_version 記録・単一トランザクション・metadata PRAGMA 判定を実装済み。
     未対応は `Storage::migrate()`（lib.rs）の別スキーマ経路統一と runbook 化
@@ -92,10 +94,6 @@ status: current
 - [ ] **[M-17]** 内部実装モジュールの過剰な pub 露出
   - provider/src/lib.rs が 32 個、tool/src/lib.rs が 24 個の実装モジュールを `pub mod`
     で露出しテストがフルパス参照。`pub(crate) mod` 化しファサード経由で公開
-- [ ] **[M-18]** `SessionOps` トレイトの object safety・Future Send 保証欠如
-  - `compaction.rs:156-170` が `#[allow(async_fn_in_trait)]` 付き async fn を 3 個、
-    dyn 化不可・Future Send 未保証で AGENTS.md §4 と不整合。`#[async_trait]`
-    付与または静的ディスパッチの意図を明記
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
@@ -106,9 +104,10 @@ status: current
 - [ ] **[M-23]** 構造化ログ・スパンの欠如
   - charter.md:64 が構造化ログを求めるがスパン生成コード 0 件、HTTP は TraceLayer のみ、補間文字列ログが多い。
     request／session id を伝播させるスパン導入とフィールド化
-- [ ] **[M-33]** OKF フロントマター／文書規約の乖離
-  - docs 配下 35 個・crates 22 ディレクトリに index.md が 0 件（docs/README.md が Index で兼ねる）、
-    adr-0001 等 4 件の date がオフセットなし、TERMUX_BUILD.md の verified がスカラー。規約に合わせて修正
+- [ ] **[M-33]** OKF フロントマターの残課題（date/verified は対応済み）
+  - ADR 4 件の date オフセット・TERMUX_BUILD の verified 構造化は完了。未対応は
+    `generated` mapping 欠如、status "Approved" の enum 不一致、TERMUX_BUILD の
+    title 欠如と本文 H1。index.md は docs/README.md が兼ねるため追加不要と判断
 - [ ] **[M-34]** CI ゲートの抜け（all-features・unsafe lint・依存監査・スクリプト）
   - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
@@ -249,6 +248,9 @@ status: current
   （2026-11-18、persist-worker）
 - [x] **[M-06]** /experimental/* 4  endpoint を 501 化
   （2026-11-18、placeholder-worker + 親）
+- [x] **[H-04 一部]** npx 依存 2 件を Exact 固定（2026-11-18、mcp-pin-worker）
+- [x] **[M-18]** SessionOps の静的ディスパッチ意図を明記（2026-11-18、sessionops-worker）
+- [x] **[M-33]** ADR の date と TERMUX_BUILD verified を OKF 準拠へ（2026-11-18、okf-worker）
 
 ## メモ
 
