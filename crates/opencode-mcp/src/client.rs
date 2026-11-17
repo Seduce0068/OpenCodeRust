@@ -739,7 +739,11 @@ impl McpClient {
             .map_err(|e| McpClientError::ProtocolError(e.to_string()))?;
 
         let response = self
-            .send_request("resources/read", Some(params_value))
+            .send_request_with_progress_timeout(
+                "resources/read",
+                Some(params_value),
+                self.catalog_timeout_ms,
+            )
             .await?;
         let result: ReadResourceResult = response
             .result
@@ -1257,6 +1261,27 @@ mod tests {
             .initialize()
             .await
             .expect_err("initialize must time out");
+        assert!(matches!(error, McpClientError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn read_resource_uses_catalog_timeout() {
+        let tool_registry = Arc::new(McpToolRegistry::new());
+        let client =
+            McpClient::new("test-server".to_string(), tool_registry).with_timeouts(McpTimeouts {
+                startup_ms: 200,
+                catalog_ms: 20,
+                execution_ms: 200,
+            });
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Box::new(HangingTransport));
+        }
+
+        let error = client
+            .read_resource("file:///test")
+            .await
+            .expect_err("read_resource must time out");
         assert!(matches!(error, McpClientError::Timeout));
     }
 }
