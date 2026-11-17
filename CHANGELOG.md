@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T02:07:18+09:00"
+  at: "2026-11-18T02:50:31+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 965 件
+  テスト総数 594 → 974 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.27% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.41% を計測
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -105,6 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `catalog_ms` タイムアウトを適用（無応答サーバーでのハングを解消）(M-27)
 - `opencode-util`: `build_filter(level)` を追加し `init_tracing` の level 引数を
   実際のログレベルへ反映（呼び出し側配線は未対応）(L-04 一部)
+- `opencode-lsp`: stdin ロックを await 前に解放し、30s 実タイムアウト・pending
+  確実削除・Drop 時の子プロセス/reader 回収を実装 (H-09)
+- `opencode-session`: LLM リトライに上限（`retries` 既定 3）と 300s ストリーム
+  タイムアウトを適用し、retry delay を saturating 計算へ変更 (H-06)
+- `ALIGNMENT.md`: テスト件数/カバレッジを 974 件／36.27% へ更新し ADR-0008 へリンク (M-22)
 
 ## [0.1.0]
 
