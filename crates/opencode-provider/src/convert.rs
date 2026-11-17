@@ -38,5 +38,3 @@ pub enum PromptContent {
     Text(String),
     Parts(Vec<PromptPart>),
 }
-
-// PLACEHOLDER_CONVERT_1

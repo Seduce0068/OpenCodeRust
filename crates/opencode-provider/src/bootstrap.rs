@@ -59,7 +59,6 @@ pub enum BootstrapError {
 
 /// Map of bundled SDK package names to their provider identifiers.
 /// Mirrors the TS `BUNDLED_PROVIDERS` record.
-/* PLACEHOLDER_BUNDLED_PROVIDERS */
 pub static BUNDLED_PROVIDERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
     m.insert("@ai-sdk/amazon-bedrock", "amazon-bedrock");
