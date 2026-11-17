@@ -119,6 +119,11 @@ impl IntoCallback
     fn into_callback(self) -> Self::Output {
         match self {
             Some(arc) => arc.into_callback(),
+            // コールバック未指定は「権限確認を上位へ委譲しない」明示的な選択であり、
+            // ここでは no-op とする。実運用の HTTP 経路（opencode-server::routes）
+            // は必ず PermissionBroker を Some で渡し、broker は無応答時に Reject
+            // を返すため fail-closed である。拒否を保証したい呼び出し側は
+            // permission_callback を設定すること。
             None => Box::new(|_req| Box::pin(async { Ok(()) })),
         }
     }
