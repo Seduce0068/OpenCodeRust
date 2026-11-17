@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -401,6 +402,9 @@ pub struct ServerState {
     pub(crate) tui_response_queue: Mutex<VecDeque<serde_json::Value>>,
     /// Wakeup signal for future response consumers (per-instance).
     pub(crate) tui_response_notify: Notify,
+    /// セッションごとの実行中プロンプトタスクのキャンセルハンドル。
+    /// `PROMPT_LOCKS` により 1 セッション同時 1 本だけが登録される。
+    pub(crate) running_prompt_tasks: StdMutex<HashMap<String, tokio::task::AbortHandle>>,
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
@@ -425,9 +429,52 @@ impl ServerState {
             tui_request_notify: Notify::new(),
             tui_response_queue: Mutex::new(VecDeque::new()),
             tui_response_notify: Notify::new(),
+            running_prompt_tasks: StdMutex::new(HashMap::new()),
             session_repo: None,
             message_repo: None,
             input_repo: None,
+        }
+    }
+
+    /// 実行中プロンプトタスクのキャンセルハンドルをセッション単位で登録する。
+    pub(crate) fn register_prompt_task(
+        &self,
+        session_id: String,
+        handle: tokio::task::AbortHandle,
+    ) {
+        self.running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id, handle);
+    }
+
+    /// セッションの実行中プロンプトを取り出してキャンセルする。
+    /// ハンドルが無い場合は `false` を返す（セッション自体の存在確認は呼び出し側で行う）。
+    pub(crate) fn abort_prompt_task(&self, session_id: &str) -> bool {
+        let handle = self
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+        if let Some(handle) = handle {
+            handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 終了したタスクのハンドルを削除する。後続タスクのハンドルは残す。
+    pub(crate) fn clear_prompt_task(&self, session_id: &str, task_id: tokio::task::Id) {
+        let mut tasks = self
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks
+            .get(session_id)
+            .is_some_and(|handle| handle.id() == task_id)
+        {
+            tasks.remove(session_id);
         }
     }
 

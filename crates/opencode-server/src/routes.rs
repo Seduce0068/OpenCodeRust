@@ -1701,6 +1701,20 @@ struct QueuedPromptRequest {
     variant: Option<String>,
 }
 
+/// プロンプトタスクの終了時に `ServerState` のキャンセルハンドルを後始末する。
+/// 正常終了・早期 return・abort のいずれの経路でも Drop が走る。
+struct PromptTaskCleanup {
+    state: Arc<ServerState>,
+    session_id: String,
+    task_id: tokio::task::Id,
+}
+
+impl Drop for PromptTaskCleanup {
+    fn drop(&mut self) {
+        self.state.clear_prompt_task(&self.session_id, self.task_id);
+    }
+}
+
 fn spawn_prompt_execution(
     task_state: Arc<ServerState>,
     session_id: String,
@@ -1734,7 +1748,14 @@ fn spawn_prompt_execution(
             return;
         }
     };
-    tokio::spawn(async move {
+    let register_state = task_state.clone();
+    let task_session_id = session_id.clone();
+    let task = tokio::spawn(async move {
+        let _cleanup = PromptTaskCleanup {
+            state: task_state.clone(),
+            session_id: session_id.clone(),
+            task_id: tokio::task::id(),
+        };
         let run_lock = {
             let mut locks = PROMPT_LOCKS.write().await;
             locks
@@ -2061,6 +2082,7 @@ fn spawn_prompt_execution(
             spawn_next_queued_prompt(task_state.clone(), session_id.clone());
         }
     });
+    register_state.register_prompt_task(task_session_id, task.abort_handle());
 }
 
 fn spawn_next_queued_prompt(state: Arc<ServerState>, session_id: String) {
@@ -2118,26 +2140,36 @@ fn retry_queued_prompts(state: Arc<ServerState>, session_id: String) {
     });
 }
 
+/// セッションの実行中プロンプトをキャンセルし、実行状態を Idle に戻す。
+/// レスポンスの形は従来どおり `aborted: true` を維持する。
+async fn abort_running_prompt(
+    state: &Arc<ServerState>,
+    session_id: &str,
+) -> Result<Json<serde_json::Value>> {
+    {
+        let sessions = state.sessions.lock().await;
+        if sessions.get(session_id).is_none() {
+            return Err(ApiError::SessionNotFound(session_id.to_string()));
+        }
+    }
+    let found = state.abort_prompt_task(session_id);
+    set_session_run_status(state, session_id, SessionRunStatus::Idle).await;
+    tracing::info!(session_id = %session_id, task_found = found, "session abort requested");
+    Ok(Json(serde_json::json!({ "aborted": true })))
+}
+
 async fn abort_prompt(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let sessions = state.sessions.lock().await;
-    if sessions.get(&id).is_none() {
-        return Err(ApiError::SessionNotFound(id));
-    }
-    Ok(Json(serde_json::json!({ "aborted": true })))
+    abort_running_prompt(&state, &id).await
 }
 
 async fn abort_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let sessions = state.sessions.lock().await;
-    if sessions.get(&id).is_none() {
-        return Err(ApiError::SessionNotFound(id));
-    }
-    Ok(Json(serde_json::json!({ "aborted": true })))
+    abort_running_prompt(&state, &id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -5286,5 +5318,69 @@ mod mapping_tests {
         let value = config_for_response(&config);
         assert_eq!(value["provider"]["openai"]["api_key"], "***");
         assert!(!value.to_string().contains("super-secret-key"));
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+
+    async fn state_with_running_prompt() -> (Arc<ServerState>, String, tokio::task::JoinHandle<()>)
+    {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id.clone()
+        };
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+        let task = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id.clone(), task.abort_handle());
+        (state, session_id, task)
+    }
+
+    #[tokio::test]
+    async fn abort_prompt_cancels_task_and_sets_idle() {
+        let (state, session_id, task) = state_with_running_prompt().await;
+
+        let response = abort_prompt(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("abort should succeed");
+        assert_eq!(response.0["aborted"], true);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task should stop after abort");
+        assert!(outcome.unwrap_err().is_cancelled());
+        assert!(SESSION_RUN_STATUS.read().await.get(&session_id).is_none());
+        assert!(state
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn abort_session_cancels_task_and_sets_idle() {
+        let (state, session_id, task) = state_with_running_prompt().await;
+
+        let response = abort_session(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("abort should succeed");
+        assert_eq!(response.0["aborted"], true);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task should stop after abort");
+        assert!(outcome.unwrap_err().is_cancelled());
+        assert!(SESSION_RUN_STATUS.read().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_prompt_rejects_unknown_session() {
+        let state = Arc::new(ServerState::new());
+        let error = abort_prompt(State(state), Path("missing-session".to_string()))
+            .await
+            .expect_err("unknown session must be rejected");
+        assert!(matches!(error, ApiError::SessionNotFound(_)));
     }
 }
