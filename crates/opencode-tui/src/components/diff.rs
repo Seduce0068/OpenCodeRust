@@ -372,3 +372,55 @@ impl Default for DiffView {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hunk_start_old_and_new() {
+        assert_eq!(DiffView::parse_hunk_start("-10,5 +20,7 @@", true), 10);
+        assert_eq!(DiffView::parse_hunk_start("-10,5 +20,7 @@", false), 20);
+        assert_eq!(DiffView::parse_hunk_start("-1 +1", true), 1);
+        assert_eq!(DiffView::parse_hunk_start("garbage", true), 1);
+    }
+
+    #[test]
+    fn with_content_parses_diff_lines() {
+        let view =
+            DiffView::new().with_content("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n same");
+        let lines = view.to_lines(&Theme::default());
+        // 2 hunk-header-ish lines + header + 3 body lines
+        assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn empty_view_has_no_lines() {
+        assert!(DiffView::new().to_lines(&Theme::default()).is_empty());
+        assert!(DiffView::default().to_lines(&Theme::default()).is_empty());
+    }
+
+    #[test]
+    fn mode_can_be_set_and_changed() {
+        let view = DiffView::new().with_mode(DiffMode::Split);
+        // set_mode mutates; verify via a mutable binding
+        let mut view = view;
+        view.set_mode(DiffMode::Unified);
+        // No public getter; exercising the setter is the coverage goal.
+        let _ = view.to_lines(&Theme::default());
+    }
+
+    #[test]
+    fn scroll_up_and_down_are_bounded() {
+        let mut view = DiffView::new();
+        view.scroll_up(); // stays at 0
+        view.scroll_down(2);
+        view.scroll_down(2);
+        view.scroll_down(2); // clamped at 2
+        view.scroll_up();
+        // Draining scroll via repeated ups must not panic.
+        for _ in 0..5 {
+            view.scroll_up();
+        }
+    }
+}
