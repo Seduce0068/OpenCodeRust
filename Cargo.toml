@@ -27,6 +27,7 @@ members = [
 
 [workspace.lints.rust]
 warnings = "deny"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
