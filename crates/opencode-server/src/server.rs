@@ -14,13 +14,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use url::Url;
 
-use opencode_config::load_config;
+use opencode_config::{load_config, Config as AppConfig};
 use opencode_plugin::init_global;
 use opencode_plugin::subprocess::{
     PluginAuthBridge, PluginContext, PluginFetchRequest, PluginLoader,
@@ -381,6 +381,7 @@ pub(crate) fn sync_custom_fetch_proxy(
 
 pub struct ServerState {
     pub sessions: Mutex<SessionManager>,
+    pub(crate) config: TokioRwLock<AppConfig>,
     pub providers: ProviderRegistry,
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
@@ -400,6 +401,7 @@ impl ServerState {
         let question_broker = Arc::new(QuestionBroker::new(tx.clone()));
         Self {
             sessions: Mutex::new(SessionManager::new()),
+            config: TokioRwLock::new(AppConfig::default()),
             providers: ProviderRegistry::new(),
             auth_manager: Arc::new(AuthManager::new()),
             event_bus: tx,
@@ -427,11 +429,10 @@ impl ServerState {
         let cwd = std::env::current_dir().unwrap_or_default();
         let loaded_config = load_config(&cwd).ok();
         if let Some(config) = loaded_config.as_ref() {
-            // Keep the shared CONFIG_STATE in sync with the loaded config so
+            // Keep this instance's config in sync with the loaded config so
             // routes that read it (model resolution, /config) see the same
             // values as the provider bootstrap.
-            let mut guard = crate::routes::CONFIG_STATE.write().await;
-            *guard = config.clone();
+            *state.config.write().await = config.clone();
         }
         let bootstrap_config = match loaded_config {
             Some(config) => {
@@ -1223,5 +1224,34 @@ mod tests {
     #[test]
     fn redact_token_handles_short_tokens() {
         assert_eq!(redact_token("abc"), "abc… (3 chars)");
+    }
+
+    #[tokio::test]
+    async fn config_is_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        {
+            let mut config = first.config.write().await;
+            config.model = Some("first-only-model".to_string());
+        }
+        assert_eq!(
+            first.config.read().await.model.as_deref(),
+            Some("first-only-model")
+        );
+        assert_eq!(second.config.read().await.model.as_deref(), None);
+
+        {
+            let mut config = second.config.write().await;
+            config.model = Some("second-only-model".to_string());
+        }
+        assert_eq!(
+            first.config.read().await.model.as_deref(),
+            Some("first-only-model")
+        );
+        assert_eq!(
+            second.config.read().await.model.as_deref(),
+            Some("second-only-model")
+        );
     }
 }
