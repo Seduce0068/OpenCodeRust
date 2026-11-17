@@ -35,3 +35,32 @@ fn blend(foreground: Color, background: Color, num: u16, den: u16) -> Color {
         _ => foreground,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_mixes_rgb_channels() {
+        // 2/3 of foreground(0) + 1/3 of background(90) = 30
+        assert_eq!(
+            blend(Color::Rgb(0, 0, 0), Color::Rgb(90, 90, 90), 1, 3),
+            Color::Rgb(30, 30, 30)
+        );
+    }
+
+    #[test]
+    fn blend_edge_cases_return_foreground() {
+        assert_eq!(blend(Color::Red, Color::Blue, 0, 0), Color::Red);
+        assert_eq!(blend(Color::Red, Color::Blue, 3, 3), Color::Red);
+        assert_eq!(blend(Color::Red, Color::Blue, 1, 2), Color::Red);
+    }
+
+    #[test]
+    fn palette_helpers_return_theme_colors() {
+        let theme = Theme::default();
+        assert_eq!(user_message_bg(&theme), theme.background_panel);
+        assert_eq!(assistant_border_color(&theme), theme.info);
+        assert_eq!(thinking_border_color(&theme), theme.background_element);
+    }
+}
