@@ -96,9 +96,6 @@ status: current
 - [ ] **[M-06]** placeholder エンドポイントの未実装隠蔽
   - `/experimental/analyze` と `/generate`（`routes.rs:4382-4384,4440-4454`）が
     `"accepted"` を返すが実処理なし、MAPPING.md に記載なし。実装するか 501 を返し ALIGNMENT／MAPPING に記録
-- [ ] **[M-07]** 設定値の HeaderValue パースにおける panic
-  - `bedrock.rs:222,223,232,262` が Result 返却関数内で `parse().unwrap()`、不正文字で
-    process panic（再現は推測）。`map_err(...)?` で設定エラーとして伝播
 - [ ] **[M-08]** 未知設定キーのサイレント破棄と環境変数展開の未検証
   - `strictPermissionChecks`／`gcBufferMb`／`references.gemini` が Config
     にフィールドなし（docs では起動を止めない意図で明記）、`{env:VAR}` 未定義が空文字化。キー追加／起動時警告と必須項目の非空検証
@@ -306,6 +303,7 @@ status: current
 - [x] プロジェクト全体クロスレビュー 5 回＋第 6 回統合（2026-11-17）
 - [x] 残タスク・機能追加案の調査 5 回＋第 6 回重複吸収（2026-11-17）
 - [x] **[L-12]** read ツールの `limit=0` 時に「0 lines read」を返すよう修正（2026-11-17）
+- [x] **[M-07]** Bedrock 署名の HeaderValue パースを `map_err(...)?` でエラー伝播に修正（2026-11-17）
 
 ## メモ
 

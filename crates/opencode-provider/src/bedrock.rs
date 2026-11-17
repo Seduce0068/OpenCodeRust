@@ -219,17 +219,26 @@ impl BedrockProvider {
 
         let body_hash = hex::encode(sha256(body));
 
-        headers.insert("Content-Type", "application/json".parse().unwrap());
-        headers.insert("X-Amz-Date", amz_date.parse().unwrap());
+        let header_value = |name: &str, value: &str| {
+            value
+                .parse::<reqwest::header::HeaderValue>()
+                .map_err(|e| ProviderError::AuthError(format!("invalid {} header: {}", name, e)))
+        };
+        headers.insert(
+            "Content-Type",
+            header_value("Content-Type", "application/json")?,
+        );
+        headers.insert("X-Amz-Date", header_value("X-Amz-Date", &amz_date)?);
         headers.insert(
             "Host",
-            format!("bedrock-runtime.{}.amazonaws.com", region)
-                .parse()
-                .unwrap(),
+            header_value("Host", &format!("bedrock-runtime.{}.amazonaws.com", region))?,
         );
 
         if let Some(ref token) = self.config.session_token {
-            headers.insert("X-Amz-Security-Token", token.parse().unwrap());
+            headers.insert(
+                "X-Amz-Security-Token",
+                header_value("X-Amz-Security-Token", token)?,
+            );
         }
 
         let canonical_request =
@@ -259,7 +268,10 @@ impl BedrockProvider {
             self.config.access_key_id, credential_scope, signature
         );
 
-        headers.insert("Authorization", authorization.parse().unwrap());
+        headers.insert(
+            "Authorization",
+            header_value("Authorization", &authorization)?,
+        );
 
         Ok(headers)
     }
@@ -524,6 +536,22 @@ fn parse_bedrock_stream(text: &str) -> Result<StreamEvent, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sign_request_rejects_invalid_session_token() {
+        let provider = BedrockProvider::with_config(BedrockConfig {
+            region: "us-east-1".to_string(),
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: Some("bad\ntoken".to_string()),
+            endpoint_url: None,
+        });
+        let result = provider.sign_request("POST", "/model", b"{}").await;
+        assert!(
+            result.is_err(),
+            "invalid header value must be an error, not a panic"
+        );
+    }
 
     #[test]
     fn sha256_known_vectors() {
