@@ -408,3 +408,58 @@ fn color_to_rgb(color: Color) -> (u8, u8, u8) {
         Color::Reset => (140, 140, 140),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_to_rgb_basics() {
+        assert_eq!(color_to_rgb(Color::Rgb(10, 20, 30)), (10, 20, 30));
+        assert_eq!(color_to_rgb(Color::Red), (255, 0, 0));
+        assert_eq!(color_to_rgb(Color::Indexed(7)), (7, 7, 7));
+        assert_eq!(color_to_rgb(Color::Reset), (140, 140, 140));
+    }
+
+    #[test]
+    fn apply_brightness_scales_and_clamps() {
+        assert_eq!(
+            apply_brightness(Color::Rgb(100, 100, 100), 2.0),
+            Color::Rgb(200, 200, 200)
+        );
+        assert_eq!(
+            apply_brightness(Color::Rgb(200, 200, 200), 2.0),
+            Color::Rgb(255, 255, 255)
+        );
+        assert_eq!(
+            apply_brightness(Color::Rgb(100, 100, 100), 1.0),
+            Color::Rgb(100, 100, 100)
+        );
+    }
+
+    #[test]
+    fn blend_alpha_scales_channels() {
+        assert_eq!(
+            blend_alpha(Color::Rgb(100, 100, 100), 0.5),
+            Color::Rgb(50, 50, 50)
+        );
+        assert_eq!(
+            blend_alpha(Color::Rgb(100, 100, 100), 2.0),
+            Color::Rgb(100, 100, 100)
+        );
+    }
+
+    #[test]
+    fn derive_trail_colors_length_and_first() {
+        let colors = derive_trail_colors(Color::Rgb(100, 100, 100), 4);
+        assert_eq!(colors.len(), 4);
+        assert_eq!(colors[0], Color::Rgb(100, 100, 100));
+        // Later entries are dimmer than the head.
+        assert_ne!(colors[3], colors[0]);
+    }
+
+    #[test]
+    fn derive_trail_colors_empty() {
+        assert!(derive_trail_colors(Color::Blue, 0).is_empty());
+    }
+}
