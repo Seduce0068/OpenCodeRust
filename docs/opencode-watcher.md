@@ -26,7 +26,8 @@ tags: [watcher, filesystem, crate]
 
 - Recursive watching by default
 - Default ignores: `.git`, `node_modules`, `target`, temp files
-- Default debounce: `100ms`
+- Default debounce: `100ms` (repeated events for the same path within this
+  window are coalesced)
 
 ## Use cases
 
