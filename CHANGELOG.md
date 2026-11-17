@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T03:22:25+09:00"
+  at: "2026-11-18T03:54:37+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 974 件
+  テスト総数 594 → 993 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.41% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.58% を計測
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -116,6 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PRAGMA で構造的に判定（エラー文字列依存を解消）(H-10 一部)
 - `opencode-local-llm`: ollama 実行を tokio 非同期化し、timeout 時 kill を実装
   （既定 300s、`OPENCODE_LOCAL_LLM_TIMEOUT_SECS` で上書き可）(M-10)
+- `opencode-tool`: パス判定を canonicalize + コンポーネント単位比較へ変更し、
+  `..`／兄弟ディレクトリ／symlink escape の誤判定を修正 (H-02)
+- `opencode-tool`: eval/source/コマンド置換等の動的実行を検出した場合に常に
+  承認要求へフォールバックし、`always allow` を生成しないように修正 (M-13)
+- `opencode-command`: `CommandError` ドメインエラーを追加し、下位エラーを
+  source チェーンで保持（公開シグネチャは anyhow::Result を維持）(M-04)
 
 ## [0.1.0]
 

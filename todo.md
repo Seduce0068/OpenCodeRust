@@ -72,10 +72,10 @@ status: current
   - pty／util／watcher／local-llm／codemode の 5 クレートが無依存（codemode は ADR-0006
     で既知の先送り）、server が portable-pty を直接依存し同名 PtyManager を再実装。配線または member 外し、
     server を opencode-pty 利用へ
-- [ ] **[M-04]** ライブラリ公開 API の `anyhow::Result` とエラー型の原因損失
-  - `command/lib.rs:119,173` 等が公開 API で anyhow を返し charter.md:63 と矛盾、
-    ToolError／ApiError が String のみで `#[source]` なし。thiserror
-    ドメインエラー化とソース保持バリアント追加
+- [ ] **[M-04]** ライブラリ公開 API の `anyhow::Result`（CommandError は対応済み、残りに絞る）
+  - `command/lib.rs` の CommandError 追加と source 保持は完了。未対応は 3 メソッドの
+    シグネチャを `Result<_, CommandError>` 化（完全な charter 準拠、破壊的変更）、
+    ToolError／ApiError の String のみで `#[source]` なしの問題は他クレートの別タスク
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
@@ -258,6 +258,9 @@ status: current
 - [x] **[H-05]** prompt タスクの AbortHandle 登録と cancel/Idle 配線（2026-11-18、abort-worker）
 - [x] **[H-10 一部]** マイグレーションを単一トランザクション化＋metadata 判定を PRAGMA 化（2026-11-18、storage-worker）
 - [x] **[M-10]** local-llm サブプロセスを async 化＋timeout/kill（2026-11-18、local-llm-worker）
+- [x] **[H-02]** パス判定を canonicalize + コンポーネント比較へ変更（2026-11-18、path-worker）
+- [x] **[M-13]** 動的実行検出時は常に承認要求へフォールバック（2026-11-18、bash-worker）
+- [x] **[M-04 一部]** CommandError で source チェーン保持（2026-11-18、command-error-worker）
 
 ## メモ
 
