@@ -372,3 +372,51 @@ fn format_preview_line(line: &str, max_chars: usize) -> String {
     let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{}…", truncated)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_glyph_maps_known_and_unknown() {
+        assert_eq!(tool_glyph("bash"), "$");
+        assert_eq!(tool_glyph("read"), "→");
+        assert_eq!(tool_glyph("grep"), "✱");
+        assert_eq!(tool_glyph("todowrite"), "☐");
+        assert_eq!(tool_glyph("unknown-tool"), "⚙");
+    }
+
+    #[test]
+    fn normalize_tool_name_lowercases_and_replaces_dashes() {
+        assert_eq!(normalize_tool_name("  Bash-Tool "), "bash_tool");
+        assert_eq!(normalize_tool_name("READ"), "read");
+    }
+
+    #[test]
+    fn is_block_tool_by_name_and_result_length() {
+        assert!(is_block_tool("bash", None));
+        assert!(is_block_tool("apply_patch", None));
+        assert!(!is_block_tool("read", None));
+        let short = ("a\nb".to_string(), false);
+        let long = ("a\nb\nc\nd\ne".to_string(), false);
+        assert!(!is_block_tool("read", Some(&short)));
+        assert!(is_block_tool("read", Some(&long)));
+    }
+
+    #[test]
+    fn tool_argument_preview_for_shell_and_read() {
+        let shell = tool_argument_preview("bash", r#"{"command":"ls -la"}"#).unwrap();
+        assert!(shell.contains("ls -la"));
+
+        let read = tool_argument_preview("read", r#"{"file_path":"src/main.rs"}"#).unwrap();
+        assert!(read.contains("src/main.rs"));
+
+        assert!(tool_argument_preview("read", "").is_none());
+    }
+
+    #[test]
+    fn tool_argument_preview_generic_fallback() {
+        let preview = tool_argument_preview("custom", "line one\nline two").unwrap();
+        assert_eq!(preview, "line one");
+    }
+}
