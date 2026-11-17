@@ -93,7 +93,7 @@ impl Replacer for LineTrimmedReplacer {
         }
 
         let search_len = search_lines.len();
-        if search_len == 0 {
+        if search_len == 0 || search_len > original_lines.len() {
             return Box::new(results.into_iter());
         }
 
@@ -808,5 +808,14 @@ mod tests {
             replacer.replace("foo bar foo", "foo", "baz", true),
             Ok("baz bar baz".to_string())
         );
+    }
+
+    #[test]
+    fn line_trimmed_replacer_handles_longer_search_than_content() {
+        // 1 content line, 3 search lines; the first line matches, so the inner
+        // loop proceeds to j=1 and indexes past the end of original_lines.
+        let replacer = LineTrimmedReplacer;
+        let found: Vec<String> = replacer.find("same", "same\nb\nc").collect();
+        assert!(found.is_empty());
     }
 }
