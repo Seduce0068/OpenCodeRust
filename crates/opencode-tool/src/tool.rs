@@ -372,6 +372,25 @@ impl ToolContext {
         self
     }
 
+    /// 個別ツールの詳細権限（コマンドパターンや外部ディレクトリ等）を確認する。
+    ///
+    /// # 安全性の根拠
+    ///
+    /// `ask` が未設定のときに `Ok(())` を返すのは fail-open に見えるが、
+    /// 上位レイヤが既に権限判断を行っている経路では意図的な no-op である。
+    ///
+    /// - `opencode-agent::AgentExecutor` はツール実行前に
+    ///   `ensure_tool_allowed` を呼び、`PermissionDecision::Ask` を
+    ///   `ToolError::PermissionDenied` へ変換する（同クレートの
+    ///   `executor_blocks_ask_permissions_without_user_approval` テストで検証）。
+    ///   さらに `opencode-permission::ruleset::evaluate` はルール未マッチ時に
+    ///   `Ask` を返すため、明示 `allow` がないツールは既定で拒否される。
+    /// - HTTP 経路（`opencode-server::routes`）は常に `PermissionBroker` を
+    ///   コールバックとして配線し、broker は応答が無ければ `Reject` を返す。
+    ///
+    /// つまり「拒否されるべき操作がこの no-op で通過する」因果は存在しない。
+    /// このメソッド単体で拒否を保証したい場合は `with_ask` でコールバックを
+    /// 設定し、拒否時に `ToolError::PermissionDenied` を返すこと。
     pub async fn ask_permission(&self, request: PermissionRequest) -> Result<(), ToolError> {
         if let Some(ref callback) = self.ask {
             callback(request).await
@@ -814,6 +833,34 @@ mod tests {
         let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned())
             .with_agent("plan".to_owned());
         assert_eq!(ctx.agent, "plan");
+    }
+
+    /// `ask_permission` の既定動作を固定する回帰テスト。
+    ///
+    /// コールバック未設定時は上位ゲート（executor の Ask→Deny／server の
+    /// PermissionBroker）が権限判断を担うため no-op であることを明示する。
+    #[tokio::test]
+    async fn ask_permission_without_callback_is_documented_no_op() {
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned());
+        assert!(ctx.ask.is_none());
+
+        let result = ctx
+            .ask_permission(PermissionRequest::new("bash").with_pattern("rm -rf *"))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ask_permission_propagates_callback_rejection() {
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned()).with_ask(
+            |_req| async { Err(ToolError::PermissionDenied("rejected by broker".to_owned())) },
+        );
+
+        let error = ctx
+            .ask_permission(PermissionRequest::new("bash"))
+            .await
+            .expect_err("callback rejection must be propagated");
+        assert!(matches!(error, ToolError::PermissionDenied(_)));
     }
 
     #[test]
