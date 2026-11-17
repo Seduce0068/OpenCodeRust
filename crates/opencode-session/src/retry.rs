@@ -20,7 +20,21 @@ pub async fn sleep_with_cancel(ms: u64, cancel: CancellationToken) -> Result<(),
     }
 }
 
+/// Compute `base * factor^exponent` using saturating arithmetic.
+///
+/// `u64::pow` and plain `*` panic on overflow in debug builds (and silently
+/// wrap in release builds). A large retry attempt must do neither — the value
+/// is eventually clamped by the caller or by [`sleep_with_cancel`].
+fn saturating_backoff(base: u64, factor: u64, exponent: u32) -> u64 {
+    let power = factor.checked_pow(exponent).unwrap_or(u64::MAX);
+    base.saturating_mul(power)
+}
+
 pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
+    // `attempt` is 1-based at every call site; saturating_sub also keeps this
+    // safe if a future caller passes 0.
+    let exponent = attempt.saturating_sub(1);
+
     if let Some(err) = error {
         if let Some(ref headers) = err.response_headers {
             if let Some(retry_after_ms) = headers.get("retry-after-ms") {
@@ -43,11 +57,11 @@ pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
                 }
             }
 
-            return RETRY_INITIAL_DELAY * RETRY_BACKOFF_FACTOR.pow(attempt - 1);
+            return saturating_backoff(RETRY_INITIAL_DELAY, RETRY_BACKOFF_FACTOR, exponent);
         }
     }
 
-    let calculated = RETRY_INITIAL_DELAY * RETRY_BACKOFF_FACTOR.pow(attempt - 1);
+    let calculated = saturating_backoff(RETRY_INITIAL_DELAY, RETRY_BACKOFF_FACTOR, exponent);
     calculated.min(RETRY_MAX_DELAY_NO_HEADERS)
 }
 
@@ -175,6 +189,17 @@ mod tests {
     #[test]
     fn delay_without_headers_is_capped() {
         assert_eq!(delay(10, None), RETRY_MAX_DELAY_NO_HEADERS);
+    }
+
+    #[test]
+    fn delay_saturates_for_large_attempt() {
+        // 2^70 would overflow u64; saturating arithmetic must not panic/wrap.
+        assert_eq!(delay(u32::MAX, None), RETRY_MAX_DELAY_NO_HEADERS);
+
+        // Headers without a retry-after hint use the uncapped branch.
+        let mut headers = HashMap::new();
+        headers.insert("x-request-id".to_owned(), "abc".to_owned());
+        assert_eq!(delay(u32::MAX, Some(&info(Some(headers)))), u64::MAX);
     }
 
     #[test]
