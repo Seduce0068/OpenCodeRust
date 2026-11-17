@@ -32,7 +32,13 @@ intelligence and editing assistance.
 
 ## Development notes
 
-- Handle timeouts, retries, and uninitialized server
+- Each JSON-RPC request is bounded by a real 30s timeout (`REQUEST_TIMEOUT` in
+  `lib.rs`). On timeout, cancellation, or write failure the pending entry is
+  removed, so it cannot leak. Retries are not implemented.
+- The stdin mutex is released before waiting for a response, so a slow request
+  does not block other requests or notifications.
+- `LspClient` retains the server `Child` and the stdout reader `JoinHandle`;
+  `Drop` aborts the reader and kills the child so no orphan process is left.
 - Keep URI/path conversion consistent
 - Consider backpressure and capacity for event broadcast channels
 
@@ -40,4 +46,5 @@ intelligence and editing assistance.
 
 ```bash
 cargo check -p opencode-lsp
+cargo test -p opencode-lsp
 ```

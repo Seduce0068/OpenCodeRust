@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
@@ -13,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, error};
 use url::Url;
 
@@ -146,6 +148,12 @@ pub struct LspServerConfig {
     pub initialization_options: Option<Value>,
 }
 
+/// Upper bound for a single JSON-RPC request/response round-trip.
+///
+/// Without this bound a request whose response never arrives (e.g. the server
+/// crashed or ignores the method) would wait forever on the oneshot channel.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct LspClient {
     root: PathBuf,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -154,6 +162,10 @@ pub struct LspClient {
     diagnostics: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
     file_versions: Arc<RwLock<HashMap<PathBuf, u32>>>,
     event_tx: broadcast::Sender<LspEvent>,
+    /// Kept alive for the lifetime of the client so it can be reaped on drop.
+    child: Option<Child>,
+    /// Reader task handle, kept so it can be aborted on drop.
+    reader_handle: Option<JoinHandle<()>>,
 }
 
 type PendingResponses = HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, LspError>>>;
@@ -184,7 +196,7 @@ impl LspClient {
 
         let (event_tx, _) = broadcast::channel(256);
 
-        let client = Self {
+        let mut client = Self {
             root,
             stdin: Arc::new(Mutex::new(stdin)),
             request_id: Arc::new(Mutex::new(0)),
@@ -192,6 +204,8 @@ impl LspClient {
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
             file_versions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            child: Some(child),
+            reader_handle: None,
         };
 
         let pending = client.pending_responses.clone();
@@ -199,7 +213,7 @@ impl LspClient {
         let server_id = config.id.clone();
         let event_tx_clone = client.event_tx.clone();
 
-        tokio::spawn(async move {
+        client.reader_handle = Some(tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
 
@@ -240,9 +254,8 @@ impl LspClient {
                     }
                 }
             }
-        });
+        }));
 
-        let mut client = client;
         client.initialize(config.initialization_options).await?;
 
         Ok(client)
@@ -278,10 +291,22 @@ impl LspClient {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Sends a JSON-RPC request and waits for its response at most `timeout`.
+    ///
+    /// The stdin mutex is released before waiting so that concurrent requests
+    /// and notifications are not serialized behind a slow response.
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, LspError> {
         let id = self.next_id().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
-
-        self.pending_responses.write().await.insert(id, tx);
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -290,14 +315,36 @@ impl LspClient {
             params,
         };
 
+        // Serialize before registering the pending entry: a serialization
+        // failure must not leave an orphaned entry in the map.
         let content = serde_json::to_string(&request)?;
         let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
+        self.pending_responses.write().await.insert(id, tx);
 
-        rx.await.map_err(|_| LspError::Timeout)?
+        // Scope the stdin guard so it is dropped before we await the response.
+        {
+            let mut stdin = self.stdin.lock().await;
+            if let Err(e) = stdin.write_all(message.as_bytes()).await {
+                self.pending_responses.write().await.remove(&id);
+                return Err(LspError::IoError(e));
+            }
+            if let Err(e) = stdin.flush().await {
+                self.pending_responses.write().await.remove(&id);
+                return Err(LspError::IoError(e));
+            }
+        }
+
+        let outcome = tokio::time::timeout(timeout, rx).await;
+        // Always drop our pending entry, on success (the reader already
+        // removed it, so this is a no-op) and especially on timeout/drop.
+        self.pending_responses.write().await.remove(&id);
+
+        match outcome {
+            Ok(Ok(value)) => value,
+            // Sender dropped without a response, or the deadline elapsed.
+            Ok(Err(_)) | Err(_) => Err(LspError::Timeout),
+        }
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), LspError> {
@@ -774,6 +821,19 @@ impl LspClient {
     }
 }
 
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // Stop the stdout reader task first, then terminate the server
+        // process so no child is left running when the client goes away.
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 #[allow(deprecated)]
 fn flatten_document_symbol(
     symbol: &lsp_types::DocumentSymbol,
@@ -1009,5 +1069,46 @@ mod tests {
         use std::str::FromStr;
         let uri = lsp_types::Uri::from_str("not-a-uri").unwrap();
         assert_eq!(uri_to_path(&uri), PathBuf::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_times_out_and_removes_pending_entry() {
+        // A child that never responds to JSON-RPC requests.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        drop(stdout);
+
+        let (event_tx, _) = broadcast::channel(16);
+        let client = LspClient {
+            root: PathBuf::from("/tmp"),
+            stdin: Arc::new(Mutex::new(stdin)),
+            request_id: Arc::new(Mutex::new(0)),
+            pending_responses: Arc::new(RwLock::new(HashMap::new())),
+            diagnostics: Arc::new(RwLock::new(HashMap::new())),
+            file_versions: Arc::new(RwLock::new(HashMap::new())),
+            event_tx,
+            child: Some(child),
+            reader_handle: None,
+        };
+
+        let result = client
+            .request_with_timeout("test/noReply", Value::Null, Duration::from_millis(50))
+            .await;
+
+        assert!(matches!(result, Err(LspError::Timeout)));
+        assert!(
+            client.pending_responses.read().await.is_empty(),
+            "pending entry leaked after timeout"
+        );
+        // Dropping the client kills the child via `Drop::drop`.
     }
 }
