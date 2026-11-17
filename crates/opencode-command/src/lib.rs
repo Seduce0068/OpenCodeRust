@@ -10,6 +10,70 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Domain error produced by the command system.
+///
+/// The public methods keep returning [`anyhow::Result`] so that existing
+/// callers remain source compatible (see M-04: a full switch to
+/// `Result<_, CommandError>` is a separate, breaking change). This error is
+/// converted into `anyhow::Error` at that boundary via anyhow's blanket
+/// `From<E>` impl. Lower-level failures are recorded in `source` fields and
+/// exposed through [`std::error::Error::source`], so the cause chain survives
+/// the conversion and callers can still recover the domain error with
+/// `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub enum CommandError {
+    /// No command with the requested name is registered.
+    NotFound {
+        /// Name that was looked up.
+        name: String,
+    },
+    /// The glob pattern used to discover command files is malformed.
+    InvalidPattern {
+        /// Pattern that could not be parsed.
+        pattern: String,
+        /// Underlying glob parsing failure.
+        source: glob::PatternError,
+    },
+    /// A path returned by the glob iterator could not be resolved.
+    DirectoryEntry {
+        /// Underlying glob iteration failure.
+        source: glob::GlobError,
+    },
+    /// A command markdown file could not be read.
+    ReadFile {
+        /// Path of the file that could not be read.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { name } => write!(f, "Command not found: {name}"),
+            Self::InvalidPattern { pattern, .. } => {
+                write!(f, "Invalid command glob pattern: {pattern}")
+            }
+            Self::DirectoryEntry { .. } => write!(f, "Failed to read command directory entry"),
+            Self::ReadFile { path, .. } => {
+                write!(f, "Failed to read command file: {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotFound { .. } => None,
+            Self::InvalidPattern { source, .. } => Some(source),
+            Self::DirectoryEntry { source } => Some(source),
+            Self::ReadFile { source, .. } => Some(source),
+        }
+    }
+}
+
 /// Command metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
@@ -126,15 +190,22 @@ impl CommandRegistry {
         let pattern = commands_dir.join("*.md");
         let pattern_str = pattern.to_string_lossy();
 
-        for entry in glob::glob(&pattern_str)? {
-            let path = entry?;
+        for entry in glob::glob(&pattern_str).map_err(|source| CommandError::InvalidPattern {
+            pattern: pattern_str.to_string(),
+            source,
+        })? {
+            let path = entry.map_err(|source| CommandError::DirectoryEntry { source })?;
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
 
-            let template = std::fs::read_to_string(&path)?;
+            let template =
+                std::fs::read_to_string(&path).map_err(|source| CommandError::ReadFile {
+                    path: path.clone(),
+                    source,
+                })?;
             let description = extract_description(&template)
                 .unwrap_or_else(|| format!("Custom command: {}", name));
 
@@ -174,7 +245,9 @@ impl CommandRegistry {
         let command = self
             .commands
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Command not found: {}", name))?;
+            .ok_or_else(|| CommandError::NotFound {
+                name: name.to_string(),
+            })?;
 
         Ok(self.render_template(&command.template, ctx))
     }
@@ -188,7 +261,9 @@ impl CommandRegistry {
         let command = self
             .commands
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Command not found: {}", name))?;
+            .ok_or_else(|| CommandError::NotFound {
+                name: name.to_string(),
+            })?;
 
         let mut rendered = self.render_template(&command.template, ctx.clone());
 
@@ -339,5 +414,37 @@ mod tests {
 
         let result = registry.render_template("Hello $1 and $2. Project: ${PROJECT}", ctx);
         assert_eq!(result, "Hello arg1 and arg2. Project: test-project");
+    }
+
+    #[test]
+    fn test_execute_unknown_command_returns_domain_error() {
+        let registry = CommandRegistry::new();
+        let error = registry
+            .execute("missing", CommandContext::new(PathBuf::from("/tmp")))
+            .expect_err("unknown command must fail");
+
+        let command_error = error
+            .downcast_ref::<CommandError>()
+            .expect("anyhow error should carry the CommandError domain error");
+        assert!(matches!(
+            command_error,
+            CommandError::NotFound { name } if name == "missing"
+        ));
+        assert_eq!(error.to_string(), "Command not found: missing");
+    }
+
+    #[test]
+    fn test_command_error_keeps_source_through_anyhow_conversion() {
+        let error = CommandError::ReadFile {
+            path: PathBuf::from("/tmp/missing.md"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "boom"),
+        };
+        let anyhow_error = anyhow::Error::from(error);
+
+        let io_error = anyhow_error
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("io error must remain reachable through source()");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
     }
 }
