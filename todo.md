@@ -198,9 +198,6 @@ status: current
 - [ ] **[L-09]** LiteRT プロバイダの未実装 FFI の設定面への露出
   - `litert.rs:60-72` が TODO のままエラー、bootstrap が `LITERT_MODEL_PATH` で登録しモデルを広告、
     MAPPING.md に記載なし。feature gate するか MAPPING.md へ追加
-- [ ] **[L-10]** POST /log 入力の未検証
-  - `routes.rs:4654-4684` が level のみ検証し service／message／extra
-    を無検証で出力（改行によるログ汚染は推測）。改行除去・長さ制限・service 許可リスト化
 - [ ] **[L-11]** 設定マイグレーションのロールバック手段欠如
   - `loader.rs:391-406` がレガシー TOML を書き込んだ直後に元ファイルを削除、バックアップなし。`.bak`
     退避または削除を任意手順化
@@ -283,6 +280,7 @@ status: current
 - [x] **[M-26]** auth.json 由来の環境変数書き換えにキー検証を追加（2026-11-17）
 - [x] **[M-25]** TUI 許可応答の送信失敗をトーストで通知（2026-11-18）
 - [x] **[M-14]** サーバ起動時の認証警告を実態（ランダム Bearer / NO_AUTH）に修正（2026-11-18）
+- [x] **[L-10]** POST /log の service/message/extra をサニタイズ（2026-11-18）
 
 ## メモ
 
