@@ -294,6 +294,10 @@ fn get_global_config_path() -> PathBuf {
 
 /// Migrate legacy global TOML config (`~/.config/opencode/config`) into
 /// `opencode.json` and merge it into the currently loaded config.
+///
+/// The original file is copied to `config.bak` before being removed so the
+/// migration can be rolled back. If the backup cannot be created, the original
+/// is left in place and a warning is logged.
 fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<PathBuf> {
     let legacy_path = config_dir.join("config");
     if !legacy_path.exists() {
@@ -397,12 +401,29 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
         return None;
     }
 
-    if let Err(error) = fs::remove_file(&legacy_path) {
-        tracing::warn!(
-            path = %legacy_path.display(),
-            %error,
-            "failed to remove legacy TOML config after migration"
-        );
+    // Keep a backup so the migration can be rolled back. The original is only
+    // removed after the backup has been created successfully; if backing up
+    // fails, the legacy file stays in place.
+    let backup_path = config_dir.join("config.bak");
+    match fs::copy(&legacy_path, &backup_path) {
+        Ok(_) => {
+            if let Err(error) = fs::remove_file(&legacy_path) {
+                tracing::warn!(
+                    path = %legacy_path.display(),
+                    backup = %backup_path.display(),
+                    %error,
+                    "failed to remove legacy TOML config after migration; backup was preserved"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %legacy_path.display(),
+                backup = %backup_path.display(),
+                %error,
+                "failed to back up legacy TOML config; leaving original in place"
+            );
+        }
     }
 
     tracing::info!(
@@ -2066,6 +2087,44 @@ theme = "dark"
             Some("anthropic/claude-3-5-sonnet")
         );
         assert_eq!(written.theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn legacy_toml_migration_keeps_backup_of_original_file() {
+        let temp = TestDir::new("opencode_legacy_toml_backup");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        let original =
+            "provider = \"anthropic\"\nmodel = \"claude-3-5-sonnet\"\ntheme = \"dark\"\n";
+        fs::write(config_dir.join("config"), original).unwrap();
+
+        let mut config = Config::default();
+        assert!(migrate_legacy_toml_config(&config_dir, &mut config).is_some());
+
+        let backup_path = config_dir.join("config.bak");
+        assert!(backup_path.exists(), "backup should exist for rollback");
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), original);
+        assert!(!config_dir.join("config").exists());
+    }
+
+    #[test]
+    fn legacy_toml_migration_keeps_original_when_backup_fails() {
+        let temp = TestDir::new("opencode_legacy_toml_backup_fail");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        // Force fs::copy to fail by making the backup destination a directory.
+        fs::create_dir(config_dir.join("config.bak")).unwrap();
+        let original = "model = \"claude\"\n";
+        fs::write(config_dir.join("config"), original).unwrap();
+
+        let mut config = Config::default();
+        assert!(migrate_legacy_toml_config(&config_dir, &mut config).is_some());
+
+        assert_eq!(
+            fs::read_to_string(config_dir.join("config")).unwrap(),
+            original
+        );
+        assert!(config_dir.join("opencode.json").exists());
     }
 }
 
