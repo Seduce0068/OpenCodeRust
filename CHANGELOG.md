@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T01:52:52+09:00"
+  at: "2026-11-18T02:07:18+09:00"
 ---
 
 # Changelog
@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   O(n log n) ソートを回避（顺序は既存と同一）(M-35)
 - `opencode-watcher`: `debounce_ms` を実際にパス単位の合体へ配線（leading-edge、
   回帰テスト追加）(M-36)
+- `opencode-server`: TUI リクエスト/レスポンスキューと Notify を `ServerState` フィールド
+  へ移行し、インスタンス間で共有される問題を解消（分離テスト追加）(M-21 P0-②)
+- `opencode-mcp`: `read_resource` を `send_request_with_progress_timeout` へ切替え、
+  `catalog_ms` タイムアウトを適用（無応答サーバーでのハングを解消）(M-27)
+- `opencode-util`: `build_filter(level)` を追加し `init_tracing` の level 引数を
+  実際のログレベルへ反映（呼び出し側配線は未対応）(L-04 一部)
 
 ## [0.1.0]
 
