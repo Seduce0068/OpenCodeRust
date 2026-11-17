@@ -186,9 +186,6 @@ status: current
 - [ ] **[L-05]** workspace lints の継承漏れ
   - `Cargo.toml:28-34` で deny を定義するが `[lints] workspace = true` は
     opencode-codemode のみ（CI の `-D warnings` で一部カバー）。全 22 クレートへ追加
-- [ ] **[L-06]** GET /config による api_key の平文漏洩
-  - `routes.rs:2783-2786` が AppConfig をそのまま返し、api_key は `skip_serializing_if`
-    のみ（現状値はプレースホルダで実際の秘密ではない）。マスク済み DTO を返す
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
@@ -281,6 +278,7 @@ status: current
 - [x] **[M-25]** TUI 許可応答の送信失敗をトーストで通知（2026-11-18）
 - [x] **[M-14]** サーバ起動時の認証警告を実態（ランダム Bearer / NO_AUTH）に修正（2026-11-18）
 - [x] **[L-10]** POST /log の service/message/extra をサニタイズ（2026-11-18）
+- [x] **[L-06]** GET/PATCH /config の provider api_key をマスク（2026-11-18）
 
 ## メモ
 

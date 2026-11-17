@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T00:17:31+09:00"
+  at: "2026-11-18T00:36:13+09:00"
 ---
 
 # Changelog
@@ -85,6 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OPENCODE_NO_AUTH`）に合わせて修正 (M-14)
 - `opencode-server`: `POST /log` の service/message/extra から制御文字を除去し
   長さを制限してログ汚染を防止 (L-10)
+- `opencode-server`: `GET/PATCH /config` が provider の `api_key` を平文で返す
+  問題を修正し、`***` にマスクして返す (L-06)
 
 ## [0.1.0]
 

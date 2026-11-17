@@ -2780,15 +2780,41 @@ fn config_routes() -> Router<Arc<ServerState>> {
 
 pub static CONFIG_STATE: Lazy<RwLock<AppConfig>> = Lazy::new(|| RwLock::new(AppConfig::default()));
 
-async fn get_config(State(_state): State<Arc<ServerState>>) -> Result<Json<AppConfig>> {
+/// Serialize a config for API responses with provider API keys masked.
+fn config_for_response(config: &AppConfig) -> serde_json::Value {
+    let mut value = match serde_json::to_value(config) {
+        Ok(v) => v,
+        Err(_) => return serde_json::Value::Null,
+    };
+    if let Some(obj) = value.as_object_mut() {
+        for key in ["provider", "providers"] {
+            if let Some(providers) = obj.get_mut(key).and_then(|p| p.as_object_mut()) {
+                for provider in providers.values_mut() {
+                    if let Some(p) = provider.as_object_mut() {
+                        for secret_key in ["api_key", "apiKey"] {
+                            if let Some(secret) = p.get_mut(secret_key) {
+                                if secret.as_str().is_some_and(|s| !s.is_empty()) {
+                                    *secret = serde_json::json!("***");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+
+async fn get_config(State(_state): State<Arc<ServerState>>) -> Result<Json<serde_json::Value>> {
     let config = CONFIG_STATE.read().await;
-    Ok(Json(config.clone()))
+    Ok(Json(config_for_response(&config)))
 }
 
 async fn patch_config(
     State(state): State<Arc<ServerState>>,
     Json(patch): Json<AppConfig>,
-) -> Result<Json<AppConfig>> {
+) -> Result<Json<serde_json::Value>> {
     let mut config = CONFIG_STATE.write().await;
     config.merge(patch.clone());
     let updated = config.clone();
@@ -2807,7 +2833,7 @@ async fn patch_config(
         })
         .to_string(),
     );
-    Ok(Json(updated))
+    Ok(Json(config_for_response(&updated)))
 }
 
 #[derive(Debug, Serialize)]
@@ -4369,8 +4395,10 @@ async fn global_event_stream(
     }))
 }
 
-async fn get_global_config(State(_state): State<Arc<ServerState>>) -> Result<Json<AppConfig>> {
-    Ok(Json(AppConfig::default()))
+async fn get_global_config(
+    State(_state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>> {
+    Ok(Json(config_for_response(&AppConfig::default())))
 }
 
 async fn dispose_all() -> Json<bool> {
@@ -5245,5 +5273,19 @@ mod mapping_tests {
         assert_eq!(sanitize_log_field("a\r\nb\tc", 100), "abc");
         assert_eq!(sanitize_log_field("abcdef", 3), "abc");
         assert_eq!(sanitize_log_field("", 10), "");
+    }
+
+    #[test]
+    fn config_for_response_masks_provider_api_keys() {
+        let mut config = AppConfig::default();
+        let provider = opencode_config::schema::ProviderConfig {
+            api_key: Some("super-secret-key".to_string()),
+            ..Default::default()
+        };
+        config.provider = Some(HashMap::from([("openai".to_string(), provider)]));
+
+        let value = config_for_response(&config);
+        assert_eq!(value["provider"]["openai"]["api_key"], "***");
+        assert!(!value.to_string().contains("super-secret-key"));
     }
 }
