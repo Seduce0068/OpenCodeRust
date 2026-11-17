@@ -4660,18 +4660,36 @@ struct WriteLogRequest {
     extra: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// Sanitize an untrusted log field: strip control characters (newlines in
+/// particular) and cap its length to avoid log-forging and oversized entries.
+fn sanitize_log_field(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
+}
+
 async fn write_log(Json(req): Json<WriteLogRequest>) -> Result<Json<bool>> {
+    let service = sanitize_log_field(&req.service, 64);
+    let message = sanitize_log_field(&req.message, 4096);
+    if service.is_empty() || message.is_empty() {
+        return Err(ApiError::BadRequest(
+            "service and message must not be empty".to_string(),
+        ));
+    }
     let extra_str = req
         .extra
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap_or_default())
         .unwrap_or_default();
+    let extra_str = sanitize_log_field(&extra_str, 4096);
 
     match req.level.as_str() {
-        "debug" => tracing::debug!(service = %req.service, extra = %extra_str, "{}", req.message),
-        "info" => tracing::info!(service = %req.service, extra = %extra_str, "{}", req.message),
-        "warn" => tracing::warn!(service = %req.service, extra = %extra_str, "{}", req.message),
-        "error" => tracing::error!(service = %req.service, extra = %extra_str, "{}", req.message),
+        "debug" => tracing::debug!(service = %service, extra = %extra_str, "{}", message),
+        "info" => tracing::info!(service = %service, extra = %extra_str, "{}", message),
+        "warn" => tracing::warn!(service = %service, extra = %extra_str, "{}", message),
+        "error" => tracing::error!(service = %service, extra = %extra_str, "{}", message),
         other => {
             return Err(ApiError::BadRequest(format!(
                 "invalid log level: '{}', expected one of: debug, info, warn, error",
@@ -5219,5 +5237,13 @@ mod mapping_tests {
         ];
         assert_eq!(text_from_parts(&parts), "hello  world");
         assert_eq!(text_from_parts(&[]), "");
+    }
+
+    #[test]
+    fn sanitize_log_field_strips_control_chars_and_caps_length() {
+        assert_eq!(sanitize_log_field("hello\nworld", 100), "helloworld");
+        assert_eq!(sanitize_log_field("a\r\nb\tc", 100), "abc");
+        assert_eq!(sanitize_log_field("abcdef", 3), "abc");
+        assert_eq!(sanitize_log_field("", 10), "");
     }
 }
