@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T22:22:00+09:00"
+  at: "2026-11-17T22:38:06+09:00"
 ---
 
 # Changelog
@@ -61,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-provider` / `opencode-session` に残っていた開発用プレースホルダ
   コメントを削除。未実装マーカーを横断監査し、`litert.rs` の FFI TODO
   (unsafe が必要で未対応) のみが実質的な残作業であることを確認
+- `opencode-tool`: `read` ツールの `limit=0` 時に「read beyond line 0」と
+  誤表示する問題を修正し、「0 lines read」を明示するよう変更 (L-12)
 
 ## [0.1.0]
 

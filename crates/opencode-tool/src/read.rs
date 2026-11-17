@@ -401,7 +401,9 @@ async fn read_file_content(
     let has_more_lines = total_lines > last_read_line;
     let truncated = has_more_lines || truncated_by_bytes;
 
-    let truncation_msg = if truncated_by_bytes {
+    let truncation_msg = if result_lines.is_empty() {
+        "\n\n(0 lines read)".to_string()
+    } else if truncated_by_bytes {
         format!(
             "\n\n(Output truncated at {} bytes. Use 'offset' parameter to read beyond line {})",
             MAX_BYTES, last_read_line
@@ -588,6 +590,26 @@ mod tests {
     fn is_binary_detects_mostly_non_printable() {
         let bytes: Vec<u8> = (0..100).map(|_| 1u8).collect();
         assert!(is_binary(&bytes));
+    }
+
+    #[tokio::test]
+    async fn read_file_content_with_zero_limit_reports_zero_lines() {
+        let content = b"first\nsecond\nthird";
+        let result = read_file_content(
+            std::path::Path::new("/tmp/test.txt"),
+            "/tmp/test.txt",
+            content,
+            1,
+            0,
+            "test".to_string(),
+            "/tmp",
+        )
+        .await
+        .unwrap();
+        // With limit=0 no lines are read; the output must say so explicitly
+        // instead of claiming a line was consumed ("beyond line 0").
+        assert!(result.output.contains("0 lines read"));
+        assert!(!result.output.contains("beyond line 0"));
     }
 
     #[test]
