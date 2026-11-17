@@ -1892,8 +1892,10 @@ async fn run_server_command(
     mdns_domain: String,
     cors: Vec<String>,
 ) -> anyhow::Result<()> {
-    if std::env::var("OPENCODE_SERVER_PASSWORD").is_err() {
-        eprintln!("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.");
+    if std::env::var("OPENCODE_NO_AUTH").is_ok() {
+        eprintln!("Warning: OPENCODE_NO_AUTH is set; server is unsecured.");
+    } else {
+        eprintln!("Authentication enabled with a random Bearer token (see server log).");
     }
 
     let bind_host = if mdns && hostname == "127.0.0.1" {
