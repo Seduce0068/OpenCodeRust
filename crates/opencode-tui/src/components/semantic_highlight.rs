@@ -149,3 +149,51 @@ fn pick_earliest(
         _ => candidate,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn theme() -> Theme {
+        Theme::default()
+    }
+
+    fn texts(line: &Line<'static>) -> Vec<String> {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn base_text_color_recognizes_none_and_theme_text() {
+        let theme = theme();
+        assert!(is_base_text_color(None, &theme));
+        assert!(is_base_text_color(Some(theme.text), &theme));
+        assert!(!is_base_text_color(Some(Color::Red), &theme));
+    }
+
+    #[test]
+    fn highlight_lines_keeps_plain_text() {
+        let lines = highlight_lines(vec![Line::from("just plain text")], &theme());
+        assert_eq!(texts(&lines[0]), vec!["just plain text"]);
+    }
+
+    #[test]
+    fn highlight_lines_splits_error_keyword() {
+        let lines = highlight_lines(vec![Line::from("an error happened")], &theme());
+        assert_eq!(texts(&lines[0]), vec!["an ", "error", " happened"]);
+    }
+
+    #[test]
+    fn highlight_lines_splits_file_path() {
+        let lines = highlight_lines(vec![Line::from("open src/main.rs now")], &theme());
+        assert_eq!(texts(&lines[0]), vec!["open ", "src/main.rs", " now"]);
+    }
+
+    #[test]
+    fn highlight_lines_splits_shell_command() {
+        let lines = highlight_lines(vec![Line::from("try $ cargo build")], &theme());
+        assert_eq!(texts(&lines[0]), vec!["try ", "$ cargo build"]);
+    }
+}
