@@ -4878,8 +4878,9 @@ impl<'a> Interpreter<'a> {
                 let text = to_js_string(&argument(0));
                 let mut re = re.borrow_mut();
                 let result = if re.global || re.sticky {
-                    // Global/sticky flag: start scanning at last_index
-                    let start = re.last_index;
+                    // Global/sticky flag: start scanning at last_index.
+                    // JS clamps a negative lastIndex to 0 for scanning.
+                    let start = re.last_index.max(0) as usize;
                     match re.regex.captures_from_pos(&text, start) {
                         Ok(Some(caps)) => {
                             let m = caps.get(0).unwrap();
@@ -4887,7 +4888,7 @@ impl<'a> Interpreter<'a> {
                                 re.last_index = 0;
                                 false
                             } else {
-                                re.last_index = m.end();
+                                re.last_index = m.end() as i64;
                                 true
                             }
                         }
@@ -4910,7 +4911,7 @@ impl<'a> Interpreter<'a> {
                 let mut re = re.borrow_mut();
                 let sticky = re.sticky;
                 let global = re.global;
-                let start = re.last_index;
+                let start = re.last_index.max(0) as usize;
 
                 // Determine the search start and whether we require an exact anchor.
                 let caps = if global || sticky {
@@ -4937,7 +4938,7 @@ impl<'a> Interpreter<'a> {
                     Some(caps) => {
                         let m = caps.get(0).unwrap();
                         if global || sticky {
-                            re.last_index = m.end();
+                            re.last_index = m.end() as i64;
                         }
                         let mut obj = indexmap::IndexMap::new();
                         obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
@@ -6119,7 +6120,7 @@ impl<'a> Interpreter<'a> {
             }
             Value::RegExp(re) if key == "lastIndex" => {
                 let num = match value {
-                    Value::Number(n) => n as usize,
+                    Value::Number(n) => n as i64,
                     _ => 0,
                 };
                 re.borrow_mut().last_index = num;
@@ -10174,6 +10175,15 @@ mod tests {
 
         let value = run_value(r#"return /[0-9]+(?= xyz)/.test("abc 123 def");"#);
         assert_eq!(value, Value::Boolean(false));
+    }
+
+    #[test]
+    fn regexp_last_index_does_not_wrap_negative_numbers() {
+        let value = run_value(
+            r#"const re = new RegExp("a", "g"); re.lastIndex = -1; return re.lastIndex;"#,
+        );
+        // JS keeps -1; the previous `as usize` cast wrapped it to a huge value.
+        assert_eq!(value, number(-1.0));
     }
 
     #[test]

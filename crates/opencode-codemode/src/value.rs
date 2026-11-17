@@ -421,7 +421,7 @@ pub struct RegExpValue {
     pub ignore_case: bool,
     pub multiline: bool,
     pub sticky: bool,
-    pub last_index: usize,
+    pub last_index: i64,
 }
 
 #[derive(Debug)]
