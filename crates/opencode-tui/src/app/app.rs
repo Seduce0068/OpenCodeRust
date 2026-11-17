@@ -4127,4 +4127,89 @@ mod tests {
         assert!(parse_permission_requested(&serde_json::json!({"request": {}})).is_none());
         assert!(parse_permission_requested(&serde_json::json!({"request": {"id": ""}})).is_none());
     }
+
+    #[test]
+    fn task_kind_from_tool_name_categories() {
+        assert_eq!(task_kind_from_tool_name("read_file"), TaskKind::FileRead);
+        assert_eq!(task_kind_from_tool_name("Grep"), TaskKind::FileRead);
+        assert_eq!(task_kind_from_tool_name("write"), TaskKind::FileWrite);
+        assert_eq!(task_kind_from_tool_name("apply_patch"), TaskKind::FileWrite);
+        assert_eq!(task_kind_from_tool_name("Bash"), TaskKind::CommandExec);
+        assert_eq!(task_kind_from_tool_name("custom"), TaskKind::ToolCall);
+        assert_eq!(task_kind_from_tool_name(""), TaskKind::ToolCall);
+    }
+
+    #[test]
+    fn provider_from_model_splits_slash_or_colon() {
+        assert_eq!(
+            provider_from_model("anthropic/claude-3"),
+            Some("anthropic".to_string())
+        );
+        assert_eq!(
+            provider_from_model("openai:gpt-5"),
+            Some("openai".to_string())
+        );
+        assert_eq!(provider_from_model("bare-model"), None);
+        assert_eq!(provider_from_model("  "), None);
+    }
+
+    #[test]
+    fn mcp_status_mapping() {
+        let status = |s: &str| McpStatusInfo {
+            name: "server".to_string(),
+            status: s.to_string(),
+            tools: 0,
+            resources: 0,
+            error: None,
+        };
+        assert!(matches!(
+            map_mcp_status(&status("connected")),
+            McpConnectionStatus::Connected
+        ));
+        assert!(matches!(
+            map_mcp_status(&status("failed")),
+            McpConnectionStatus::Failed
+        ));
+        assert!(matches!(
+            map_mcp_status(&status("needs_auth")),
+            McpConnectionStatus::NeedsAuth
+        ));
+        assert!(matches!(
+            map_mcp_status(&status("unknown")),
+            McpConnectionStatus::Disconnected
+        ));
+    }
+
+    #[test]
+    fn agent_color_is_deterministic() {
+        let theme = crate::theme::Theme::default();
+        let first = agent_color_from_name(&theme, "build");
+        let second = agent_color_from_name(&theme, "build");
+        assert_eq!(first, second);
+        if theme.agent_colors.is_empty() {
+            assert_eq!(first, theme.primary);
+        } else {
+            assert!(theme.agent_colors.contains(&first));
+        }
+    }
+
+    #[test]
+    fn run_status_mapping() {
+        let status = |busy: bool| crate::api::SessionStatusInfo {
+            status: "idle".to_string(),
+            idle: !busy,
+            busy,
+            attempt: None,
+            message: None,
+            next: None,
+        };
+        assert!(matches!(
+            map_api_run_status(&status(false)),
+            SessionStatus::Idle
+        ));
+        assert!(matches!(
+            map_api_run_status(&status(true)),
+            SessionStatus::Running
+        ));
+    }
 }
