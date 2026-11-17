@@ -26,10 +26,6 @@ status: current
 - [ ] **[H-01]** 秘密情報の平文保存（GitHub PAT）
   - `.env:1` に GitHub PAT が平文、`.envrc:1` の dotenv で direnv 自動ロード、copilot-auth.ts
     が `GITHUB_TOKEN` 参照。取り消し再発行し、リポジトリ外の秘密管理先へ移して dotenv を無効化する
-- [ ] **[H-02]** パス正規化欠如による project 外・traversal パスの誤判定
-  - `tool.rs:666-673` が文字列 `starts_with` で判定し `..` や兄弟ディレクトリを project 内と誤判定、
-    `read.rs:490-495` の canonicalize と不整合。両方を `Path::canonicalize`
-    後にコンポーネント単位で比較し、失敗時は external 扱い
 - [ ] **[H-03]** プラグイン subprocess bridge のサプライチェーン／信頼境界
   - `loader.rs:334-349` が未指定 npm spec に `*`、`:268-313` で install 実行、
     plugin-host.ts:403 が検証なし import、`$` ヘルパ／認証ヘッダ渡し fetch／Deno `--allow-all`。
@@ -37,10 +33,9 @@ status: current
 - [ ] **[H-04]** MCP 実行時依存（`npx -y`）のバージョン固定・完全性検証欠如
   - `opencode.jsonc:99-145` の 4 件が未固定、`transport.rs:40` がそのまま実行、cargo audit は
     Rust のみ。Exact バージョン固定＋lockfile＋CI の npm スキャン対象化
-- [ ] **[H-07]** マイグレーションのバージョン管理・原子性・経路統一の欠如
-  - `database.rs:100-120` が単純ループでバージョン記録なし、metadata ALTER をエラー文字列で冪等判定、
-    複数文がトランザクション外、`Storage::migrate()` が別スキーマ経路。`sqlx::migrate!`／`user_version`
-    ＋単一トランザクション＋経路統一＋runbook 化
+- [ ] **[H-07]** マイグレーションの経路統一（version/原子性は対応済み、残りに絞る）
+  - `database.rs` は user_version 記録・単一トランザクション・metadata PRAGMA 判定を実装済み。
+    未対応は `Storage::migrate()`（lib.rs）の別スキーマ経路統一と runbook 化
 - [ ] **[H-08]** プラグイン subprocess のロック保持中 await によるデッドロック
   - `client.rs:288` の rpc_lock ガードを spawn タスクへ移し `:301` で stdout ロック保持、`:394`
     のタイムアウト後も JoinHandle 未保持で `:428` が永久ブロック。AbortHandle を保持して abort するか
@@ -85,20 +80,10 @@ status: current
 - [ ] **[M-08]** 未知設定キーのサイレント破棄と環境変数展開の未検証
   - `strictPermissionChecks`／`gcBufferMb`／`references.gemini` が Config
     にフィールドなし（docs では起動を止めない意図で明記）、`{env:VAR}` 未定義が空文字化。キー追加／起動時警告と必須項目の非空検証
-- [ ] **[M-09]** 認証情報のリテラル設定による環境変数上書き不能
-  - `opencode.jsonc:6` のプレースホルダ値が `{env:VAR}` 展開を通らず最初の非空値として採用され
-    `ANTHROPIC_API_KEY` が効かない（値自体は秘密ではない）。`{env:ANTHROPIC_API_KEY}` 化または auth
-    store へ委譲
 - [ ] **[M-11]** 重要パス（認証・PTY・DB・provider）のテストカバレッジ空白
   - mcp/oauth.rs（561 行）・server/oauth.rs・server/pty.rs・storage/database.rs がテスト 0
     件、provider 統合テストに HTTP／ストリーミング／認証フローなし（ADR-0008 の改善対象外だが明示的先送りではない）。モック
     OAuth／callback 分岐／PtyManager／DB in_memory を網羅
-- [ ] **[M-12]** 未信頼ツール結果への system-reminder ラップ欠如
-  - `prompt.rs:3511` が bash 出力を素のまま `add_tool_result` へ、MCP リソース（:449）や
-    AGENTS.md 由来（:612）はラップ済みで不整合（被害はモデル依存の推測）。全ツール結果を `system_reminder` でラップ
-- [ ] **[M-13]** 動的実行コマンドの権限抽出漏れ（eval / source / コマンド置換）
-  - `bash.rs:338-450` が tree-sitter の command ノードのみ対象、`eval "rm -rf /"`
-    の内部コマンドを抽出できず `eval *` が always allow になりうる（無承認実行は推測）。動的実行を検出したら常に承認／deny
 - [ ] **[M-15]** Rust 依存バージョンのピン留め不足と workspace 依存のバイパス
   - 厳密ピンは 8 件のみ、各クレートが serde／axum 等で workspace 定義をバイパスし AGENTS.md §4
     と矛盾（Cargo.lock はコミット済み）。workspace 集約＋厳密ピン＋CI `--locked` 必須化
@@ -261,6 +246,9 @@ status: current
 - [x] **[H-02]** パス判定を canonicalize + コンポーネント比較へ変更（2026-11-18、path-worker）
 - [x] **[M-13]** 動的実行検出時は常に承認要求へフォールバック（2026-11-18、bash-worker）
 - [x] **[M-04 一部]** CommandError で source チェーン保持（2026-11-18、command-error-worker）
+- [x] **[H-07]** マイグレーションに PRAGMA user_version を記録（2026-11-18、migration-version-worker）
+- [x] **[M-12]** 未信頼ツール結果を変換点で system-reminder ラップ（2026-11-18、prompt-wrap-worker）
+- [x] **[M-09]** opencode.jsonc の認証キーを env 参照へ（2026-11-18、config-key-worker）
 
 ## メモ
 
