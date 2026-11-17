@@ -237,4 +237,35 @@ mod tests {
         toast.tick(TRANSITION_MS);
         assert_eq!(toast.slide_offset(), 0);
     }
+
+    #[test]
+    fn progress_ratio_clamps_and_handles_zero_total() {
+        assert_eq!(progress_ratio(0, 0), 1.0);
+        assert_eq!(progress_ratio(500, 1000), 0.5);
+        assert_eq!(progress_ratio(2000, 1000), 1.0);
+        assert_eq!(progress_ratio(100, 1000), 0.1);
+    }
+
+    #[test]
+    fn mix_u8_interpolates_and_clamps_alpha() {
+        assert_eq!(mix_u8(0, 100, 0.0), 0);
+        assert_eq!(mix_u8(0, 100, 1.0), 100);
+        assert_eq!(mix_u8(0, 100, 0.5), 50);
+        assert_eq!(mix_u8(100, 0, 2.0), 0);
+    }
+
+    #[test]
+    fn blend_colors_combines_rgb() {
+        assert_eq!(
+            blend_colors(Color::Rgb(0, 0, 0), Color::Rgb(100, 100, 100), 0.5),
+            Color::Rgb(50, 50, 50)
+        );
+    }
+
+    #[test]
+    fn color_to_rgb_named_colors() {
+        assert_eq!(color_to_rgb(Color::Black), (0, 0, 0));
+        assert_eq!(color_to_rgb(Color::Red), (205, 49, 49));
+        assert_eq!(color_to_rgb(Color::Green), (13, 188, 121));
+    }
 }
