@@ -183,9 +183,6 @@ status: current
   - `logging.rs:390` で WorkerGuard が早期ドロップ、rolling 未使用、`init_tracing` 呼び出し 0 件、
     CLI は `fmt::init()` で `config.log_level` 未参照（現状の実行時影響なし）。Guard
     延伸＋rolling＋logLevel 配線
-- [ ] **[L-05]** workspace lints の継承漏れ
-  - `Cargo.toml:28-34` で deny を定義するが `[lints] workspace = true` は
-    opencode-codemode のみ（CI の `-D warnings` で一部カバー）。全 22 クレートへ追加
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
@@ -195,9 +192,6 @@ status: current
 - [ ] **[L-09]** LiteRT プロバイダの未実装 FFI の設定面への露出
   - `litert.rs:60-72` が TODO のままエラー、bootstrap が `LITERT_MODEL_PATH` で登録しモデルを広告、
     MAPPING.md に記載なし。feature gate するか MAPPING.md へ追加
-- [ ] **[L-11]** 設定マイグレーションのロールバック手段欠如
-  - `loader.rs:391-406` がレガシー TOML を書き込んだ直後に元ファイルを削除、バックアップなし。`.bak`
-    退避または削除を任意手順化
 - [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケーション
   - `routes.rs:1103-1118` が全件 collect、`:1316-1317` が全履歴 clone（O(n) は推測）。
     ページネーション／差分取得と Arc による copy-on-write
@@ -277,6 +271,8 @@ status: current
 - [x] **[L-10]** POST /log の service/message/extra をサニタイズ（2026-11-18）
 - [x] **[L-06]** GET/PATCH /config の provider api_key をマスク（2026-11-18）
 - [x] **[L-13]** RegExp lastIndex を i64 で保持し負数を JS と同じく保持（2026-11-18）
+- [x] **[L-05]** 全クレートへ `[lints] workspace = true` を継承（2026-11-18、lints-worker）
+- [x] **[L-11]** レガシー設定マイグレーションで `.bak` 退避を追加（2026-11-18、migration-worker）
 
 ## メモ
 
@@ -292,6 +288,10 @@ status: current
   重複吸収後に P-01〜P-08 を追加）。cross-review の H/M/L と重複する項目
   （experimental placeholder・MCP list_changed・未配線コード・LiteRT・CI ゲート・
   ドキュメント数値）は既存項目を優先し、P-* は新規発見のみを記録した。
+- M-21 調査（2026-11-18、static-auditor）: ServerState 外 static 10 種を洗い出し。
+  P0 は CONFIG_STATE と TUI キュー群の state 化（CONFIG_STATE は後始動インスタンスが
+  設定を上書きする共有バグ）、P1 は SESSION_RUN_STATUS/PROMPT_LOCKS・PTY_MANAGER・
+  TODO_MANAGER（M-20 と連携）、MODEL_VARIANT_LOOKUP は不変キャッシュで移行不要。
 - ベースライン検証（2026-11-17）: `cargo check --all-targets` /
   `cargo clippy --workspace --all-targets -- -D warnings` /
   `cargo test --workspace --all-targets` すべて exit 0。レビューエージェントはコードを変更していない。
