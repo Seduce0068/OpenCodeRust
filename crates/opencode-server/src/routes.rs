@@ -13,12 +13,12 @@ use axum::{
 use futures::stream::Stream;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify, OnceCell, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, OnceCell, RwLock};
 use tokio_stream::{
     wrappers::{BroadcastStream, ReceiverStream},
     StreamExt,
@@ -4117,21 +4117,14 @@ pub struct PromptRequest {
     pub text: String,
 }
 
-static TUI_REQUEST_QUEUE: Lazy<Mutex<VecDeque<TuiRequest>>> =
-    Lazy::new(|| Mutex::new(VecDeque::new()));
-static TUI_RESPONSE_QUEUE: Lazy<Mutex<VecDeque<serde_json::Value>>> =
-    Lazy::new(|| Mutex::new(VecDeque::new()));
-static TUI_REQUEST_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
-static TUI_RESPONSE_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
-
 async fn enqueue_tui_request(state: &Arc<ServerState>, path: &str, body: serde_json::Value) {
-    let mut queue = TUI_REQUEST_QUEUE.lock().await;
+    let mut queue = state.tui_request_queue.lock().await;
     queue.push_back(TuiRequest {
         path: path.to_string(),
         body: body.clone(),
     });
     drop(queue);
-    TUI_REQUEST_NOTIFY.notify_one();
+    state.tui_request_notify.notify_one();
 
     state.broadcast(
         &serde_json::json!({
@@ -4343,22 +4336,30 @@ pub struct TuiRequest {
     pub body: serde_json::Value,
 }
 
-async fn get_next_tui_request() -> Json<Option<TuiRequest>> {
+async fn get_next_tui_request(State(state): State<Arc<ServerState>>) -> Json<Option<TuiRequest>> {
     loop {
-        let mut queue = TUI_REQUEST_QUEUE.lock().await;
+        let mut queue = state.tui_request_queue.lock().await;
         if let Some(next) = queue.pop_front() {
             return Json(Some(next));
         }
         drop(queue);
-        TUI_REQUEST_NOTIFY.notified().await;
+        state.tui_request_notify.notified().await;
     }
 }
 
-async fn submit_tui_response(Json(body): Json<serde_json::Value>) -> Json<bool> {
-    let mut queue = TUI_RESPONSE_QUEUE.lock().await;
+// NOTE: `/control/response` is a registered HTTP route and part of the
+// documented TUI bridge (see `tui_routes`). This codebase currently has no
+// consumer that pops from the response queue, but the endpoint is kept for
+// external API compatibility; its storage now lives on `ServerState` instead
+// of a process-global static (see `ServerState::tui_response_queue`).
+async fn submit_tui_response(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<bool> {
+    let mut queue = state.tui_response_queue.lock().await;
     queue.push_back(body);
     drop(queue);
-    TUI_RESPONSE_NOTIFY.notify_one();
+    state.tui_response_notify.notify_one();
     Json(true)
 }
 
