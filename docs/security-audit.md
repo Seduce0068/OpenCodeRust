@@ -9,7 +9,7 @@ tags:
   - audit
 verified:
   by: dsh
-  at: "2026-11-17T00:45:35+09:00"
+  at: "2026-11-17T10:59:26+09:00"
 ---
 
 ## 実行手順
@@ -138,6 +138,21 @@ grep で確認し、コメント中の単語や `tower_http` / `new_random_sha25
 "didn't find any unused dependencies in this directory. Good job!" を報告する。
 削除後も `cargo check --all-targets`、`cargo clippy --workspace --all-targets
 -- -D warnings`、`cargo test --workspace --all-targets` (591 passed) は green である。
+
+## 定期再検証 (2026-11-17)
+
+カバレッジ作業の区切りで監査を再実行した (advisory DB 1509 件、
+Cargo.lock 530 crate)。
+
+- `cargo audit`: 脆弱性 0、許可済みの warning 1 件
+  (`bincode` RUSTSEC-2025-0141 unmaintained) のみ。
+- `cargo outdated`: "All dependencies are up to date"。
+- `cargo check/clippy --workspace --all-targets --all-features`: 成功。
+- `cargo test --workspace --all-targets --all-features`: 899 passed。
+  (`#[cfg(not(feature = "lsp"))]` の 1 件が標準ビルドとの差。)
+- `cargo nextest run --workspace`: 900 passed、0 skipped。
+- `cargo build --workspace --release`: 成功、`version` は
+  `OpenCode 0.1.0` を出力。
 
 ## 残作業
 
