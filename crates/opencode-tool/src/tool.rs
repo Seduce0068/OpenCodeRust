@@ -663,13 +663,34 @@ impl ToolContext {
         self.abort.is_cancelled()
     }
 
+    /// Whether `path` resolves outside the project root.
+    ///
+    /// Both the candidate and the project root are canonicalized before
+    /// comparison, so `..` segments, sibling directories that share a string
+    /// prefix with the root, and symlink escapes are not mistaken for paths
+    /// inside the project. Comparison is done on path components via
+    /// [`std::path::Path::starts_with`], not on the raw string prefix.
+    ///
+    /// If either path cannot be canonicalized (for example, the target does
+    /// not exist), the path is treated as external. That is the safe side for
+    /// the permission checks that call this method.
     pub fn is_external_path(&self, path: &str) -> bool {
-        let abs_path = if std::path::Path::new(path).is_absolute() {
-            path.to_string()
+        let candidate = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
         } else {
-            format!("{}/{}", self.directory, path)
+            std::path::Path::new(&self.directory).join(path)
         };
-        !abs_path.starts_with(&self.project_root)
+
+        let candidate = match candidate.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(_) => return true,
+        };
+        let root = match std::path::Path::new(&self.project_root).canonicalize() {
+            Ok(resolved) => resolved,
+            Err(_) => return true,
+        };
+
+        !candidate.starts_with(&root)
     }
 }
 
@@ -797,9 +818,85 @@ mod tests {
 
     #[test]
     fn is_external_path_checks_project_root() {
-        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        let ctx = ToolContext::new(
+            "s".to_owned(),
+            "m".to_owned(),
+            root.to_string_lossy().to_string(),
+        );
+
         assert!(!ctx.is_external_path("src/main.rs"));
+        assert!(!ctx.is_external_path(&root.join("src/main.rs").to_string_lossy()));
         assert!(ctx.is_external_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn is_external_path_rejects_sibling_with_shared_string_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let sibling = tmp.path().join("project-sibling");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("file.txt"), "").unwrap();
+        let ctx = ToolContext::new(
+            "s".to_owned(),
+            "m".to_owned(),
+            root.to_string_lossy().to_string(),
+        );
+
+        // The absolute sibling path shares the root's string prefix but is outside it.
+        let sibling_file = sibling.join("file.txt").to_string_lossy().to_string();
+        assert!(ctx.is_external_path(&sibling_file));
+        // The same path reached through ".." must not be accepted either.
+        assert!(ctx.is_external_path("../project-sibling/file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_external_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let ctx = ToolContext::new(
+            "s".to_owned(),
+            "m".to_owned(),
+            root.to_string_lossy().to_string(),
+        );
+
+        assert!(ctx.is_external_path("escape/secret.txt"));
+    }
+
+    #[test]
+    fn is_external_path_treats_canonicalize_failure_as_external() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::new(
+            "s".to_owned(),
+            "m".to_owned(),
+            root.to_string_lossy().to_string(),
+        );
+
+        assert!(ctx.is_external_path("does-not-exist.rs"));
+
+        let missing_root = ToolContext::new(
+            "s".to_owned(),
+            "m".to_owned(),
+            tmp.path()
+                .join("missing-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+        assert!(missing_root.is_external_path("/etc/passwd"));
     }
 
     #[test]
