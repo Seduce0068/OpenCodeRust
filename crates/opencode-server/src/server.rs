@@ -9,12 +9,12 @@ use axum::{
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use tokio::sync::{broadcast, oneshot, Mutex, RwLock as TokioRwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -388,6 +388,19 @@ pub struct ServerState {
     pub auth_token: Option<String>,
     pub permission_broker: Arc<PermissionBroker>,
     pub question_broker: Arc<QuestionBroker>,
+    /// Per-instance queue of pending TUI requests (was a process-global static).
+    pub(crate) tui_request_queue: Mutex<VecDeque<routes::TuiRequest>>,
+    /// Wakeup signal for `get_next_tui_request` waiters (per-instance).
+    pub(crate) tui_request_notify: Notify,
+    /// Per-instance response inbox for `/control/response`.
+    ///
+    /// Kept as an instance field rather than removed: `/control/response` is a
+    /// registered HTTP route (external API) documented as part of the TUI
+    /// bridge, so removing it would be a breaking change even though this
+    /// codebase currently has no consumer that pops from the queue.
+    pub(crate) tui_response_queue: Mutex<VecDeque<serde_json::Value>>,
+    /// Wakeup signal for future response consumers (per-instance).
+    pub(crate) tui_response_notify: Notify,
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
@@ -408,6 +421,10 @@ impl ServerState {
             auth_token: Some(auth_token),
             permission_broker,
             question_broker,
+            tui_request_queue: Mutex::new(VecDeque::new()),
+            tui_request_notify: Notify::new(),
+            tui_response_queue: Mutex::new(VecDeque::new()),
+            tui_response_notify: Notify::new(),
             session_repo: None,
             message_repo: None,
             input_repo: None,
@@ -1253,5 +1270,45 @@ mod tests {
             second.config.read().await.model.as_deref(),
             Some("second-only-model")
         );
+    }
+
+    #[tokio::test]
+    async fn tui_queues_are_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        first
+            .tui_request_queue
+            .lock()
+            .await
+            .push_back(routes::TuiRequest {
+                path: "/tui/first-only".to_string(),
+                body: serde_json::json!({"text": "first"}),
+            });
+        first
+            .tui_response_queue
+            .lock()
+            .await
+            .push_back(serde_json::json!({"reply": "first"}));
+
+        assert_eq!(first.tui_request_queue.lock().await.len(), 1);
+        assert_eq!(
+            first.tui_request_queue.lock().await[0].path,
+            "/tui/first-only"
+        );
+        assert_eq!(first.tui_response_queue.lock().await.len(), 1);
+        assert!(second.tui_request_queue.lock().await.is_empty());
+        assert!(second.tui_response_queue.lock().await.is_empty());
+
+        second
+            .tui_request_queue
+            .lock()
+            .await
+            .push_back(routes::TuiRequest {
+                path: "/tui/second-only".to_string(),
+                body: serde_json::json!({"text": "second"}),
+            });
+        assert_eq!(first.tui_request_queue.lock().await.len(), 1);
+        assert_eq!(second.tui_request_queue.lock().await.len(), 1);
     }
 }
