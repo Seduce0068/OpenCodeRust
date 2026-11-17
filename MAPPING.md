@@ -65,6 +65,9 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 6. `opencode/src/acp` — Rust は外部 ACP ブリッジ起動のみ (HTTP fallback)。
 7. v2 `core` の policy / location / integration / credential /
    observability 層 — 対応 crate がない。
+8. `/experimental/*` (analyze / generate / refactor / test) — Rust サーバーでは
+   未実装であり、2026-11-18 以降は 501 Not Implemented を返す
+   (`opencode-server` の routes)。以前の `"accepted"` placeholder レスポンスは廃止。
 
 ## 設定スキーマの追随状況 (2026-11-15)
 

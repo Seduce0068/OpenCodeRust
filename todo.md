@@ -50,9 +50,10 @@ status: current
 - [ ] **[H-13]** TUI イベントルートのブロッキング HTTP と全件再マッピング
   - `app.rs:3186-3215` が 16ms ループから `reqwest::blocking`（timeout
     30s）で同期取得し全件再マッピング。非同期 `reqwest::Client`＋`tokio::spawn` とメッセージ ID 単位の差分取得へ変更
-- [ ] **[H-14]** 認証情報ファイルの読み込み・永続化エラーの飲み込み
-  - `provider/auth.rs:77-87` が失敗時に空 credentials を返し、set／remove は `()` で persist
-    失敗を warn のみ。戻り値を `anyhow::Result` 化し呼び出し側へ明示
+- [ ] **[H-14]** 認証情報エラーの呼び出し側配線（try_* API は対応済み、残りに絞る）
+  - `provider/auth.rs` に `try_load_from_file` / `try_set` / `try_remove` と状態アクセサを追加済み。
+    未対応は既存呼び出し元（server の oauth.rs / server.rs / routes.rs）を try_* へ切替え、
+    HTTP レスポンスへ反映すること（別 writeScope）
 
 ### 優先度: 中
 
@@ -74,9 +75,6 @@ status: current
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
-- [ ] **[M-06]** placeholder エンドポイントの未実装隠蔽
-  - `/experimental/analyze` と `/generate`（`routes.rs:4382-4384,4440-4454`）が
-    `"accepted"` を返すが実処理なし、MAPPING.md に記載なし。実装するか 501 を返し ALIGNMENT／MAPPING に記録
 - [ ] **[M-08]** 未知設定キーのサイレント破棄と環境変数展開の未検証
   - `strictPermissionChecks`／`gcBufferMb`／`references.gemini` が Config
     にフィールドなし（docs では起動を止めない意図で明記）、`{env:VAR}` 未定義が空文字化。キー追加／起動時警告と必須項目の非空検証
@@ -98,10 +96,6 @@ status: current
   - `compaction.rs:156-170` が `#[allow(async_fn_in_trait)]` 付き async fn を 3 個、
     dyn 化不可・Future Send 未保証で AGENTS.md §4 と不整合。`#[async_trait]`
     付与または静的ディスパッチの意図を明記
-- [ ] **[M-19]** 永続化結果の握りつぶしと成功契約の矛盾
-  - `compaction.rs:456,566,574,606,625,770` や `todo.rs:50-158` が
-    `let _ = ops.update_message(...)`。失敗を `?` で伝播させるか `warn!` 記録＋契約を doc comment
-    に明記
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
@@ -249,6 +243,12 @@ status: current
 - [x] **[H-07]** マイグレーションに PRAGMA user_version を記録（2026-11-18、migration-version-worker）
 - [x] **[M-12]** 未信頼ツール結果を変換点で system-reminder ラップ（2026-11-18、prompt-wrap-worker）
 - [x] **[M-09]** opencode.jsonc の認証キーを env 参照へ（2026-11-18、config-key-worker）
+- [x] **[H-14]** 認証情報のエラーを try_* API と状態アクセサで明示
+  （2026-11-18、auth-error-worker）
+- [x] **[M-19]** compaction 永続化失敗を伝播、TodoManager は warn 明記
+  （2026-11-18、persist-worker）
+- [x] **[M-06]** /experimental/* 4  endpoint を 501 化
+  （2026-11-18、placeholder-worker + 親）
 
 ## メモ
 
