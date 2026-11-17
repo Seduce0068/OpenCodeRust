@@ -134,10 +134,10 @@ status: current
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
-- [ ] **[M-21]** ServerState 外のグローバル static 状態
-  - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、
-    CONFIG_STATE／PROJECT_METADATA／キューが static Lazy でプロセス共有。ServerState フィールドへ移し
-    `Arc<ServerState>` 経由で参照
+- [ ] **[M-21]** ServerState 外のグローバル static 状態（CONFIG_STATE は対応済み、残りに絞る）
+  - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、TUI キュー群、
+    PROJECT_METADATA が static Lazy でプロセス共有。ServerState フィールドへ移し
+    `Arc<ServerState>` 経由で参照（CONFIG_STATE は state.config へ移行済み）
 - [ ] **[M-22]** 現況ドキュメントのテスト件数・カバレッジ数値ドリフト
   - ALIGNMENT.md:47,98 が 813 件／34.14%、ADR-0008 が 946 件、CHANGELOG が 946
     件／35.89%（更新漏れは推測）。ALIGNMENT を最終値へ更新し ADR-0008 をリンク
@@ -155,12 +155,6 @@ status: current
   - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
     `clippy_args` 追加、`unsafe_code = "deny"`、Renovate 設定
-- [ ] **[M-35]** TUI file_index の同期走査と過剰アロケーション
-  - `file_index.rs:31-67` が 5 秒毎に WalkDir 同期走査、`:86-100` が全エントリ clone＋sort 後
-    truncate（O(n log n) は推測）。Top-K ヒープとバックグラウンド refresh
-- [ ] **[M-36]** watch の debounce 仕様と実装の矛盾
-  - `docs/opencode-watcher.md:29` が 100ms と仕様化するが `lib.rs:140-147` が到達毎に即 send、
-    `debounce_ms` は poll_interval に渡すだけ。パス単位の最終時刻で送出を遅延
 - [ ] **[M-37]** async ハンドラ／ツール内の同期ファイル I/O による tokio ワーカー占有（要確認）
   - `routes.rs:3431,3532-3601` と `grep_tool.rs:140-170` が async 内で同期走査（`:2546` は
     tokio::fs と混在、レイテンシ悪化は未計測）。`tokio::fs` と `spawn_blocking` へ移行
@@ -273,6 +267,9 @@ status: current
 - [x] **[L-13]** RegExp lastIndex を i64 で保持し負数を JS と同じく保持（2026-11-18）
 - [x] **[L-05]** 全クレートへ `[lints] workspace = true` を継承（2026-11-18、lints-worker）
 - [x] **[L-11]** レガシー設定マイグレーションで `.bak` 退避を追加（2026-11-18、migration-worker）
+- [x] **[M-21/P0]** CONFIG_STATE を ServerState.config へ移行（2026-11-18、state-worker）
+- [x] **[M-35]** file_index 検索を Top-K ヒープへ（2026-11-18、index-worker）
+- [x] **[M-36]** watch debounce を leading-edge 合体で実装（2026-11-18、watch-worker）
 
 ## メモ
 

@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T01:29:22+09:00"
+  at: "2026-11-18T01:52:52+09:00"
 ---
 
 # Changelog
@@ -93,6 +93,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace の deny 設定を一括継承 (L-05)
 - `opencode-config`: レガシー TOML マイグレーション時に元ファイルを `config.bak`
   へ退避し、コピー失敗時は元を保持するよう修正 (L-11)
+- `opencode-server`: `CONFIG_STATE` 静的設定を `ServerState.config` へ移行し、
+  複数インスタンス間で設定が上書きされる問題を修正（分離テスト追加）(M-21 P0)
+- `opencode-tui`: `FileIndex::search` を Top-K ヒープへ変更し、全候補の clone と
+  O(n log n) ソートを回避（顺序は既存と同一）(M-35)
+- `opencode-watcher`: `debounce_ms` を実際にパス単位の合体へ配線（leading-edge、
+  回帰テスト追加）(M-36)
 
 ## [0.1.0]
 
