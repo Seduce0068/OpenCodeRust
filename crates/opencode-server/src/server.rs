@@ -486,7 +486,14 @@ impl ServerState {
 
     pub async fn new_with_storage_for_url(server_url: String) -> anyhow::Result<Self> {
         let mut state = Self::new();
-        let auth_manager = Arc::new(AuthManager::load_from_file(&auth_data_dir()).await);
+        let auth_dir = auth_data_dir();
+        let auth_path = auth_dir.join("auth.json");
+        let auth_manager = Arc::new(match AuthManager::try_load_from_file(&auth_dir).await {
+            Ok(manager) => manager,
+            // A missing auth file is the normal first-run state, not a load failure.
+            Err(_) if !auth_path.exists() => AuthManager::with_filepath(auth_path),
+            Err(error) => return Err(error),
+        });
         state.auth_manager = auth_manager.clone();
         load_plugin_auth_store(&server_url, auth_manager.clone()).await;
         let auth_store = auth_manager.list().await;
@@ -836,19 +843,25 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
                 sync_custom_fetch_proxy(&provider_id, bridge.clone(), result.has_custom_fetch);
 
                 if let Some(api_key) = result.api_key {
-                    auth_manager
-                        .set(
+                    if let Err(error) = auth_manager
+                        .try_set(
                             &provider_id,
                             AuthInfo::Api {
                                 key: api_key.clone(),
                             },
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(provider = %provider_id, %error, "failed to persist plugin auth credentials");
+                    }
                     // TS parity: copilot auth can power both standard and enterprise providers.
                     if provider_id == "github-copilot" {
-                        auth_manager
-                            .set("github-copilot-enterprise", AuthInfo::Api { key: api_key })
-                            .await;
+                        if let Err(error) = auth_manager
+                            .try_set("github-copilot-enterprise", AuthInfo::Api { key: api_key })
+                            .await
+                        {
+                            tracing::warn!(%error, "failed to persist enterprise plugin auth credentials");
+                        }
                     }
                 }
             }

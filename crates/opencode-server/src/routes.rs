@@ -28,7 +28,7 @@ use crate::mcp_oauth::{
     LocalMcpConfig, McpOAuthError, McpOAuthManager, McpRuntimeConfig,
     McpServerInfo as McpServerInfoStruct, McpServerLogEntry, RemoteMcpConfig, RemoteOAuthSettings,
 };
-use crate::oauth::ProviderAuth;
+use crate::oauth::{ProviderAuth, ProviderAuthError};
 use crate::pty::{PtyManager, PtySession as PtySessionStruct, PtySubscription};
 use crate::worktree::{self, WorktreeInfo as WorktreeInfoStruct};
 use crate::{ApiError, Result, ServerState};
@@ -2782,7 +2782,10 @@ async fn oauth_callback(
     ProviderAuth::new(state.auth_manager.clone())
         .callback(loader, &id, req.code.as_deref())
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|error| match error {
+            ProviderAuthError::Auth(error) => ApiError::BadRequest(error.to_string()),
+            ProviderAuthError::Persist(error) => ApiError::InternalError(error.to_string()),
+        })?;
 
     // Refresh auth loader state after callback and apply custom-fetch proxy changes immediately.
     if let Some(bridge) = loader.auth_bridge(&id).await {
@@ -4954,7 +4957,11 @@ async fn set_auth(
 ) -> Result<Json<serde_json::Value>> {
     let auth_info = parse_auth_info_payload(req.body)
         .ok_or_else(|| ApiError::BadRequest("Invalid auth payload".to_string()))?;
-    state.auth_manager.set(&id, auth_info).await;
+    state
+        .auth_manager
+        .try_set(&id, auth_info)
+        .await
+        .map_err(|error| ApiError::InternalError(error.to_string()))?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -4962,7 +4969,11 @@ async fn delete_auth(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    state.auth_manager.remove(&id).await;
+    state
+        .auth_manager
+        .try_remove(&id)
+        .await
+        .map_err(|error| ApiError::InternalError(error.to_string()))?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
