@@ -295,7 +295,10 @@ impl PluginSubprocess {
         let (chunk_tx, chunk_rx) = mpsc::channel(128);
         let stdout = Arc::clone(&self.stdout);
 
-        tokio::spawn(async move {
+        // Keep the JoinHandle: if the start frame never arrives, the spawned task
+        // would otherwise retain `rpc_guard` and the stdout lock forever, making
+        // every subsequent RPC block indefinitely.
+        let task = tokio::spawn(async move {
             let _rpc_guard = rpc_guard;
             let mut start_tx = Some(start_tx);
             let mut reader = stdout.lock().await;
@@ -391,10 +394,24 @@ impl PluginSubprocess {
             }
         });
 
-        let (status, response_headers) = tokio::time::timeout(self.timeout, start_rx)
-            .await
-            .map_err(|_| PluginSubprocessError::Timeout)?
-            .map_err(|_| PluginSubprocessError::NotRunning)??;
+        // Abort the reader task on every failure path so that `rpc_lock` and the
+        // stdout lock are released even when the plugin never sends a start frame.
+        let start = tokio::time::timeout(self.timeout, start_rx).await;
+        let (status, response_headers) = match start {
+            Ok(Ok(Ok(value))) => value,
+            Ok(Ok(Err(err))) => {
+                task.abort();
+                return Err(err);
+            }
+            Ok(Err(_)) => {
+                task.abort();
+                return Err(PluginSubprocessError::NotRunning);
+            }
+            Err(_) => {
+                task.abort();
+                return Err(PluginSubprocessError::Timeout);
+            }
+        };
 
         Ok(AuthFetchStreamResult {
             status,
@@ -425,7 +442,11 @@ impl PluginSubprocess {
         method: &str,
         params: Option<Value>,
     ) -> Result<T, PluginSubprocessError> {
-        let _rpc_guard = self.rpc_lock.lock().await;
+        // Apply the timeout to lock acquisition as well: a hung stream task must
+        // not turn a lock wait into an unbounded block.
+        let _rpc_guard = tokio::time::timeout(self.timeout, self.rpc_lock.lock())
+            .await
+            .map_err(|_| PluginSubprocessError::Timeout)?;
         let id = self.next_id();
         self.write_request(id, method, params).await?;
 
@@ -506,5 +527,50 @@ impl PluginSubprocess {
         reader.read_exact(&mut buf).await?;
         let value: Value = serde_json::from_slice(&buf)?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream start timeout must release `rpc_lock`; otherwise every later RPC
+    /// call blocks forever on `call()`'s lock acquisition (todo.md H-08).
+    #[tokio::test]
+    async fn stream_start_timeout_releases_rpc_lock() {
+        // `sleep` never writes a framed start response, so `start_rx` times out.
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep subprocess");
+        let stdin = child.stdin.take().expect("take stdin");
+        let stdout = child.stdout.take().expect("take stdout");
+        let sub = PluginSubprocess {
+            name: String::new(),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            rpc_lock: Arc::new(Mutex::new(())),
+            process: Mutex::new(child),
+            request_id: AtomicU64::new(1),
+            hooks: Vec::new(),
+            auth_meta: None,
+            timeout: Duration::from_millis(100),
+        };
+
+        let headers = std::collections::HashMap::new();
+        let result = sub
+            .auth_fetch_stream("http://example.invalid", "GET", &headers, None)
+            .await;
+        assert!(matches!(result, Err(PluginSubprocessError::Timeout)));
+
+        // Before the fix, the spawned reader task still held this guard.
+        let acquired = tokio::time::timeout(Duration::from_millis(100), sub.rpc_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "rpc_lock remained held after stream start timeout"
+        );
     }
 }
