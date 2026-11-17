@@ -63,9 +63,6 @@ status: current
 - [ ] **[H-11]** キュー再実行による assistant レスポンス重複と冪等性欠如
   - promoted 更新失敗はログのみでキューが processing のまま残り起動時に再実行、assistant 側に冪等性なし（課金重複は推測）。
     `queue_id` を assistant にも相関 ID 保持するか promoted 更新を同一トランザクション化
-- [ ] **[H-12]** Bearer トークンの平文ログ出力
-  - `server.rs:925-926,958-960` が 32 バイト乱数トークンを全桁 `tracing::info!` 出力、
-    ファイル出力と組み合わさりディスク永続化。ADR-0001 を見直しマスク出力またはローカル TTY のみに制限
 - [ ] **[H-13]** TUI イベントルートのブロッキング HTTP と全件再マッピング
   - `app.rs:3186-3215` が 16ms ループから `reqwest::blocking`（timeout
     30s）で同期取得し全件再マッピング。非同期 `reqwest::Client`＋`tokio::spawn` とメッセージ ID 単位の差分取得へ変更
@@ -294,6 +291,7 @@ status: current
 - [x] **[M-30]** メッセージ順序に `rowid ASC` タイブレークを追加しキューと統一（2026-11-17）
 - [x] **[M-31]** ID 生成を単一 Mutex + 12bit カウンタに変更し timestamp 破損を防止（2026-11-17）
 - [x] **[M-32]** README のバイナリ名を `opencoderust` に修正（2026-11-17）
+- [x] **[H-12]** 認証トークンのログ出力をマスク（先头4文字＋長さ）に変更（2026-11-17）
 
 ## メモ
 
