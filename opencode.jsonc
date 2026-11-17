@@ -103,7 +103,7 @@
       "command": [
         "npx",
         "-y",
-        "chrome-devtools-mcp",
+        "chrome-devtools-mcp@1.13.0",
         "--user-data-dir",
         ".opencode/browser-session",
       ],
@@ -118,7 +118,7 @@
     },
     "tavily-mcp": {
       "type": "local",
-      "command": ["npx", "-y", "tavily-mcp@latest"],
+      "command": ["npx", "-y", "tavily-mcp@0.2.22"],
       "environment": {
         "DEFAULT_PARAMETERS": "{\"include_images\": true, \"max_results\": 15, \"search_depth\": \"advanced\"}",
       },
