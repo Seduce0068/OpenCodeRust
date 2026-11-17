@@ -401,6 +401,13 @@ When constructing the summary, try to stick to this template:
     /// with full metadata, fires the `experimental.session.compacting` plugin
     /// hook (with context injection), converts messages via
     /// `to_model_messages()`, runs the LLM, and handles auto-continue.
+    ///
+    /// When `session_ops` is supplied, every `SessionOps::update_message` and
+    /// `SessionOps::update_part` call is part of the success contract: a
+    /// persistence failure is propagated with `?`, so `Ok` is returned only if
+    /// all requested writes succeeded. With no `session_ops`, persistence is
+    /// skipped by design. LLM call failures are reported separately as
+    /// `CompactionResult::Stop`.
     pub async fn process<S: SessionOps>(
         &self,
         input: CompactionInput,
@@ -452,8 +459,10 @@ When constructing the summary, try to stick to this template:
         };
 
         // Persist the assistant message if session ops are available.
+        // A failure here is returned to the caller: no compaction is reported
+        // as successful before its summary message has been persisted.
         if let Some(ops) = session_ops {
-            let _ = ops.update_message(assistant_info.clone()).await;
+            ops.update_message(assistant_info.clone()).await?;
         }
 
         // TS: const compacting = await Plugin.trigger("experimental.session.compacting", ...)
@@ -563,15 +572,14 @@ When constructing the summary, try to stick to this template:
                         }),
                         metadata: Some(metadata),
                     };
-                    let _ = ops
-                        .update_part(&input.session_id, &assistant_id, summary_part)
-                        .await;
+                    ops.update_part(&input.session_id, &assistant_id, summary_part)
+                        .await?;
 
                     let mut completed_info = assistant_info.clone();
                     if let MessageInfo::Assistant { time, .. } = &mut completed_info {
                         time.completed = Some(now_part);
                     }
-                    let _ = ops.update_message(completed_info).await;
+                    ops.update_message(completed_info).await?;
                 }
 
                 // TS: if (result === "continue" && input.auto) { ... create continue message ... }
@@ -603,7 +611,7 @@ When constructing the summary, try to stick to this template:
                             tools: None,
                             variant: input.variant.clone(),
                         };
-                        let _ = ops.update_message(continue_user).await;
+                        ops.update_message(continue_user).await?;
 
                         // Create a synthetic text part with the continue prompt.
                         let continue_part_id =
@@ -622,9 +630,8 @@ When constructing the summary, try to stick to this template:
                             }),
                             metadata: None,
                         };
-                        let _ = ops
-                            .update_part(&input.session_id, &continue_msg_id, continue_part)
-                            .await;
+                        ops.update_part(&input.session_id, &continue_msg_id, continue_part)
+                            .await?;
                     }
                 }
 
@@ -714,6 +721,10 @@ When constructing the summary, try to stick to this template:
     ///
     /// This is the high-level async version that mirrors the TS `prune()`
     /// function which fetches messages, prunes, and persists updates.
+    ///
+    /// Every `SessionOps::update_part` call is part of the success contract:
+    /// a persistence failure is propagated with `?` instead of returning a
+    /// successful prune result.
     pub async fn prune_session<S: SessionOps>(
         &self,
         session_id: &str,
@@ -767,9 +778,9 @@ When constructing the summary, try to stick to this template:
                                 },
                                 metadata: tool_part.metadata.clone(),
                             });
-                            let _ = session_ops
+                            session_ops
                                 .update_part(session_id, message_id, updated_part)
-                                .await;
+                                .await?;
                         }
                     }
                 }
@@ -1473,6 +1484,45 @@ mod tests {
             _ => false,
         });
         assert!(has_completed_summary_message);
+    }
+
+    #[tokio::test]
+    async fn test_process_propagates_persistence_failure() {
+        struct FailingSessionOps;
+
+        impl SessionOps for FailingSessionOps {
+            async fn messages(&self, _session_id: &str) -> anyhow::Result<Vec<MessageWithParts>> {
+                Ok(vec![])
+            }
+
+            async fn update_message(&self, _info: MessageInfo) -> anyhow::Result<MessageInfo> {
+                anyhow::bail!("update_message failed")
+            }
+
+            async fn update_part(
+                &self,
+                _session_id: &str,
+                _message_id: &str,
+                _part: Part,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("update_part failed")
+            }
+        }
+
+        let engine = CompactionEngine::default();
+        let provider = Arc::new(MockProvider::new(
+            "mock-model",
+            8192,
+            1024,
+            "summary from llm",
+        ));
+        let input = make_input("mock-model", None, None);
+
+        let err = engine
+            .process(input, provider, Some(&FailingSessionOps))
+            .await
+            .expect_err("persistence failure must be reported to the caller");
+        assert!(err.to_string().contains("update_message failed"));
     }
 
     #[tokio::test]
