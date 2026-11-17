@@ -301,3 +301,37 @@ fn list_local_models() -> Result<String, Box<dyn std::error::Error>> {
         .into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_response_builds_json_rpc_error() {
+        let response = error_response(Some(json!(7)), -32601, "Method not found");
+        assert_eq!(response.jsonrpc, "2.0");
+        assert_eq!(response.id, Some(json!(7)));
+        assert!(response.result.is_none());
+        let error = response.error.expect("error should be present");
+        assert_eq!(error.code, -32601);
+        assert_eq!(error.message, "Method not found");
+        assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn error_response_allows_null_id() {
+        let response = error_response(None, -32600, "Invalid request");
+        assert!(response.id.is_none());
+        assert_eq!(response.error.expect("error").code, -32600);
+    }
+
+    #[test]
+    fn error_response_serializes_without_result() {
+        let response = error_response(Some(json!("id")), -1, "fail");
+        let value = serde_json::to_value(response).expect("serialize");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], "id");
+        assert!(value.get("result").is_none());
+        assert_eq!(value["error"]["code"], -1);
+    }
+}
