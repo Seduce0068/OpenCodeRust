@@ -2,7 +2,9 @@
 type: Playbook
 description: Termux/Android 環境での build 制約と回避策を記録する。
 tags: [termux, android, build]
-verified: "2026-10-16T00:30:00+09:00"
+verified:
+  by: agent
+  at: "2026-10-16T00:30:00+09:00"
 ---
 
 # Rust Build Notes for Termux/Android
