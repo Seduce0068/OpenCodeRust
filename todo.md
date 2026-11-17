@@ -50,16 +50,16 @@ status: current
     書き込みスコープ外）にあり 30s timeout。Tick は 2 秒ごとで約 12 箇所の同期呼び出し。
     根本修正には api.rs の非同期化＋サーバの差分 API＋12 箇所の async 化が必要で
     大幅変更。app.rs のみの workaround は UI  timing を変えるため見送り
-- [ ] **[H-14]** 認証情報エラーの呼び出し側配線（try_* API は対応済み、残りに絞る）
-  - `provider/auth.rs` に `try_load_from_file` / `try_set` / `try_remove` と状態アクセサを追加済み。
-    未対応は既存呼び出し元（server の oauth.rs / server.rs / routes.rs）を try_* へ切替え、
-    HTTP レスポンスへ反映すること（別 writeScope）
 
 ### 優先度: 中
 
 - [ ] **[M-02]** 共有型の重複定義と serde_json 往復による変換
-  - session が types に依存せず `SessionMessage` 等を重複定義、`server.rs:569-574` が serde
-    往復（フィールド差による欠落は推測）。型を `opencode-types` へ集約し `From` 変換へ置換
+  - 事実確認済み（2026-11-18、shared-type-worker）: serde 往復で session 側の `usage` /
+    `synthetic` / `ignored` が消えることを一時テストで実証。ただし session は types に非依存で、
+    型集約には types 側フィールド追加＋session の依存追加＋server.rs の From 置換が
+    必要（大幅変更）。推奨: types/message.rs へ3フィールド追加 → session を
+    `pub use` 化 → server.rs を明示 From へ（H-10 の非アトミック書き出しと
+    同一箇所、同時対応が効率的）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - pty／util／watcher／local-llm／codemode の 5 クレートが無依存（codemode は ADR-0006
     で既知の先送り）、server が portable-pty を直接依存し同名 PtyManager を再実装。配線または member 外し、
@@ -246,6 +246,8 @@ status: current
 - [x] **[H-08]** plugin subprocess の JoinHandle abort とロック timeout（2026-11-18、plugin-lock-worker）
 - [x] **[M-01]** fail-open 因果は否定、root とテストで明記（2026-11-18、permission-worker）
 - [x] **[M-15 一部]** CI locked 明示＋workspace 集約 6 件（2026-11-18、deps-worker）
+- [x] **[H-14]** 認証永続化失敗を HTTP 500/400 へ反映（2026-11-18、auth-wire-worker）
+- [x] **[M-34 一部]** workspace lints に unsafe_code = deny（2026-11-18、unsafe-lint-worker）
 
 ## メモ
 
