@@ -102,3 +102,34 @@ fn user_border_color_for_agent(agent: Option<&str>, theme: &Theme) -> Color {
     let idx = (hasher.finish() as usize) % theme.agent_colors.len();
     theme.agent_colors[idx]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_badge_strips_prefix_and_uppercases() {
+        assert_eq!(mime_badge("image/png"), "[PNG]");
+        assert_eq!(mime_badge("text/plain"), "[PLAIN]");
+        assert_eq!(mime_badge("application/pdf"), "[PDF]");
+        assert_eq!(mime_badge("custom"), "[CUSTOM]");
+    }
+
+    #[test]
+    fn border_color_defaults_to_primary() {
+        let theme = Theme::default();
+        assert_eq!(user_border_color_for_agent(None, &theme), theme.primary);
+    }
+
+    #[test]
+    fn border_color_is_stable_for_agent() {
+        let theme = Theme::default();
+        if theme.agent_colors.is_empty() {
+            return;
+        }
+        let first = user_border_color_for_agent(Some("build"), &theme);
+        let second = user_border_color_for_agent(Some("build"), &theme);
+        assert_eq!(first, second);
+        assert!(theme.agent_colors.contains(&first));
+    }
+}
