@@ -134,20 +134,16 @@ status: current
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
-- [ ] **[M-21]** ServerState 外のグローバル static 状態（CONFIG_STATE は対応済み、残りに絞る）
-  - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、TUI キュー群、
-    PROJECT_METADATA が static Lazy でプロセス共有。ServerState フィールドへ移し
-    `Arc<ServerState>` 経由で参照（CONFIG_STATE は state.config へ移行済み）
+- [ ] **[M-21]** ServerState 外のグローバル static 状態（CONFIG_STATE／TUI キューは対応済み、残りに絞る）
+  - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、PROJECT_METADATA が
+    static Lazy でプロセス共有。ServerState フィールドへ移し `Arc<ServerState>`
+    経由で参照（CONFIG_STATE は state.config、TUI キュー群は state フィールドへ移行済み）
 - [ ] **[M-22]** 現況ドキュメントのテスト件数・カバレッジ数値ドリフト
   - ALIGNMENT.md:47,98 が 813 件／34.14%、ADR-0008 が 946 件、CHANGELOG が 946
     件／35.89%（更新漏れは推測）。ALIGNMENT を最終値へ更新し ADR-0008 をリンク
 - [ ] **[M-23]** 構造化ログ・スパンの欠如
   - charter.md:64 が構造化ログを求めるがスパン生成コード 0 件、HTTP は TraceLayer のみ、補間文字列ログが多い。
     request／session id を伝播させるスパン導入とフィールド化
-- [ ] **[M-27]** MCP 操作のタイムアウト未適用
-  - `client.rs:734-743` の `read_resource` がタイムアウトなしの `send_request`、receive
-    ループは無限で stdio `read_line()` がブロック（docs:40-54 と矛盾）。
-    `send_request_with_progress_timeout` へ切替
 - [ ] **[M-33]** OKF フロントマター／文書規約の乖離
   - docs 配下 35 個・crates 22 ディレクトリに index.md が 0 件（docs/README.md が Index で兼ねる）、
     adr-0001 等 4 件の date がオフセットなし、TERMUX_BUILD.md の verified がスカラー。規約に合わせて修正
@@ -173,10 +169,10 @@ status: current
 - [ ] **[L-03]** 未配線コードの dead_code 抑制と CHANGELOG の矛盾
   - `prompt.rs:1961-1962` が定義のみ、`markdown/parser.rs` が 363 行全体を抑制、
     CHANGELOG.md:61-63 の「のみ」と矛盾。配線または削除し CHANGELOG を修正
-- [ ] **[L-04]** tracing 初期化の未配線と logLevel 未反映
-  - `logging.rs:390` で WorkerGuard が早期ドロップ、rolling 未使用、`init_tracing` 呼び出し 0 件、
-    CLI は `fmt::init()` で `config.log_level` 未参照（現状の実行時影響なし）。Guard
-    延伸＋rolling＋logLevel 配線
+- [ ] **[L-04]** tracing 初期化の未配線（level 反映は対応済み、残りに絞る）
+  - `build_filter(level)` で logLevel 反映は実装済み。未対応は `logging.rs` の
+    WorkerGuard 早期ドロップ、rolling 未使用、`init_tracing` 呼び出し 0 件、
+    CLI が `fmt::init()` で `config.log_level` 未参照。Guard 延伸＋rolling＋呼出配線
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
@@ -270,6 +266,9 @@ status: current
 - [x] **[M-21/P0]** CONFIG_STATE を ServerState.config へ移行（2026-11-18、state-worker）
 - [x] **[M-35]** file_index 検索を Top-K ヒープへ（2026-11-18、index-worker）
 - [x] **[M-36]** watch debounce を leading-edge 合体で実装（2026-11-18、watch-worker）
+- [x] **[M-21/P0-②]** TUI キュー群を ServerState フィールドへ移行（2026-11-18、queue-worker）
+- [x] **[M-27]** MCP `read_resource` に catalog timeout を適用（2026-11-18、mcp-timeout-worker）
+- [x] **[L-04 一部]** `build_filter(level)` で logLevel を反映（2026-11-18、logging-worker）
 
 ## メモ
 
