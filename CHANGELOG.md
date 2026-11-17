@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T13:46:27+09:00"
+  at: "2026-11-17T13:54:19+09:00"
 ---
 
 # Changelog
@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-tool`: BatchTool のスキーマ (`toolCalls`) とデシリアライズ
   (`tool_calls`) の不整合を serde rename + alias で解消。全ツールの
   スキーマ/引数名を横断監査し、不整合はこの 2 件のみであることを確認
+- `opencode-provider` / `opencode-session` に残っていた開発用プレースホルダ
+  コメントを削除。未実装マーカーを横断監査し、`litert.rs` の FFI TODO
+  (unsafe が必要で未対応) のみが実質的な残作業であることを確認
 
 ## [0.1.0]
 
