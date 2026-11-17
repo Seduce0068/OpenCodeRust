@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T09:34:19+09:00"
+  at: "2026-11-17T09:45:32+09:00"
 ---
 
 # Changelog
@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 34.79% を計測
-  (前回 34.83% から計測揺らぎで微減、テスト件数は増加)
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 34.82% を計測
+  (34.79% → 34.82% は計測揺らぎ、再計測で回復を確認)
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (44MB バイナリ、
   脆弱性 0、依存は最新)
 
