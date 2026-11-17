@@ -266,7 +266,7 @@ async fn list_sessions(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 #[derive(Default)]
-enum SessionRunStatus {
+pub(crate) enum SessionRunStatus {
     #[default]
     Idle,
     Busy,
@@ -277,18 +277,13 @@ enum SessionRunStatus {
     },
 }
 
-static SESSION_RUN_STATUS: Lazy<RwLock<HashMap<String, SessionRunStatus>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-static PROMPT_LOCKS: Lazy<RwLock<HashMap<String, Arc<Mutex<()>>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
 async fn set_session_run_status(
     state: &Arc<ServerState>,
     session_id: &str,
     status: SessionRunStatus,
 ) {
     {
-        let mut statuses = SESSION_RUN_STATUS.write().await;
+        let mut statuses = state.session_run_status.write().await;
         match &status {
             SessionRunStatus::Idle => {
                 statuses.remove(session_id);
@@ -312,7 +307,7 @@ async fn set_session_run_status(
 async fn session_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<HashMap<String, SessionStatusInfo>>> {
-    let run_status = SESSION_RUN_STATUS.read().await.clone();
+    let run_status = state.session_run_status.read().await.clone();
     let manager = state.sessions.lock().await;
     let sessions = manager.list();
     let status: HashMap<String, SessionStatusInfo> = sessions
@@ -439,8 +434,8 @@ async fn delete_session(
         .await
         .delete(&id)
         .ok_or_else(|| ApiError::SessionNotFound(id.clone()))?;
-    SESSION_RUN_STATUS.write().await.remove(&id);
-    PROMPT_LOCKS.write().await.remove(&id);
+    state.session_run_status.write().await.remove(&id);
+    state.prompt_locks.write().await.remove(&id);
     persist_sessions_if_enabled(&state).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -1757,7 +1752,7 @@ fn spawn_prompt_execution(
             task_id: tokio::task::id(),
         };
         let run_lock = {
-            let mut locks = PROMPT_LOCKS.write().await;
+            let mut locks = task_state.prompt_locks.write().await;
             locks
                 .entry(session_id.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -5352,7 +5347,12 @@ mod abort_tests {
             .await
             .expect("task should stop after abort");
         assert!(outcome.unwrap_err().is_cancelled());
-        assert!(SESSION_RUN_STATUS.read().await.get(&session_id).is_none());
+        assert!(state
+            .session_run_status
+            .read()
+            .await
+            .get(&session_id)
+            .is_none());
         assert!(state
             .running_prompt_tasks
             .lock()
@@ -5373,7 +5373,12 @@ mod abort_tests {
             .await
             .expect("task should stop after abort");
         assert!(outcome.unwrap_err().is_cancelled());
-        assert!(SESSION_RUN_STATUS.read().await.get(&session_id).is_none());
+        assert!(state
+            .session_run_status
+            .read()
+            .await
+            .get(&session_id)
+            .is_none());
     }
 
     #[tokio::test]
