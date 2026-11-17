@@ -198,9 +198,6 @@ status: current
 - [ ] **[L-11]** 設定マイグレーションのロールバック手段欠如
   - `loader.rs:391-406` がレガシー TOML を書き込んだ直後に元ファイルを削除、バックアップなし。`.bak`
     退避または削除を任意手順化
-- [ ] **[L-13]** codemode の RegExp `lastIndex` 型変換による parity 欠如
-  - `interpreter.rs:6120-6126` が負数を 0 にサチュレートして JS と parity を欠く（「usize::MAX
-    付近」という主張は技術的に誤りで修正済み）。符号付き型で保持
 - [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケーション
   - `routes.rs:1103-1118` が全件 collect、`:1316-1317` が全履歴 clone（O(n) は推測）。
     ページネーション／差分取得と Arc による copy-on-write
@@ -279,6 +276,7 @@ status: current
 - [x] **[M-14]** サーバ起動時の認証警告を実態（ランダム Bearer / NO_AUTH）に修正（2026-11-18）
 - [x] **[L-10]** POST /log の service/message/extra をサニタイズ（2026-11-18）
 - [x] **[L-06]** GET/PATCH /config の provider api_key をマスク（2026-11-18）
+- [x] **[L-13]** RegExp lastIndex を i64 で保持し負数を JS と同じく保持（2026-11-18）
 
 ## メモ
 
