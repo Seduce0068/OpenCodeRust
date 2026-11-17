@@ -184,4 +184,47 @@ mod tests {
             panic!("Expected remote reference");
         }
     }
+
+    #[test]
+    fn normalize_input_strips_git_hash_and_slashes() {
+        assert_eq!(
+            normalize_input("git+https://host/a///#frag"),
+            "https://host/a"
+        );
+        assert_eq!(normalize_input("  github:a/b  "), "github:a/b");
+    }
+
+    #[test]
+    fn trim_git_suffix_and_get_parts() {
+        assert_eq!(trim_git_suffix("repo.git"), "repo");
+        assert_eq!(trim_git_suffix("repo"), "repo");
+        assert_eq!(get_parts(" owner / repo.git / "), vec!["owner", "repo"]);
+    }
+
+    #[test]
+    fn safe_host_and_segment_reject_unsafe() {
+        assert!(safe_host("github.com"));
+        assert!(!safe_host(""));
+        assert!(!safe_host("-evil"));
+        assert!(!safe_host("bad host"));
+
+        assert!(safe_segment("repo"));
+        assert!(!safe_segment("."));
+        assert!(!safe_segment(".."));
+        assert!(!safe_segment("a:b"));
+    }
+
+    #[test]
+    fn host_like_detects_hosts() {
+        assert!(host_like("github.com"));
+        assert!(host_like("host:22"));
+        assert!(host_like("localhost"));
+        assert!(!host_like("repo"));
+    }
+
+    #[test]
+    fn parse_rejects_empty_and_unsafe() {
+        assert!(parse("").is_none());
+        assert!(parse("-bad").is_none());
+    }
 }
