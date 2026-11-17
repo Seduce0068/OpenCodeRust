@@ -357,13 +357,20 @@ impl Log {
     }
 }
 
-pub fn init_tracing(
-    _level: Option<&str>,
-    log_dir: Option<PathBuf>,
-    print: bool,
-) -> Option<PathBuf> {
+/// 明示指定されたログレベルを `EnvFilter` へ反映する。
+///
+/// `level` が `Some` で空でない場合はその値をディレクティブとして使用し、
+/// それ以外は従来どおり `RUST_LOG` → `info` の順でフォールバックする。
+fn build_filter(level: Option<&str>) -> EnvFilter {
+    match level {
+        Some(level) if !level.trim().is_empty() => EnvFilter::new(level),
+        _ => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    }
+}
+
+pub fn init_tracing(level: Option<&str>, log_dir: Option<PathBuf>, print: bool) -> Option<PathBuf> {
     if print {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = build_filter(level);
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer())
@@ -388,7 +395,7 @@ pub fn init_tracing(
 
     if let Some(file) = file {
         let (non_blocking, _guard) = tracing_appender::non_blocking(file);
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = build_filter(level);
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().with_writer(non_blocking))

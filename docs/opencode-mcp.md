@@ -42,7 +42,7 @@ with support for multiple transports and OAuth.
 `McpTimeouts` holds per-operation timeouts in milliseconds:
 
 - `startup_ms` – transport connect and `initialize` handshake (default 30s)
-- `catalog_ms` – `tools/list` discovery (default 30s)
+- `catalog_ms` – `tools/list` discovery and `resources/read` (default 30s)
 - `execution_ms` – `tools/call` (default 12h)
 
 The defaults follow the OpenCode MCP schema; see
@@ -52,6 +52,10 @@ behaviour. `McpConfig::timeout` (the global `mcp.timeout`) and a server's own
 
 `McpClient::with_timeouts` applies them; `with_timeout(ms)` sets all three.
 A timeout surfaces as `McpClientError::Timeout`.
+
+`resources/read` uses the progress-aware request helper with `catalog_ms`, so a
+server that never replies no longer blocks the calling task indefinitely.
+A `notifications/progress` message extends the deadline by another `catalog_ms`.
 
 ## Validation
 
