@@ -1448,4 +1448,40 @@ mod tests {
         assert_eq!(format_number(0), "0");
         assert_eq!(format_number(1234567), "1,234,567");
     }
+
+    fn joined(lines: &[Vec<Span<'static>>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_spans_splits_at_width() {
+        let wrapped = wrap_spans(vec![Span::raw("abcdefg")], 3);
+        assert_eq!(joined(&wrapped), vec!["abc", "def", "g"]);
+    }
+
+    #[test]
+    fn wrap_spans_respects_newlines() {
+        let wrapped = wrap_spans(vec![Span::raw("ab\ncd")], 5);
+        assert_eq!(joined(&wrapped), vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn wrap_spans_zero_width_is_unchanged() {
+        let wrapped = wrap_spans(vec![Span::raw("abc")], 0);
+        assert_eq!(joined(&wrapped), vec!["abc"]);
+    }
+
+    #[test]
+    fn wrap_block_line_without_gutter() {
+        let line = Line::from(vec![Span::raw("abcdef"), Span::raw("gh")]);
+        let wrapped = wrap_block_line(line, 3);
+        let texts: Vec<String> = wrapped
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["abc", "def", "gh"]);
+    }
 }
