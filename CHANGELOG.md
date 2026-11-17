@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T23:58:05+09:00"
+  at: "2026-11-18T00:04:18+09:00"
 ---
 
 # Changelog
@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-grep`: WalkDir / ファイル読み取りエラーを握りつぶさず `Err` として伝播 (M-24)
 - `opencode-config`: auth.json 由来の `set_var` にキー形式検証と危険キー
   (`PATH` / `LD_PRELOAD` 等) の拒否を追加 (M-26)
+- `opencode-tui`: 許可プロンプトの送信失敗をトーストで通知し、question 応答と
+  一貫したエラー扱いに変更 (M-25)
 
 ## [0.1.0]
 

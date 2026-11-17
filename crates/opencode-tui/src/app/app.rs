@@ -322,6 +322,19 @@ impl App {
         Ok(())
     }
 
+    /// Reply to a permission request, surfacing delivery failures to the user.
+    fn reply_permission(&mut self, id: &str, decision: &str) {
+        if let Some(client) = self.context.get_api_client() {
+            if let Err(error) = client.reply_permission(id, decision) {
+                self.toast.show(
+                    ToastVariant::Error,
+                    &format!("Failed to send permission reply: {}", error),
+                    3000,
+                );
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: &Event) -> anyhow::Result<()> {
         self.event_caused_change = true;
 
@@ -332,30 +345,22 @@ impl App {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
                             if let Some(request) = self.permission_prompt.approve() {
-                                if let Some(client) = self.context.get_api_client() {
-                                    let _ = client.reply_permission(&request.id, "once");
-                                }
+                                self.reply_permission(&request.id, "once");
                             }
                         }
                         KeyCode::Char('n') => {
                             if let Some(request) = self.permission_prompt.deny() {
-                                if let Some(client) = self.context.get_api_client() {
-                                    let _ = client.reply_permission(&request.id, "reject");
-                                }
+                                self.reply_permission(&request.id, "reject");
                             }
                         }
                         KeyCode::Char('a') => {
                             if let Some(request) = self.permission_prompt.approve_always() {
-                                if let Some(client) = self.context.get_api_client() {
-                                    let _ = client.reply_permission(&request.id, "always");
-                                }
+                                self.reply_permission(&request.id, "always");
                             }
                         }
                         KeyCode::Esc => {
                             if let Some(request) = self.permission_prompt.deny() {
-                                if let Some(client) = self.context.get_api_client() {
-                                    let _ = client.reply_permission(&request.id, "reject");
-                                }
+                                self.reply_permission(&request.id, "reject");
                             }
                         }
                         _ => {}
