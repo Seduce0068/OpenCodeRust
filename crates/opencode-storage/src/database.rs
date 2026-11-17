@@ -207,6 +207,14 @@ mod migration_tests {
             .expect("set user_version");
     }
 
+    async fn count_sessions(pool: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("count sessions")
+    }
+
     #[tokio::test]
     async fn first_migration_records_schema_version() {
         let database = Database::in_memory().await.expect("database initializes");
@@ -267,6 +275,104 @@ mod migration_tests {
             read_user_version(database.pool()).await,
             advanced,
             "second run must not rewrite user_version"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_failure_rolls_back_partial_schema() {
+        // sessions を project_id なしで作り、CREATE INDEX を確実に失敗させる。
+        // これによりマイグレーションの途中（先行する CREATE TABLE の後）で
+        // エラーが起き、トランザクション全体がロールバックされることを検証する。
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("empty database");
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("pre-existing sessions table");
+
+        let database = Database { pool };
+        assert!(
+            database.run_migrations().await.is_err(),
+            "migration must fail on the conflicting schema"
+        );
+
+        assert_eq!(
+            read_user_version(database.pool()).await,
+            0,
+            "failed migration must not record user_version"
+        );
+        let messages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("sqlite_master readable");
+        assert_eq!(
+            messages, 0,
+            "tables created before the failure must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_transaction_commits_and_rolls_back() {
+        let database = Database::in_memory().await.expect("database initializes");
+
+        // commit した行は永続化される（run_migrations と同じトランザクション経路）。
+        {
+            let mut tx = database.begin().await.expect("begin");
+            sqlx::query(
+                "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('tx-commit', 'project-1', 'test', '.', 'Test', 1, 1)",
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("insert inside committed transaction");
+            tx.commit().await.expect("commit");
+        }
+        assert_eq!(
+            count_sessions(database.pool(), "tx-commit").await,
+            1,
+            "committed row must be visible"
+        );
+
+        // commit せずにドロップしたトランザクションはロールバックされる。
+        {
+            let mut tx = database.begin().await.expect("begin");
+            sqlx::query(
+                "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('tx-rollback', 'project-1', 'test', '.', 'Test', 1, 1)",
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("insert inside rolled-back transaction");
+            // tx を commit せずにドロップ → 暗黙のロールバック
+        }
+        assert_eq!(
+            count_sessions(database.pool(), "tx-rollback").await,
+            0,
+            "uncommitted row must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_databases_are_isolated() {
+        // in_memory() は接続ごとに private な SQLite DB を持つ（max_connections=1）。
+        // 別インスタンス間でデータが漏れないことを確認する。
+        let first = Database::in_memory().await.expect("first database");
+        let second = Database::in_memory().await.expect("second database");
+
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('isolated', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(first.pool())
+        .await
+        .expect("insert into first database");
+        assert_eq!(count_sessions(first.pool(), "isolated").await, 1);
+        assert_eq!(
+            count_sessions(second.pool(), "isolated").await,
+            0,
+            "each in_memory database must have its own storage"
         );
     }
 }
