@@ -1302,7 +1302,7 @@ async fn stream_message(
     Json(req): Json<SendMessageRequest>,
 ) -> std::result::Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>, ApiError>
 {
-    let config = CONFIG_STATE.read().await;
+    let config = state.config.read().await;
     let (provider, provider_id, model_id) =
         resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)?;
     drop(config);
@@ -1659,7 +1659,7 @@ async fn session_prompt(
         }
     }
 
-    let config = CONFIG_STATE.read().await;
+    let config = state.config.read().await;
     let (_provider, provider_id, model_id) =
         resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)?;
     drop(config);
@@ -2337,7 +2337,7 @@ async fn prompt_async(
         .ok_or_else(|| ApiError::InternalError("durable queue storage unavailable".into()))?;
     let (provider_id, model_id) = {
         let request_model = req.model.as_ref().and_then(serde_json::Value::as_str);
-        let config = CONFIG_STATE.read().await;
+        let config = state.config.read().await;
         let (_, provider_id, model_id) =
             resolve_provider_and_model(&state, request_model, config.model.as_deref(), None)?;
         (provider_id, model_id)
@@ -2778,8 +2778,6 @@ fn config_routes() -> Router<Arc<ServerState>> {
         .route("/providers", get(get_config_providers))
 }
 
-pub static CONFIG_STATE: Lazy<RwLock<AppConfig>> = Lazy::new(|| RwLock::new(AppConfig::default()));
-
 /// Serialize a config for API responses with provider API keys masked.
 fn config_for_response(config: &AppConfig) -> serde_json::Value {
     let mut value = match serde_json::to_value(config) {
@@ -2806,8 +2804,8 @@ fn config_for_response(config: &AppConfig) -> serde_json::Value {
     value
 }
 
-async fn get_config(State(_state): State<Arc<ServerState>>) -> Result<Json<serde_json::Value>> {
-    let config = CONFIG_STATE.read().await;
+async fn get_config(State(state): State<Arc<ServerState>>) -> Result<Json<serde_json::Value>> {
+    let config = state.config.read().await;
     Ok(Json(config_for_response(&config)))
 }
 
@@ -2815,7 +2813,7 @@ async fn patch_config(
     State(state): State<Arc<ServerState>>,
     Json(patch): Json<AppConfig>,
 ) -> Result<Json<serde_json::Value>> {
-    let mut config = CONFIG_STATE.write().await;
+    let mut config = state.config.write().await;
     config.merge(patch.clone());
     let updated = config.clone();
     drop(config);
