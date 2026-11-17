@@ -916,13 +916,19 @@ async fn auth_middleware(
     }
 }
 
+/// Redact an auth token for logging: show only a short prefix and the length.
+fn redact_token(token: &str) -> String {
+    let prefix: String = token.chars().take(4).collect();
+    format!("{}… ({} chars)", prefix, token.len())
+}
+
 pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
     let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
     routes::resume_queued_prompts(state.clone()).await?;
 
     if is_auth_enabled() {
         if let Some(token) = &state.auth_token {
-            tracing::info!("Authentication enabled. Token: {}", token);
+            tracing::info!("Authentication enabled. Token: {}", redact_token(token));
             tracing::info!("Set Authorization: Bearer <token> header for all requests");
         }
     } else {
@@ -956,7 +962,7 @@ pub async fn run_server_with_state(
     routes::resume_queued_prompts(state.clone()).await?;
     if is_auth_enabled() {
         if let Some(token) = &state.auth_token {
-            tracing::info!("Authentication enabled. Token: {}", token);
+            tracing::info!("Authentication enabled. Token: {}", redact_token(token));
         }
     } else {
         tracing::warn!("Authentication DISABLED (OPENCODE_NO_AUTH=1). Not safe for production.");
@@ -1203,5 +1209,19 @@ mod tests {
         assert!(!broker.reply("missing", Vec::new()).await);
         assert!(!broker.reject("missing").await);
         assert!(broker.list().await.is_empty());
+    }
+
+    #[test]
+    fn redact_token_hides_secret_body() {
+        let token = "abcd1234secret-secret-secret";
+        let redacted = redact_token(token);
+        assert!(redacted.starts_with("abcd"));
+        assert!(redacted.contains("28 chars"));
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn redact_token_handles_short_tokens() {
+        assert_eq!(redact_token("abc"), "abc… (3 chars)");
     }
 }
