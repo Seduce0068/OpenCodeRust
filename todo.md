@@ -50,8 +50,10 @@ status: current
   - promoted 更新失敗はログのみでキューが processing のまま残り起動時に再実行、assistant 側に冪等性なし（課金重複は推測）。
     `queue_id` を assistant にも相関 ID 保持するか promoted 更新を同一トランザクション化
 - [ ] **[H-13]** TUI イベントルートのブロッキング HTTP と全件再マッピング
-  - `app.rs:3186-3215` が 16ms ループから `reqwest::blocking`（timeout
-    30s）で同期取得し全件再マッピング。非同期 `reqwest::Client`＋`tokio::spawn` とメッセージ ID 単位の差分取得へ変更
+  - 事実確認済み（2026-11-18、tui-http-worker）: 同期 HTTP は `ApiClient`（api.rs、
+    書き込みスコープ外）にあり 30s timeout。Tick は 2 秒ごとで約 12 箇所の同期呼び出し。
+    根本修正には api.rs の非同期化＋サーバの差分 API＋12 箇所の async 化が必要で
+    大幅変更。app.rs のみの workaround は UI  timing を変えるため見送り
 - [ ] **[H-14]** 認証情報エラーの呼び出し側配線（try_* API は対応済み、残りに絞る）
   - `provider/auth.rs` に `try_load_from_file` / `try_set` / `try_remove` と状態アクセサを追加済み。
     未対応は既存呼び出し元（server の oauth.rs / server.rs / routes.rs）を try_* へ切替え、
@@ -77,9 +79,6 @@ status: current
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
-- [ ] **[M-08]** 未知設定キーのサイレント破棄と環境変数展開の未検証
-  - `strictPermissionChecks`／`gcBufferMb`／`references.gemini` が Config
-    にフィールドなし（docs では起動を止めない意図で明記）、`{env:VAR}` 未定義が空文字化。キー追加／起動時警告と必須項目の非空検証
 - [ ] **[M-11]** 重要パス（認証・PTY・DB・provider）のテストカバレッジ空白
   - mcp/oauth.rs（561 行）・server/oauth.rs・server/pty.rs・storage/database.rs がテスト 0
     件、provider 統合テストに HTTP／ストリーミング／認証フローなし（ADR-0008 の改善対象外だが明示的先送りではない）。モック
@@ -101,9 +100,6 @@ status: current
   - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、PROJECT_METADATA が
     static Lazy でプロセス共有。ServerState フィールドへ移し `Arc<ServerState>`
     経由で参照（CONFIG_STATE は state.config、TUI キュー群は state フィールドへ移行済み）
-- [ ] **[M-23]** 構造化ログ・スパンの欠如
-  - charter.md:64 が構造化ログを求めるがスパン生成コード 0 件、HTTP は TraceLayer のみ、補間文字列ログが多い。
-    request／session id を伝播させるスパン導入とフィールド化
 - [ ] **[M-33]** OKF フロントマターの残課題（date/verified は対応済み）
   - ADR 4 件の date オフセット・TERMUX_BUILD の verified 構造化は完了。未対応は
     `generated` mapping 欠如、status "Approved" の enum 不一致、TERMUX_BUILD の
@@ -251,6 +247,8 @@ status: current
 - [x] **[H-04 一部]** npx 依存 2 件を Exact 固定（2026-11-18、mcp-pin-worker）
 - [x] **[M-18]** SessionOps の静的ディスパッチ意図を明記（2026-11-18、sessionops-worker）
 - [x] **[M-33]** ADR の date と TERMUX_BUILD verified を OKF 準拠へ（2026-11-18、okf-worker）
+- [x] **[M-08]** 未知キーと未定義 env を警告化（値は非記録）（2026-11-18、config-key2-worker）
+- [x] **[M-23]** request/session id の構造化スパンを導入（2026-11-18、span-worker）
 
 ## メモ
 
