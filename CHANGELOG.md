@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T22:47:58+09:00"
+  at: "2026-11-17T22:55:20+09:00"
 ---
 
 # Changelog
@@ -66,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-provider`: Bedrock 署名ヘッダの `parse().unwrap()` を
   `map_err(...)?` に変更し、不正な `session_token` 等で panic せず
   `AuthError` として伝播するよう修正 (M-07)
+- `opencode-tool`: `LineTrimmedReplacer` が検索行数の方が多い場合に範囲外
+  インデックスで panic する問題を早期 return で回避 (M-28)
 
 ## [0.1.0]
 
