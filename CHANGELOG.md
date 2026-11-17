@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T02:50:31+09:00"
+  at: "2026-11-18T03:22:25+09:00"
 ---
 
 # Changelog
@@ -110,6 +110,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-session`: LLM リトライに上限（`retries` 既定 3）と 300s ストリーム
   タイムアウトを適用し、retry delay を saturating 計算へ変更 (H-06)
 - `ALIGNMENT.md`: テスト件数/カバレッジを 974 件／36.27% へ更新し ADR-0008 へリンク (M-22)
+- `opencode-server`: 実行中 prompt の `AbortHandle` を `ServerState` で保持し、abort 時に
+  キャンセルと Idle 更新を配線（外部契约 `aborted: true` は維持）(H-05)
+- `opencode-storage`: マイグレーションを単一トランザクション化し、metadata 列の有無を
+  PRAGMA で構造的に判定（エラー文字列依存を解消）(H-10 一部)
+- `opencode-local-llm`: ollama 実行を tokio 非同期化し、timeout 時 kill を実装
+  （既定 300s、`OPENCODE_LOCAL_LLM_TIMEOUT_SECS` で上書き可）(M-10)
 
 ## [0.1.0]
 
