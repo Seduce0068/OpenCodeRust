@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use opencode_plugin::{HookContext, HookEvent};
@@ -20,6 +21,17 @@ pub const OUTPUT_TOKEN_MAX: u64 = 8192;
 /// Doom loop detection threshold: if the last N tool calls are identical,
 /// trigger a permission ask.
 const DOOM_LOOP_THRESHOLD: usize = 3;
+
+/// Retry limit used when a [`StreamInput`] does not specify `retries`.
+const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Hard bound for a single streaming LLM attempt.
+///
+/// Provider adapters construct their HTTP clients without a request timeout,
+/// so a stalled provider could otherwise block the retry loop forever. The
+/// value is intentionally generous to accommodate long-running generations;
+/// cancellation via [`StreamInput::abort`] still applies during retry sleeps.
+const LLM_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct LlmAgent {
@@ -306,8 +318,23 @@ impl StreamProcessor {
         self.needs_compaction = false;
         self.model_limits = Some(resolve_model_limits(&stream_input, provider.as_ref()));
 
+        let max_attempts = stream_input.retries.unwrap_or(DEFAULT_MAX_RETRIES);
+        let mut retry_state = retry::RetryState::new(max_attempts);
+
         loop {
-            match self.process_stream(&stream_input, provider.clone()).await {
+            // Bound every attempt so a stalled provider cannot block forever.
+            // Provider adapters build their HTTP clients without a timeout.
+            let attempt_result = match tokio::time::timeout(
+                LLM_STREAM_TIMEOUT,
+                self.process_stream(&stream_input, provider.clone()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("LLM stream timed out")),
+            };
+
+            match attempt_result {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::error!(
@@ -321,39 +348,58 @@ impl StreamProcessor {
 
                     let retry_msg = retry::retryable(&error);
                     if let Some(retry_message) = retry_msg {
-                        self.attempt += 1;
+                        if retry_state.should_retry() {
+                            retry_state.increment(retry_message.clone());
+                            self.attempt = retry_state.attempt;
 
-                        let api_info = match &error {
-                            MessageError::ApiError {
-                                message,
-                                is_retryable,
-                                response_headers,
-                                response_body,
-                                ..
-                            } => Some(ApiErrorInfo {
-                                message: message.clone(),
-                                is_retryable: *is_retryable,
-                                response_headers: response_headers.clone(),
-                                response_body: response_body.clone(),
-                            }),
-                            _ => None,
-                        };
+                            let api_info = match &error {
+                                MessageError::ApiError {
+                                    message,
+                                    is_retryable,
+                                    response_headers,
+                                    response_body,
+                                    ..
+                                } => Some(ApiErrorInfo {
+                                    message: message.clone(),
+                                    is_retryable: *is_retryable,
+                                    response_headers: response_headers.clone(),
+                                    response_body: response_body.clone(),
+                                }),
+                                _ => None,
+                            };
 
-                        let delay_ms = retry::delay(self.attempt, api_info.as_ref());
+                            let delay_ms = retry_state.next_delay(api_info.as_ref());
 
-                        tracing::info!(
-                            session_id = %self.session_id,
-                            attempt = self.attempt,
-                            delay_ms = delay_ms,
-                            message = %retry_message,
-                            "Retrying after error"
-                        );
+                            tracing::info!(
+                                session_id = %self.session_id,
+                                attempt = self.attempt,
+                                max_attempts = max_attempts,
+                                delay_ms = delay_ms,
+                                message = %retry_message,
+                                "Retrying after error"
+                            );
 
-                        // Sleep with cancellation support
-                        let _ =
-                            retry::sleep_with_cancel(delay_ms, stream_input.abort.clone()).await;
+                            // Sleep with cancellation support. Only an
+                            // uninterrupted sleep earns another attempt.
+                            if retry::sleep_with_cancel(delay_ms, stream_input.abort.clone())
+                                .await
+                                .is_ok()
+                            {
+                                continue;
+                            }
 
-                        continue;
+                            tracing::info!(
+                                session_id = %self.session_id,
+                                "Retry sleep cancelled by abort"
+                            );
+                        } else {
+                            tracing::warn!(
+                                session_id = %self.session_id,
+                                attempt = self.attempt,
+                                max_attempts = max_attempts,
+                                "Retry limit reached; stopping"
+                            );
+                        }
                     }
 
                     self.error = Some(error);
