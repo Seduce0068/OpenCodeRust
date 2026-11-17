@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T23:24:33+09:00"
+  at: "2026-11-17T23:30:37+09:00"
 ---
 
 # Changelog
@@ -74,6 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   同一 `created_at` のメッセージ順序をキューと同じ規則で安定化 (M-30)
 - `opencode-core`: ID 生成の timestamp と counter を単一 Mutex で管理し、
   counter を 12bit マスクしてオーバーフロー時の timestamp 破損を防止 (M-31)
+- `README.md`: CLI バイナリ名の記載を `opencode` から実際の `opencoderust` へ修正 (M-32)
 
 ## [0.1.0]
 

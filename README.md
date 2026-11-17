@@ -142,7 +142,7 @@ See: `docs/opencode-config.md`
 The complete 22-crate map and major execution paths are documented in
 [`docs/architecture.md`](docs/architecture.md).
 
-- `crates/opencode-cli` – CLI entrypoint (binary: `opencode`)
+- `crates/opencode-cli` – CLI entrypoint (binary: `opencoderust`)
 - `crates/opencode-server` – HTTP/SSE/WebSocket server
 - `crates/opencode-tui` – Terminal UI
 - `crates/opencode-session` – Sessions and messages

@@ -164,9 +164,6 @@ status: current
   - `client.rs:734-743` の `read_resource` がタイムアウトなしの `send_request`、receive
     ループは無限で stdio `read_line()` がブロック（docs:40-54 と矛盾）。
     `send_request_with_progress_timeout` へ切替
-- [ ] **[M-32]** README のバイナリ名と実装の乖離
-  - `README.md:145` が `binary: opencode` と記載するが実装は `opencoderust`（同一 README
-    の他行とも自己矛盾）。`binary: opencoderust` へ修正
 - [ ] **[M-33]** OKF フロントマター／文書規約の乖離
   - docs 配下 35 個・crates 22 ディレクトリに index.md が 0 件（docs/README.md が Index で兼ねる）、
     adr-0001 等 4 件の date がオフセットなし、TERMUX_BUILD.md の verified がスカラー。規約に合わせて修正
@@ -296,6 +293,7 @@ status: current
 - [x] **[M-29]** `apply_patch` の行番号オーバーフローを `InvalidArguments` としてエラー化（2026-11-17）
 - [x] **[M-30]** メッセージ順序に `rowid ASC` タイブレークを追加しキューと統一（2026-11-17）
 - [x] **[M-31]** ID 生成を単一 Mutex + 12bit カウンタに変更し timestamp 破損を防止（2026-11-17）
+- [x] **[M-32]** README のバイナリ名を `opencoderust` に修正（2026-11-17）
 
 ## メモ
 
