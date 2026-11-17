@@ -405,8 +405,12 @@ pub struct ServerState {
     /// Wakeup signal for future response consumers (per-instance).
     pub(crate) tui_response_notify: Notify,
     /// セッションごとの実行中プロンプトタスクのキャンセルハンドル。
-    /// `PROMPT_LOCKS` により 1 セッション同時 1 本だけが登録される。
+    /// `prompt_locks` により 1 セッション同時 1 本だけが登録される。
     pub(crate) running_prompt_tasks: StdMutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// セッションごとの実行状態（旧プロセス共有 static `SESSION_RUN_STATUS`）。
+    pub(crate) session_run_status: TokioRwLock<HashMap<String, routes::SessionRunStatus>>,
+    /// セッションごとのプロンプト直列化ロック（旧プロセス共有 static `PROMPT_LOCKS`）。
+    pub(crate) prompt_locks: TokioRwLock<HashMap<String, Arc<Mutex<()>>>>,
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
@@ -432,6 +436,8 @@ impl ServerState {
             tui_response_queue: Mutex::new(VecDeque::new()),
             tui_response_notify: Notify::new(),
             running_prompt_tasks: StdMutex::new(HashMap::new()),
+            session_run_status: TokioRwLock::new(HashMap::new()),
+            prompt_locks: TokioRwLock::new(HashMap::new()),
             session_repo: None,
             message_repo: None,
             input_repo: None,
@@ -1422,5 +1428,31 @@ mod tests {
             });
         assert_eq!(first.tui_request_queue.lock().await.len(), 1);
         assert_eq!(second.tui_request_queue.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_run_state_and_prompt_locks_are_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        first
+            .session_run_status
+            .write()
+            .await
+            .insert("session-a".to_string(), routes::SessionRunStatus::Busy);
+        first
+            .prompt_locks
+            .write()
+            .await
+            .insert("session-a".to_string(), Arc::new(Mutex::new(())));
+
+        assert!(first
+            .session_run_status
+            .read()
+            .await
+            .contains_key("session-a"));
+        assert!(first.prompt_locks.read().await.contains_key("session-a"));
+        assert!(second.session_run_status.read().await.is_empty());
+        assert!(second.prompt_locks.read().await.is_empty());
     }
 }
