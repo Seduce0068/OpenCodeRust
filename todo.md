@@ -248,10 +248,66 @@ status: current
   - `routes.rs:1103-1118` が全件 collect、`:1316-1317` が全履歴 clone（O(n) は推測）。
     ページネーション／差分取得と Arc による copy-on-write
 
+### 優先度: 高（残タスク調査で追加）
+
+- [ ] **[P-01]** API パスの `/api` prefix 不一致（parity 構造問題）
+  - upstream の HTTP パス 126 種はすべて `/api/...`（例 `packages/protocol/src/groups/agent.ts:10`
+    の `/api/agent`）。Rust は `crates/opencode-server/src/routes.rs:49`
+    で `/agent` 等を直置きし、
+    `server.rs:932` にも prefix 層なし。公式 client をそのまま接続できない。実害は Rust 側に
+    JS client が無いため未確認だが、G-01 の generate 接続の前提となる。範囲と互換方針を ADR 化
+- [ ] **[P-02]** `/experimental/generate` の契約が upstream と完全に不一致
+  - Rust は `{prompt?, context?}` → `{operation, status, message, ...}` の placeholder
+    (`routes.rs:4423,4440,4462`)。upstream は `/api/experimental/generate/text` /
+    `/image` / `/decisions` に実 handler（`packages/server/src/handlers/generate.ts:20-63`）と
+    契約（`packages/protocol/src/groups/generate.ts:25-73`）あり。M-06 の具体化。
+    text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
+
+### 優先度: 中（残タスク調査で追加）
+
+- [ ] **[P-03]** 未配線の設定フィールド群
+  - `Config.keybinds` (`opencode-config/src/schema.rs:13`) が TUI の `KeybindRegistry::new()`
+    (`opencode-tui/src/context/keybind.rs:147-211`) へ一切渡されずハードコード固定。
+    同一ファイルの `snapshot` / `autoupdate` / `enterprise` / `experimental` の 4 フィールドと、
+    `ExperimentalConfig` の 5 サブフィールド (`schema.rs:1175-1188`) も runtime 参照 0 件。
+    配線するか、未対応をドキュメントへ明記
+- [ ] **[P-04]** interleaved thinking の正規化が no-op
+  - `opencode-provider/src/transform.rs:303-308` の
+    `normalize_interleaved_field` は空本体だが
+    呼び出し元 `:297` は生存。実処理は
+    `normalize_messages_with_interleaved_field` (`:312`) に
+    あるが re-export のみで呼び出し 0 件。model の `interleaved` 設定を runtime へ反映する配線
+- [ ] **[P-05]** MCP protocol negotiation の `Auto` が probe せず常に legacy
+  - `McpProtocol::Auto` はコメントで probe + fallback を謳うが
+    `revision()` (`opencode-config/src/schema.rs:571-592`) は `Legacy` と同じ
+    `"2025-11-25"` を返す。MAPPING.md:96-97 の「protocol 未実装」は stale だが、
+    Auto の実挙動は未実装。probe 実装またはドキュメント修正
+- [ ] **[P-06]** upstream 新規設定キー `timezone` / `policies` / `worktree` が未対応
+  - upstream `packages/schema/src/config.ts:55,61,109`
+    （追加 2026-09〜10、MAPPING baseline より後）。
+    Rust `Config` (`opencode-config/src/schema.rs:4-124`) に同名字段なし。
+    `update` / `commands` / `plugins` の複数形キー (`config.ts:39,94,106`) も単数形フィールドと
+    不一致で捨てられる可能性（要 Runtime Proof）
+- [ ] **[P-07]** upstream 2026-08〜10 追加グループの parity ギャップ
+  - artifacts (G-05)、persistent-pty (G-06)、websearch/rpc/migration/form/media (G-08)、
+    v2 core credential/integration/location (G-09)、native ACP (G-11)、JS SDK (G-12)。
+    出典は `docs/investigation-final-report.md` と `.cache/investigation/round3-upstream.md`。
+    優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
+
+### 優先度: 低（残タスク調査で追加）
+
+- [ ] **[P-08]** ADR-0006 の前提ファイル名が実在しない
+  - `docs/adr/adr-0006-codemode-async-deferred.md:35` が参照する
+    `packages/codemode/src/async.ts` / `scheduler.ts` / `vm.ts` は本 checkout の HEAD・
+    `origin/dev`・全 ref に存在せず、実体は `interpreter/runner.ts:142` /
+    `promises.ts:19` / `interpreter.ts:419` の job queue + Promise reaction 基盤。
+    判断（同期維持）は upstream 進展で再検証対象。リンクと事実関係を修正
+
 ## 完了
 
 - [x] `todo.md` をプロジェクト内へ配置（2026-11-17）
 - [x] プロジェクト全体クロスレビュー 5 回＋第 6 回統合（2026-11-17）
+- [x] 残タスク・機能追加案の調査 5 回＋第 6 回重複吸収（2026-11-17）
 
 ## メモ
 
@@ -263,6 +319,10 @@ status: current
   plugin-host.ts の実パスは `host/`（H-03）。
 - 秘密情報は値を記録しない。`.env:1` の PAT は未追跡・履歴なしで、有効性と漏洩の有無は未確認。
 - 詳細な根拠・検証ログ: `docs/cross-review-report-2026-11-17.md`。
+- 残タスク調査の詳細: `docs/investigation-final-report.md`（延べ 10 エージェント、
+  重複吸収後に P-01〜P-08 を追加）。cross-review の H/M/L と重複する項目
+  （experimental placeholder・MCP list_changed・未配線コード・LiteRT・CI ゲート・
+  ドキュメント数値）は既存項目を優先し、P-* は新規発見のみを記録した。
 - ベースライン検証（2026-11-17）: `cargo check --all-targets` /
   `cargo clippy --workspace --all-targets -- -D warnings` /
   `cargo test --workspace --all-targets` すべて exit 0。レビューエージェントはコードを変更していない。
