@@ -37,10 +37,6 @@ status: current
 - [ ] **[H-04]** MCP 実行時依存（`npx -y`）のバージョン固定・完全性検証欠如
   - `opencode.jsonc:99-145` の 4 件が未固定、`transport.rs:40` がそのまま実行、cargo audit は
     Rust のみ。Exact バージョン固定＋lockfile＋CI の npm スキャン対象化
-- [ ] **[H-05]** abort ハンドラのキャンセル未実装と孤児タスク
-  - `routes.rs:2121-2141` が存在確認のみで `aborted:true` を返し、cancel 呼び出し 0 件・spawn
-    ハンドル未保持・ADR-0005 と矛盾。`ServerState` に session_id → AbortHandle レジストリを追加し
-    cancel／Idle 更新を配線
 - [ ] **[H-07]** マイグレーションのバージョン管理・原子性・経路統一の欠如
   - `database.rs:100-120` が単純ループでバージョン記録なし、metadata ALTER をエラー文字列で冪等判定、
     複数文がトランザクション外、`Storage::migrate()` が別スキーマ経路。`sqlx::migrate!`／`user_version`
@@ -49,9 +45,10 @@ status: current
   - `client.rs:288` の rpc_lock ガードを spawn タスクへ移し `:301` で stdout ロック保持、`:394`
     のタイムアウト後も JoinHandle 未保持で `:428` が永久ブロック。AbortHandle を保持して abort するか
     rpc_lock 保持区間を短縮
-- [ ] **[H-10]** セッション永続化のトランザクション境界と並行制御の欠如（要確認）
-  - `server.rs:553-588` がロック解放後に非アトミック書き出し、古い snapshot の遅延 commit で更新喪失は推測、
-    delete＋1 件ずつ create が途中失敗で欠損。単一ライタの persist キュー＋`Database::transaction` で原子化
+- [ ] **[H-10]** セッション永続化のトランザクション境界と並行制御（移行は対応済み、残りに絞る）
+  - `database.rs` の移行は単一トランザクション化済み。未対応は `server.rs:553-588` の
+    非アトミック書き出し（delete＋1 件ずつ create）と単一ライタ persist キュー。
+    古い snapshot の遅延 commit による更新喪失は推測のまま
 - [ ] **[H-11]** キュー再実行による assistant レスポンス重複と冪等性欠如
   - promoted 更新失敗はログのみでキューが processing のまま残り起動時に再実行、assistant 側に冪等性なし（課金重複は推測）。
     `queue_id` を assistant にも相関 ID 保持するか promoted 更新を同一トランザクション化
@@ -92,9 +89,6 @@ status: current
   - `opencode.jsonc:6` のプレースホルダ値が `{env:VAR}` 展開を通らず最初の非空値として採用され
     `ANTHROPIC_API_KEY` が効かない（値自体は秘密ではない）。`{env:ANTHROPIC_API_KEY}` 化または auth
     store へ委譲
-- [ ] **[M-10]** ローカル LLM サブプロセスのタイムアウト・kill 欠落
-  - `local-llm/main.rs:266-290` が同期 `Command::output()` で ollama を待ち、MCP ループも同期。
-    async 化＋`tokio::time::timeout`＋タイムアウト時 kill
 - [ ] **[M-11]** 重要パス（認証・PTY・DB・provider）のテストカバレッジ空白
   - mcp/oauth.rs（561 行）・server/oauth.rs・server/pty.rs・storage/database.rs がテスト 0
     件、provider 統合テストに HTTP／ストリーミング／認証フローなし（ADR-0008 の改善対象外だが明示的先送りではない）。モック
@@ -261,6 +255,9 @@ status: current
 - [x] **[H-09]** LSP の実 timeout・pending 削除・子プロセス回収を実装（2026-11-18、lsp-worker）
 - [x] **[H-06]** LLM リトライ上限と 300s ストリーム timeout を適用（2026-11-18、llm-timeout-worker）
 - [x] **[M-22]** ALIGNMENT を 974 件／36.27% へ更新（2026-11-18、docs-worker）
+- [x] **[H-05]** prompt タスクの AbortHandle 登録と cancel/Idle 配線（2026-11-18、abort-worker）
+- [x] **[H-10 一部]** マイグレーションを単一トランザクション化＋metadata 判定を PRAGMA 化（2026-11-18、storage-worker）
+- [x] **[M-10]** local-llm サブプロセスを async 化＋timeout/kill（2026-11-18、local-llm-worker）
 
 ## メモ
 
