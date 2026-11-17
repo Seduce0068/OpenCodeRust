@@ -147,9 +147,6 @@ status: current
 - [ ] **[M-23]** 構造化ログ・スパンの欠如
   - charter.md:64 が構造化ログを求めるがスパン生成コード 0 件、HTTP は TraceLayer のみ、補間文字列ログが多い。
     request／session id を伝播させるスパン導入とフィールド化
-- [ ] **[M-24]** 検索処理におけるエラーの飲み込みと不完全結果
-  - `grep/search.rs:78` が Result を破棄、`:104` が `filter_map(|e| e.ok())` で WalkDir
-    エラーを捨て `Ok` を返し docs:36 と矛盾。warn 記録または Err 返却
 - [ ] **[M-25]** TUI 許可プロンプトの送信エラー通知欠如
   - `app.rs:333-360` の全分岐が `let _ = client.reply_permission(...)`、question
     応答はトースト表示があり一貫性なし。`if let Err` でトースト表示し再送可能な状態を保持
@@ -292,6 +289,7 @@ status: current
 - [x] **[M-31]** ID 生成を単一 Mutex + 12bit カウンタに変更し timestamp 破損を防止（2026-11-17）
 - [x] **[M-32]** README のバイナリ名を `opencoderust` に修正（2026-11-17）
 - [x] **[H-12]** 認証トークンのログ出力をマスク（先头4文字＋長さ）に変更（2026-11-17）
+- [x] **[M-24]** 検索処理の WalkDir / ファイル読み取りエラーを伝播（2026-11-17）
 
 ## メモ
 

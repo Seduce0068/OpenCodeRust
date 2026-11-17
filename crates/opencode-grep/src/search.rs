@@ -71,11 +71,19 @@ impl Ripgrep {
             search_file(path, &regex, &mut matches, limit)?;
         } else if path.is_dir() {
             let files = Self::files(path, FileSearchOptions::default())?;
+            let mut errors: Vec<io::Error> = Vec::new();
             for file in files {
                 if matches.len() >= limit {
                     break;
                 }
-                let _ = search_file(&file, &regex, &mut matches, limit);
+                if let Err(e) = search_file(&file, &regex, &mut matches, limit) {
+                    errors.push(e);
+                }
+            }
+            if matches.is_empty() {
+                if let Some(e) = errors.into_iter().next() {
+                    return Err(Box::new(e));
+                }
             }
         }
 
@@ -101,7 +109,10 @@ impl Ripgrep {
             walk = walk.max_depth(depth);
         }
 
-        for entry in walk.into_iter().filter_map(|e| e.ok()) {
+        for entry in walk.into_iter() {
+            let entry = entry.map_err(|e| {
+                io::Error::other(format!("failed to walk {}: {}", path.display(), e))
+            })?;
             let entry_path = entry.path();
 
             if !entry.file_type().is_file() {
