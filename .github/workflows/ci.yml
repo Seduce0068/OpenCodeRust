@@ -24,4 +24,7 @@ jobs:
     with:
       apt_packages: |
         libssl-dev
+      # Cargo.lock をコミット済みなので --locked を明示的に必須化する
+      #（共通ワークフローの locked 既定値も true のため挙動は不変）
+      locked: true
       audit: true

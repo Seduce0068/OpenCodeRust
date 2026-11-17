@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
-axum = { version = "0.8", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 tower-http = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 dirs = { workspace = true }
