@@ -383,7 +383,7 @@ impl MessageRepository {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             r#"SELECT id, session_id, role, created_at, data 
-               FROM messages WHERE session_id = ? ORDER BY created_at ASC"#,
+               FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC"#,
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -780,6 +780,40 @@ impl InputRepository {
             .await
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod message_repository_tests {
+    use super::MessageRepository;
+    use crate::Database;
+    use chrono::{TimeZone, Utc};
+    use opencode_types::SessionMessage;
+
+    #[tokio::test]
+    async fn list_for_session_breaks_created_at_ties_by_insertion_order() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+        let same_time = Utc.timestamp_millis_opt(1_000).unwrap();
+
+        for text in ["first", "second", "third"] {
+            let mut message = SessionMessage::user("session-1", text);
+            message.created_at = same_time;
+            repository.create(&message).await.expect("message created");
+        }
+
+        let messages = repository
+            .list_for_session("session-1")
+            .await
+            .expect("list works");
+        let texts: Vec<String> = messages.iter().map(|m| m.get_text()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
     }
 }
 
