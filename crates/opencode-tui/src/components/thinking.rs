@@ -103,3 +103,51 @@ impl ThinkingBlock {
         frame.render_widget(paragraph, area);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_strips_redacted_markers_and_trims() {
+        let block = ThinkingBlock::new("  hello [REDACTED] world  ".to_string());
+        assert_eq!(block.content, "hello  world");
+        assert!(block.collapsed);
+        assert!(block.visible);
+        assert!(block.duration_ms.is_none());
+    }
+
+    #[test]
+    fn with_duration_sets_value() {
+        let block = ThinkingBlock::new("x".to_string()).with_duration(1500);
+        assert_eq!(block.duration_ms, Some(1500));
+    }
+
+    #[test]
+    fn toggle_flips_collapsed_state() {
+        let mut block = ThinkingBlock::new("x".to_string());
+        assert!(block.collapsed);
+        block.toggle();
+        assert!(!block.collapsed);
+        block.toggle();
+        assert!(block.collapsed);
+    }
+
+    #[test]
+    fn expand_and_collapse() {
+        let mut block = ThinkingBlock::new("x".to_string());
+        block.expand();
+        assert!(!block.collapsed);
+        block.collapse();
+        assert!(block.collapsed);
+    }
+
+    #[test]
+    fn set_visible_controls_visibility() {
+        let mut block = ThinkingBlock::new("x".to_string());
+        block.set_visible(false);
+        assert!(!block.visible);
+        block.set_visible(true);
+        assert!(block.visible);
+    }
+}
