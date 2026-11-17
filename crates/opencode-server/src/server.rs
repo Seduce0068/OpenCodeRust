@@ -19,7 +19,9 @@ use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tracing::Instrument;
 use url::Url;
+use uuid::Uuid;
 
 use opencode_config::{load_config, Config as AppConfig};
 use opencode_plugin::init_global;
@@ -928,6 +930,42 @@ fn is_extra_allowed_origin_exact(origin: &str) -> bool {
     }
 }
 
+/// `/session/{id}/...` パスから session id を取り出す。
+fn session_id_from_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/session/")?;
+    let id = rest.split('/').next().unwrap_or_default();
+    (!id.is_empty()).then_some(id)
+}
+
+/// リクエストごとの構造化スパンを生成し、request id / session id をログ文脈に伝播させる。
+///
+/// トークン・クエリ文字列・ボディはスパン属性に含めない。
+async fn request_span_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let session_id = session_id_from_path(request.uri().path()).map(str::to_owned);
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        session_id = tracing::field::Empty,
+    );
+    if let Some(session_id) = &session_id {
+        span.record("session_id", session_id);
+    }
+
+    next.run(request).instrument(span).await
+}
+
 fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
@@ -1009,6 +1047,7 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
         ))
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(request_span_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1042,6 +1081,7 @@ pub async fn run_server_with_state(
         ))
         .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(request_span_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1057,6 +1097,18 @@ pub async fn run_server_with_state(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn session_id_from_path_extracts_only_session_routes() {
+        assert_eq!(
+            session_id_from_path("/session/abc-123/message"),
+            Some("abc-123")
+        );
+        assert_eq!(session_id_from_path("/session/abc-123"), Some("abc-123"));
+        assert_eq!(session_id_from_path("/session"), None);
+        assert_eq!(session_id_from_path("/health"), None);
+        assert_eq!(session_id_from_path("/session//message"), None);
+    }
 
     fn state_with_repos(
         session_repo: SessionRepository,
