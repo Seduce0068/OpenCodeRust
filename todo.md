@@ -41,10 +41,6 @@ status: current
   - `routes.rs:2121-2141` が存在確認のみで `aborted:true` を返し、cancel 呼び出し 0 件・spawn
     ハンドル未保持・ADR-0005 と矛盾。`ServerState` に session_id → AbortHandle レジストリを追加し
     cancel／Idle 更新を配線
-- [ ] **[H-06]** LLM リクエストのタイムアウト欠如とリトライ上限未適用
-  - `llm.rs:309-357` が無上限ループ、`RetryState::max_attempts` 未使用、adapter に timeout
-    なし、`retry.rs` の delay が非 saturating。`.timeout()` と試行上限を強制し `saturating_mul`
-    で計算
 - [ ] **[H-07]** マイグレーションのバージョン管理・原子性・経路統一の欠如
   - `database.rs:100-120` が単純ループでバージョン記録なし、metadata ALTER をエラー文字列で冪等判定、
     複数文がトランザクション外、`Storage::migrate()` が別スキーマ経路。`sqlx::migrate!`／`user_version`
@@ -53,10 +49,6 @@ status: current
   - `client.rs:288` の rpc_lock ガードを spawn タスクへ移し `:301` で stdout ロック保持、`:394`
     のタイムアウト後も JoinHandle 未保持で `:428` が永久ブロック。AbortHandle を保持して abort するか
     rpc_lock 保持区間を短縮
-- [ ] **[H-09]** LSP リクエストの無限待機とリソースリーク
-  - `lib.rs:280-301` が stdin ロック保持中に `rx.await`、sender がドロップされず実タイムアウトなし、
-    Child／JoinHandle 未保持（`docs/opencode-lsp.md:35` と矛盾）。`tokio::time::timeout` と
-    pending 削除、Drop 時 kill／abort
 - [ ] **[H-10]** セッション永続化のトランザクション境界と並行制御の欠如（要確認）
   - `server.rs:553-588` がロック解放後に非アトミック書き出し、古い snapshot の遅延 commit で更新喪失は推測、
     delete＋1 件ずつ create が途中失敗で欠損。単一ライタの persist キュー＋`Database::transaction` で原子化
@@ -138,9 +130,6 @@ status: current
   - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、PROJECT_METADATA が
     static Lazy でプロセス共有。ServerState フィールドへ移し `Arc<ServerState>`
     経由で参照（CONFIG_STATE は state.config、TUI キュー群は state フィールドへ移行済み）
-- [ ] **[M-22]** 現況ドキュメントのテスト件数・カバレッジ数値ドリフト
-  - ALIGNMENT.md:47,98 が 813 件／34.14%、ADR-0008 が 946 件、CHANGELOG が 946
-    件／35.89%（更新漏れは推測）。ALIGNMENT を最終値へ更新し ADR-0008 をリンク
 - [ ] **[M-23]** 構造化ログ・スパンの欠如
   - charter.md:64 が構造化ログを求めるがスパン生成コード 0 件、HTTP は TraceLayer のみ、補間文字列ログが多い。
     request／session id を伝播させるスパン導入とフィールド化
@@ -269,6 +258,9 @@ status: current
 - [x] **[M-21/P0-②]** TUI キュー群を ServerState フィールドへ移行（2026-11-18、queue-worker）
 - [x] **[M-27]** MCP `read_resource` に catalog timeout を適用（2026-11-18、mcp-timeout-worker）
 - [x] **[L-04 一部]** `build_filter(level)` で logLevel を反映（2026-11-18、logging-worker）
+- [x] **[H-09]** LSP の実 timeout・pending 削除・子プロセス回収を実装（2026-11-18、lsp-worker）
+- [x] **[H-06]** LLM リトライ上限と 300s ストリーム timeout を適用（2026-11-18、llm-timeout-worker）
+- [x] **[M-22]** ALIGNMENT を 974 件／36.27% へ更新（2026-11-18、docs-worker）
 
 ## メモ
 
