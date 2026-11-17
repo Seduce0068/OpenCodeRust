@@ -390,3 +390,52 @@ impl TodoWriteToolView {
         frame.render_widget(paragraph, area);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_patch_extracts_file_paths() {
+        let view = ApplyPatchToolView::new(
+            "--- a/old.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n+++ b/src/lib.rs\n"
+                .to_string(),
+        );
+        assert_eq!(view.files, vec!["src/main.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn apply_patch_handles_plain_plus_header() {
+        let view = ApplyPatchToolView::new("+++ README.md\n@@ -1 +1 @@\n".to_string());
+        assert_eq!(view.files, vec!["README.md"]);
+    }
+
+    #[test]
+    fn apply_patch_no_headers_yields_empty() {
+        let view = ApplyPatchToolView::new("just content".to_string());
+        assert!(view.files.is_empty());
+    }
+
+    #[test]
+    fn simple_views_store_their_args() {
+        let glob = GlobToolView::new("*.rs".to_string());
+        assert_eq!(glob.pattern, "*.rs");
+
+        let grep = GrepToolView::new("fn main".to_string());
+        assert_eq!(grep.pattern, "fn main");
+
+        let list = ListToolView::new("/tmp".to_string());
+        assert_eq!(list.path, "/tmp");
+    }
+
+    #[test]
+    fn edit_and_patch_views_store_inputs() {
+        let edit = EditToolView::new("a.rs".to_string(), "diff".to_string());
+        assert_eq!(edit.file_path, "a.rs");
+        assert_eq!(edit.diff_content, "diff");
+        assert!(edit.diagnostics.is_empty());
+
+        let patch = ApplyPatchToolView::new("+++ b/a.rs\n".to_string());
+        assert_eq!(patch.diff_content, "+++ b/a.rs\n");
+    }
+}
