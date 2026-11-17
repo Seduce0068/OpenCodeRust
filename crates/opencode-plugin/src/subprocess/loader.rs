@@ -638,4 +638,40 @@ mod tests {
         assert_eq!(parse_npm_spec("@scope/foo@2.0"), ("@scope/foo", "2.0"));
         assert_eq!(parse_npm_spec("@scope/foo"), ("@scope/foo", "*"));
     }
+
+    #[test]
+    fn first_value_returns_first_matching_key() {
+        let mut source = Map::new();
+        source.insert("modelID".to_string(), serde_json::json!("m1"));
+        source.insert("model_id".to_string(), serde_json::json!("m2"));
+        assert_eq!(
+            first_value(&source, &["modelID", "model_id"]),
+            Some(serde_json::json!("m1"))
+        );
+        assert_eq!(first_value(&source, &["missing"]), None);
+    }
+
+    #[test]
+    fn synthesize_model_uses_snake_case_fallback() {
+        let mut source = Map::new();
+        source.insert("model_id".to_string(), serde_json::json!("gpt-5"));
+        source.insert("provider_id".to_string(), serde_json::json!("openai"));
+
+        let model = synthesize_model(&source).unwrap();
+        assert_eq!(model["modelID"], serde_json::json!("gpt-5"));
+        assert_eq!(model["id"], serde_json::json!("gpt-5"));
+        assert_eq!(model["providerID"], serde_json::json!("openai"));
+    }
+
+    #[test]
+    fn synthesize_model_without_id_is_none() {
+        assert!(synthesize_model(&Map::new()).is_none());
+    }
+
+    #[test]
+    fn normalize_hook_key_converts_snake_to_camel() {
+        assert_eq!(normalize_hook_key("tool_id"), "toolID");
+        assert_eq!(normalize_hook_key("max_tokens"), "maxTokens");
+        assert_eq!(normalize_hook_key("custom"), "custom");
+    }
 }
