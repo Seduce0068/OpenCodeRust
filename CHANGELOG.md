@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T07:28:37+09:00"
+  at: "2026-11-18T08:03:02+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1011 件
+  テスト総数 594 → 1015 件
 
 ### Changed
 
@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.80% を計測
-  （前回 36.81% から計測揺らぎの範囲で微減）
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.76% を計測
+  （最近 36.81% → 36.80% → 36.76% は計測揺らぎの範囲）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -153,6 +153,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   初回起動の未存在ファイルは空認証へフォールバック（キー値は非ログ）(H-14)
 - Cargo: `[workspace.lints.rust]` に `unsafe_code = "deny"` を追加し、全クレートで
   unsafe Rust を禁止 (M-34 一部)
+- `opencode-server`: `SESSION_RUN_STATUS` / `PROMPT_LOCKS` を `ServerState` フィールドへ
+  移行し、インスタンス間で実行状態が共有される問題を解消（分離テスト追加）(M-21)
+- `opencode-storage`: DB マイグレーションの rollback / commit / in_memory 分離を
+  検証するテストを 3 件追加 (M-11)
 
 ## [0.1.0]
 

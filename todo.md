@@ -71,10 +71,10 @@ status: current
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
-- [ ] **[M-11]** 重要パス（認証・PTY・DB・provider）のテストカバレッジ空白
-  - mcp/oauth.rs（561 行）・server/oauth.rs・server/pty.rs・storage/database.rs がテスト 0
-    件、provider 統合テストに HTTP／ストリーミング／認証フローなし（ADR-0008 の改善対象外だが明示的先送りではない）。モック
-    OAuth／callback 分岐／PtyManager／DB in_memory を網羅
+- [ ] **[M-11]** 重要パスのテストカバレッジ空白（database.rs は対応済み）
+  - storage/database.rs に rollback/commit/分離テスト 3 件を追加済み。未対応は
+    mcp/oauth.rs・server/oauth.rs・server/pty.rs と provider 統合テストの
+    HTTP／ストリーミング／認証フロー（モック OAuth／callback／PtyManager）
 - [ ] **[M-15]** 依存ピン留めの残課題（CI locked と集約 6 件は対応済み）
   - 残り 22 件の workspace バイパス＋9 件の未集約依存は段階的集約が必要。特に serde_json は
     `preserve_order` feature の挙動影響を事前評価。厳密ピン拡充（8/61）は複数バージョン併存
@@ -90,10 +90,10 @@ status: current
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
-- [ ] **[M-21]** ServerState 外のグローバル static 状態（CONFIG_STATE／TUI キューは対応済み、残りに絞る）
-  - `routes.rs:280-283` の SESSION_RUN_STATUS／PROMPT_LOCKS、PROJECT_METADATA が
-    static Lazy でプロセス共有。ServerState フィールドへ移し `Arc<ServerState>`
-    経由で参照（CONFIG_STATE は state.config、TUI キュー群は state フィールドへ移行済み）
+- [ ] **[M-21]** ServerState 外のグローバル static（CONFIG_STATE／TUI キュー／実行状態は対応済み）
+  - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS。
+    未対応: PROJECT_METADATA（cwd キーで実害限定的、ハンドラ 4 箇所のシグネチャ変更要）、
+    TODO_MANAGER / PTY_MANAGER（M-05 / M-20 と連携した配線が必要）
 - [ ] **[M-33]** OKF フロントマターの残課題（date/verified は対応済み）
   - ADR 4 件の date オフセット・TERMUX_BUILD の verified 構造化は完了。未対応は
     `generated` mapping 欠如、status "Approved" の enum 不一致、TERMUX_BUILD の
@@ -102,9 +102,11 @@ status: current
   - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
     `clippy_args` 追加、`unsafe_code = "deny"`、Renovate 設定
-- [ ] **[M-37]** async ハンドラ／ツール内の同期ファイル I/O による tokio ワーカー占有（要確認）
-  - `routes.rs:3431,3532-3601` と `grep_tool.rs:140-170` が async 内で同期走査（`:2546` は
-    tokio::fs と混在、レイテンシ悪化は未計測）。`tokio::fs` と `spawn_blocking` へ移行
+- [ ] **[M-37]** async ハンドラ／ツール内の同期ファイル I/O（要確認）
+  - 事実確認済み（2026-11-18、grep-io-worker）: opencode-grep は同期ライブラリで tokio 非依存、
+    問題の実体は `opencode-tool/src/grep_tool.rs:140-195`（async 内で WalkDir/File::open）と
+    `server/routes.rs` の std::fs 混在箇所。レイテンシ悪化は未計測。
+    推奨: 走査部分を所有値クロージャへ切り出し `spawn_blocking(...).await` で逃がす
 - [ ] **[M-38]** ストリーミング応答のタスク寿命・キャンセル安全性（要確認）
   - `routes.rs:1365` が spawn するがハンドル未保持、`:1295` が `let _ = tx.send`
     で切断後も処理継続（切断頻度・課金規模は未計測）。`tx.closed()` を select で監視し AbortHandle を紐付け
@@ -248,6 +250,8 @@ status: current
 - [x] **[M-15 一部]** CI locked 明示＋workspace 集約 6 件（2026-11-18、deps-worker）
 - [x] **[H-14]** 認証永続化失敗を HTTP 500/400 へ反映（2026-11-18、auth-wire-worker）
 - [x] **[M-34 一部]** workspace lints に unsafe_code = deny（2026-11-18、unsafe-lint-worker）
+- [x] **[M-21 一部]** SESSION_RUN_STATUS / PROMPT_LOCKS を state 化（2026-11-18、static-migrate-worker）
+- [x] **[M-11 一部]** database.rs に rollback/commit/分離テスト追加（2026-11-18、db-test-worker）
 
 ## メモ
 
