@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 opencode-provider = { path = "../opencode-provider" }
 opencode-permission = { path = "../opencode-permission" }

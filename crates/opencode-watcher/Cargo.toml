@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "File system watcher for opencode"
 
+[lints]
+workspace = true
+
 [dependencies]
 notify = { version = "8.0", features = ["serde"] }
 tokio = { workspace = true, features = ["sync", "time"] }

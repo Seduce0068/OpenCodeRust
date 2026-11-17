@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "LSP client for opencode"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true, features = ["full", "process", "io-util"] }
 serde = { workspace = true, features = ["derive"] }
