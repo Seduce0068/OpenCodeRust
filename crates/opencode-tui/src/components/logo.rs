@@ -128,3 +128,39 @@ impl Logo {
         frame.render_widget(paragraph, area);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_colors_rgb_uses_shadow_factor() {
+        // 75% bg + 25% fg
+        let result = blend_colors(Color::Rgb(100, 100, 100), Color::Rgb(0, 0, 0));
+        assert_eq!(result, Color::Rgb(25, 25, 25));
+    }
+
+    #[test]
+    fn blend_colors_non_rgb_keeps_bg() {
+        assert_eq!(blend_colors(Color::Red, Color::Blue), Color::Blue);
+    }
+
+    #[test]
+    fn parse_logo_line_plain_chars() {
+        let spans = parse_logo_line("ab", Color::White, Color::Black, false);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_logo_line_replaces_markers() {
+        let spans = parse_logo_line("_^~", Color::White, Color::Black, false);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec![" ", "▀", "▀"]);
+    }
+
+    #[test]
+    fn parse_logo_line_empty() {
+        assert!(parse_logo_line("", Color::White, Color::Black, true).is_empty());
+    }
+}
