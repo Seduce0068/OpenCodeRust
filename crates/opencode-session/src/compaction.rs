@@ -153,6 +153,21 @@ pub struct MessageForPrune {
 /// This abstracts the Session.messages(), Session.updateMessage(), and
 /// Session.updatePart() calls from the TS source so the engine can be
 /// tested independently.
+///
+/// # Static dispatch only (not object safe)
+///
+/// This trait deliberately uses `async fn` with `#[allow(async_fn_in_trait)]`
+/// and is consumed only through generic bounds (`S: SessionOps`) in
+/// `process`, `create`, `prune_session`, and `run_compaction`. `dyn SessionOps`
+/// is intentionally unsupported: making it object safe requires
+/// `#[async_trait]`, which in turn requires moving `async-trait` from
+/// `[dev-dependencies]` to `[dependencies]` in this crate's `Cargo.toml`.
+///
+/// The futures returned by these methods are not guaranteed `Send` by the
+/// trait itself. Under static dispatch the concrete implementation's future
+/// determines `Send`-ness; callers that move these futures across threads
+/// (e.g. `tokio::spawn`) must use a `SessionOps` implementation whose futures
+/// are `Send`.
 #[allow(async_fn_in_trait)]
 pub trait SessionOps: Send + Sync {
     /// Fetch all messages (with parts) for a session.
