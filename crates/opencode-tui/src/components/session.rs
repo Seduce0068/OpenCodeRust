@@ -1405,3 +1405,47 @@ fn format_number(value: u64) -> String {
     }
     out.chars().rev().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_gutter_span_detects_borders() {
+        assert!(is_gutter_span("│"));
+        assert!(is_gutter_span("┃   "));
+        assert!(!is_gutter_span("   "));
+        assert!(!is_gutter_span("│ x"));
+        assert!(!is_gutter_span(""));
+    }
+
+    #[test]
+    fn point_in_optional_rect_bounds() {
+        let area = Some(Rect::new(5, 5, 10, 10));
+        assert!(point_in_optional_rect(area, 5, 5));
+        assert!(point_in_optional_rect(area, 14, 14));
+        assert!(!point_in_optional_rect(area, 15, 14));
+        assert!(!point_in_optional_rect(area, 5, 15));
+        assert!(!point_in_optional_rect(None, 0, 0));
+    }
+
+    #[test]
+    fn tint_sidebar_overlay_blends_rgb() {
+        // 80% of (100, 100, 100) + 20% of (200, 200, 200) = 120
+        let result = tint_sidebar_overlay(Color::Rgb(100, 100, 100), Color::Rgb(200, 200, 200));
+        assert_eq!(result, Color::Rgb(120, 120, 120));
+    }
+
+    #[test]
+    fn tint_sidebar_overlay_keeps_non_rgb() {
+        assert_eq!(tint_sidebar_overlay(Color::Blue, Color::Red), Color::Blue);
+    }
+
+    #[test]
+    fn titlecase_and_format_number() {
+        assert_eq!(titlecase("hello"), "Hello");
+        assert_eq!(titlecase(""), "");
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(1234567), "1,234,567");
+    }
+}
