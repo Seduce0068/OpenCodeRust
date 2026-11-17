@@ -164,9 +164,6 @@ status: current
   - `client.rs:734-743` の `read_resource` がタイムアウトなしの `send_request`、receive
     ループは無限で stdio `read_line()` がブロック（docs:40-54 と矛盾）。
     `send_request_with_progress_timeout` へ切替
-- [ ] **[M-30]** メッセージ順序のタイブレーク欠如
-  - `repository.rs:384-387` が `ORDER BY created_at ASC`
-    のみ（ミリ秒精度）でキュー（`:661,:731`）は rowid タイブレークと不整合。同じ順序規則へ統一
 - [ ] **[M-31]** ID 生成の順序キー整合性
   - `core/id.rs:35-36` が timestamp と counter を別クリティカルセクションで更新し同一ミリ秒で衝突しうる（推測）、
     counter≥0x1000 で繰り上がり、uuid v4 と形式混在。単一 Mutex＋12bit マスク＋形式統一
@@ -300,6 +297,7 @@ status: current
 - [x] **[M-07]** Bedrock 署名の HeaderValue パースを `map_err(...)?` でエラー伝播に修正（2026-11-17）
 - [x] **[M-28]** `LineTrimmedReplacer` の範囲外インデックスを早期 return で回避（2026-11-17）
 - [x] **[M-29]** `apply_patch` の行番号オーバーフローを `InvalidArguments` としてエラー化（2026-11-17）
+- [x] **[M-30]** メッセージ順序に `rowid ASC` タイブレークを追加しキューと統一（2026-11-17）
 
 ## メモ
 
