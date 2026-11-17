@@ -44,10 +44,24 @@ impl TodoManager {
         }
     }
 
+    /// Replace the todo list for a session in memory and, when a database is
+    /// configured, in storage.
+    ///
+    /// Persistence is best-effort and is not part of this method's success
+    /// contract: `delete_for_session` / `upsert` failures are recorded with
+    /// `tracing::warn!` and do not prevent the in-memory update or the
+    /// `todo.updated` event. Callers that require a durable write must use
+    /// `opencode_storage::TodoRepository` directly.
     pub async fn update(&self, session_id: &str, todos: Vec<TodoInfo>) {
         let todos_payload = todos.clone();
         if let Some(ref db) = self.db {
-            let _ = db.delete_for_session(session_id).await;
+            if let Err(e) = db.delete_for_session(session_id).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to delete persisted todos for session"
+                );
+            }
             for (i, todo) in todos.iter().enumerate() {
                 let item = opencode_storage::TodoItem {
                     id: format!("{}_{}", session_id, i),
@@ -56,7 +70,14 @@ impl TodoManager {
                     priority: todo.priority.clone(),
                     position: i as i64,
                 };
-                let _ = db.upsert(session_id, &item).await;
+                if let Err(e) = db.upsert(session_id, &item).await {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        todo_id = %item.id,
+                        error = %e,
+                        "Failed to persist todo"
+                    );
+                }
             }
         }
 
@@ -79,17 +100,31 @@ impl TodoManager {
         }
     }
 
+    /// Return the stored todo list for a session.
+    ///
+    /// A configured database is read first; if the read fails, the error is
+    /// logged with `tracing::warn!` and the in-memory state is used as a
+    /// fallback rather than reported to the caller as an error.
     pub async fn get(&self, session_id: &str) -> Vec<TodoInfo> {
         if let Some(ref db) = self.db {
-            if let Ok(items) = db.list_for_session(session_id).await {
-                return items
-                    .into_iter()
-                    .map(|item| TodoInfo {
-                        content: item.content,
-                        status: item.status,
-                        priority: item.priority,
-                    })
-                    .collect();
+            match db.list_for_session(session_id).await {
+                Ok(items) => {
+                    return items
+                        .into_iter()
+                        .map(|item| TodoInfo {
+                            content: item.content,
+                            status: item.status,
+                            priority: item.priority,
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to read persisted todos, falling back to in-memory state"
+                    );
+                }
             }
         }
 
@@ -97,15 +132,31 @@ impl TodoManager {
         state.get(session_id).cloned().unwrap_or_default()
     }
 
+    /// Remove a session's todos from memory and, when a database is
+    /// configured, from storage.
+    ///
+    /// Persistence is best-effort: a `delete_for_session` failure is logged
+    /// with `tracing::warn!` but does not fail this method.
     pub async fn clear(&self, session_id: &str) {
         if let Some(ref db) = self.db {
-            let _ = db.delete_for_session(session_id).await;
+            if let Err(e) = db.delete_for_session(session_id).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to delete persisted todos for session"
+                );
+            }
         }
 
         let mut state = self.state.write().await;
         state.remove(session_id);
     }
 
+    /// Change one todo's status and return whether `index` existed.
+    ///
+    /// The boolean reflects only the in-memory update. When a database is
+    /// configured, an `upsert` failure is logged with `tracing::warn!` and does
+    /// not change the returned value.
     pub async fn set_status(&self, session_id: &str, index: usize, status: &str) -> bool {
         let mut state = self.state.write().await;
         if let Some(todos) = state.get_mut(session_id) {
@@ -120,7 +171,14 @@ impl TodoManager {
                         priority: todos[index].priority.clone(),
                         position: index as i64,
                     };
-                    let _ = db.upsert(session_id, &item).await;
+                    if let Err(e) = db.upsert(session_id, &item).await {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            todo_id = %item.id,
+                            error = %e,
+                            "Failed to persist todo status"
+                        );
+                    }
                 }
 
                 return true;
@@ -129,6 +187,11 @@ impl TodoManager {
         false
     }
 
+    /// Append a todo to a session's list.
+    ///
+    /// When a database is configured, an `upsert` failure is logged with
+    /// `tracing::warn!` and does not fail this method; the in-memory list is
+    /// always updated first.
     pub async fn add(&self, session_id: &str, todo: TodoInfo) {
         let mut state = self.state.write().await;
         let todos = state.entry(session_id.to_string()).or_insert_with(Vec::new);
@@ -143,10 +206,22 @@ impl TodoManager {
                 priority: todo.priority,
                 position: position as i64,
             };
-            let _ = db.upsert(session_id, &item).await;
+            if let Err(e) = db.upsert(session_id, &item).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    todo_id = %item.id,
+                    error = %e,
+                    "Failed to persist added todo"
+                );
+            }
         }
     }
 
+    /// Remove a todo by index and return whether `index` existed.
+    ///
+    /// The boolean reflects only the in-memory removal. When a database is
+    /// configured, a `delete` failure is logged with `tracing::warn!` and does
+    /// not change the returned value.
     pub async fn remove(&self, session_id: &str, index: usize) -> bool {
         let mut state = self.state.write().await;
         if let Some(todos) = state.get_mut(session_id) {
@@ -155,7 +230,14 @@ impl TodoManager {
 
                 if let Some(ref db) = self.db {
                     let todo_id = format!("{}_{}", session_id, index);
-                    let _ = db.delete(session_id, &todo_id).await;
+                    if let Err(e) = db.delete(session_id, &todo_id).await {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            todo_id = %todo_id,
+                            error = %e,
+                            "Failed to delete persisted todo"
+                        );
+                    }
                 }
 
                 return true;
