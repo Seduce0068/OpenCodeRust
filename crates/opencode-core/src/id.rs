@@ -1,5 +1,4 @@
 use rand::RngExt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const BASE62_CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -32,8 +31,10 @@ impl Prefix {
     }
 }
 
-static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-static COUNTER: Mutex<u32> = Mutex::new(0);
+/// Timestamp and the 12-bit counter share one critical section so a timestamp
+/// change and the accompanying counter reset are atomic.
+static CLOCK: Mutex<(u64, u32)> = Mutex::new((0, 0));
+const COUNTER_MASK: u32 = 0x0FFF;
 
 fn random_base62(length: usize) -> String {
     let mut rng = rand::rng();
@@ -45,10 +46,15 @@ fn random_base62(length: usize) -> String {
     result
 }
 
-fn get_counter() -> u32 {
-    let mut counter = COUNTER.lock().unwrap();
-    *counter += 1;
-    *counter
+fn next_counter(current_timestamp: u64) -> u32 {
+    let mut clock = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if clock.0 != current_timestamp {
+        clock.0 = current_timestamp;
+        clock.1 = 0;
+    } else {
+        clock.1 = (clock.1 + 1) & COUNTER_MASK;
+    }
+    clock.1
 }
 
 pub fn create(prefix: Prefix, _descending: bool, timestamp: Option<u64>) -> String {
@@ -59,14 +65,7 @@ pub fn create(prefix: Prefix, _descending: bool, timestamp: Option<u64>) -> Stri
             .as_millis() as u64
     });
 
-    let last = LAST_TIMESTAMP.load(Ordering::Relaxed);
-    if current_timestamp != last {
-        LAST_TIMESTAMP.store(current_timestamp, Ordering::Relaxed);
-        let mut counter = COUNTER.lock().unwrap();
-        *counter = 0;
-    }
-
-    let counter_val = get_counter();
+    let counter_val = next_counter(current_timestamp);
     let now = current_timestamp * 0x1000 + u64::from(counter_val);
     let time_bytes = now.to_be_bytes();
     let hex_time = hex::encode(time_bytes);
@@ -113,5 +112,34 @@ mod tests {
         let id = create(Prefix::Session, false, None);
         assert!(validate_prefix(&id, Prefix::Session));
         assert!(!validate_prefix(&id, Prefix::Message));
+    }
+
+    #[test]
+    fn test_same_millisecond_ids_are_unique() {
+        let ts = 1_700_000_000_000;
+        let ids: Vec<String> = (0..100)
+            .map(|_| create(Prefix::Message, false, Some(ts)))
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn test_counter_overflow_does_not_corrupt_timestamp() {
+        let ts = 1_700_000_000_000;
+        let baseline = create(Prefix::Part, false, Some(ts));
+        let baseline_ts = timestamp(&baseline);
+
+        // Generate enough IDs in the same millisecond to cross 0x1000. The
+        // counter is masked to 12 bits, so the encoded timestamp prefix stays
+        // stable instead of spilling into the next millisecond.
+        let ids: Vec<String> = (0..0x1010)
+            .map(|_| create(Prefix::Part, false, Some(ts)))
+            .collect();
+        for id in ids {
+            assert_eq!(timestamp(&id), baseline_ts);
+        }
     }
 }
