@@ -398,16 +398,21 @@ fn parse_multi_file_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError>
                     file.hunks.push(hunk);
                 }
 
-                let old_start: usize = caps[1].parse().unwrap_or(1);
-                let old_count: usize = caps
-                    .get(2)
-                    .map(|m| m.as_str().parse().unwrap_or(1))
-                    .unwrap_or(1);
-                let new_start: usize = caps[3].parse().unwrap_or(1);
-                let new_count: usize = caps
-                    .get(4)
-                    .map(|m| m.as_str().parse().unwrap_or(1))
-                    .unwrap_or(1);
+                let parse_num = |value: &str| -> Result<usize, ToolError> {
+                    value.parse::<usize>().map_err(|e| {
+                        ToolError::InvalidArguments(format!("invalid line number: {}", e))
+                    })
+                };
+                let old_start = parse_num(&caps[1])?;
+                let old_count = match caps.get(2) {
+                    Some(m) => parse_num(m.as_str())?,
+                    None => 1,
+                };
+                let new_start = parse_num(&caps[3])?;
+                let new_count = match caps.get(4) {
+                    Some(m) => parse_num(m.as_str())?,
+                    None => 1,
+                };
 
                 current_hunk = Some(Hunk {
                     old_start,
@@ -894,6 +899,21 @@ mod tests {
     fn parse_empty_patch() {
         let patches = parse_model_patch("*** Begin Patch\n*** End Patch").unwrap();
         assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn parse_multi_file_patch_rejects_overflowing_line_numbers() {
+        let patch = concat!(
+            "--- a/file.rs\n",
+            "+++ b/file.rs\n",
+            "@@ -999999999999999999999999999999 +1 @@\n",
+            " old\n",
+            " new"
+        );
+        assert!(
+            parse_multi_file_patch(patch).is_err(),
+            "overflowing line numbers must be an error, not a silent fallback to 1"
+        );
     }
 
     #[test]
