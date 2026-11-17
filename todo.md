@@ -38,10 +38,6 @@ status: current
 - [ ] **[H-07]** マイグレーションの経路統一（version/原子性は対応済み、残りに絞る）
   - `database.rs` は user_version 記録・単一トランザクション・metadata PRAGMA 判定を実装済み。
     未対応は `Storage::migrate()`（lib.rs）の別スキーマ経路統一と runbook 化
-- [ ] **[H-08]** プラグイン subprocess のロック保持中 await によるデッドロック
-  - `client.rs:288` の rpc_lock ガードを spawn タスクへ移し `:301` で stdout ロック保持、`:394`
-    のタイムアウト後も JoinHandle 未保持で `:428` が永久ブロック。AbortHandle を保持して abort するか
-    rpc_lock 保持区間を短縮
 - [ ] **[H-10]** セッション永続化のトランザクション境界と並行制御（移行は対応済み、残りに絞る）
   - `database.rs` の移行は単一トランザクション化済み。未対応は `server.rs:553-588` の
     非アトミック書き出し（delete＋1 件ずつ create）と単一ライタ persist キュー。
@@ -61,10 +57,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **[M-01]** 権限チェックの fail-open とデフォルト全許可（要確認）
-  - `tool.rs:323,375-381` が ask:None で `Ok(())`、`prompt.rs:1431-1435` が no-op、
-    `opencode.jsonc:62-64` が `"*": "allow"`。executor は Ask→Deny 変換（テストあり）で因果は否定、
-    影響は executor／callback 未指定経路に限定。fail-closed 化と PermissionBroker 配線
 - [ ] **[M-02]** 共有型の重複定義と serde_json 往復による変換
   - session が types に依存せず `SessionMessage` 等を重複定義、`server.rs:569-574` が serde
     往復（フィールド差による欠落は推測）。型を `opencode-types` へ集約し `From` 変換へ置換
@@ -83,9 +75,11 @@ status: current
   - mcp/oauth.rs（561 行）・server/oauth.rs・server/pty.rs・storage/database.rs がテスト 0
     件、provider 統合テストに HTTP／ストリーミング／認証フローなし（ADR-0008 の改善対象外だが明示的先送りではない）。モック
     OAuth／callback 分岐／PtyManager／DB in_memory を網羅
-- [ ] **[M-15]** Rust 依存バージョンのピン留め不足と workspace 依存のバイパス
-  - 厳密ピンは 8 件のみ、各クレートが serde／axum 等で workspace 定義をバイパスし AGENTS.md §4
-    と矛盾（Cargo.lock はコミット済み）。workspace 集約＋厳密ピン＋CI `--locked` 必須化
+- [ ] **[M-15]** 依存ピン留めの残課題（CI locked と集約 6 件は対応済み）
+  - 残り 22 件の workspace バイパス＋9 件の未集約依存は段階的集約が必要。特に serde_json は
+    `preserve_order` feature の挙動影響を事前評価。厳密ピン拡充（8/61）は複数バージョン併存
+    リスクの精査が必要（Cargo.lock コミット＋CI locked で再現性は担保済み）
+  - 別課題: 7 クレートが version.workspace を使わず authors/license 欠如
 - [ ] **[M-16]** 依存方向の逆転と ADR／アーキテクチャ方針との矛盾
   - charter の依存方向と逆に permission→plugin、tool→permission/plugin、session→
     provider/tool/mcp/lsp、types が sqlx::Type を derive（循環なし、feature 分割は皆無）。ADR
@@ -249,6 +243,9 @@ status: current
 - [x] **[M-33]** ADR の date と TERMUX_BUILD verified を OKF 準拠へ（2026-11-18、okf-worker）
 - [x] **[M-08]** 未知キーと未定義 env を警告化（値は非記録）（2026-11-18、config-key2-worker）
 - [x] **[M-23]** request/session id の構造化スパンを導入（2026-11-18、span-worker）
+- [x] **[H-08]** plugin subprocess の JoinHandle abort とロック timeout（2026-11-18、plugin-lock-worker）
+- [x] **[M-01]** fail-open 因果は否定、root とテストで明記（2026-11-18、permission-worker）
+- [x] **[M-15 一部]** CI locked 明示＋workspace 集約 6 件（2026-11-18、deps-worker）
 
 ## メモ
 
