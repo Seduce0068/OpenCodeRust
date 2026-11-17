@@ -164,9 +164,6 @@ status: current
   - `client.rs:734-743` の `read_resource` がタイムアウトなしの `send_request`、receive
     ループは無限で stdio `read_line()` がブロック（docs:40-54 と矛盾）。
     `send_request_with_progress_timeout` へ切替
-- [ ] **[M-29]** `apply_patch` の行番号パース失敗時の暗黙フォールバック
-  - `apply_patch.rs:401-410` が `parse::<usize>().unwrap_or(1)`、巨大十進数が暗黙に 1 となり
-    `:667-671` の offset 計算へ。parse 失敗をエラー化
 - [ ] **[M-30]** メッセージ順序のタイブレーク欠如
   - `repository.rs:384-387` が `ORDER BY created_at ASC`
     のみ（ミリ秒精度）でキュー（`:661,:731`）は rowid タイブレークと不整合。同じ順序規則へ統一
@@ -302,6 +299,7 @@ status: current
 - [x] **[L-12]** read ツールの `limit=0` 時に「0 lines read」を返すよう修正（2026-11-17）
 - [x] **[M-07]** Bedrock 署名の HeaderValue パースを `map_err(...)?` でエラー伝播に修正（2026-11-17）
 - [x] **[M-28]** `LineTrimmedReplacer` の範囲外インデックスを早期 return で回避（2026-11-17）
+- [x] **[M-29]** `apply_patch` の行番号オーバーフローを `InvalidArguments` としてエラー化（2026-11-17）
 
 ## メモ
 

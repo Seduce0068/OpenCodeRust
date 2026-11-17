@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T22:55:20+09:00"
+  at: "2026-11-17T23:04:08+09:00"
 ---
 
 # Changelog
@@ -68,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AuthError` として伝播するよう修正 (M-07)
 - `opencode-tool`: `LineTrimmedReplacer` が検索行数の方が多い場合に範囲外
   インデックスで panic する問題を早期 return で回避 (M-28)
+- `opencode-tool`: `apply_patch` の巨大な行番号が暗黙に 1 へフォールバック
+  する問題を修正し、`InvalidArguments` として伝播 (M-29)
 
 ## [0.1.0]
 
