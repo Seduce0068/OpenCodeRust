@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-17T23:47:40+09:00"
+  at: "2026-11-17T23:58:05+09:00"
 ---
 
 # Changelog
@@ -77,6 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `README.md`: CLI バイナリ名の記載を `opencode` から実際の `opencoderust` へ修正 (M-32)
 - `opencode-server`: 認証トークンの平文ログ出力をマスク（先头4文字と長さのみ）に変更 (H-12)
 - `opencode-grep`: WalkDir / ファイル読み取りエラーを握りつぶさず `Err` として伝播 (M-24)
+- `opencode-config`: auth.json 由来の `set_var` にキー形式検証と危険キー
+  (`PATH` / `LD_PRELOAD` 等) の拒否を追加 (M-26)
 
 ## [0.1.0]
 

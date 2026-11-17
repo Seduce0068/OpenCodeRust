@@ -73,6 +73,30 @@ fn read_wellknown_entries() -> HashMap<String, WellKnownAuth> {
     result
 }
 
+/// Returns true when an auth.json key is safe to expose as a process
+/// environment variable. Blocks names that would alter program loading or
+/// lookup behaviour for every later subprocess.
+fn is_safe_env_key(key: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "SHELL",
+        "USER",
+        "PWD",
+        "IFS",
+    ];
+    let valid = !key.is_empty()
+        && key
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_uppercase() || (i > 0 && c.is_ascii_digit()));
+    valid && !BLOCKED.contains(&key)
+}
+
 /// Fetches remote config from all wellknown auth entries and returns a merged
 /// `Config` representing the combined remote configuration.
 ///
@@ -101,7 +125,12 @@ pub async fn load_wellknown() -> Config {
         }
 
         // Set the env var so downstream code (e.g. provider auth) can use it,
-        // matching the TS behaviour: `process.env[value.key] = value.token`
+        // matching the TS behaviour: `process.env[value.key] = value.token`.
+        // Refuse keys that would hijack process loading or lookup behaviour.
+        if !is_safe_env_key(&auth.key) {
+            tracing::warn!(url = %url, key = %auth.key, "refusing unsafe env key from auth.json");
+            continue;
+        }
         std::env::set_var(&auth.key, &auth.token);
 
         let endpoint = format!("{}/.well-known/opencode", url.trim_end_matches('/'));
@@ -245,5 +274,22 @@ mod tests {
         // With no auth.json, should return default config without error
         let config = load_wellknown().await;
         assert!(config.model.is_none());
+    }
+
+    #[test]
+    fn safe_env_keys_accept_auth_vars() {
+        assert!(is_safe_env_key("OPENAI_API_KEY"));
+        assert!(is_safe_env_key("GH_TOKEN"));
+        assert!(is_safe_env_key("MY_TOKEN_1"));
+    }
+
+    #[test]
+    fn safe_env_keys_reject_hijacking_names() {
+        assert!(!is_safe_env_key("PATH"));
+        assert!(!is_safe_env_key("LD_PRELOAD"));
+        assert!(!is_safe_env_key("DYLD_INSERT_LIBRARIES"));
+        assert!(!is_safe_env_key("lowerCase"));
+        assert!(!is_safe_env_key("1BAD"));
+        assert!(!is_safe_env_key("BAD-KEY"));
     }
 }

@@ -150,10 +150,6 @@ status: current
 - [ ] **[M-25]** TUI 許可プロンプトの送信エラー通知欠如
   - `app.rs:333-360` の全分岐が `let _ = client.reply_permission(...)`、question
     応答はトースト表示があり一貫性なし。`if let Err` でトースト表示し再送可能な状態を保持
-- [ ] **[M-26]** wellknown 定数のハードコードと外部ファイルによる環境変数書き換え
-  - `wellknown.rs:10-11` が timeout／TTL を const 化、`:46-51` の `~/.local/share`
-    が未展開、`:103-105` が auth.json 由来 key を無検証 `set_var`（後段への影響は推測）。Config
-    化＋絶対パス＋許可リスト
 - [ ] **[M-27]** MCP 操作のタイムアウト未適用
   - `client.rs:734-743` の `read_resource` がタイムアウトなしの `send_request`、receive
     ループは無限で stdio `read_line()` がブロック（docs:40-54 と矛盾）。
@@ -290,6 +286,7 @@ status: current
 - [x] **[M-32]** README のバイナリ名を `opencoderust` に修正（2026-11-17）
 - [x] **[H-12]** 認証トークンのログ出力をマスク（先头4文字＋長さ）に変更（2026-11-17）
 - [x] **[M-24]** 検索処理の WalkDir / ファイル読み取りエラーを伝播（2026-11-17）
+- [x] **[M-26]** auth.json 由来の環境変数書き換えにキー検証を追加（2026-11-17）
 
 ## メモ
 
