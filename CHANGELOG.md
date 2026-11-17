@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T06:54:16+09:00"
+  at: "2026-11-18T07:28:37+09:00"
 ---
 
 # Changelog
@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.81% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.80% を計測
+  （前回 36.81% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -148,6 +149,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-tool`/`opencode-session`: 権限 fail-open の因果が上位ゲート
   （executor の Ask→Deny／broker の Reject）で否定されたことを root とテストで明記 (M-01)
 - Cargo: CI に `locked: true` を明示し、workspace 依存を 6 件集約（バイパス 28→22）(M-15 一部)
+- `opencode-server`: 認証情報の永続化失敗を `try_*` API 経由で HTTP 500/400 へ反映し、
+  初回起動の未存在ファイルは空認証へフォールバック（キー値は非ログ）(H-14)
+- Cargo: `[workspace.lints.rust]` に `unsafe_code = "deny"` を追加し、全クレートで
+  unsafe Rust を禁止 (M-34 一部)
 
 ## [0.1.0]
 
