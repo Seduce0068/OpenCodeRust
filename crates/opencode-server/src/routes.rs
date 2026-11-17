@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::Request,
+    http::{Request, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, Sse},
     response::{Html, IntoResponse, Response},
@@ -4496,44 +4496,34 @@ pub struct ExperimentalTaskResponse {
     pub context: Option<serde_json::Value>,
 }
 
-fn make_experimental_response(
-    operation: &str,
-    payload: ExperimentalTaskRequest,
-) -> ExperimentalTaskResponse {
-    ExperimentalTaskResponse {
-        operation: operation.to_string(),
-        status: "accepted".to_string(),
-        message: format!(
-            "Experimental endpoint `{}` is available but currently returns a placeholder response in Rust.",
-            operation
-        ),
-        prompt: payload.prompt,
-        context: payload.context,
-    }
+/// 未実装の experimental エンドポイントであることを明示する 501 レスポンスを生成する。
+fn experimental_not_implemented(operation: &str) -> Response {
+    let body = Json(serde_json::json!({
+        "error": {
+            "message": format!(
+                "Experimental endpoint `{}` is not implemented in the Rust server.",
+                operation
+            ),
+            "type": "not_implemented"
+        }
+    }));
+    (StatusCode::NOT_IMPLEMENTED, body).into_response()
 }
 
-async fn experimental_analyze(
-    Json(payload): Json<ExperimentalTaskRequest>,
-) -> Json<ExperimentalTaskResponse> {
-    Json(make_experimental_response("analyze", payload))
+async fn experimental_analyze(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+    experimental_not_implemented("analyze")
 }
 
-async fn experimental_generate(
-    Json(payload): Json<ExperimentalTaskRequest>,
-) -> Json<ExperimentalTaskResponse> {
-    Json(make_experimental_response("generate", payload))
+async fn experimental_generate(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+    experimental_not_implemented("generate")
 }
 
-async fn experimental_refactor(
-    Json(payload): Json<ExperimentalTaskRequest>,
-) -> Json<ExperimentalTaskResponse> {
-    Json(make_experimental_response("refactor", payload))
+async fn experimental_refactor(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+    experimental_not_implemented("refactor")
 }
 
-async fn experimental_test(
-    Json(payload): Json<ExperimentalTaskRequest>,
-) -> Json<ExperimentalTaskResponse> {
-    Json(make_experimental_response("test", payload))
+async fn experimental_test(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+    experimental_not_implemented("test")
 }
 
 #[derive(Debug, Serialize)]
@@ -5382,5 +5372,63 @@ mod abort_tests {
             .await
             .expect_err("unknown session must be rejected");
         assert!(matches!(error, ApiError::SessionNotFound(_)));
+    }
+}
+
+#[cfg(test)]
+mod experimental_not_implemented_tests {
+    use super::*;
+
+    async fn assert_not_implemented(response: Response, operation: &str) {
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(value["error"]["type"], "not_implemented");
+        assert!(value["error"]["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains(operation));
+        assert!(
+            value.get("status").is_none(),
+            "placeholder `accepted` status must not be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn experimental_analyze_returns_501() {
+        let payload = ExperimentalTaskRequest {
+            prompt: Some("inspect this".to_string()),
+            context: None,
+        };
+        assert_not_implemented(experimental_analyze(Json(payload)).await, "analyze").await;
+    }
+
+    #[tokio::test]
+    async fn experimental_generate_returns_501() {
+        let payload = ExperimentalTaskRequest {
+            prompt: Some("generate this".to_string()),
+            context: None,
+        };
+        assert_not_implemented(experimental_generate(Json(payload)).await, "generate").await;
+    }
+
+    #[tokio::test]
+    async fn experimental_refactor_returns_501() {
+        let payload = ExperimentalTaskRequest {
+            prompt: Some("refactor this".to_string()),
+            context: None,
+        };
+        assert_not_implemented(experimental_refactor(Json(payload)).await, "refactor").await;
+    }
+
+    #[tokio::test]
+    async fn experimental_test_returns_501() {
+        let payload = ExperimentalTaskRequest {
+            prompt: Some("test this".to_string()),
+            context: None,
+        };
+        assert_not_implemented(experimental_test(Json(payload)).await, "test").await;
     }
 }
