@@ -52,7 +52,6 @@ const MESSAGE_SUMMARY_DIFFS_KEY: &str = "summary_diffs";
 /// them in double quotes and using octal or C-style escape sequences.
 /// This function reverses that encoding.
 pub fn unquote_git_path(input: &str) -> String {
-    // PLACEHOLDER_CONTINUE
     if !input.starts_with('"') || !input.ends_with('"') {
         return input.to_string();
     }
@@ -807,5 +806,28 @@ mod tests {
             Some("Summary Pipeline")
         );
         assert!(updated.metadata.contains_key("summary_diffs"));
+    }
+
+    #[test]
+    fn test_unquote_git_path_empty_and_quotes_only() {
+        assert_eq!(unquote_git_path(""), "");
+        assert_eq!(unquote_git_path("\"\""), "");
+    }
+
+    #[test]
+    fn test_unquote_git_path_trailing_backslash() {
+        // Inside the quotes: "dir\\" — the final backslash is escaped as a literal.
+        assert_eq!(unquote_git_path("\"dir\\\\\""), "dir\\");
+    }
+
+    #[test]
+    fn test_unquote_git_path_unknown_escape_keeps_char() {
+        assert_eq!(unquote_git_path("\"a\\qb\""), "aqb");
+    }
+
+    #[test]
+    fn test_unquote_git_path_octal_max_three_digits() {
+        // 3 octal digits are consumed; the 4th remains a literal char.
+        assert_eq!(unquote_git_path("\"\\1012\""), "A2");
     }
 }
