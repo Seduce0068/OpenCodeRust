@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,8 @@ pub enum WatcherError {
 pub struct WatcherConfig {
     /// Paths to ignore (glob patterns)
     pub ignore_patterns: Vec<String>,
-    /// Debounce interval for events
+    /// Debounce window in milliseconds: repeated events for the same path
+    /// within this window are coalesced into a single notification.
     pub debounce_ms: u64,
     /// Whether to watch recursively
     pub recursive: bool,
@@ -78,6 +79,8 @@ pub struct FileWatcher {
     ignore_patterns: Vec<glob::Pattern>,
     event_tx: broadcast::Sender<WatcherEvent>,
     debounce_ms: u64,
+    /// Last emitted event time per path (used for debouncing).
+    event_last_seen: DashMap<PathBuf, Instant>,
 }
 
 impl FileWatcher {
@@ -97,6 +100,7 @@ impl FileWatcher {
             ignore_patterns,
             event_tx,
             debounce_ms: config.debounce_ms,
+            event_last_seen: DashMap::new(),
         })
     }
 
@@ -117,6 +121,8 @@ impl FileWatcher {
 
         let event_tx = self.event_tx.clone();
         let ignore_patterns = self.ignore_patterns.clone();
+        let event_last_seen = self.event_last_seen.clone();
+        let debounce_window = Duration::from_millis(self.debounce_ms);
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
@@ -136,6 +142,17 @@ impl FileWatcher {
                             debug!(path = ?path, "Ignoring file event");
                             continue;
                         }
+
+                        // Coalesce repeated events for the same path within the
+                        // debounce window instead of forwarding every arrival.
+                        let now = Instant::now();
+                        if let Some(last) = event_last_seen.get(path) {
+                            if now.duration_since(*last) < debounce_window {
+                                debug!(path = ?path, "Debouncing file event");
+                                continue;
+                            }
+                        }
+                        event_last_seen.insert(path.clone(), now);
 
                         let watcher_event = WatcherEvent {
                             file: path.clone(),
@@ -268,6 +285,36 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty) => {}
             Err(e) => panic!("Unexpected error: {}", e),
         }
+    }
+
+    #[tokio::test]
+    async fn test_debounce_coalesces_repeated_events_for_same_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WatcherConfig {
+            debounce_ms: 5_000,
+            ..WatcherConfig::default()
+        };
+        let watcher = FileWatcher::new(config).unwrap();
+        let mut rx = watcher.subscribe();
+
+        watcher.watch(temp_dir.path()).unwrap();
+
+        let test_file = temp_dir.path().join("debounce.txt");
+        fs::write(&test_file, "first").unwrap();
+        sleep(Duration::from_millis(50)).await;
+        fs::write(&test_file, "second").unwrap();
+
+        let mut count = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(event)) if event.file == test_file => count += 1,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(count, 1, "expected a single coalesced event for the path");
     }
 
     #[test]
