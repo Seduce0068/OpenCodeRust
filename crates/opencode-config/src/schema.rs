@@ -123,6 +123,56 @@ pub struct Config {
     pub env: Option<HashMap<String, String>>,
 }
 
+/// Top-level config keys that `Config` recognizes on input.
+///
+/// This lists every serde field name plus its `rename`/`alias` spelling. The
+/// loader uses it to *warn* about unknown keys while still ignoring them, so a
+/// config from a newer OpenCode version never prevents startup (see the
+/// compatibility notes on `PermissionsConfig` and `PermissionListEntry`).
+/// Keep this list in sync when adding or renaming a top-level field.
+pub(crate) fn known_config_keys() -> &'static [&'static str] {
+    &[
+        "$schema",
+        "theme",
+        "keybinds",
+        "logLevel",
+        "log_level",
+        "tui",
+        "server",
+        "command",
+        "skills",
+        "watcher",
+        "plugin",
+        "snapshot",
+        "share",
+        "autoshare",
+        "autoupdate",
+        "disabled_providers",
+        "enabled_providers",
+        "model",
+        "small_model",
+        "default_agent",
+        "username",
+        "permissions",
+        "agents",
+        "mode",
+        "agent",
+        "provider",
+        "providers",
+        "mcp",
+        "formatter",
+        "lsp",
+        "instructions",
+        "layout",
+        "permission",
+        "tools",
+        "enterprise",
+        "compaction",
+        "experimental",
+        "env",
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShareMode {

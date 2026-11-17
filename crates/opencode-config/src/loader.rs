@@ -1,6 +1,6 @@
 use crate::schema::{
-    AgentConfig, AgentConfigs, AgentMode, CommandConfig, PermissionAction, PermissionConfig,
-    PermissionRule, ProviderConfig,
+    known_config_keys, AgentConfig, AgentConfigs, AgentMode, CommandConfig, PermissionAction,
+    PermissionConfig, PermissionRule, ProviderConfig,
 };
 use crate::Config;
 use anyhow::{Context, Result};
@@ -441,7 +441,19 @@ fn substitute_env_vars(text: &str) -> String {
     let re = regex::Regex::new(r"\{env:([^}]+)\}").unwrap();
     re.replace_all(text, |caps: &regex::Captures| {
         let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_default()
+        match std::env::var(var_name) {
+            Ok(value) => value,
+            Err(_) => {
+                // Keep the existing empty-string expansion so startup is not
+                // blocked, but surface the missing variable by name only.
+                // Never log the value (it may be a secret).
+                tracing::warn!(
+                    variable = %var_name,
+                    "undefined environment variable in config expanded to an empty string; startup continues"
+                );
+                String::new()
+            }
+        }
     })
     .to_string()
 }
@@ -523,7 +535,36 @@ fn parse_jsonc(content: &str) -> Result<Config> {
         .with_context(|| "Failed to parse JSONC")?
         .context("Config content is empty")?;
 
+    // Warn about (but never reject) unknown top-level keys. Only the key name
+    // is logged -- never its value, which may hold secrets. Ignoring unknown
+    // keys keeps the documented "never block startup" compatibility policy.
+    for key in unknown_config_keys(&parsed) {
+        tracing::warn!(
+            key = %key,
+            "unknown configuration key ignored; startup continues"
+        );
+    }
+
     serde_json::from_value(parsed).with_context(|| "Failed to parse config JSON")
+}
+
+/// Returns the names of top-level keys in a parsed config that `Config` does
+/// not recognize. Values are deliberately discarded: callers log only the
+/// key names. Only top-level keys are inspected because the M-08 findings
+/// (`security.strictPermissionChecks`, `storage.gcBufferMb`,
+/// `references.gemini`) are all unknown top-level sections.
+fn unknown_config_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let known: std::collections::HashSet<&str> = known_config_keys().iter().copied().collect();
+    let mut unknown: Vec<String> = object
+        .keys()
+        .filter(|key| !known.contains(key.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
 }
 
 fn normalize_existing_path(path: &Path) -> PathBuf {
@@ -1528,6 +1569,37 @@ mod tests {
         let content = r#"{"model": "claude-3-opus"}"#;
         let config: Config = parse_jsonc(content).unwrap();
         assert_eq!(config.model, Some("claude-3-opus".to_string()));
+    }
+
+    #[test]
+    fn unknown_config_keys_detects_m08_sections_without_values() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "model": "known-key",
+                "security": {"strictPermissionChecks": true},
+                "storage": {"gcBufferMb": 4096},
+                "references": {"gemini": {"secret-looking": "DO-NOT-LOG-ME"}}
+            }"#,
+        )
+        .unwrap();
+        let unknown = unknown_config_keys(&value);
+        assert_eq!(unknown, vec!["references", "security", "storage"]);
+        // No config value must ever be included in the warning payload.
+        assert!(unknown.iter().all(|key| !key.contains("DO-NOT-LOG-ME")));
+    }
+
+    #[test]
+    fn unknown_config_keys_accepts_renames_and_aliases() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "$schema": "https://opencode.ai/config.json",
+                "logLevel": "INFO",
+                "log_level": "DEBUG",
+                "providers": {}
+            }"#,
+        )
+        .unwrap();
+        assert!(unknown_config_keys(&value).is_empty());
     }
 
     #[test]
