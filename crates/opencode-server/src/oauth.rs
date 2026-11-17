@@ -5,6 +5,18 @@ use opencode_plugin::subprocess::PluginLoader;
 use opencode_provider::{AuthError, AuthInfo, AuthManager, AuthMethodType, Authorization};
 use serde::{Deserialize, Serialize};
 
+/// Errors surfaced by provider authentication operations.
+///
+/// Persistence errors are kept distinct from plugin/AuthError failures so callers can map them to
+/// an appropriate HTTP status. Their messages never contain credential values.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderAuthError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error("failed to persist provider credentials: {0}")]
+    Persist(#[from] anyhow::Error),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthMethodInfo {
     #[serde(rename = "type")]
@@ -71,7 +83,7 @@ impl ProviderAuth {
         loader: &PluginLoader,
         provider_id: &str,
         code: Option<&str>,
-    ) -> Result<(), AuthError> {
+    ) -> Result<(), ProviderAuthError> {
         let bridge = loader
             .auth_bridge(provider_id)
             .await
@@ -83,7 +95,7 @@ impl ProviderAuth {
 
         let auth_type = result.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if auth_type != "success" {
-            return Err(AuthError::OauthCallbackFailed);
+            return Err(AuthError::OauthCallbackFailed.into());
         }
 
         // Plugin callback can override target provider (e.g. copilot enterprise).
@@ -99,13 +111,13 @@ impl ProviderAuth {
             .or_else(|| result.get("token").and_then(|v| v.as_str()))
         {
             self.auth_manager
-                .set(
+                .try_set(
                     target_provider,
                     AuthInfo::Api {
                         key: key.to_string(),
                     },
                 )
-                .await;
+                .await?;
             return Ok(());
         }
 
@@ -121,11 +133,11 @@ impl ProviderAuth {
             .to_string();
 
         if access.is_empty() && refresh.is_empty() {
-            return Err(AuthError::OauthCallbackFailed);
+            return Err(AuthError::OauthCallbackFailed.into());
         }
 
         self.auth_manager
-            .set(
+            .try_set(
                 target_provider,
                 AuthInfo::OAuth {
                     access,
@@ -141,18 +153,20 @@ impl ProviderAuth {
                         .map(str::to_string),
                 },
             )
-            .await;
+            .await?;
 
         Ok(())
     }
 
-    pub async fn set_api_key(&self, provider_id: &str, key: String) {
+    /// Set an API key and persist it, returning any persistence error to the caller.
+    pub async fn set_api_key(&self, provider_id: &str, key: String) -> anyhow::Result<()> {
         self.auth_manager
-            .set(provider_id, AuthInfo::Api { key })
-            .await;
+            .try_set(provider_id, AuthInfo::Api { key })
+            .await
     }
 
-    pub async fn remove(&self, provider_id: &str) {
-        self.auth_manager.remove(provider_id).await;
+    /// Remove credentials and persist the deletion, returning any persistence error.
+    pub async fn remove(&self, provider_id: &str) -> anyhow::Result<()> {
+        self.auth_manager.try_remove(provider_id).await
     }
 }
