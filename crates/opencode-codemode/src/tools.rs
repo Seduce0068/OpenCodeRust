@@ -81,3 +81,72 @@ pub trait ToolHost {
         arguments: Vec<JsonValue>,
     ) -> Result<JsonValue, ToolError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value as JsonValue};
+
+    use super::{ToolError, ToolHost};
+
+    /// Host stub: no external execution, only a fixed plain-data result.
+    struct DummyHost;
+
+    impl ToolHost for DummyHost {
+        fn invoke(
+            &mut self,
+            _path: &[String],
+            _arguments: Vec<JsonValue>,
+        ) -> Result<JsonValue, ToolError> {
+            Ok(json!("dummy-result"))
+        }
+    }
+
+    fn assert_std_error<T: std::error::Error>() {}
+
+    #[test]
+    fn tool_error_without_data_exposes_message_only() {
+        let error = ToolError::new("safe failure");
+
+        assert_eq!(error.message(), "safe failure");
+        assert_eq!(error.data(), None);
+        assert_eq!(error.to_string(), "safe failure");
+        assert_eq!(error, ToolError::new("safe failure"));
+        assert_ne!(error, ToolError::new("different failure"));
+        assert_std_error::<ToolError>();
+    }
+
+    #[test]
+    fn tool_error_with_data_keeps_structured_payload() {
+        let payload = json!({ "code": 7, "items": [1, 2] });
+        let error = ToolError::with_data("structured failure", payload.clone());
+
+        assert_eq!(error.message(), "structured failure");
+        assert_eq!(error.data(), Some(&payload));
+        assert_eq!(error.to_string(), "structured failure");
+        assert_eq!(error, ToolError::with_data("structured failure", payload));
+    }
+
+    #[test]
+    fn tool_error_distinguishes_json_null_from_absent_data() {
+        let error = ToolError::with_data("", JsonValue::Null);
+
+        assert_eq!(error.message(), "");
+        assert_eq!(error.data(), Some(&JsonValue::Null));
+        assert_ne!(error, ToolError::new(""));
+        assert!(error.to_string().is_empty());
+    }
+
+    #[test]
+    fn default_keys_returns_empty_for_any_path() {
+        let mut host = DummyHost;
+        let path = vec!["math".to_string(), "add".to_string()];
+
+        assert!(host.keys(&path).is_empty());
+        assert!(host.keys(&[]).is_empty());
+
+        let result = host
+            .invoke(&path, vec![json!(1), json!(2)])
+            .expect("dummy host returns a plain value");
+        assert_eq!(result, json!("dummy-result"));
+    }
+}
