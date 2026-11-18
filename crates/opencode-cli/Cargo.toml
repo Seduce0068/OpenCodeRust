@@ -26,6 +26,7 @@ opencode-tui = { path = "../opencode-tui" }
 opencode-types = { path = "../opencode-types" }
 opencode-command = { path = "../opencode-command" }
 opencode-lsp = { path = "../opencode-lsp" }
+opencode-util = { path = "../opencode-util" }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
