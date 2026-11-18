@@ -9,7 +9,7 @@ tags:
   - roadmap
 verified:
   by: dsh
-  at: "2026-11-16T23:51:46+09:00"
+  at: "2026-11-19T07:33:31+09:00"
 ---
 
 ## 文書の位置付け
@@ -17,8 +17,8 @@ verified:
 upstream checkout (`github.com/anomalyco/opencode` @ `941e71d`、2026-08-10)
 に対する 2026-10-18 時点の対応調査である。掲載した対応と欠落は checkout の
 path で確認した事実に基づく。Rust 側の実装状況は workspace とテストにより
-2026-11-16 時点で再確認した。旧版の初期計画 (specs/ 前提) は git 履歴を
-参照。フェーズ計画は [ALIGNMENT.md](ALIGNMENT.md)。
+2026-11-16 および 2026-11-19 時点で再確認した。旧版の初期計画
+(specs/ 前提) は git 履歴を参照。フェーズ計画は [ALIGNMENT.md](ALIGNMENT.md)。
 
 ## upstream の構造前提
 
@@ -206,6 +206,69 @@ snapshot ハッシュ)、provider 側の `enable_experimental` /
   `opencode-pty`、`opencode-command` (upstream は `core/src` の module)。
 - `opencode-local-llm` は upstream に対応物がない (Ollama 用 stdio MCP)。
 - バイナリ名は `opencoderust` (upstream は `opencode`)。
+
+## /session/{id}/stream の位置付け (2026-11-19, M-46)
+
+`opencode-server` には `POST /session/{id}/stream` と
+`POST /session/{id}/prompt` の 2 つの応答経路がある。外観は似るが契約と
+内部実装は異なり、互いに置き換えられない。以下は `routes.rs` の
+`stream_message` と `session_prompt` / `spawn_prompt_execution` を
+2026-11-19 に確認した結果である。
+
+### /stream はエージェント・ツールなしの生 chat_stream
+
+`stream_message` は `SendMessageRequest` (`content` / `model` / `variant` /
+`stream`) を受け取り、`opencode_provider::ChatRequest` を `system: None`、
+`tools: None` で構築して `provider.chat_stream()` を直接呼ぶ。agent も
+`StreamProcessor` も介在せず、プロバイダーの生のストリームを SSE へ中継する
+だけである。ユーザーメッセージと assistant プレースホルダの追加、完了時の
+テキスト／tool_call の反映と永続化は行うが、ツール実行・権限確認・
+question 応答・agent system prompt の注入は行わない。
+
+### /prompt との主な差異
+
+`session_prompt` は JSON を返し、実行は `spawn_prompt_execution` が
+バックグラウンドで行う。主な差異は次のとおり。
+
+| 観点 | /stream | /prompt |
+| --- | --- | --- |
+| 応答契約 | SSE | JSON + broadcast |
+| system prompt | なし | provider + agent + env |
+| ツール / 権限 | なし | registry + broker |
+| エージェント | なし | 既定 `build` + AgentParams |
+| 実行系 | 直接 `chat_stream` | `SessionPrompt` + hook |
+| キャンセル | 切断検知のみ | abort + キュー |
+| 永続化 | 完了時に反映 | 完了時 + queue 遷移 |
+
+補足:
+
+- 応答契約: `/stream` は `message_start` / `message_delta` / `message_end`
+  に加え tool_call / usage / error の SSE を返す。`/prompt` は JSON 応答の
+  後、update_hook から `session.updated` (`source: prompt.stream`) と
+  完了時の同イベント (`source: prompt.final`) を broadcast する。
+- 実行系: `/prompt` は `SessionPrompt::prompt_with_update_hook` が `loop_inner`
+  を駆動し `provider.chat_stream()` を直接消費する。retry / compaction /
+  abort は `loop_inner` 内で処理され、`llm.rs` の `StreamProcessor` は
+  本番配線されていない (参照はテストモジュールのみ)。`/stream` は
+  `loop_inner` を通さない。
+- キャンセル: `/stream` はクライアント切断を `tx.closed()` で検知して
+  生成を止めるが、`/prompt/abort` には登録しない。`/prompt` は
+  `/prompt/abort` が AbortHandle を保持し、durable input のキューも処理する。
+- 永続化: `/prompt` は `sessions.update` と queue 状態遷移
+  (`mark_as_promoted` / `mark_as_failed`) まで行う。
+
+この差は実装上の細部ではなく応答品質と課金に直結する。`/stream` には
+system prompt とツール定義が渡らないため応答品質が `/prompt` と異なり、
+トークン消費と請求額も一致しない。両者を同じ経路として扱わないこと。
+
+### 新規利用の案内
+
+新規クライアントは `POST /session/{id}/prompt` と
+`GET /event` (`global_event_stream` / `event_stream`) の組み合わせを使う。
+`/stream` は生の `chat_stream` が要る既存利用向けの経路で、エージェント機能を
+期待する用途には適さない。経路統合は破壊的変更 (5〜7 ファイル、見積りは
+speculative) になるため M-46 では見送り、現状維持と本節での明記を選んだ。
+M-38 で AbortHandle 保持が見送り済みである点も変更リスクの一因である。
 
 ## 更新手順
 

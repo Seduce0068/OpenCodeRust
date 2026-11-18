@@ -44,7 +44,22 @@ use opencode_provider::{
 use opencode_session::system::{EnvironmentContext, SystemPrompt};
 use opencode_tool::create_default_registry;
 
+/// アプリケーション全体のルータ。
+///
+/// 既存の全ルート（prefix なし）を維持したまま、同じハンドラを `/api` 配下にも
+/// 公開する。upstream の `/api/...` 契約に合わせたクライアント向けの互換口であり、
+/// 既存ルート・wire format・ハンドラは一切変更しない。
 pub fn router() -> Router<Arc<ServerState>> {
+    // `Router<Arc<ServerState>>` は Clone なので api_routes() を 2 回呼んで
+    // 独立したルータを生成し、片方を `/api` に nest してマージする。
+    api_routes().merge(Router::new().nest("/api", api_routes()))
+}
+
+/// prefix なしの API ルート定義（`router()` の本体）。
+///
+/// `router()` から 2 回呼ばれ、1 回目は既存パス、2 回目は `/api` 配下の
+/// エイリアスとして使用される。
+fn api_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/", get(web_index))
         .route("/health", get(health))
@@ -5899,5 +5914,88 @@ mod list_messages_pagination_tests {
         );
         assert_eq!(query.limit, Some(2));
         assert_eq!(query.offset, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod api_alias_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn router_builds_with_api_alias_without_panic() {
+        // axum の nest/merge は経路重複時に構築時 panic するため、
+        // /api エイリアス追加で既存ルートと衝突しないことを検証する。
+        let _root = api_routes();
+        let _app = router();
+    }
+
+    /// ループバックのテストサーバへ素の HTTP/1.1 GET を送り、(status, body) を返す。
+    ///
+    /// tower が workspace から削除済みのため `ServiceExt::oneshot` は使えず、
+    /// 既存依存（tokio + axum）のみで実際のルーティングを通す。
+    async fn http_get(addr: SocketAddr, path: &str) -> (StatusCode, String) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect to loopback test server");
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.expect("read response");
+            let raw = String::from_utf8(raw).expect("response should be utf-8");
+            let status: u16 = raw
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("status line")
+                .parse()
+                .expect("numeric status");
+            let body = raw
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_string())
+                .unwrap_or_default();
+            (StatusCode::from_u16(status).expect("valid status"), body)
+        })
+        .await
+        .expect("http exchange should not hang")
+    }
+
+    #[tokio::test]
+    async fn api_alias_routes_reach_same_handlers() {
+        let app = router().with_state(Arc::new(ServerState::new()));
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                // CI / サンドボックスで loopback bind が不可な場合、テストが黙って
+                // 成功する（false green）と見逃されるため、目立つマーカーを出す。
+                eprintln!("SKIPPED: api alias routing test requires loopback bind ({err})");
+                return;
+            }
+        };
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("test server stopped: {err}");
+            }
+        });
+
+        // 既存ルートと /api エイリアスが同じハンドラへ到達し、同一の応答を返すことを検証する。
+        for path in ["/health", "/session", "/session/status"] {
+            let plain = http_get(addr, path).await;
+            let aliased = http_get(addr, &format!("/api{path}")).await;
+            assert_eq!(plain.0, StatusCode::OK, "GET {path} should succeed");
+            assert!(!plain.1.is_empty(), "GET {path} should return a body");
+            assert_eq!(aliased.0, plain.0, "GET /api{path} status should match");
+            assert_eq!(aliased.1, plain.1, "GET /api{path} body should match");
+        }
+
+        server.abort();
     }
 }
