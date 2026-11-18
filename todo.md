@@ -98,9 +98,11 @@ status: current
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
     `clippy_args` 追加、`unsafe_code = "deny"`、Renovate 設定
 - [ ] **[M-37]** async ハンドラ内の同期ファイル I/O（tool 側は対応済み）
-  - opencode-tool/grep_tool.rs は spawn_blocking 化済み。未対応は server/routes.rs の
-    std::fs 混在箇所（現行 L3433-3642 付近）。レイテンシ悪化は未計測、
-    tokio::fs / spawn_blocking 移行は推奨対応（性能影響の事前計測が望ましい）
+  - 事実確認済み（2026-11-18、routes-io-worker）: routes.rs の std::fs（3479/3522/
+    3623/3644/3688）と git subprocess（3536/3799）、canonicalize 多発（is_within_root）。
+    性能改善動機で未計測のため I/O 移行は見送り。推奨: ①find_text/find_files を
+    spawn_blocking → ②read_file を tokio::fs → ③list_files → ④git を tokio::process、
+    3836 は read guard を落としてから await（要計測）
 - [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
   - `tx.closed()` の協調 break を実装済み。JoinHandle 保持は再調査（2026-11-18、
     stream-handle-worker）で「tokio の破棄はデタッチ、協調 break で十分、AbortHandle は
@@ -116,9 +118,10 @@ status: current
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
-- [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケーション
-  - `routes.rs:1103-1118` が全件 collect、`:1316-1317` が全履歴 clone（O(n) は推測）。
-    ページネーション／差分取得と Arc による copy-on-write
+- [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケ（clone は削除済み）
+  - stream_message の冗長な全履歴 clone は削除済み。未対応は list_messages の
+    全件 collect（1098-1113、外部契約のためページネーションは変更を伴う）と
+    Arc copy-on-write。O(n) の実害は未計測
 
 ### 優先度: 高（残タスク調査で追加）
 
@@ -260,6 +263,9 @@ status: current
 - [x] **[L-08 第3段]** missing_docs 276 件を 0 件へ（2026-11-18、apidoc3-worker）
 - [x] **[L-09]** 未実装 LiteRT を登録せず警告（2026-11-18、litert-worker）
 - [x] **[M-16 一部]** 未使用の SessionID の sqlx derive を削除（2026-11-18、sqlx-derive-worker）
+- [x] **[M-11 一部]** watcher に debounce 対照テスト 2 件（2026-11-18、watcher-test-worker）
+- [x] **[M-11 一部]** codemode/tools.rs に 4 テスト（2026-11-18、codemode-test-worker）
+- [x] **[L-14]** stream_message の冗長な全履歴 clone を削除（2026-11-18、routes-io-worker）
 
 ## メモ
 

@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T12:37:41+09:00"
+  at: "2026-11-18T13:12:38+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1069 件
+  テスト総数 594 → 1075 件
 
 ### Changed
 
@@ -202,6 +202,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-types`: 未使用の `SessionID` の `sqlx::Type` derive を削除
   （`SessionStatus` は storage が実使用のため維持）(M-16 一部)
 - MAPPING.md / docs/opencode-provider.md: LiteRT 未実装の現状を明記 (L-09)
+- `opencode-watcher`: debounce のパス独立性と window=0 の対照テスト 2 件を追加
+  （5 回連続 pass でフレーキ確認）(M-11)
+- `opencode-codemode`: ToolError の構造化データ保持と JSON null/不在の区別など
+  4 テストを追加 (M-11)
+- `opencode-server`: stream_message の冗長な全履歴 clone を廃止し、ロック保持中に
+  provider 用メッセージへ直接変換（provider へ渡る履歴は不変）(L-14)
 
 ## [0.1.0]
 
