@@ -223,3 +223,301 @@ pub const ALL_MIGRATIONS: &[&str] = &[
     CREATE_INDEXES,
     IDX_SESSION_INPUT,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// ALL_MIGRATIONS が作成すべきテーブル（session_input は WITH_METADATA 版のみ）。
+    const EXPECTED_TABLES: &[&str] = &[
+        "sessions",
+        "messages",
+        "parts",
+        "todos",
+        "permissions",
+        "session_shares",
+        "session_input",
+    ];
+
+    /// ベースライン DDL が宣言すべきインデックス名。
+    const EXPECTED_INDEXES: &[&str] = &[
+        "idx_sessions_project",
+        "idx_sessions_parent",
+        "idx_sessions_updated",
+        "idx_sessions_status",
+        "idx_messages_session",
+        "idx_messages_created",
+        "idx_parts_message",
+        "idx_parts_session",
+        "idx_parts_order",
+        "idx_todos_session",
+        "idx_todos_status",
+        "idx_session_input_session",
+        "idx_session_input_status",
+    ];
+
+    fn migrations_ddl() -> String {
+        ALL_MIGRATIONS.join("\n")
+    }
+
+    fn count(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    fn table_statement<'a>(ddl: &'a str, table: &str) -> &'a str {
+        let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+        let start = ddl
+            .find(&marker)
+            .unwrap_or_else(|| panic!("`{table}` の CREATE TABLE が見つからない"));
+        let end = ddl[start..]
+            .find("\n);")
+            .unwrap_or_else(|| panic!("`{table}` の CREATE TABLE が閉じられていない"));
+        &ddl[start..start + end]
+    }
+
+    fn declared_columns(statement: &str) -> Vec<&str> {
+        statement
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("--"))
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|token| !matches!(*token, "CREATE" | "PRIMARY" | "FOREIGN" | ");"))
+            .collect()
+    }
+
+    #[test]
+    fn all_migrations_create_every_required_table_exactly_once() {
+        let ddl = migrations_ddl();
+        for table in EXPECTED_TABLES {
+            let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+            assert_eq!(
+                count(&ddl, &marker),
+                1,
+                "`{table}` の CREATE TABLE は 1 回だけ宣言されるべき"
+            );
+        }
+        assert_eq!(
+            count(&ddl, "CREATE TABLE"),
+            EXPECTED_TABLES.len(),
+            "必須テーブル以外の CREATE TABLE が混入していないこと"
+        );
+    }
+
+    #[test]
+    fn all_migrations_statements_are_non_empty_and_unique() {
+        assert!(!ALL_MIGRATIONS.is_empty());
+        for (i, statement) in ALL_MIGRATIONS.iter().enumerate() {
+            assert!(
+                !statement.trim().is_empty(),
+                "ALL_MIGRATIONS[{i}] が空文字列"
+            );
+            for other in ALL_MIGRATIONS.iter().skip(i + 1) {
+                assert_ne!(statement, other, "ALL_MIGRATIONS に重複した文がある");
+            }
+        }
+    }
+
+    #[test]
+    fn required_columns_exist_in_each_table() {
+        let ddl = migrations_ddl();
+        let required: &[(&str, &[&str])] = &[
+            (
+                "sessions",
+                &[
+                    "id",
+                    "project_id",
+                    "parent_id",
+                    "slug",
+                    "directory",
+                    "title",
+                    "version",
+                    "share_url",
+                    "summary_additions",
+                    "summary_deletions",
+                    "summary_files",
+                    "summary_diffs",
+                    "revert",
+                    "permission",
+                    "usage_input_tokens",
+                    "usage_output_tokens",
+                    "usage_reasoning_tokens",
+                    "usage_cache_write_tokens",
+                    "usage_cache_read_tokens",
+                    "usage_total_cost",
+                    "status",
+                    "created_at",
+                    "updated_at",
+                    "time_compacting",
+                    "time_archived",
+                ],
+            ),
+            (
+                "messages",
+                &[
+                    "id",
+                    "session_id",
+                    "role",
+                    "created_at",
+                    "provider_id",
+                    "model_id",
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_reasoning",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                    "cost",
+                    "data",
+                ],
+            ),
+            (
+                "parts",
+                &[
+                    "id",
+                    "message_id",
+                    "session_id",
+                    "created_at",
+                    "part_type",
+                    "text",
+                    "tool_name",
+                    "tool_call_id",
+                    "tool_arguments",
+                    "tool_result",
+                    "tool_error",
+                    "tool_status",
+                    "file_url",
+                    "file_filename",
+                    "file_mime",
+                    "reasoning",
+                    "sort_order",
+                    "data",
+                ],
+            ),
+            (
+                "todos",
+                &[
+                    "session_id",
+                    "todo_id",
+                    "content",
+                    "status",
+                    "priority",
+                    "position",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "permissions",
+                &["project_id", "created_at", "updated_at", "data"],
+            ),
+            (
+                "session_shares",
+                &["session_id", "id", "secret", "url", "created_at"],
+            ),
+            (
+                "session_input",
+                &[
+                    "id",
+                    "session_id",
+                    "prompt",
+                    "delivery",
+                    "metadata",
+                    "status",
+                    "created_at",
+                ],
+            ),
+        ];
+
+        for (table, columns) in required {
+            let statement = table_statement(&ddl, table);
+            let declared = declared_columns(statement);
+            for column in *columns {
+                assert!(
+                    declared.contains(column),
+                    "`{table}` に必須カラム `{column}` が無い"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_migrations_declare_expected_indexes_without_duplicates() {
+        let ddl = migrations_ddl();
+        let mut names = Vec::new();
+        for line in ddl.lines() {
+            if let Some(rest) = line.trim().strip_prefix("CREATE INDEX IF NOT EXISTS ") {
+                let name = rest
+                    .split_whitespace()
+                    .next()
+                    .expect("CREATE INDEX の直後にインデックス名があること");
+                names.push(name.to_string());
+            }
+        }
+
+        assert_eq!(count(&ddl, "CREATE INDEX"), EXPECTED_INDEXES.len());
+        assert_eq!(names.len(), EXPECTED_INDEXES.len());
+        for expected in EXPECTED_INDEXES {
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.as_str() == *expected)
+                    .count(),
+                1,
+                "インデックス `{expected}` は 1 回だけ宣言されるべき"
+            );
+        }
+        let mut seen = HashSet::new();
+        for name in &names {
+            assert!(seen.insert(name.as_str()), "重複インデックス名: {name}");
+        }
+    }
+
+    #[test]
+    fn foreign_keys_all_use_cascade_delete() {
+        let ddl = migrations_ddl();
+        let foreign_key_count = count(&ddl, "FOREIGN KEY (");
+        assert_eq!(foreign_key_count, 6, "全 FK が検証対象であること");
+        assert_eq!(
+            count(&ddl, "ON DELETE CASCADE"),
+            foreign_key_count,
+            "全 FK で ON DELETE CASCADE が指定されていること"
+        );
+    }
+
+    #[test]
+    fn session_input_baseline_matches_metadata_migration() {
+        let ddl = migrations_ddl();
+
+        // ベースラインは既に metadata 列を持つ版のみを使う。
+        assert!(CREATE_SESSION_INPUT_TABLE_WITH_METADATA.contains("metadata TEXT"));
+        assert!(!CREATE_SESSION_INPUT_TABLE.contains("metadata"));
+        assert_eq!(count(&ddl, "CREATE TABLE IF NOT EXISTS session_input ("), 1);
+        assert!(ALL_MIGRATIONS.contains(&CREATE_SESSION_INPUT_TABLE_WITH_METADATA));
+        assert!(!ALL_MIGRATIONS.contains(&CREATE_SESSION_INPUT_TABLE));
+
+        // 旧スキーマ用 ALTER は ALL_MIGRATIONS に含めない。
+        // database.rs が PRAGMA table_info で列の有無を判定して実行するため。
+        assert_eq!(
+            MIGRATE_SESSION_INPUT_METADATA,
+            "ALTER TABLE session_input ADD COLUMN metadata TEXT;"
+        );
+        assert!(!ALL_MIGRATIONS.contains(&MIGRATE_SESSION_INPUT_METADATA));
+    }
+
+    #[test]
+    fn schema_ddl_does_not_manage_user_version() {
+        // user_version の記録は database.rs の SCHEMA_VERSION が担う。
+        // 0 のままだとマイグレーションが毎回実行されてしまう。
+        const { assert!(crate::database::SCHEMA_VERSION > 0) };
+
+        for statement in ALL_MIGRATIONS
+            .iter()
+            .chain(std::iter::once(&MIGRATE_SESSION_INPUT_METADATA))
+        {
+            assert!(
+                !statement.to_ascii_lowercase().contains("user_version"),
+                "スキーマ DDL に user_version 操作を含めないこと"
+            );
+        }
+    }
+}
