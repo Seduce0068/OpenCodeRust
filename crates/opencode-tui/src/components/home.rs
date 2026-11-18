@@ -334,3 +334,237 @@ fn parse_tip_highlights(tip: &str, theme: &crate::theme::Theme) -> Vec<Span<'sta
 
     spans
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{McpServerStatus, Session};
+    use crate::theme::Theme;
+    use once_cell::sync::Lazy;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    /// OPENCODE_STATE_DIR を一時ディレクトリへ切り替えて AppContext を構築する。
+    /// prompt.rs のテストと同じ方式で、履歴・frecency・stash の実状態との接触を避ける。
+    /// ネットワークアクセスや外部サービスは行わない。
+    fn with_isolated_context<T>(f: impl FnOnce(Arc<AppContext>) -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let state_dir =
+            std::env::temp_dir().join(format!("opencode-tui-home-{}", uuid::Uuid::new_v4()));
+        let previous = std::env::var("OPENCODE_STATE_DIR").ok();
+        std::env::set_var("OPENCODE_STATE_DIR", &state_dir);
+
+        let context = Arc::new(AppContext::new());
+        let result = f(context);
+
+        if let Some(prev) = previous {
+            std::env::set_var("OPENCODE_STATE_DIR", prev);
+        } else {
+            std::env::remove_var("OPENCODE_STATE_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&state_dir);
+        result
+    }
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        // ratatui-core の Buffer は Display を実装しないため cell() で走査する。
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn new_stores_the_given_context() {
+        with_isolated_context(|context| {
+            let expected = Arc::clone(&context);
+            let view = HomeView::new(context);
+
+            assert!(Arc::ptr_eq(&view.context, &expected));
+        });
+    }
+
+    #[test]
+    fn render_draws_tagline_prompt_placeholder_and_branding() {
+        with_isolated_context(|context| {
+            let view = HomeView::new(context);
+            let text = render_to_string(100, 30, |frame| {
+                view.render(frame, Rect::new(0, 0, 100, 30));
+            });
+
+            assert!(text.contains(APP_TAGLINE), "tagline should be drawn");
+            assert!(
+                text.contains("Ask anything..."),
+                "default placeholder missing"
+            );
+            assert!(
+                text.contains("Fix a TODO in the codebase"),
+                "prompt example missing"
+            );
+            assert!(text.contains(APP_SHORT_NAME), "short name missing");
+            assert!(text.contains(APP_VERSION_DATE), "version date missing");
+            // セッションが空（新規ユーザー）のときは Tips を出さない。
+            assert!(!text.contains("● Tip"), "tips should be hidden initially");
+        });
+    }
+
+    #[test]
+    fn render_applies_outer_padding() {
+        with_isolated_context(|context| {
+            let view = HomeView::new(context);
+            let area = Rect::new(10, 5, 100, 30);
+            let text = render_to_string(120, 40, |frame| {
+                view.render(frame, area);
+            });
+            let rows: Vec<&str> = text.lines().collect();
+
+            assert_eq!(rows.len(), 40);
+            assert!(
+                rows[..5].iter().all(|row| row.trim().is_empty()),
+                "rows above the area must stay blank"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row.chars().take(10).all(|c| c == ' ')),
+                "columns left of the area must stay blank"
+            );
+            assert!(text.contains(APP_TAGLINE));
+        });
+    }
+
+    #[test]
+    fn render_with_prompt_uses_the_supplied_prompt() {
+        with_isolated_context(|context| {
+            let view = HomeView::new(Arc::clone(&context));
+            const CUSTOM_PLACEHOLDER: &str = "Custom home prompt >";
+            let prompt = Prompt::new(Arc::clone(&context)).with_placeholder(CUSTOM_PLACEHOLDER);
+
+            let text = render_to_string(100, 30, |frame| {
+                view.render_with_prompt(frame, Rect::new(0, 0, 100, 30), &prompt);
+            });
+
+            assert!(text.contains(CUSTOM_PLACEHOLDER), "custom prompt missing");
+            assert!(
+                !text.contains("Ask anything..."),
+                "default placeholder leaked"
+            );
+            assert!(text.contains(APP_TAGLINE), "home chrome missing");
+        });
+    }
+
+    #[test]
+    fn render_with_prompt_is_noop_for_zero_sized_inner_area() {
+        with_isolated_context(|context| {
+            let view = HomeView::new(Arc::clone(&context));
+            let prompt = Prompt::new(context);
+            for area in [
+                Rect::new(0, 0, 0, 30),
+                Rect::new(0, 0, 100, 0),
+                Rect::new(0, 0, 4, 30),
+                Rect::new(0, 0, 100, 2),
+            ] {
+                let text = render_to_string(100, 30, |frame| {
+                    view.render_with_prompt(frame, area, &prompt);
+                });
+                assert!(
+                    text.chars().all(|c| c == ' ' || c == '\n'),
+                    "expected blank buffer for {area:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tips_render_only_for_returning_user_when_enabled() {
+        with_isolated_context(|context| {
+            {
+                let mut session = context.session.write();
+                let now = chrono::Utc::now();
+                session.sessions.insert(
+                    "seed-session".to_string(),
+                    Session {
+                        id: "seed-session".to_string(),
+                        title: "seed".to_string(),
+                        created_at: now,
+                        updated_at: now,
+                        parent_id: None,
+                        share: None,
+                    },
+                );
+            }
+            let view = HomeView::new(Arc::clone(&context));
+
+            *context.tips_hidden.write() = true;
+            let hidden = render_to_string(100, 30, |frame| {
+                view.render(frame, Rect::new(0, 0, 100, 30));
+            });
+            assert!(!hidden.contains("● Tip"), "tips must respect tips_hidden");
+
+            *context.tips_hidden.write() = false;
+            let shown = render_to_string(100, 30, |frame| {
+                view.render(frame, Rect::new(0, 0, 100, 30));
+            });
+            assert!(
+                shown.contains("● Tip"),
+                "tips should render for returning user"
+            );
+        });
+    }
+
+    #[test]
+    fn footer_reports_connected_mcp_count() {
+        with_isolated_context(|context| {
+            context.mcp_servers.write().push(McpServerStatus {
+                name: "demo".to_string(),
+                status: McpConnectionStatus::Connected,
+                error: None,
+            });
+            let view = HomeView::new(context);
+
+            let text = render_to_string(100, 30, |frame| {
+                view.render(frame, Rect::new(0, 0, 100, 30));
+            });
+
+            assert!(text.contains("⊙"), "MCP status dot missing");
+            assert!(text.contains("1 MCP"), "connected count missing");
+        });
+    }
+
+    #[test]
+    fn parse_tip_highlights_splits_marked_segments() {
+        let theme = Theme::dark();
+        let spans = parse_tip_highlights("Press {highlight}Tab{/highlight} now", &theme);
+        let texts: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+
+        assert_eq!(texts, vec!["Press ", "Tab", " now"]);
+    }
+
+    #[test]
+    fn parse_tip_highlights_handles_plain_and_unclosed_markers() {
+        let theme = Theme::dark();
+        let plain = parse_tip_highlights("plain tip", &theme);
+        let plain_texts: Vec<&str> = plain.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(plain_texts, vec!["plain tip"]);
+
+        let unclosed = parse_tip_highlights("{highlight}Tab", &theme);
+        let unclosed_texts: Vec<&str> = unclosed.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(unclosed_texts, vec!["{highlight}", "Tab"]);
+    }
+}
