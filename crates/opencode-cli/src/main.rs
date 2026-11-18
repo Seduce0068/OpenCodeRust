@@ -578,7 +578,14 @@ enum GithubCommands {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // L-04: `config.logLevel` を tracing の EnvFilter へ反映する。
+    // `print = true` は既存 `fmt::init()` と同じ stdout 出力を維持し、
+    // `log_dir = None` は print 時の早期 return で不使用なため渡さない。
+    let startup_log_level = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| load_config(&cwd).ok())
+        .and_then(|config| config.log_level);
+    let _ = opencode_util::init_tracing(startup_log_level.as_deref(), None, true);
 
     let cli = Cli::parse();
 
