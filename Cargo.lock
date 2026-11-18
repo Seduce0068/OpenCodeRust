@@ -2234,6 +2234,7 @@ dependencies = [
  "opencode-tool",
  "opencode-tui",
  "opencode-types",
+ "opencode-util",
  "reqwest",
  "serde",
  "serde_json",
