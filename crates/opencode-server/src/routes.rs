@@ -1710,6 +1710,25 @@ impl Drop for PromptTaskCleanup {
     }
 }
 
+/// キュー投入プロンプトの実行で新規生成された assistant メッセージに、
+/// 起点となったキュー項目の `queue_id` を相関 ID として付与する。
+///
+/// 再実行時に重複した assistant レスポンスを検出・識別するための付加情報であり、
+/// キュー状態そのものは変更しない（冪等性そのものはキュー側の終端状態管理が担う）。
+fn correlate_assistant_messages_with_queue(
+    session: &mut opencode_session::Session,
+    first_message_index: usize,
+    queue_id: &str,
+) {
+    for message in session.messages.iter_mut().skip(first_message_index) {
+        if matches!(message.role, opencode_session::MessageRole::Assistant) {
+            message
+                .metadata
+                .insert("queue_id".to_string(), serde_json::json!(queue_id));
+        }
+    }
+}
+
 fn spawn_prompt_execution(
     task_state: Arc<ServerState>,
     session_id: String,
@@ -1999,6 +2018,9 @@ fn spawn_prompt_execution(
             tools: Some(tools.iter().map(|t| (t.name.clone(), true)).collect()),
         };
 
+        // この実行で追加された assistant メッセージだけに queue_id を付与するため、
+        // プロンプト実行前のメッセージ数を記録する。
+        let first_message_index = session.messages.len();
         let result = prompt_runner
             .prompt_with_update_hook(
                 input,
@@ -2048,6 +2070,9 @@ fn spawn_prompt_execution(
                 }
             }
         }
+        if let Some(queue_id) = queue_id.as_deref() {
+            correlate_assistant_messages_with_queue(&mut session, first_message_index, queue_id);
+        }
         let _ = update_task.await;
 
         {
@@ -2069,6 +2094,13 @@ fn spawn_prompt_execution(
                 if result.is_ok() {
                     if let Err(error) = input_repo.mark_as_promoted(queue_id).await {
                         tracing::error!(%queue_id, %error, "failed marking queued prompt complete");
+                        // assistant レスポンスは既にセッションへ永続化済みであり、この
+                        // キュー項目を processing のまま残すのは安全ではない。再起動時の
+                        // reset_processing() で pending に戻り再実行されるのを避けるため、
+                        // 終端状態である failed への切り替えをフォールバックで試みる。
+                        if let Err(fail_error) = input_repo.mark_as_failed(queue_id).await {
+                            tracing::error!(%queue_id, %fail_error, "failed marking queued prompt failed after promote failure");
+                        }
                     }
                 } else if let Err(error) = input_repo.mark_as_failed(queue_id).await {
                     tracing::error!(%queue_id, %error, "failed marking queued prompt failed");
@@ -5259,6 +5291,39 @@ mod mapping_tests {
         assert_eq!(message_role_name(&MessageRole::Assistant), "assistant");
         assert_eq!(message_role_name(&MessageRole::System), "system");
         assert_eq!(message_role_name(&MessageRole::Tool), "tool");
+    }
+
+    #[test]
+    fn correlate_assistant_messages_tags_only_new_assistants() {
+        use opencode_session::{MessageRole, Session};
+
+        let mut session = Session::new("proj", "/tmp");
+        // 実行前の既存メッセージ（相関 ID は付与されない）
+        session.add_user_message("old");
+        session.add_assistant_message();
+        let first_new_index = session.messages.len();
+
+        // 今回の実行で追加されたメッセージ
+        session.add_user_message("new");
+        session.add_assistant_message();
+        let last = session.add_assistant_message();
+        last.add_text("response");
+
+        correlate_assistant_messages_with_queue(&mut session, first_new_index, "in_123");
+
+        assert!(session.messages[..first_new_index]
+            .iter()
+            .all(|m| !m.metadata.contains_key("queue_id")));
+        for message in &session.messages[first_new_index..] {
+            if matches!(message.role, MessageRole::Assistant) {
+                assert_eq!(
+                    message.metadata.get("queue_id"),
+                    Some(&serde_json::json!("in_123"))
+                );
+            } else {
+                assert!(!message.metadata.contains_key("queue_id"));
+            }
+        }
     }
 
     #[test]
