@@ -1382,7 +1382,20 @@ async fn stream_message(
 
         match provider.chat_stream(request).await {
             Ok(mut provider_stream) => {
-                while let Some(item) = provider_stream.next().await {
+                'provider_stream: loop {
+                    // クライアント切断時は Sse/ReceiverStream がドロップされ `rx` が閉じる。
+                    // `tx.closed()` も同時に待つことで、切断後もプロバイダーの
+                    // ストリームを消費し続ける（＝不要な生成の課金が継続する）
+                    // ことを防ぐ。SSE のイベント内容・順序は不変。
+                    let next = tokio::select! {
+                        biased;
+                        _ = tx.closed() => None,
+                        next = provider_stream.next() => next,
+                    };
+                    let item = match next {
+                        Some(item) => item,
+                        None => break 'provider_stream,
+                    };
                     match item {
                         Ok(opencode_provider::StreamEvent::TextDelta(delta)) => {
                             if delta.is_empty() {
