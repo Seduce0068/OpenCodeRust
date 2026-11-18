@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T19:41:26+09:00"
+  at: "2026-11-18T20:13:31+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1352 件
+  テスト総数 594 → 1397 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 39.42% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 39.65% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -266,6 +266,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   （各プロバイダ固有のモデル ID・capability・コスト、実 API キーなし）(M-11)
 - `opencode-provider`: cohere.rs / deepinfra.rs / openrouter.rs に 26 テストを追加
   （swarm-coding R2 の 3 エージェント並列実装、R4 独立レビュー指摘 0 件、実キーなし）(M-11)
+- `opencode-tui`: router / branding / app/state / slash_command / hooks に 45 テストを
+  追加（swarm-coding R1-R6）。R4 が検出した `navigate()` の history 重複バグを
+  修正し、`go_back()` が正しい前ルートへ戻るよう修正 (M-11)
 
 ## [0.1.0]
 
