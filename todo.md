@@ -153,18 +153,18 @@ status: current
 
 ### 優先度: 中（残タスク調査で追加）
 
-- [ ] **[P-03]** 未配線の設定フィールド群
-  - `Config.keybinds` (`opencode-config/src/schema.rs:13`) が TUI の `KeybindRegistry::new()`
-    (`opencode-tui/src/context/keybind.rs:147-211`) へ一切渡されずハードコード固定。
-    同一ファイルの `snapshot` / `autoupdate` / `enterprise` / `experimental` の 4 フィールドと、
-    `ExperimentalConfig` の 5 サブフィールド (`schema.rs:1175-1188`) も runtime 参照 0 件。
-    配線するか、未対応をドキュメントへ明記
-- [ ] **[P-04]** interleaved thinking の正規化が no-op
-  - `opencode-provider/src/transform.rs:303-308` の
-    `normalize_interleaved_field` は空本体だが
-    呼び出し元 `:297` は生存。実処理は
-    `normalize_messages_with_interleaved_field` (`:312`) に
-    あるが re-export のみで呼び出し 0 件。model の `interleaved` 設定を runtime へ反映する配線
+- [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
+  - `Config.keybinds` が TUI の `KeybindRegistry::new()` へ渡されずハードコード固定。
+    `snapshot` / `autoupdate` / `enterprise` / `experimental` と
+    `ExperimentalConfig` の **6 サブフィールド**
+    （現行 schema.rs:1224-1238、旧 todo の「5 件」は古い）も runtime
+    参照 0 件。未対応の旨は MAPPING.md の「設定スキーマの追随状況」に明記済み。
+    未対応は実際の配線（TUI/CLI 側の改修が必要）
+- [ ] **[P-04]** interleaved thinking の runtime 反映（no-op は削除済み）
+  - 空本体の `normalize_interleaved_field` と呼び出しを削除済み（挙動不変）。
+    未対応は `transform_messages` 経路自体が未呼び出しで、`InterleavedConfig` を渡す
+    引数追加＋呼び出し側（bootstrap 等）の改修が必要。model.interleaved → runtime
+    capabilities への変換自体は bootstrap.rs で別経路配線済み
 - [ ] **[P-05]** MCP protocol negotiation の `Auto` が probe せず常に legacy
   - `McpProtocol::Auto` はコメントで probe + fallback を謳うが
     `revision()` (`opencode-config/src/schema.rs:571-592`) は `Legacy` と同じ
@@ -293,6 +293,9 @@ status: current
 - [x] **[M-21]** PROJECT_METADATA を ServerState へ移行（2026-11-18、project-meta-worker）
 - [x] **[M-11 一部]** storage/schema.rs に 7 テスト（2026-11-18、schema-test-worker）
 - [x] **[M-11 一部]** mcp/tool.rs に 8 テスト（2026-11-18、mcp-tool-test-worker）
+- [x] **[P-03]** 未配線設定フィールドを MAPPING.md へ明記（2026-11-18、p03-worker）
+- [x] **[P-04]** interleaved の no-op 関数と呼び出しを削除（2026-11-18、p04-worker）
+- [x] **[M-11 一部]** provider/tools.rs に 17 テスト（2026-11-18、provider-tools-test-worker）
 
 ## メモ
 
