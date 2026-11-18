@@ -101,10 +101,11 @@ status: current
     本番で `event_bus.send*` 呼び出しは 0 件。実際の配送は app.rs:102 の別 mpsc チャネルで
     動作しており実害なし。receiver 保持は読む event loop が無くキュー蓄積リスクがあるため
     見送り。真に統合するなら app.rs 改修（EventBus を app のチャネルへ統合、または削除）が必要
-- [ ] **[M-21]** ServerState 外のグローバル static（CONFIG_STATE／TUI キュー／実行状態は対応済み）
-  - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS。
-    未対応: PROJECT_METADATA（cwd キーで実害限定的、ハンドラ 4 箇所のシグネチャ変更要）、
-    TODO_MANAGER / PTY_MANAGER（M-05 / M-20 と連携した配線が必要）
+- [ ] **[M-21]** ServerState 外のグローバル static（主要項目は移行済み）
+  - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS、PROJECT_METADATA。
+    未対応: TODO_MANAGER / PTY_MANAGER（M-05 / M-20 と連携した配線が必要）、
+    MODEL_VARIANT_LOOKUP / MCP_OAUTH_MANAGER / PLUGIN_LOADER / EXTRA_CORS_WHITELIST
+    （不変または初期化一回の OnceCell で実害限定的）
 - [ ] **[M-34]** CI ゲートの抜け（all-features・unsafe lint・依存監査・スクリプト）
   - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
@@ -289,6 +290,9 @@ status: current
 - [x] **[M-17 一部]** 7 モジュールを pub(crate) 化（2026-11-18、pubmod-worker）
 - [x] **[M-11 一部]** tui/session_context.rs に 11 テスト（2026-11-18、session-ctx-test-worker）
 - [x] **[M-04 一部]** source 付きエラーバリアントを追加（2026-11-18、error-source-worker）
+- [x] **[M-21]** PROJECT_METADATA を ServerState へ移行（2026-11-18、project-meta-worker）
+- [x] **[M-11 一部]** storage/schema.rs に 7 テスト（2026-11-18、schema-test-worker）
+- [x] **[M-11 一部]** mcp/tool.rs に 8 テスト（2026-11-18、mcp-tool-test-worker）
 
 ## メモ
 
