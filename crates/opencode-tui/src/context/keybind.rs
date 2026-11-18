@@ -173,7 +173,9 @@ impl KeybindRegistry {
         self.register("agent_cycle", Keybind::key(KeyCode::Tab));
         self.register("agent_cycle_reverse", Keybind::key(KeyCode::BackTab));
         self.register("model_cycle", Keybind::ctrl(KeyCode::Char('m')));
-        self.register("variant_cycle", Keybind::ctrl(KeyCode::Char('v')));
+        // M-51: ctrl+v は input_paste（標準の貼り付け）と重複するため、
+        // variant_cycle 側を alt+v へ変更する（app.rs の参照名はそのまま）。
+        self.register("variant_cycle", Keybind::alt(KeyCode::Char('v')));
 
         self.register("session_parent", Keybind::ctrl(KeyCode::Char('o')));
         self.register("session_child_cycle", Keybind::ctrl(KeyCode::Char('j')));
@@ -186,6 +188,11 @@ impl KeybindRegistry {
         self.register("session_interrupt", Keybind::key(KeyCode::Esc));
 
         self.register("sidebar_toggle", Keybind::ctrl(KeyCode::Char('s')));
+        // M-51: app.rs の matches_keybind("display_thinking" / "tool_details") と
+        // 同じ名前で登録する。未登録だとトグルが到達不能になる。
+        self.register("display_thinking", Keybind::ctrl(KeyCode::Char('t')));
+        // ctrl+shift+t は多くのターミナルで ctrl+t と区別できないため alt+t を使う。
+        self.register("tool_details", Keybind::alt(KeyCode::Char('t')));
         self.register("help_toggle", Keybind::ctrl(KeyCode::Char('h')));
 
         self.register("editor_open", Keybind::ctrl(KeyCode::Char('e')));
@@ -478,5 +485,44 @@ mod tests {
         assert_eq!(registry.print("input_newline"), "alt+enter");
         assert_eq!(registry.print("agent_cycle_reverse"), "shift+tab");
         assert_eq!(registry.print("missing"), "?");
+    }
+
+    #[test]
+    fn registry_registers_view_toggle_keybinds_used_by_app() {
+        let registry = KeybindRegistry::new();
+
+        // app.rs の matches_keybind と同じ参照名で登録されていること（M-51）。
+        assert_eq!(
+            registry.get("display_thinking"),
+            Some(&Keybind::ctrl(KeyCode::Char('t')))
+        );
+        assert_eq!(
+            registry.get("tool_details"),
+            Some(&Keybind::alt(KeyCode::Char('t')))
+        );
+        assert!(registry.match_key(
+            "display_thinking",
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(registry.match_key("tool_details", KeyCode::Char('t'), KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn registry_paste_and_variant_cycle_do_not_share_ctrl_v() {
+        let registry = KeybindRegistry::new();
+
+        // M-51: ctrl+v は貼り付け専用。variant_cycle は alt+v に退避した。
+        assert_eq!(
+            registry.get("input_paste"),
+            Some(&Keybind::ctrl(KeyCode::Char('v')))
+        );
+        assert_eq!(
+            registry.get("variant_cycle"),
+            Some(&Keybind::alt(KeyCode::Char('v')))
+        );
+        assert!(registry.match_key("input_paste", KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(!registry.match_key("variant_cycle", KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(registry.match_key("variant_cycle", KeyCode::Char('v'), KeyModifiers::ALT));
     }
 }

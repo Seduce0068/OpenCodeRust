@@ -34,7 +34,8 @@ impl HelpDialog {
             return;
         }
 
-        let dialog_area = centered_rect(74, 20, area);
+        // キー割当の説明行を 2 行追加したため、80x24 でも末尾が見えるよう 20 -> 22 に拡大。
+        let dialog_area = centered_rect(74, 22, area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -87,7 +88,9 @@ impl HelpDialog {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from("  Ctrl+M  Model list"),
-            Line::from("  Ctrl+V  Cycle model variant"),
+            Line::from("  Alt+V   Cycle model variant"),
+            Line::from("  Ctrl+T  Toggle thinking"),
+            Line::from("  Alt+T   Toggle tool details"),
             Line::from("  Use /agents to open full agent list"),
             Line::from("  Ctrl+S  Toggle sidebar"),
             Line::from("  Use command palette for session/theme/status/MCP dialogs"),
@@ -250,5 +253,21 @@ mod tests {
         assert!(text.contains("Prompt"), "prompt section");
         assert!(text.contains("Esc"), "close hint key");
         assert!(text.contains("close"), "close hint label");
+    }
+
+    #[test]
+    fn render_shows_view_toggle_and_variant_keybinds() {
+        let mut dialog = HelpDialog::new();
+        dialog.open();
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        // R5: keybind.rs の割当（alt+v / ctrl+t / alt+t）と表示を一致させる。
+        assert!(text.contains("Alt+V"), "variant cycle keybind");
+        assert!(text.contains("Ctrl+T"), "toggle thinking keybind");
+        assert!(text.contains("Alt+T"), "toggle tool details keybind");
     }
 }
