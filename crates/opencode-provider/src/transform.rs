@@ -292,19 +292,6 @@ pub fn normalize_messages(
         }
         _ => {}
     }
-
-    // Handle interleaved thinking field (move reasoning to providerOptions)
-    normalize_interleaved_field(messages, model_id);
-}
-
-/// For models with interleaved thinking that use a specific field
-/// (reasoning_content or reasoning_details), move reasoning parts
-/// from content into providerOptions.openaiCompatible.<field>.
-fn normalize_interleaved_field(_messages: &mut Vec<Message>, _model_id: &str) {
-    // This is handled at a higher level via the ModelInfo.interleaved field.
-    // The caller should check model.interleaved and pass the field name.
-    // For now this is a no-op; the full implementation is in
-    // normalize_messages_with_interleaved_field below.
 }
 
 /// Normalize messages for models that store reasoning in a specific provider field.

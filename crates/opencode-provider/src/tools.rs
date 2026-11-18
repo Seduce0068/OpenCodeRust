@@ -655,3 +655,455 @@ pub fn prepare_tools(
         tool_warnings,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ダミーの function ツール定義。HTTP 通信や秘密情報を一切含まない。
+    fn function_tool(name: &str) -> InputTool {
+        InputTool::Function {
+            name: name.to_string(),
+            description: Some("dummy description".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "value": { "type": "string" } }
+            }),
+        }
+    }
+
+    fn provider_tool(id: &str, name: &str, args: serde_json::Value) -> InputTool {
+        InputTool::ProviderDefined {
+            id: id.to_string(),
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    #[test]
+    fn responses_tools_without_tools_returns_none_and_ignores_choice() {
+        let prepared = prepare_responses_tools(None, Some(&InputToolChoice::Required), true);
+        assert!(prepared.tools.is_none());
+        assert!(prepared.tool_choice.is_none());
+        assert!(prepared.tool_warnings.is_empty());
+
+        let empty: [InputTool; 0] = [];
+        let prepared = prepare_responses_tools(
+            Some(&empty),
+            Some(&InputToolChoice::Tool {
+                tool_name: "dummy_tool".to_string(),
+            }),
+            false,
+        );
+        assert!(prepared.tools.is_none());
+        assert!(prepared.tool_choice.is_none());
+        assert!(prepared.tool_warnings.is_empty());
+    }
+
+    #[test]
+    fn chat_tools_without_tools_returns_none_and_ignores_choice() {
+        let prepared = prepare_tools(None, Some(&InputToolChoice::Auto));
+        assert!(prepared.tools.is_none());
+        assert!(prepared.tool_choice.is_none());
+        assert!(prepared.tool_warnings.is_empty());
+
+        let empty: [InputTool; 0] = [];
+        let prepared = prepare_tools(Some(&empty), Some(&InputToolChoice::Required));
+        assert!(prepared.tools.is_none());
+        assert!(prepared.tool_choice.is_none());
+        assert!(prepared.tool_warnings.is_empty());
+    }
+
+    #[test]
+    fn responses_tools_maps_function_and_strict_flag() {
+        let tools = vec![function_tool("dummy_tool")];
+
+        let strict = prepare_responses_tools(Some(&tools), None, true);
+        let mapped = strict.tools.expect("tools should be present");
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            ResponsesTool::Function {
+                name,
+                description,
+                parameters,
+                strict,
+            } => {
+                assert_eq!(name.as_str(), "dummy_tool");
+                assert_eq!(description.as_deref(), Some("dummy description"));
+                assert_eq!(parameters["type"], "object");
+                assert_eq!(*strict, Some(true));
+            }
+            other => panic!("expected function tool, got {:?}", other),
+        }
+        assert!(strict.tool_warnings.is_empty());
+
+        let non_strict = prepare_responses_tools(Some(&tools), None, false);
+        match &non_strict.tools.expect("tools should be present")[0] {
+            ResponsesTool::Function { strict, .. } => assert_eq!(*strict, None),
+            other => panic!("expected function tool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chat_tools_maps_function_definition() {
+        let tools = vec![function_tool("dummy_tool")];
+        let prepared = prepare_tools(Some(&tools), None);
+        let mapped = prepared.tools.expect("tools should be present");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].tool_type, "function");
+        assert_eq!(mapped[0].function.name, "dummy_tool");
+        assert_eq!(
+            mapped[0].function.description.as_deref(),
+            Some("dummy description")
+        );
+        assert_eq!(mapped[0].function.parameters["type"], "object");
+        assert!(prepared.tool_warnings.is_empty());
+    }
+
+    #[test]
+    fn unsupported_provider_tools_produce_warnings() {
+        let tools = vec![
+            function_tool("dummy_tool"),
+            provider_tool("unknown.tool", "unknown_tool", serde_json::json!({})),
+        ];
+
+        let responses = prepare_responses_tools(Some(&tools), None, false);
+        assert_eq!(responses.tools.expect("tools").len(), 1);
+        assert!(responses.tool_warnings.iter().any(|warning| {
+            matches!(warning, CallWarning::UnsupportedTool { tool_name: Some(name) }
+                if name.as_str() == "unknown_tool")
+        }));
+
+        let chat = prepare_tools(Some(&tools), None);
+        assert_eq!(chat.tools.expect("tools").len(), 1);
+        assert!(chat.tool_warnings.iter().any(|warning| {
+            matches!(warning, CallWarning::UnsupportedTool { tool_name: Some(name) }
+                if name.as_str() == "unknown_tool")
+        }));
+    }
+
+    #[test]
+    fn responses_tool_choice_maps_modes_and_named_tools() {
+        let tools = vec![function_tool("dummy_tool")];
+        let cases = [
+            (InputToolChoice::Auto, "auto"),
+            (InputToolChoice::None, "none"),
+            (InputToolChoice::Required, "required"),
+        ];
+        for (choice, expected) in cases {
+            let prepared = prepare_responses_tools(Some(&tools), Some(&choice), false);
+            match prepared.tool_choice.expect("choice") {
+                ResponsesToolChoice::Mode(mode) => assert_eq!(mode, expected),
+                other => panic!("expected mode choice, got {:?}", other),
+            }
+        }
+
+        let builtin = prepare_responses_tools(
+            Some(&tools),
+            Some(&InputToolChoice::Tool {
+                tool_name: "web_search".to_string(),
+            }),
+            false,
+        );
+        match builtin.tool_choice.expect("choice") {
+            ResponsesToolChoice::Specific(specific) => {
+                assert_eq!(specific.choice_type, "web_search");
+                assert!(specific.name.is_none());
+            }
+            other => panic!("expected specific choice, got {:?}", other),
+        }
+
+        let named = prepare_responses_tools(
+            Some(&tools),
+            Some(&InputToolChoice::Tool {
+                tool_name: "dummy_tool".to_string(),
+            }),
+            false,
+        );
+        match named.tool_choice.expect("choice") {
+            ResponsesToolChoice::Specific(specific) => {
+                assert_eq!(specific.choice_type, "function");
+                assert_eq!(specific.name.as_deref(), Some("dummy_tool"));
+            }
+            other => panic!("expected specific choice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chat_tool_choice_maps_modes_and_named_tools() {
+        let tools = vec![function_tool("dummy_tool")];
+        let cases = [
+            (InputToolChoice::Auto, "auto"),
+            (InputToolChoice::None, "none"),
+            (InputToolChoice::Required, "required"),
+        ];
+        for (choice, expected) in cases {
+            let prepared = prepare_tools(Some(&tools), Some(&choice));
+            match prepared.tool_choice.expect("choice") {
+                ChatToolChoice::Mode(mode) => assert_eq!(mode, expected),
+                other => panic!("expected mode choice, got {:?}", other),
+            }
+        }
+
+        let named = prepare_tools(
+            Some(&tools),
+            Some(&InputToolChoice::Tool {
+                tool_name: "dummy_tool".to_string(),
+            }),
+        );
+        match named.tool_choice.expect("choice") {
+            ChatToolChoice::Specific(specific) => {
+                assert_eq!(specific.choice_type, "function");
+                assert_eq!(specific.function.name, "dummy_tool");
+            }
+            other => panic!("expected specific choice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn responses_tools_convert_provider_defined_builtins() {
+        let tools = vec![
+            provider_tool("openai.local_shell", "local_shell", serde_json::json!({})),
+            provider_tool("openai.web_search", "web_search", serde_json::json!({})),
+            provider_tool(
+                "openai.web_search_preview",
+                "web_search_preview",
+                serde_json::json!({}),
+            ),
+            provider_tool(
+                "openai.file_search",
+                "file_search",
+                serde_json::json!({ "vector_store_ids": ["vs_dummy"] }),
+            ),
+            provider_tool(
+                "openai.code_interpreter",
+                "code_interpreter",
+                serde_json::json!({}),
+            ),
+            provider_tool(
+                "openai.image_generation",
+                "image_generation",
+                serde_json::json!({}),
+            ),
+        ];
+
+        let prepared = prepare_responses_tools(Some(&tools), None, false);
+        assert!(prepared.tool_warnings.is_empty());
+        let mapped = prepared.tools.expect("tools should be present");
+        assert_eq!(mapped.len(), 6);
+        assert!(matches!(&mapped[0], ResponsesTool::LocalShell {}));
+        assert!(matches!(&mapped[1], ResponsesTool::WebSearch { .. }));
+        assert!(matches!(&mapped[2], ResponsesTool::WebSearchPreview { .. }));
+        assert!(matches!(&mapped[3], ResponsesTool::FileSearch { .. }));
+        assert!(matches!(&mapped[4], ResponsesTool::CodeInterpreter { .. }));
+        assert!(matches!(&mapped[5], ResponsesTool::ImageGeneration { .. }));
+    }
+
+    #[test]
+    fn responses_tools_file_search_maps_ranking_and_filters() {
+        let tools = vec![provider_tool(
+            "openai.file_search",
+            "file_search",
+            serde_json::json!({
+                "vector_store_ids": ["vs_dummy"],
+                "max_num_results": 3,
+                "ranking": { "ranker": "auto" },
+                "filters": { "key": "dummy" }
+            }),
+        )];
+
+        let prepared = prepare_responses_tools(Some(&tools), None, false);
+        match &prepared.tools.expect("tools")[0] {
+            ResponsesTool::FileSearch {
+                vector_store_ids,
+                max_num_results,
+                ranking_options,
+                filters,
+            } => {
+                assert_eq!(vector_store_ids, &vec!["vs_dummy".to_string()]);
+                assert_eq!(*max_num_results, Some(3));
+                assert_eq!(
+                    ranking_options.as_ref().expect("ranking_options")["ranker"],
+                    "auto"
+                );
+                assert_eq!(filters.as_ref().expect("filters")["key"], "dummy");
+            }
+            other => panic!("expected file search tool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn responses_tools_code_interpreter_container_variants() {
+        let defaults = vec![provider_tool(
+            "openai.code_interpreter",
+            "code_interpreter",
+            serde_json::json!({}),
+        )];
+        let prepared = prepare_responses_tools(Some(&defaults), None, false);
+        match &prepared.tools.expect("tools")[0] {
+            ResponsesTool::CodeInterpreter { container } => {
+                assert_eq!(container["type"], "auto");
+            }
+            other => panic!("expected code interpreter tool, got {:?}", other),
+        }
+
+        let by_id = vec![provider_tool(
+            "openai.code_interpreter",
+            "code_interpreter",
+            serde_json::json!({ "container": "cntr_dummy" }),
+        )];
+        let prepared = prepare_responses_tools(Some(&by_id), None, false);
+        match &prepared.tools.expect("tools")[0] {
+            ResponsesTool::CodeInterpreter { container } => {
+                assert_eq!(container.as_str(), Some("cntr_dummy"));
+            }
+            other => panic!("expected code interpreter tool, got {:?}", other),
+        }
+
+        let by_config = vec![provider_tool(
+            "openai.code_interpreter",
+            "code_interpreter",
+            serde_json::json!({ "container": { "file_ids": ["file_dummy"] } }),
+        )];
+        let prepared = prepare_responses_tools(Some(&by_config), None, false);
+        match &prepared.tools.expect("tools")[0] {
+            ResponsesTool::CodeInterpreter { container } => {
+                assert_eq!(container["type"], "auto");
+                assert_eq!(container["file_ids"][0], "file_dummy");
+            }
+            other => panic!("expected code interpreter tool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn responses_tools_skip_provider_tool_with_invalid_args() {
+        let tools = vec![provider_tool(
+            "openai.file_search",
+            "file_search",
+            serde_json::json!({ "unexpected": "shape" }),
+        )];
+        let prepared = prepare_responses_tools(Some(&tools), None, false);
+        assert!(prepared.tools.expect("tools").is_empty());
+        assert!(prepared.tool_warnings.is_empty());
+    }
+
+    #[test]
+    fn input_tool_serde_uses_wire_field_names_and_roundtrips() {
+        let tool = function_tool("dummy_tool");
+        let value = serde_json::to_value(&tool).expect("serialize");
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["name"], "dummy_tool");
+        assert_eq!(value["inputSchema"]["type"], "object");
+        assert!(value.get("input_schema").is_none());
+
+        let decoded: InputTool = serde_json::from_value(value).expect("deserialize");
+        match decoded {
+            InputTool::Function {
+                name, input_schema, ..
+            } => {
+                assert_eq!(name, "dummy_tool");
+                assert_eq!(input_schema["type"], "object");
+            }
+            other => panic!("expected function tool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn input_tool_omits_absent_description() {
+        let tool = InputTool::Function {
+            name: "dummy_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(&tool).expect("serialize");
+        assert!(value.get("description").is_none());
+    }
+
+    #[test]
+    fn tagged_output_types_serialize_with_wire_discriminators() {
+        let search = WebSearchAction::Search {
+            query: Some("dummy query".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&search).expect("serialize"),
+            serde_json::json!({ "type": "search", "query": "dummy query" })
+        );
+
+        let find = WebSearchAction::Find {
+            url: "https://example.invalid/page".to_string(),
+            pattern: "dummy".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&find).expect("serialize")["type"],
+            "find"
+        );
+
+        let logs = CodeInterpreterOutputItem::Logs {
+            logs: "dummy log".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&logs).expect("serialize"),
+            serde_json::json!({ "type": "logs", "logs": "dummy log" })
+        );
+
+        let local_shell = ResponsesTool::LocalShell {};
+        assert_eq!(
+            serde_json::to_value(&local_shell).expect("serialize"),
+            serde_json::json!({ "type": "local_shell" })
+        );
+    }
+
+    #[test]
+    fn local_shell_action_serde_renames_camel_case_fields() {
+        let action = LocalShellInputAction {
+            action_type: "exec".to_string(),
+            command: vec!["echo".to_string(), "dummy".to_string()],
+            timeout_ms: Some(1234),
+            user: None,
+            working_directory: Some("/tmp/dummy".to_string()),
+            env: None,
+        };
+        let value = serde_json::to_value(LocalShellInput { action }).expect("serialize");
+        assert_eq!(value["action"]["timeoutMs"], 1234);
+        assert_eq!(value["action"]["workingDirectory"], "/tmp/dummy");
+        assert!(value["action"].get("timeout_ms").is_none());
+        assert!(value["action"].get("working_directory").is_none());
+        assert!(value["action"].get("user").is_none());
+    }
+
+    #[test]
+    fn user_location_serde_renames_location_type() {
+        let location = UserLocation {
+            location_type: "approximate".to_string(),
+            city: Some("DummyCity".to_string()),
+            country: None,
+            region: None,
+            timezone: None,
+        };
+        let value = serde_json::to_value(&location).expect("serialize");
+        assert_eq!(value["type"], "approximate");
+        assert_eq!(value["city"], "DummyCity");
+        assert!(value.get("location_type").is_none());
+        assert!(value.get("country").is_none());
+    }
+
+    #[test]
+    fn chat_tool_serde_uses_wire_type_discriminator() {
+        let tool = ChatTool {
+            tool_type: "function".to_string(),
+            function: ChatToolFunction {
+                name: "dummy_tool".to_string(),
+                description: None,
+                parameters: serde_json::json!({}),
+            },
+        };
+        let value = serde_json::to_value(&tool).expect("serialize");
+        assert_eq!(value["type"], "function");
+        assert!(value.get("tool_type").is_none());
+        assert!(value["function"].get("description").is_none());
+    }
+}
