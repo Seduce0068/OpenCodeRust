@@ -197,9 +197,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
-- [ ] **[M-43]** PTY セッションが Exited/Error に遷移せず child も回収されない
-  - `server/pty.rs:124-158,212-223`。EOF 後も status=Running のまま、child.wait() 不在で
-    ゾンビ蓄積（confirmed / R1-SV01）
 - [ ] **[M-44]** ストレージ復元で summary/metadata が失われ total_cost にトークン数が入る
   - `server.rs:588-627`。`/session/{id}/diff` が空になりコスト表示が壊れる（confirmed）
 - [ ] **[M-45]** 未実装ハンドラが 501 ではなく成功レスポンスを返す
@@ -218,15 +215,12 @@ status: current
 - [ ] **[M-50]** 再試行がクレジット枯渇を対象とし retry-after に上限がない
   - `session/retry.rs:40-95`。FreeUsageLimitError が Some を返し無駄な再試行、
     ヘッダ由来遅延がクランプされない（confirmed / R1-SV05）
-- [ ] **[M-51]** キーバインド display_thinking / tool_details が未登録
-  - `tui/context/keybind.rs:156,213`。参照名と登録名が不一致でトグル到達不能（confirmed）
-- [ ] **[M-52]** API bool 応答を unwrap_or(true) で読み失敗を成功と報告
-  - `tui/api.rs:404,575,589,600,671`。削除・切断・認証解除の失敗が隠れる（confirmed）
-- [ ] **[M-53]** UTF-8 境界を無視したバイトスライスが多バイト文字で panic
-  - `tool/read.rs:377-378` / `truncation.rs:50-53`。外部ファイル内容で再現可能な DoS（confirmed）
 
 ## 完了
 
+- [x] **[M-43]** PTY の status 遷移と child 回収（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-51/M-52]** キーバインド登録と bool 応答の厳密化（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-53]** UTF-8 境界を尊重するスライス（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-19]** MCP OAuth に RFC 8707 resource を追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-21]** サブセッションへ disabled_tools を継承（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-22/H-23]** Anthropic SSE を状態付きパーサへ変更（2026-11-19、swarm-coding R1-R6）
@@ -390,6 +384,13 @@ status: current
 
 ## メモ
 
+- M-43 の残存（2026-11-19、swarm-coding R4 が指摘、却下/未修正）:
+  - Linux の PTY master は EOF が EIO（Err）として表面化することがあり、
+    `Ok(0)=Exited / Err(_)=Error` の二分だと正常終了が error と報告され得る
+    （confidence medium）。実 PTY での確認が必要なため推測に基づく分類変更は避けた。
+  - `spawn_blocking` の `reader_handle.abort()` は実行中スレッドを停止できず、
+    kill() が read() を解除するまで削除後も broadcast が続く（コメントは実態どおり修正済み）。
+    完全停止には shutdown フラグ＋JoinHandle await が必要。
 - H-19/H-21/H-22/H-23/H-25 の残存（2026-11-19、swarm-coding R2/R5 が申告、未修正）:
   - `anthropic.rs` は bytes chunk 単位で `lines()` を切るため SSE フレームが chunk を
     またぐと取りこぼす。今回は現状維持（従来と同等の空 TextDelta プレースホルダ）。
