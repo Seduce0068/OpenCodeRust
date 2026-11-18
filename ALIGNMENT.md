@@ -9,7 +9,7 @@ tags:
   - compatibility
 verified:
   by: dsh
-  at: "2026-11-18T23:12:49+09:00"
+  at: "2026-11-18T23:34:46+09:00"
 ---
 
 ## 目標
@@ -44,7 +44,7 @@ verified:
   snapshot の非同一 transaction、単一 process 前提) は
   [DESIGN_RUNNER.md](DESIGN_RUNNER.md) に記録。
 - Phase 3: `opencode-agent` / `opencode-tool` は実装・テスト済み
-  (workspace テスト 1909 件 green、2026-11-18 実行、カバレッジ 45.01%、
+  (workspace テスト 1948 件 green、2026-11-18 実行、カバレッジ 46.15%、
   [ADR-0008](docs/adr/adr-0008-coverage-baseline.md))。
   差分照合の初版は [MAPPING.md](MAPPING.md) に記録済み。未移植機能の
   実装が残作業。
@@ -96,7 +96,7 @@ verified:
 - 全 feature (`--all-features`) で check / clippy / test が成功。
 - ツールのスキーマと引数名を横断監査し、`InvalidTool` と `BatchTool` の
   不整合を serde alias / rename で解消。
-- ワークスペースのテストは 1909 件 green、カバレッジは 45.01%
+- ワークスペースのテストは 1948 件 green、カバレッジは 46.15%
   (2026-11-18 再計測、[ADR-0008](docs/adr/adr-0008-coverage-baseline.md)
   に推移を記録)。
 - リリースビルド、`cargo audit`、`cargo outdated` を再検証済み。
