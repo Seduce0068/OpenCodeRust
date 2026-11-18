@@ -67,6 +67,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
 
+    /// IANA time zone used for schedules (upstream `Config.Info.timezone`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<PermissionsConfig>,
 
@@ -153,6 +157,7 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
         "small_model",
         "default_agent",
         "username",
+        "timezone",
         "permissions",
         "agents",
         "mode",
@@ -2475,5 +2480,32 @@ mod tests {
         let mut target = vec!["a".to_owned(), "b".to_owned()];
         append_unique_keep_order(&mut target, vec!["b".to_owned(), "c".to_owned()]);
         assert_eq!(target, vec!["a", "b", "c"]);
+    }
+
+    /// Runtime proof for P-06: `timezone` is parsed; upstream-only keys are
+    /// silently discarded (no `deny_unknown_fields`) and still parse fine.
+    #[test]
+    fn parses_timezone_and_discards_unmapped_upstream_keys() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "timezone": "America/Los_Angeles",
+                "policies": [{"action": "tool.use", "resource": "shell:git *", "effect": "deny"}],
+                "worktree": {"directory": "../worktrees"},
+                "update": "notify",
+                "commands": {"hello": {"template": "echo hi"}},
+                "plugins": ["some-plugin"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.timezone.as_deref(), Some("America/Los_Angeles"));
+        assert!(config.command.is_none());
+        assert!(config.plugin.is_empty());
+        assert!(config.autoupdate.is_none());
+
+        let known = known_config_keys();
+        assert!(known.contains(&"timezone"));
+        for key in ["policies", "worktree", "update", "commands", "plugins"] {
+            assert!(!known.contains(&key), "{key} must stay unmapped");
+        }
     }
 }
