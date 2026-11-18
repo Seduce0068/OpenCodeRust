@@ -58,16 +58,20 @@ impl Provider for LiteRTProvider {
     }
 
     async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-        // TODO: Implement actual LiteRT-LM C++ FFI call
-        // For now, return a placeholder to allow agent development
+        // TODO: Implement the LiteRT-LM C++ FFI call. Until then the provider is
+        // intentionally not registered by bootstrap; keep the failure explicit.
         Err(ProviderError::ApiError(
-            "LiteRT native provider is not yet fully linked. Build in progress.".to_string(),
+            "LiteRT provider is not implemented: the native LiteRT-LM FFI is not linked. \
+             LITERT_MODEL_PATH is configuration-only and no model can be served."
+                .to_string(),
         ))
     }
 
     async fn chat_stream(&self, _request: ChatRequest) -> Result<StreamResult, ProviderError> {
         Err(ProviderError::ApiError(
-            "LiteRT native stream is not yet implemented.".to_string(),
+            "LiteRT provider is not implemented: streaming is unavailable until the native \
+             LiteRT-LM FFI is linked."
+                .to_string(),
         ))
     }
 }
