@@ -12,6 +12,7 @@
 //! - <https://datatracker.ietf.org/doc/html/rfc9728>
 //! - <https://datatracker.ietf.org/doc/html/rfc8414>
 //! - <https://datatracker.ietf.org/doc/html/rfc7591>
+//! - <https://datatracker.ietf.org/doc/html/rfc8707> (resource indicator)
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -71,6 +72,9 @@ pub struct OAuthEndpoints {
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
     pub scopes: Vec<String>,
+    /// RFC 8707 resource indicator advertised by the protected resource metadata.
+    /// `None` keeps the legacy behavior of omitting the `resource` parameter.
+    pub resource: Option<String>,
 }
 
 fn http_client() -> reqwest::Client {
@@ -246,6 +250,8 @@ pub async fn discover_endpoints(
             token_endpoint: token_endpoint.to_string(),
             registration_endpoint: None,
             scopes: Vec::new(),
+            // No metadata was fetched, so there is no resource indicator.
+            resource: None,
         });
     }
 
@@ -273,6 +279,9 @@ pub async fn discover_endpoints(
             .unwrap_or(token_endpoint),
         registration_endpoint: metadata.registration_endpoint,
         scopes: metadata.scopes_supported,
+        // Carry the RFC 8707 resource from the protected resource metadata so
+        // the OAuth flow can bind issued tokens to this MCP resource.
+        resource: resource.resource,
     })
 }
 
@@ -354,5 +363,30 @@ mod tests {
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));
         assert!(url.contains("/path"));
+    }
+
+    #[test]
+    fn resource_metadata_deserializes_resource_indicator() {
+        // Pure serde test; no network I/O against a real OAuth server.
+        let metadata: ProtectedResourceMetadata = serde_json::from_str(
+            r#"{
+                "resource": "https://mcp.example.invalid/mcp",
+                "authorization_servers": ["https://auth.example.invalid"],
+                "scopes_supported": ["mcp:read"]
+            }"#,
+        )
+        .expect("protected resource metadata must parse");
+
+        assert_eq!(
+            metadata.resource.as_deref(),
+            Some("https://mcp.example.invalid/mcp")
+        );
+    }
+
+    #[test]
+    fn oauth_endpoints_default_has_no_resource() {
+        // `None` must keep the legacy behavior of omitting the resource param.
+        let endpoints = OAuthEndpoints::default();
+        assert!(endpoints.resource.is_none());
     }
 }

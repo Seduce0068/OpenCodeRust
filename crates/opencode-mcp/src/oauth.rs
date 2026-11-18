@@ -49,6 +49,10 @@ pub struct McpOAuthManager {
     server_url: String,
     config: RwLock<McpOAuthConfig>,
     pending: RwLock<Option<PendingAuth>>,
+    /// RFC 8707 resource indicator discovered during endpoint discovery.
+    /// Kept on the manager (not `McpOAuthConfig`) so existing external config
+    /// struct literals remain source-compatible. `None` omits the parameter.
+    resource: RwLock<Option<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +73,18 @@ pub enum OAuthError {
     Storage(#[from] std::io::Error),
 }
 
+/// Appends the RFC 8707 `resource` parameter to an authorization request when
+/// a resource indicator is available. `None` leaves the request untouched.
+fn with_resource_param<'a>(
+    mut request: oauth2::AuthorizationRequest<'a>,
+    resource: Option<String>,
+) -> oauth2::AuthorizationRequest<'a> {
+    if let Some(resource) = resource {
+        request = request.add_extra_param("resource", resource);
+    }
+    request
+}
+
 impl McpOAuthManager {
     pub fn new(mcp_name: String, server_url: String, config: McpOAuthConfig) -> Self {
         Self {
@@ -76,6 +92,15 @@ impl McpOAuthManager {
             server_url,
             config: RwLock::new(config),
             pending: RwLock::new(None),
+            resource: RwLock::new(None),
+        }
+    }
+
+    /// Records the RFC 8707 resource indicator from discovered endpoints.
+    /// A missing value leaves any previously discovered indicator untouched.
+    async fn remember_resource(&self, resource: Option<String>) {
+        if let Some(resource) = resource {
+            *self.resource.write().await = Some(resource);
         }
     }
 
@@ -114,16 +139,20 @@ impl McpOAuthManager {
         .await
         .map_err(|e| OAuthError::Config(format!("endpoint discovery failed: {e}")))?;
 
-        let mut config = self.config.write().await;
-        if config.auth_url.is_empty() {
-            config.auth_url = endpoints.authorization_endpoint;
+        {
+            let mut config = self.config.write().await;
+            if config.auth_url.is_empty() {
+                config.auth_url = endpoints.authorization_endpoint;
+            }
+            if config.token_url.is_empty() {
+                config.token_url = endpoints.token_endpoint;
+            }
+            if config.scopes.is_empty() {
+                config.scopes = endpoints.scopes;
+            }
         }
-        if config.token_url.is_empty() {
-            config.token_url = endpoints.token_endpoint;
-        }
-        if config.scopes.is_empty() {
-            config.scopes = endpoints.scopes;
-        }
+
+        self.remember_resource(endpoints.resource).await;
         Ok(())
     }
 
@@ -176,6 +205,7 @@ impl McpOAuthManager {
                 }
             }
             registration_endpoint = endpoints.registration_endpoint;
+            self.remember_resource(endpoints.resource).await;
 
             // Persist endpoints so a restart can resume the flow.
             let (auth_url, token_url) = {
@@ -296,6 +326,10 @@ impl McpOAuthManager {
         for scope in &config.scopes {
             auth_request = auth_request.add_scope(Scope::new(scope.clone()));
         }
+        // RFC 8707: bind the authorization request to the resource advertised
+        // by the MCP server. When absent, behavior is unchanged.
+        let resource = self.resource.read().await.as_ref().cloned();
+        let auth_request = with_resource_param(auth_request, resource);
 
         let (url, csrf_state) = auth_request.set_pkce_challenge(pkce_challenge).url();
 
@@ -356,9 +390,17 @@ impl McpOAuthManager {
 
         let http_client = reqwest::Client::new();
 
-        let token_result = client
+        let resource = self.resource.read().await.as_ref().cloned();
+        let mut token_request = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
-            .set_pkce_verifier(PkceCodeVerifier::new(verifier_secret))
+            .set_pkce_verifier(PkceCodeVerifier::new(verifier_secret));
+        // RFC 8707: the token request must carry the same resource indicator
+        // that was sent in the authorization request.
+        if let Some(resource) = resource {
+            token_request = token_request.add_extra_param("resource", resource);
+        }
+
+        let token_result = token_request
             .request_async(&http_client)
             .await
             .map_err(|e| OAuthError::TokenExchange(e.to_string()))?;
@@ -595,6 +637,40 @@ mod tests {
         )
     }
 
+    /// Builds an authorization URL and asserts which `resource` params it has.
+    /// The oauth2 client type changes to the `EndpointSet` variant after the
+    /// `set_*_uri` calls, so all of those types stay local to this helper.
+    fn assert_authorize_url_resource(config: &McpOAuthConfig, resource: Option<&str>) {
+        let manager = manager_with(config.clone());
+        let (client_id, client_secret, auth_url, token_url, redirect_url) = manager
+            .parsed_config(config)
+            .expect("dummy config must parse");
+        let mut client = oauth2::basic::BasicClient::new(client_id)
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(redirect_url);
+        if let Some(secret) = client_secret {
+            client = client.set_client_secret(secret);
+        }
+
+        let (challenge, _verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut request = client.authorize_url(CsrfToken::new_random);
+        for scope in &config.scopes {
+            request = request.add_scope(Scope::new(scope.clone()));
+        }
+        let request = with_resource_param(request, resource.map(str::to_string));
+        let (url, _state) = request.set_pkce_challenge(challenge).url();
+
+        let params: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        let resources: Vec<&str> = params
+            .iter()
+            .filter(|(key, _)| key == "resource")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let expected: Vec<&str> = resource.into_iter().collect();
+        assert_eq!(resources, expected);
+    }
+
     #[test]
     fn csrf_state_is_unique_and_non_empty() {
         const N: usize = 32;
@@ -763,5 +839,29 @@ mod tests {
 
         registry.remove("dummy-server").await;
         assert!(registry.get("dummy-server").await.is_none());
+    }
+
+    #[test]
+    fn authorize_url_includes_resource_param_when_discovered() {
+        // Pure URL construction; no disk writes and no real OAuth server.
+        assert_authorize_url_resource(&dummy_config(), Some("https://mcp.example.invalid/mcp"));
+    }
+
+    #[test]
+    fn authorize_url_omits_resource_param_when_absent() {
+        assert_authorize_url_resource(&dummy_config(), None);
+    }
+
+    #[tokio::test]
+    async fn remember_resource_keeps_discovered_indicator() {
+        let manager = manager_with(dummy_config());
+        manager
+            .remember_resource(Some("https://mcp.example.invalid/mcp".to_string()))
+            .await;
+        // A later discovery without the field must not erase a known value.
+        manager.remember_resource(None).await;
+
+        let resource = manager.resource.read().await;
+        assert_eq!(resource.as_deref(), Some("https://mcp.example.invalid/mcp"));
     }
 }

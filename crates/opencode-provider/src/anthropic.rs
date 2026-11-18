@@ -213,6 +213,11 @@ impl Provider for AnthropicProvider {
             return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
         }
 
+        // ストリーム全体で 1 つのパーサを共有し、content_block_start で得た tool_use id を
+        // 後続の content_block_delta (partial_json) へ対応付ける。
+        // move クロージャが parser を所有し、FnMut として呼ばれるたびに
+        // push(&mut self) で状態を更新するため、束縛を mut にする必要がある。
+        let mut parser = crate::stream::AnthropicSseParser::new();
         let stream = response
             .bytes_stream()
             .map(move |chunk_result| match chunk_result {
@@ -220,7 +225,7 @@ impl Provider for AnthropicProvider {
                     let text = String::from_utf8_lossy(&bytes);
                     for line in text.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
-                            if let Some(event) = crate::stream::parse_anthropic_sse(data) {
+                            if let Some(event) = parser.push(data) {
                                 return Ok(event);
                             }
                         }
