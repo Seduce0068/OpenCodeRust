@@ -230,3 +230,142 @@ fn openai_reasoning_effort(model_id: &str, variant: Option<&str>) -> Option<&'st
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 外部 HTTP を呼ばず、ダミー値だけで検証できる純粋ロジックに限定する。
+    // 実 API キー・実 endpoint は一切使用しない。
+    fn provider() -> AzureProvider {
+        AzureProvider::new(
+            "dummy-azure-key-for-tests",
+            "https://dummy-endpoint.invalid",
+        )
+    }
+
+    #[test]
+    fn id_and_name_are_stable() {
+        let provider = provider();
+        assert_eq!(provider.id(), "azure");
+        assert_eq!(provider.name(), "Azure OpenAI");
+    }
+
+    #[test]
+    fn new_stores_endpoint_and_dummy_key_with_default_config() {
+        let provider = provider();
+
+        assert_eq!(provider.config.api_key, "dummy-azure-key-for-tests");
+        assert_eq!(provider.config.endpoint, "https://dummy-endpoint.invalid");
+        assert!(provider.config.deployment_name.is_none());
+        assert!(provider.config.api_version.is_none());
+    }
+
+    #[test]
+    fn models_are_prepopulated_with_expected_ids() {
+        let provider = provider();
+        let models = provider.models();
+
+        assert_eq!(models.len(), 4);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-35-turbo"]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.provider == "azure" && !m.name.is_empty()));
+    }
+
+    #[test]
+    fn get_model_returns_known_model_fields() {
+        let provider = provider();
+        let model = provider
+            .get_model("gpt-4o")
+            .expect("gpt-4o should be present");
+
+        assert_eq!(model.id, "gpt-4o");
+        assert_eq!(model.name, "GPT-4o (Azure)");
+        assert_eq!(model.provider, "azure");
+        assert_eq!(model.context_window, 128000);
+        assert_eq!(model.max_output_tokens, 16384);
+        assert_eq!(model.cost_per_million_input, 2.5);
+        assert_eq!(model.cost_per_million_output, 10.0);
+    }
+
+    #[test]
+    fn get_model_distinguishes_capability_flags() {
+        let provider = provider();
+
+        let gpt_4o = provider
+            .get_model("gpt-4o")
+            .expect("gpt-4o should be present");
+        assert!(gpt_4o.supports_vision);
+        assert!(gpt_4o.supports_tools);
+
+        let gpt_35 = provider
+            .get_model("gpt-35-turbo")
+            .expect("gpt-35-turbo should be present");
+        assert!(!gpt_35.supports_vision);
+        assert!(gpt_35.supports_tools);
+        assert_eq!(gpt_35.name, "GPT-3.5 Turbo (Azure)");
+    }
+
+    #[test]
+    fn get_model_returns_none_for_unknown_id() {
+        let provider = provider();
+        assert!(provider.get_model("gpt-99").is_none());
+        assert!(provider.get_model("").is_none());
+    }
+
+    #[test]
+    fn models_returns_owned_snapshot() {
+        let provider = provider();
+        let mut models = provider.models();
+        models.clear();
+
+        assert!(models.is_empty());
+        assert_eq!(provider.models().len(), 4);
+    }
+
+    #[test]
+    fn build_url_uses_model_as_deployment_and_default_api_version() {
+        let provider = provider();
+
+        assert_eq!(
+            provider.build_url("gpt-4o", false),
+            "https://dummy-endpoint.invalid/openai/deployments/gpt-4o/chat/completions\
+             ?api-version=2024-02-15-preview"
+        );
+    }
+
+    #[test]
+    fn build_url_trims_trailing_slash_from_endpoint() {
+        let provider = AzureProvider::new(
+            "dummy-azure-key-for-tests",
+            "https://dummy-endpoint.invalid/",
+        );
+
+        assert_eq!(
+            provider.build_url("gpt-4o", true),
+            "https://dummy-endpoint.invalid/openai/deployments/gpt-4o/chat/completions\
+             ?api-version=2024-02-15-preview"
+        );
+    }
+
+    #[test]
+    fn build_url_honors_explicit_deployment_and_api_version() {
+        let provider = AzureProvider::with_config(AzureConfig {
+            api_key: "dummy-azure-key-for-tests".to_string(),
+            endpoint: "https://dummy-endpoint.invalid".to_string(),
+            deployment_name: Some("my-deployment".to_string()),
+            api_version: Some("2024-10-01-preview".to_string()),
+        });
+
+        assert_eq!(
+            provider.build_url("gpt-4o", false),
+            "https://dummy-endpoint.invalid/openai/deployments/my-deployment/chat/completions\
+             ?api-version=2024-10-01-preview"
+        );
+    }
+}
