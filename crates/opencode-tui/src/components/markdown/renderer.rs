@@ -648,3 +648,248 @@ fn line_is_blank(line: &Line<'_>) -> bool {
         .iter()
         .all(|span| span.content.as_ref().trim().is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_theme() -> Theme {
+        Theme::default()
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn new_retains_theme_and_derives_code_theme() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        // Theme / CodeTheme は PartialEq 未実装のためフィールドで比較する。
+        assert_eq!(renderer.theme.text, theme.text);
+        assert_eq!(renderer.theme.markdown_heading, theme.markdown_heading);
+        assert_eq!(renderer.theme.primary, theme.primary);
+        assert_eq!(renderer.theme.agent_colors, theme.agent_colors);
+        assert!(!renderer.concealed);
+
+        // CodeTheme::from_app_theme の写像を確認する。
+        assert_eq!(renderer.code_theme.text, theme.text);
+        assert_eq!(renderer.code_theme.keyword, theme.primary);
+        assert_eq!(renderer.code_theme.string, theme.success);
+        assert_eq!(renderer.code_theme.number, theme.warning);
+        assert_eq!(renderer.code_theme.comment, theme.text_muted);
+        assert_eq!(renderer.code_theme.punctuation, theme.border);
+        assert_eq!(renderer.code_theme.function, theme.info);
+    }
+
+    #[test]
+    fn to_lines_empty_text_returns_no_lines() {
+        let renderer = MarkdownRenderer::new(test_theme());
+        assert!(renderer.to_lines("").is_empty());
+    }
+
+    #[test]
+    fn to_lines_plain_paragraph_uses_theme_text() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        let lines = renderer.to_lines("hello world");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "hello world");
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.text));
+    }
+
+    #[test]
+    fn to_lines_heading_uses_hash_prefix_and_heading_style() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        let lines = renderer.to_lines("# Title");
+        assert_eq!(lines.len(), 1);
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "# ");
+        assert_eq!(spans[0].style.fg, Some(theme.markdown_heading));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].content.as_ref(), "Title");
+        assert_eq!(spans[1].style.fg, Some(theme.markdown_heading));
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn to_lines_heading_level_controls_hash_count() {
+        let renderer = MarkdownRenderer::new(test_theme());
+        for (markdown, prefix) in [
+            ("# one", "# "),
+            ("## two", "## "),
+            ("### three", "### "),
+            ("###### six", "###### "),
+        ] {
+            let lines = renderer.to_lines(markdown);
+            assert_eq!(lines.len(), 1, "input: {markdown}");
+            assert_eq!(
+                lines[0].spans[0].content.as_ref(),
+                prefix,
+                "input: {markdown}"
+            );
+        }
+    }
+
+    #[test]
+    fn to_lines_unordered_list_uses_bullet_prefix() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        let lines = renderer.to_lines("- alpha\n- beta");
+        assert_eq!(lines.len(), 2);
+        for (line, expected) in lines.iter().zip(["alpha", "beta"]) {
+            assert_eq!(line.spans.len(), 2);
+            assert_eq!(line.spans[0].content.as_ref(), "• ");
+            assert_eq!(line.spans[0].style.fg, Some(theme.markdown_list_item));
+            assert_eq!(line.spans[1].content.as_ref(), expected);
+            assert_eq!(line.spans[1].style.fg, Some(theme.text));
+        }
+    }
+
+    #[test]
+    fn to_lines_ordered_list_increments_prefix() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        let lines = renderer.to_lines("1. first\n2. second\n3. third");
+        assert_eq!(lines.len(), 3);
+        for (line, (prefix, text)) in
+            lines
+                .iter()
+                .zip([("1. ", "first"), ("2. ", "second"), ("3. ", "third")])
+        {
+            assert_eq!(line.spans.len(), 2);
+            assert_eq!(line.spans[0].content.as_ref(), prefix);
+            assert_eq!(
+                line.spans[0].style.fg,
+                Some(theme.markdown_list_enumeration)
+            );
+            assert_eq!(line.spans[1].content.as_ref(), text);
+            assert_eq!(line.spans[1].style.fg, Some(theme.text));
+        }
+    }
+
+    #[test]
+    fn to_lines_table_renders_borders_header_and_rows() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        let lines = renderer.to_lines("| Name | Age |\n| --- | --- |\n| Alice | 30 |");
+        assert_eq!(lines.len(), 5);
+
+        assert_eq!(line_text(&lines[0]), "┌───────┬─────┐");
+        assert_eq!(line_text(&lines[1]), "│ Name  │ Age │");
+        assert_eq!(line_text(&lines[2]), "├───────┼─────┤");
+        assert_eq!(line_text(&lines[3]), "│ Alice │ 30  │");
+        assert_eq!(line_text(&lines[4]), "└───────┴─────┘");
+
+        for index in [0, 2, 4] {
+            assert_eq!(lines[index].spans.len(), 1, "line: {index}");
+            assert_eq!(
+                lines[index].spans[0].style.fg,
+                Some(theme.markdown_horizontal_rule),
+                "line: {index}"
+            );
+        }
+
+        let name = lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "Name")
+            .expect("header cell");
+        assert_eq!(name.style.fg, Some(theme.markdown_heading));
+        assert!(name.style.add_modifier.contains(Modifier::BOLD));
+
+        let alice = lines[3]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "Alice")
+            .expect("body cell");
+        assert_eq!(alice.style.fg, Some(theme.text));
+        assert!(!alice.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn to_lines_table_alignment_controls_padding() {
+        let renderer = MarkdownRenderer::new(test_theme());
+
+        let lines = renderer
+            .to_lines("| a | b | c |\n| :--- | :---: | ---: |\n| longer | longer | longer |");
+        assert_eq!(lines.len(), 5);
+        assert_eq!(line_text(&lines[0]), "┌────────┬────────┬────────┐");
+        assert_eq!(line_text(&lines[1]), "│ a      │   b    │      c │");
+        assert_eq!(line_text(&lines[2]), "├────────┼────────┼────────┤");
+        assert_eq!(line_text(&lines[3]), "│ longer │ longer │ longer │");
+        assert_eq!(line_text(&lines[4]), "└────────┴────────┴────────┘");
+    }
+
+    #[test]
+    fn to_lines_code_block_renders_frame_and_content() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone());
+
+        let lines = renderer.to_lines("```unknown_language_token_xyz\nalpha\nbeta\n```");
+        assert_eq!(lines.len(), 4);
+
+        let dashes = "─".repeat(20);
+        let header = &lines[0].spans;
+        assert_eq!(header.len(), 3);
+        assert_eq!(header[0].content.as_ref(), "╭");
+        assert_eq!(header[0].style.fg, Some(theme.markdown_horizontal_rule));
+        assert_eq!(header[1].content.as_ref(), " unknown_language_token_xyz ");
+        assert_eq!(header[1].style.fg, Some(theme.markdown_code_block));
+        assert_eq!(header[2].content.as_ref(), dashes.as_str());
+        assert_eq!(header[2].style.fg, Some(theme.markdown_horizontal_rule));
+
+        for (line, expected) in lines[1..3].iter().zip(["alpha", "beta"]) {
+            assert_eq!(line.spans.len(), 2);
+            assert_eq!(line.spans[0].content.as_ref(), "│ ");
+            assert_eq!(line.spans[0].style.fg, Some(theme.markdown_horizontal_rule));
+            assert_eq!(line.spans[1].content.as_ref(), expected);
+            assert_eq!(line.spans[1].style.fg, Some(theme.text));
+        }
+
+        assert_eq!(lines[3].spans.len(), 1);
+        assert_eq!(lines[3].spans[0].content.as_ref(), "╰───");
+        assert_eq!(
+            lines[3].spans[0].style.fg,
+            Some(theme.markdown_horizontal_rule)
+        );
+    }
+
+    #[test]
+    fn to_lines_code_block_without_language_uses_code_label() {
+        let renderer = MarkdownRenderer::new(test_theme());
+
+        let lines = renderer.to_lines("```\nx\n```");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[1].content.as_ref(), " code ");
+        assert_eq!(lines[1].spans[1].content.as_ref(), "x");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "╰───");
+    }
+
+    #[test]
+    fn to_lines_concealed_code_block_shows_summary() {
+        let theme = test_theme();
+        let renderer = MarkdownRenderer::new(theme.clone()).with_concealed(true);
+
+        let lines = renderer.to_lines("```rust\na\nb\n```");
+        assert_eq!(lines.len(), 1);
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "▶ ");
+        assert_eq!(spans[0].style.fg, Some(theme.primary));
+        assert_eq!(spans[1].content.as_ref(), "[rust - 2 lines]");
+        assert_eq!(spans[1].style.fg, Some(theme.text_muted));
+    }
+}
