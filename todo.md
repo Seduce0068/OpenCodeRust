@@ -299,6 +299,7 @@ status: current
 - [x] **[M-21]** TODO_MANAGER / PTY_MANAGER を ServerState へ移行（2026-11-18、managers-state-worker）
 - [x] **[M-11 一部]** provider/google.rs に 8 テスト（2026-11-18、google-test-worker）
 - [x] **[M-11 一部]** provider/mistral.rs・deepseek.rs に 12 テスト（2026-11-18、mistral-deepseek-test-worker）
+- [x] **[M-11 一部]** provider/azure.rs (10)・groq.rs (6)・xai.rs (7) にテスト（2026-11-18）
 
 ## メモ
 
