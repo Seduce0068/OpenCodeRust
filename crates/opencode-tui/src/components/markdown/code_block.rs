@@ -379,3 +379,182 @@ impl CodeTheme {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_theme() -> CodeTheme {
+        CodeTheme::default()
+    }
+
+    fn text_of(spans: &[Span<'static>]) -> String {
+        spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn new_retains_language_and_code() {
+        let block = CodeBlock::new(Some("rust".to_string()), "fn main() {}".to_string());
+
+        assert_eq!(block.language.as_deref(), Some("rust"));
+        assert_eq!(block.code.as_str(), "fn main() {}");
+    }
+
+    #[test]
+    fn new_retains_none_language_and_code() {
+        let block = CodeBlock::new(None, "plain text".to_string());
+
+        assert!(block.language.is_none());
+        assert_eq!(block.code.as_str(), "plain text");
+    }
+
+    #[test]
+    fn to_lines_empty_code_returns_no_lines() {
+        let theme = test_theme();
+        let block = CodeBlock::new(None, String::new());
+
+        assert!(block.to_lines(&theme).is_empty());
+    }
+
+    #[test]
+    fn to_lines_splits_lines_for_unknown_language() {
+        let theme = test_theme();
+        let block = CodeBlock::new(
+            Some("unknown_language_token_xyz".to_string()),
+            "alpha\nbeta\ngamma".to_string(),
+        );
+
+        let lines = block.to_lines(&theme);
+        assert_eq!(lines.len(), 3);
+        for (line, expected) in lines.iter().zip(["alpha", "beta", "gamma"]) {
+            assert_eq!(line.len(), 1);
+            assert_eq!(line[0].content.as_ref(), expected);
+            assert_eq!(line[0].style.fg, Some(theme.text));
+        }
+    }
+
+    #[test]
+    fn to_lines_unknown_language_keeps_trailing_and_blank_lines_behavior() {
+        let theme = test_theme();
+        let block = CodeBlock::new(None, "a\n\nb\n".to_string());
+
+        let lines = block.to_lines(&theme);
+        // str::lines(): "a\n\nb\n" -> ["a", "", "b"]
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0][0].content.as_ref(), "a");
+        assert_eq!(lines[1][0].content.as_ref(), "");
+        assert_eq!(lines[2][0].content.as_ref(), "b");
+        for line in &lines {
+            assert_eq!(line.len(), 1);
+            assert_eq!(line[0].style.fg, Some(theme.text));
+        }
+    }
+
+    #[test]
+    fn to_lines_unknown_language_does_not_apply_keyword_highlight() {
+        let theme = test_theme();
+        let block = CodeBlock::new(
+            Some("unknown_language_token_xyz".to_string()),
+            "fn main() {}".to_string(),
+        );
+
+        let lines = block.to_lines(&theme);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 1);
+        assert_eq!(lines[0][0].content.as_ref(), "fn main() {}");
+        assert_eq!(lines[0][0].style.fg, Some(theme.text));
+        assert!(!lines[0][0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn to_lines_rust_uses_syntect_and_preserves_content() {
+        let theme = test_theme();
+        let source = "fn main() {\n    let x = 42;\n}\n";
+        let block = CodeBlock::new(Some("rust".to_string()), source.to_string());
+
+        let lines = block.to_lines(&theme);
+        assert_eq!(lines.len(), 3);
+        let expected: Vec<&str> = source.lines().collect();
+        for (line, want) in lines.iter().zip(expected) {
+            assert!(!line.is_empty());
+            assert_eq!(text_of(line).as_str(), want);
+        }
+        assert!(lines.iter().any(|line| line.len() > 1));
+    }
+
+    #[test]
+    fn to_lines_python_uses_syntect_and_preserves_content() {
+        let theme = test_theme();
+        let source = "def add(a, b):\n    return a + b\n";
+        let block = CodeBlock::new(Some("python".to_string()), source.to_string());
+
+        let lines = block.to_lines(&theme);
+        assert_eq!(lines.len(), 2);
+        let expected: Vec<&str> = source.lines().collect();
+        for (line, want) in lines.iter().zip(expected) {
+            assert!(!line.is_empty());
+            assert_eq!(text_of(line).as_str(), want);
+        }
+        assert!(lines.iter().any(|line| line.len() > 1));
+    }
+
+    #[test]
+    fn highlight_rust_keyword_uses_keyword_color_and_bold() {
+        let theme = test_theme();
+        let block = CodeBlock::new(Some("rust".to_string()), String::new());
+
+        let spans = block.highlight_rust("fn", &theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "fn");
+        assert_eq!(spans[0].style.fg, Some(theme.keyword));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn highlight_python_keyword_uses_keyword_color_and_bold() {
+        let theme = test_theme();
+        let block = CodeBlock::new(Some("python".to_string()), String::new());
+
+        let spans = block.highlight_python("def", &theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "def");
+        assert_eq!(spans[0].style.fg, Some(theme.keyword));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn highlight_rust_comment_uses_comment_color() {
+        let theme = test_theme();
+        let block = CodeBlock::new(Some("rust".to_string()), String::new());
+
+        let spans = block.highlight_rust("// note", &theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "// note");
+        assert_eq!(spans[0].style.fg, Some(theme.comment));
+    }
+
+    #[test]
+    fn highlight_python_string_uses_string_color() {
+        let theme = test_theme();
+        let block = CodeBlock::new(Some("python".to_string()), String::new());
+
+        let spans = block.highlight_python("\"hi\"", &theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "\"hi\"");
+        assert_eq!(spans[0].style.fg, Some(theme.string));
+    }
+
+    #[test]
+    fn highlight_rust_number_uses_number_color() {
+        let theme = test_theme();
+        let block = CodeBlock::new(Some("rust".to_string()), String::new());
+
+        let spans = block.highlight_rust("42", &theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "42");
+        assert_eq!(spans[0].style.fg, Some(theme.number));
+    }
+}
