@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T14:47:20+09:00"
+  at: "2026-11-18T15:17:39+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1147 件
+  テスト総数 594 → 1161 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 38.33% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 38.44% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -220,6 +220,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   全 StateChange variant の Clone/Debug。serde derive 不在は明記）(M-11)
 - provider/tool: 外部フルパス参照ゼロの 7 モジュールを `pub(crate) mod` へ
   縮小（ファサード公開経路は不変、dead_code 発生箇所は見送り）(M-17 一部)
+- `opencode-tui`: context/session_context.rs に 11 テストを追加
+  （データ型の serde 往復、内部型は snake_case で自己整合）(M-11)
+- tool/provider: ToolError と ProviderError に source 付きバリアントを追加
+  （加法変更、既存パターンに倣う。呼び出し元置換は未実施）(M-04 一部)
 
 ## [0.1.0]
 
