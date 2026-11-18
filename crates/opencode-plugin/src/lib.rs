@@ -1,3 +1,15 @@
+//! プラグイン機構とフック（Hook）の登録・実行を提供するクレート。
+//!
+//! `HookEvent` ごとに `Hook` を登録すると `PluginSystem` が優先度順に実行し、
+//! `PluginRegistry` がプラグインの登録とフックシステムへの接続を管理する。
+//! `subprocess` は TypeScript 製プラグインを子プロセスとして起動し、
+//! Content-Length フレームの JSON-RPC で通信するサポートを提供する。
+//!
+//! # 使い方
+//!
+//! `Hook::new` でフックを作り `PluginSystem::register` に登録した上で、
+//! `HookContext` を渡して `trigger` / `trigger_collect` を呼び出す。
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

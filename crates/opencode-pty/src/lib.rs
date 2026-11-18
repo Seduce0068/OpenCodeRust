@@ -1,3 +1,14 @@
+//! 疑似ターミナル（PTY）経由でコマンドを実行するクレート。
+//!
+//! `PtyManager` が `portable-pty` で PTY を開き、`spawn` で指定コマンドを
+//! 起動して `PtySession` を返す。`PtySession::stream_output` はターミナル出力を
+//! `tokio::sync::mpsc` のチャネルへストリームする。
+//!
+//! # 使い方
+//!
+//! `PtyManager::new()` でマネージャーを作り、`spawn(command, args)` した
+//! セッションの `stream_output()` が返すレシーバから出力を受け取る。
+
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 use tokio::sync::mpsc;

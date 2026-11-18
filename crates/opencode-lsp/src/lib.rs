@@ -1,3 +1,16 @@
+//! Language Server Protocol (LSP) クライアントを提供するクレート。
+//!
+//! `LspClient` が外部 LSP サーバーを子プロセスとして起動し、JSON-RPC で
+//! 初期化・テキスト同期・診断・定義／参照／ホバー・補完・リネーム・
+//! コールヒエラルキーなどのリクエストを送る。`LspClientRegistry` が
+//! 複数のサーバーをパス単位で管理し、`LspEvent` を broadcast で配信する。
+//!
+//! # 使い方
+//!
+//! `LspServerConfig` とルートパスを指定して `LspClient::start` で起動し、
+//! `get_diagnostics` や `goto_definition` を呼び出す。`subscribe` で
+//! 非同期イベントを受け取れる。
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

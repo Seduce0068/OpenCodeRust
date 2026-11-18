@@ -1,3 +1,15 @@
+//! SQLite によるデータ永続化を担うクレート。
+//!
+//! `schema` が sessions / messages / parts / todos / session_input などの
+//! テーブル定義とマイグレーションを保持し、`database` が接続とマイグレーション
+//! 実行を提供する。`repository` はセッション・メッセージ・Todo・入力キューへの
+//! CRUD 操作をまとめる。
+//!
+//! # 使い方
+//!
+//! `Storage::new(db_path)` で接続し、`migrate()` でスキーマを適用した上で
+//! `SessionRepository` などのリポジトリを利用する。
+
 pub mod database;
 pub mod repository;
 pub mod schema;
