@@ -355,3 +355,208 @@ fn parse_google_sse(data: &str) -> Option<StreamEvent> {
 
     Some(StreamEvent::TextDelta(text))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ContentPart;
+
+    fn dummy_config() -> GoogleConfig {
+        GoogleConfig {
+            api_key: "dummy-key-for-tests".to_string(),
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn new_exposes_google_identity_and_bundled_models() {
+        let provider = GoogleProvider::new("dummy-key");
+        assert_eq!(provider.id(), "google");
+        assert_eq!(provider.name(), "Google AI");
+
+        let models = provider.models();
+        assert_eq!(models.len(), 5);
+        assert!(models.iter().all(|m| m.provider == "google"));
+        assert!(models
+            .iter()
+            .any(|m| m.id == "gemini-2.5-pro-preview-06-05"));
+        assert!(models.iter().any(|m| m.id == "gemini-2.0-flash-lite"));
+    }
+
+    #[test]
+    fn with_config_keeps_config_and_model_catalog() {
+        let base_url = "http://127.0.0.1:9/v1beta/models";
+        let provider = GoogleProvider::with_config(GoogleConfig {
+            api_key: "dummy-key".to_string(),
+            base_url: Some(base_url.to_string()),
+        });
+        assert_eq!(provider.config.api_key, "dummy-key");
+        assert_eq!(provider.config.base_url.as_deref(), Some(base_url));
+        assert_eq!(provider.models().len(), 5);
+
+        let default_provider = GoogleProvider::with_config(dummy_config());
+        assert_eq!(default_provider.config.base_url, None);
+        assert_eq!(default_provider.models().len(), provider.models().len());
+    }
+
+    #[test]
+    fn get_model_finds_known_model_and_rejects_unknown() {
+        let provider = GoogleProvider::new("dummy-key");
+        let model = provider
+            .get_model("gemini-1.5-pro")
+            .expect("bundled model must be present");
+        assert_eq!(model.name, "Gemini 1.5 Pro");
+        assert_eq!(model.context_window, 2_000_000);
+        assert!(provider.get_model("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn convert_request_maps_roles_and_generation_config() {
+        let provider = GoogleProvider::new("dummy-key");
+        let request = ChatRequest::new(
+            "gemini-2.0-flash",
+            vec![
+                Message::system("system prompt"),
+                Message::user("hello"),
+                Message::assistant("previous answer"),
+            ],
+        )
+        .with_max_tokens(128)
+        .with_temperature(0.5);
+
+        let converted = provider.convert_request(request);
+
+        let system = converted.system_instruction.expect("system instruction");
+        assert_eq!(system.role, "user");
+        assert_eq!(system.parts.len(), 1);
+        assert_eq!(system.parts[0].text.as_deref(), Some("system prompt"));
+
+        assert_eq!(converted.contents.len(), 2);
+        assert_eq!(converted.contents[0].role, "user");
+        assert_eq!(
+            converted.contents[0].parts[0].text.as_deref(),
+            Some("hello")
+        );
+        assert_eq!(converted.contents[1].role, "model");
+        assert_eq!(
+            converted.contents[1].parts[0].text.as_deref(),
+            Some("previous answer")
+        );
+
+        let config = converted.generation_config.expect("generation config");
+        assert_eq!(config.max_output_tokens, Some(128));
+        assert_eq!(config.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn convert_request_joins_text_parts_and_skips_tool_messages() {
+        let provider = GoogleProvider::new("dummy-key");
+        let user_parts = Message {
+            role: Role::User,
+            content: Content::Parts(vec![
+                ContentPart {
+                    text: Some("first".to_string()),
+                    ..Default::default()
+                },
+                ContentPart {
+                    text: None,
+                    ..Default::default()
+                },
+                ContentPart {
+                    text: Some("second".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            cache_control: None,
+            provider_options: None,
+        };
+        let tool_message = Message {
+            role: Role::Tool,
+            content: Content::Text("tool output".to_string()),
+            cache_control: None,
+            provider_options: None,
+        };
+        let request = ChatRequest::new("gemini-2.0-flash", vec![user_parts, tool_message]);
+
+        let converted = provider.convert_request(request);
+
+        assert!(converted.system_instruction.is_none());
+        assert_eq!(converted.contents.len(), 1);
+        assert_eq!(converted.contents[0].role, "user");
+        assert_eq!(
+            converted.contents[0].parts[0].text.as_deref(),
+            Some("first second")
+        );
+        let config = converted.generation_config.expect("generation config");
+        assert_eq!(config.max_output_tokens, None);
+        assert_eq!(config.temperature, None);
+    }
+
+    #[test]
+    fn convert_request_ignores_non_text_system_content() {
+        let provider = GoogleProvider::new("dummy-key");
+        let system_parts = Message {
+            role: Role::System,
+            content: Content::Parts(vec![ContentPart {
+                text: Some("ignored".to_string()),
+                ..Default::default()
+            }]),
+            cache_control: None,
+            provider_options: None,
+        };
+        let converted =
+            provider.convert_request(ChatRequest::new("gemini-2.0-flash", vec![system_parts]));
+        assert!(converted.system_instruction.is_none());
+        assert!(converted.contents.is_empty());
+    }
+
+    #[test]
+    fn convert_google_response_maps_text_usage_and_finish_reason() {
+        let response = GoogleResponse {
+            candidates: vec![GoogleCandidate {
+                content: GoogleContent {
+                    parts: vec![GooglePart::text("answer")],
+                    role: "model".to_string(),
+                },
+                finish_reason: Some("STOP".to_string()),
+            }],
+            usage_metadata: Some(GoogleUsage {
+                prompt_token_count: 10,
+                candidates_token_count: 4,
+                total_token_count: 14,
+            }),
+        };
+
+        let converted = convert_google_response(response);
+
+        assert!(converted.id.starts_with("google_"));
+        assert_eq!(converted.model, "google");
+        assert_eq!(converted.choices.len(), 1);
+        assert_eq!(converted.choices[0].finish_reason.as_deref(), Some("STOP"));
+        assert!(matches!(
+            &converted.choices[0].message.content,
+            Content::Text(text) if text == "answer"
+        ));
+        let usage = converted.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn parse_google_sse_handles_text_and_invalid_payloads() {
+        let event = parse_google_sse(
+            r#"{"candidates":[{"content":{"parts":[{"text":"chunk"}],"role":"model"}}]}"#,
+        )
+        .expect("valid SSE payload");
+        assert!(matches!(event, StreamEvent::TextDelta(text) if text == "chunk"));
+        assert!(parse_google_sse("").is_none());
+        assert!(parse_google_sse("not json").is_none());
+        assert!(
+            parse_google_sse(r#"{"candidates":[{"content":{"parts":[],"role":"model"}}]}"#)
+                .is_none()
+        );
+    }
+}
