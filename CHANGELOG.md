@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T02:24:29+09:00"
+  at: "2026-11-19T02:58:57+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1996 件
+  テスト総数 594 → 2010 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 46.71% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 46.80% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -300,6 +300,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-tool`: multiedit に権限確認、apply_patch Move の移送先検証、
   WebFetch の SSRF 対策（6to4/Teredo 含む）を追加（swarm-coding R1-R6、
   R4 のリグレッション/IPv6 抜け穴指摘を R5 で修正）(H-15/M-54/H-24)
+- `provider` / `config` / `core` / `mcp`: リトライ判定の不一致、env 展開の
+  JSON 文字列エスケープ、MCP initialized の notification 送信、FileSystemImpl の
+  パス検証を修正（swarm-coding R1-R6、R4 の timeout/後方互換指摘を R5 で修正）
+  (H-16/H-17/H-18/H-20)
 
 ## [0.1.0]
 

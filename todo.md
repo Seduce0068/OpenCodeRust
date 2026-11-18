@@ -166,22 +166,9 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
-- [ ] **[H-16]** NetworkErrorWithSource が再試行判定から漏れる
-  - `provider.rs:109-113` は WithSource を retryable と判定するが
-    `parse_api_call_error`（`:248-255`）は `NetworkError(_)` のみ拾い
-    `_ => (None,false)` に落ちる。M-04 の置換で実害化（confirmed / R1-SV03）
-- [ ] **[H-17]** 設定ローダーが JSONC パース前に {env:VAR} を生文字列置換
-  - `config/loader.rs:61,440,442`。値に引用符・改行があるとパース失敗／設定キー注入。
-    パース後に serde_json::Value として代入する方式へ（confirmed / R1-SV06）
-- [ ] **[H-18]** MCP notifications/initialized を id 付きリクエストとして送信
-  - `mcp/client.rs:607,499`。JSON-RPC notification は id を持たず応答も来ないため
-    準拠サーバで 30 秒タイムアウト。JsonRpcNotification で送信し応答待ちを削除（confirmed）
 - [ ] **[H-19]** MCP OAuth が RFC 8707 resource インジケーターを送信しない
   - `mcp/discovery.rs:38,68` / `oauth.rs:295`。resource をパースするだけで
     認可リクエストへ渡さず confused deputy に無防備（confirmed）
-- [ ] **[H-20]** FileSystemImpl がルート外への相対パス走査を検証しない
-  - `core/filesystem.rs:46-49,52-55`。`root.join(path)` のみで `../../etc/passwd` が読める。
-    canonicalize して root 配下を検証（confirmed / R1-SV05）
 - [ ] **[H-21]** サブセッションが親の disabled_tools を継承しない
   - `agent/executor.rs:439-477,498-500`。tool 引数の agent_name/model で別エージェントを
     選べ、禁止ツールを迂回。深さ上限も無し（confirmed / R1-SV05）
@@ -255,6 +242,10 @@ status: current
 
 ## 完了
 
+- [x] **[H-16]** NetworkErrorWithSource をリトライ判定へ追加（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-17]** env 展開を JSON 文字列として安全に挿入（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-18]** MCP initialized を notification 送信へ変更（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-20]** FileSystemImpl にパス検証を追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-15]** multiedit に権限確認（external_directory/edit/file_time_assert/
   with_file_lock）を追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-54]** apply_patch Move の移送先検証を追加（2026-11-19、swarm-coding R1-R6）
@@ -410,6 +401,11 @@ status: current
 
 ## メモ
 
+- `is_retryable` と `parse_api_call_error` の既存差異（2026-11-19、swarm-coding R4 が発見、
+  却下）: openai 系 `ApiErrorWithStatus(404)` は is_retryable 側が非対象
+  （429/500/502/503/504 のみ）とし parse 側が retryable=true とするが、
+  `test_openai_retryable_404` が意図を固定しており本次差分以前から存在する設計差異のため
+  H-16 では対応しない。ポリシー一元化は別タスク候補。
 - H-24/H-15/M-54 の残存リスク（2026-11-19、swarm-coding R4/R5）:
   - DNS rebinding（WebFetch の検証時と実際の接続時で DNS 解決が別）は既知残存。
   - パス検証と書込みの間の TOCTOU（symlink 差し替え）は残存。R4 指摘は却下
