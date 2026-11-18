@@ -553,3 +553,166 @@ impl Default for CommandRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_command(name: &str, aliases: &[&str], category: CommandCategory) -> SlashCommand {
+        SlashCommand {
+            name: name.to_string(),
+            aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            title: "Dummy Title".to_string(),
+            description: "Dummy description".to_string(),
+            category,
+            keybind: None,
+            suggested: false,
+            action: CommandAction::ShowHelp,
+        }
+    }
+
+    fn dummy_registry() -> CommandRegistry {
+        let mut registry = CommandRegistry {
+            commands: HashMap::new(),
+            by_category: HashMap::new(),
+        };
+        registry.register(dummy_command(
+            "/dummy",
+            &["/dummy-alias"],
+            CommandCategory::Display,
+        ));
+        registry.register(dummy_command("/other", &[], CommandCategory::Prompt));
+        registry
+    }
+
+    #[test]
+    fn fuzzy_match_treats_blank_query_as_neutral() {
+        assert_eq!(fuzzy_match("", "/new"), Some(0));
+        assert_eq!(fuzzy_match("   \t", "/new"), Some(0));
+    }
+
+    #[test]
+    fn fuzzy_match_distinguishes_hit_and_miss() {
+        assert!(fuzzy_match("new", "/new").is_some());
+        assert!(fuzzy_match("zzz_qqq_xxx", "/new").is_none());
+    }
+
+    #[test]
+    fn register_indexes_primary_name_and_aliases_without_duplicating_category() {
+        let registry = dummy_registry();
+
+        let primary = registry.get("/dummy").expect("primary name");
+        assert_eq!(primary.title, "Dummy Title");
+
+        let alias = registry.get("/dummy-alias").expect("alias");
+        assert_eq!(alias.name, "/dummy");
+        assert_eq!(alias.title, primary.title);
+
+        let names = registry
+            .by_category
+            .get(&CommandCategory::Display)
+            .expect("category index");
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_str(), "/dummy");
+    }
+
+    #[test]
+    fn get_returns_none_for_unregistered_name() {
+        let registry = dummy_registry();
+        assert!(registry.get("/not-registered").is_none());
+    }
+
+    #[test]
+    fn all_commands_deduplicates_aliases() {
+        let registry = dummy_registry();
+        let all = registry.all_commands();
+
+        let mut names: Vec<&str> = all.iter().map(|cmd| cmd.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+
+        assert_eq!(total, 2);
+        assert_eq!(
+            names.len(),
+            total,
+            "aliases must not create duplicate entries"
+        );
+        assert!(names.contains(&"/dummy"));
+        assert!(names.contains(&"/other"));
+    }
+
+    #[test]
+    fn suggested_commands_only_returns_flagged_primary_commands() {
+        let registry = dummy_registry();
+        assert!(registry.suggested_commands().is_empty());
+
+        let mut registry = dummy_registry();
+        for cmd in registry.commands.values_mut() {
+            if cmd.name == "/dummy" {
+                cmd.suggested = true;
+            }
+        }
+
+        let suggested = registry.suggested_commands();
+        assert_eq!(suggested.len(), 1);
+        assert_eq!(suggested[0].name, "/dummy");
+        assert!(suggested.iter().all(|cmd| cmd.suggested));
+    }
+
+    #[test]
+    fn get_by_category_returns_only_primary_commands_of_that_category() {
+        let registry = dummy_registry();
+
+        let display = registry.get_by_category(&CommandCategory::Display);
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].name, "/dummy");
+        assert!(display.iter().all(|cmd| cmd.name != "/dummy-alias"));
+
+        let prompt = registry.get_by_category(&CommandCategory::Prompt);
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].name, "/other");
+    }
+
+    #[test]
+    fn get_by_category_on_empty_registry_is_empty() {
+        let registry = CommandRegistry {
+            commands: HashMap::new(),
+            by_category: HashMap::new(),
+        };
+        assert!(registry
+            .get_by_category(&CommandCategory::System)
+            .is_empty());
+    }
+
+    #[test]
+    fn search_finds_command_by_name_and_alias() {
+        let registry = dummy_registry();
+
+        assert!(registry
+            .search("/dummy")
+            .iter()
+            .any(|cmd| cmd.name == "/dummy"));
+        assert!(registry
+            .search("/dummy-alias")
+            .iter()
+            .any(|cmd| cmd.name == "/dummy"));
+    }
+
+    #[test]
+    fn builtin_registry_resolves_known_name_and_alias() {
+        let registry = CommandRegistry::new();
+
+        let primary = registry.get("/new").expect("built-in /new");
+        assert!(matches!(primary.action, CommandAction::NewSession));
+
+        let alias = registry.get("/clear").expect("built-in /clear alias");
+        assert_eq!(alias.name, "/new");
+
+        assert!(registry.get("/definitely-not-a-command").is_none());
+        assert!(registry
+            .suggested_commands()
+            .iter()
+            .any(|cmd| cmd.name == "/new"));
+    }
+}

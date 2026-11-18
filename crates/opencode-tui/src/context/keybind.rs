@@ -247,3 +247,236 @@ impl KeybindRegistry {
         &self.bindings
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- LeaderKeyState ---
+
+    #[test]
+    fn leader_state_new_and_default_are_inactive() {
+        for state in [LeaderKeyState::new(), LeaderKeyState::default()] {
+            assert!(!state.active);
+            assert!(state.start_time.is_none());
+            assert!(state.leader_key.is_none());
+        }
+    }
+
+    #[test]
+    fn leader_state_start_sets_active_time_and_key() {
+        let mut state = LeaderKeyState::new();
+        state.start(KeyCode::Char('x'));
+
+        assert!(state.active);
+        assert!(state.start_time.is_some());
+        assert_eq!(state.leader_key, Some(KeyCode::Char('x')));
+    }
+
+    #[test]
+    fn leader_state_start_refreshes_timer() {
+        let mut state = LeaderKeyState::new();
+        state.start(KeyCode::Char('a'));
+        // Force the recorded start far into the past without waiting.
+        state.start_time = Some(Instant::now() - Duration::from_secs(3600));
+
+        state.start(KeyCode::Char('b'));
+
+        assert_eq!(state.leader_key, Some(KeyCode::Char('b')));
+        // A fresh start resets the timer, so it must not be expired anymore.
+        assert!(!state.check_timeout());
+        assert!(state.active);
+    }
+
+    #[test]
+    fn leader_state_reset_clears_all_fields() {
+        let mut state = LeaderKeyState::new();
+        state.start(KeyCode::Char('x'));
+
+        state.reset();
+
+        assert!(!state.active);
+        assert!(state.start_time.is_none());
+        assert!(state.leader_key.is_none());
+    }
+
+    #[test]
+    fn leader_state_check_timeout_without_start_returns_false() {
+        let mut state = LeaderKeyState::new();
+
+        assert!(!state.check_timeout());
+        assert!(!state.active);
+        assert!(state.start_time.is_none());
+    }
+
+    #[test]
+    fn leader_state_check_timeout_before_deadline_returns_false() {
+        let mut state = LeaderKeyState::new();
+        state.start(KeyCode::Char('x'));
+        // Set the start time directly so the test never depends on wall-clock waiting.
+        state.start_time = Some(Instant::now());
+
+        assert!(!state.check_timeout());
+        assert!(state.active);
+        assert_eq!(state.leader_key, Some(KeyCode::Char('x')));
+        assert!(state.start_time.is_some());
+    }
+
+    #[test]
+    fn leader_state_check_timeout_after_deadline_returns_true_and_resets() {
+        let mut state = LeaderKeyState::new();
+        state.start(KeyCode::Char('x'));
+        // Move the recorded start safely past the deadline (no sleep involved).
+        state.start_time = Some(Instant::now() - Duration::from_millis(LEADER_TIMEOUT_MS + 500));
+
+        assert!(state.check_timeout());
+        assert!(!state.active);
+        assert!(state.start_time.is_none());
+        assert!(state.leader_key.is_none());
+    }
+
+    // --- Keybind ---
+
+    #[test]
+    fn keybind_constructors_set_code_and_modifiers() {
+        let code = KeyCode::Char('a');
+
+        assert_eq!(
+            Keybind::new(code, KeyModifiers::ALT).modifiers,
+            KeyModifiers::ALT
+        );
+        assert_eq!(Keybind::key(code).modifiers, KeyModifiers::empty());
+        assert_eq!(Keybind::ctrl(code).modifiers, KeyModifiers::CONTROL);
+        assert_eq!(Keybind::alt(code).modifiers, KeyModifiers::ALT);
+        assert_eq!(Keybind::shift(code).modifiers, KeyModifiers::SHIFT);
+        assert_eq!(
+            Keybind::ctrl_shift(code).modifiers,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        );
+
+        for bind in [
+            Keybind::new(code, KeyModifiers::ALT),
+            Keybind::key(code),
+            Keybind::ctrl(code),
+            Keybind::alt(code),
+            Keybind::shift(code),
+            Keybind::ctrl_shift(code),
+        ] {
+            assert_eq!(bind.code, code);
+        }
+    }
+
+    #[test]
+    fn keybind_equality_depends_on_code_and_modifiers() {
+        assert_eq!(
+            Keybind::ctrl(KeyCode::Char('c')),
+            Keybind::ctrl(KeyCode::Char('c'))
+        );
+        assert_ne!(
+            Keybind::ctrl(KeyCode::Char('c')),
+            Keybind::alt(KeyCode::Char('c'))
+        );
+        assert_ne!(
+            Keybind::ctrl(KeyCode::Char('c')),
+            Keybind::ctrl(KeyCode::Char('d'))
+        );
+    }
+
+    #[test]
+    fn keybind_display_formats_modifiers_and_keys() {
+        assert_eq!(Keybind::ctrl(KeyCode::Char('c')).to_string(), "ctrl+c");
+        assert_eq!(
+            Keybind::ctrl_shift(KeyCode::Char('c')).to_string(),
+            "ctrl+shift+c"
+        );
+        assert_eq!(Keybind::key(KeyCode::Enter).to_string(), "enter");
+        assert_eq!(Keybind::alt(KeyCode::Enter).to_string(), "alt+enter");
+        assert_eq!(Keybind::key(KeyCode::BackTab).to_string(), "shift+tab");
+        assert_eq!(Keybind::key(KeyCode::F(5)).to_string(), "f5");
+        assert_eq!(Keybind::key(KeyCode::Char('z')).to_string(), "z");
+        // Modifier order is fixed: ctrl, alt, shift.
+        let all = Keybind::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(all.to_string(), "ctrl+alt+shift+a");
+    }
+
+    #[test]
+    fn keybind_display_unknown_key_is_question_mark() {
+        assert_eq!(Keybind::key(KeyCode::CapsLock).to_string(), "?");
+    }
+
+    // --- KeybindRegistry ---
+
+    #[test]
+    fn registry_new_contains_default_bindings() {
+        let registry = KeybindRegistry::new();
+
+        assert_eq!(
+            registry.get("app_exit"),
+            Some(&Keybind::ctrl(KeyCode::Char('c')))
+        );
+        assert_eq!(
+            registry.get("input_submit"),
+            Some(&Keybind::key(KeyCode::Enter))
+        );
+        assert!(registry.get("does_not_exist").is_none());
+        assert!(!registry.all().is_empty());
+        assert!(registry.all().contains_key("app_exit"));
+    }
+
+    #[test]
+    fn registry_default_and_new_have_same_bindings() {
+        let new = KeybindRegistry::new();
+        let default = KeybindRegistry::default();
+
+        assert_eq!(new.all(), default.all());
+    }
+
+    #[test]
+    fn registry_register_overrides_existing_binding() {
+        let mut registry = KeybindRegistry::new();
+        registry.register("app_exit", Keybind::key(KeyCode::Char('q')));
+
+        assert_eq!(
+            registry.get("app_exit"),
+            Some(&Keybind::key(KeyCode::Char('q')))
+        );
+        assert!(registry.match_key("app_exit", KeyCode::Char('q'), KeyModifiers::empty()));
+        assert!(!registry.match_key("app_exit", KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn registry_match_key_compares_code_and_modifiers_exactly() {
+        let registry = KeybindRegistry::new();
+
+        assert!(registry.match_key("app_exit", KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!registry.match_key("app_exit", KeyCode::Char('c'), KeyModifiers::empty()));
+        assert!(!registry.match_key("app_exit", KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(!registry.match_key("unknown", KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn registry_match_key_accepts_backtab_reporting_variants() {
+        let registry = KeybindRegistry::new();
+        let name = "agent_cycle_reverse";
+
+        assert!(registry.match_key(name, KeyCode::BackTab, KeyModifiers::empty()));
+        assert!(registry.match_key(name, KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(registry.match_key(name, KeyCode::Tab, KeyModifiers::SHIFT));
+        // A plain Tab is a different binding (agent_cycle), not the reverse one.
+        assert!(!registry.match_key(name, KeyCode::Tab, KeyModifiers::empty()));
+        assert!(!registry.match_key(name, KeyCode::BackTab, KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn registry_print_formats_known_and_unknown_bindings() {
+        let registry = KeybindRegistry::new();
+
+        assert_eq!(registry.print("app_exit"), "ctrl+c");
+        assert_eq!(registry.print("input_newline"), "alt+enter");
+        assert_eq!(registry.print("agent_cycle_reverse"), "shift+tab");
+        assert_eq!(registry.print("missing"), "?");
+    }
+}
