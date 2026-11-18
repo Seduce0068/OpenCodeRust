@@ -133,14 +133,14 @@ fn ask_question_via_stdin(q: &QuestionDef) -> Result<Vec<String>, ToolError> {
         print!("> ");
         io::stdout()
             .flush()
-            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+            .map_err(|e| ToolError::execution_with_source(e.to_string(), e))?;
 
         let stdin = io::stdin();
         let mut answer = String::new();
         stdin
             .lock()
             .read_line(&mut answer)
-            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+            .map_err(|e| ToolError::execution_with_source(e.to_string(), e))?;
 
         return Ok(vec![answer.trim().to_string()]);
     }
@@ -165,14 +165,14 @@ fn ask_question_via_stdin(q: &QuestionDef) -> Result<Vec<String>, ToolError> {
     print!("> ");
     io::stdout()
         .flush()
-        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        .map_err(|e| ToolError::execution_with_source(e.to_string(), e))?;
 
     let stdin = io::stdin();
     let mut input = String::new();
     stdin
         .lock()
         .read_line(&mut input)
-        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        .map_err(|e| ToolError::execution_with_source(e.to_string(), e))?;
 
     let input = input.trim();
     let answers: Vec<String> = input

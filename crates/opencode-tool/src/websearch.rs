@@ -200,7 +200,7 @@ impl Tool for WebSearchTool {
                 if e.is_timeout() {
                     ToolError::ExecutionError("Search request timed out".to_string())
                 } else {
-                    ToolError::ExecutionError(format!("Search request failed: {}", e))
+                    ToolError::execution_with_source("Search request failed", e)
                 }
             })?;
 
@@ -208,7 +208,7 @@ impl Tool for WebSearchTool {
         let response_text = response
             .text()
             .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| ToolError::execution_with_source("Failed to read response", e))?;
 
         if !status.is_success() {
             return Err(ToolError::ExecutionError(format!(

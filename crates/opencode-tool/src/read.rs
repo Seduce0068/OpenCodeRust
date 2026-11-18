@@ -167,9 +167,9 @@ impl Tool for ReadTool {
             return read_directory(&path, offset, limit, title);
         }
 
-        let content = fs::read(&path)
-            .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+        let content = fs::read(&path).await.map_err(|e| {
+            ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+        })?;
 
         let mime = detect_mime(&path);
 

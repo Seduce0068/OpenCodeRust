@@ -202,7 +202,9 @@ impl Tool for GrepTool {
             (matches, has_errors)
         })
         .await
-        .map_err(|e| ToolError::ExecutionError(format!("grep scan task failed: {}", e)))?;
+        .map_err(|e| {
+            ToolError::execution_with_source(format!("grep scan task failed: {}", e), e)
+        })?;
 
         matches.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 

@@ -109,9 +109,7 @@ impl Tool for CodeSearchTool {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| {
-                ToolError::ExecutionError(format!("Failed to create HTTP client: {}", e))
-            })?;
+            .map_err(|e| ToolError::execution_with_source("Failed to create HTTP client", e))?;
 
         let request = McpRequest {
             jsonrpc: "2.0".to_string(),
@@ -136,7 +134,7 @@ impl Tool for CodeSearchTool {
                 .json(&request)
                 .send()
                 .await
-                .map_err(|e| ToolError::ExecutionError(format!("HTTP request failed: {}", e)))
+                .map_err(|e| ToolError::execution_with_source("HTTP request failed", e))
         };
 
         tokio::select! {
@@ -150,7 +148,7 @@ impl Tool for CodeSearchTool {
                 }
 
                 let response_text = response.text().await
-                    .map_err(|e| ToolError::ExecutionError(format!("Failed to read response: {}", e)))?;
+                    .map_err(|e| ToolError::execution_with_source("Failed to read response", e))?;
 
                 let output = parse_sse_response(&response_text)
                     .unwrap_or_else(|| {

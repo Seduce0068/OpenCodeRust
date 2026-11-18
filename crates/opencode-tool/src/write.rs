@@ -123,13 +123,13 @@ impl Tool for WriteTool {
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::ExecutionError(format!("Failed to create directory: {}", e))
+                ToolError::execution_with_source(format!("Failed to create directory: {}", e), e)
             })?;
         }
 
-        fs::write(&path, &content)
-            .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+        fs::write(&path, &content).await.map_err(|e| {
+            ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
+        })?;
 
         ctx.do_publish_bus(
             "file.edited",

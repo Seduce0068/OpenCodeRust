@@ -104,9 +104,9 @@ impl Tool for MultiEditTool {
                 )));
             }
 
-            let content = tokio::fs::read_to_string(&file_path)
-                .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+            let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+            })?;
 
             let mut new_content = content;
             let mut file_edits = 0;
@@ -139,7 +139,7 @@ impl Tool for MultiEditTool {
                 tokio::fs::write(&file_path, &new_content)
                     .await
                     .map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to write file: {}", e))
+                        ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
                     })?;
 
                 ctx.do_publish_bus(

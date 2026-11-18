@@ -199,9 +199,9 @@ impl Tool for BashTool {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to spawn process: {}", e)))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            ToolError::execution_with_source(format!("Failed to spawn process: {}", e), e)
+        })?;
 
         let child_pid = child.id();
 
@@ -285,10 +285,9 @@ impl Tool for BashTool {
             }
         }
 
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to wait for process: {}", e)))?;
+        let status = child.wait().await.map_err(|e| {
+            ToolError::execution_with_source(format!("Failed to wait for process: {}", e), e)
+        })?;
 
         let exit_code = status.code().unwrap_or(-1);
 
