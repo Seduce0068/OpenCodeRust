@@ -4445,10 +4445,8 @@ async fn global_event_stream(
     }))
 }
 
-async fn get_global_config(
-    State(_state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>> {
-    Ok(Json(config_for_response(&AppConfig::default())))
+async fn get_global_config(State(_state): State<Arc<ServerState>>) -> Response {
+    not_implemented("global config")
 }
 
 async fn dispose_all() -> Response {
@@ -4566,54 +4564,12 @@ pub struct ToolInfo {
     pub description: String,
 }
 
-async fn list_tool_ids() -> Json<Vec<String>> {
-    Json(vec![
-        "read".to_string(),
-        "write".to_string(),
-        "edit".to_string(),
-        "bash".to_string(),
-        "glob".to_string(),
-        "grep".to_string(),
-        "ls".to_string(),
-        "webfetch".to_string(),
-        "websearch".to_string(),
-        "task".to_string(),
-        "lsp".to_string(),
-        "batch".to_string(),
-        "plan_enter".to_string(),
-        "plan_exit".to_string(),
-        "todoread".to_string(),
-        "todowrite".to_string(),
-        "codesearch".to_string(),
-        "apply_patch".to_string(),
-        "skill".to_string(),
-        "multiedit".to_string(),
-    ])
+async fn list_tool_ids() -> Response {
+    not_implemented("tool ids")
 }
 
-async fn list_tools(Query(_params): Query<HashMap<String, String>>) -> Json<Vec<ToolInfo>> {
-    Json(vec![
-        ToolInfo {
-            id: "read".to_string(),
-            name: "Read".to_string(),
-            description: "Read files".to_string(),
-        },
-        ToolInfo {
-            id: "write".to_string(),
-            name: "Write".to_string(),
-            description: "Write files".to_string(),
-        },
-        ToolInfo {
-            id: "edit".to_string(),
-            name: "Edit".to_string(),
-            description: "Edit files".to_string(),
-        },
-        ToolInfo {
-            id: "bash".to_string(),
-            name: "Bash".to_string(),
-            description: "Execute commands".to_string(),
-        },
-    ])
+async fn list_tools(Query(_params): Query<HashMap<String, String>>) -> Response {
+    not_implemented("tools")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4705,30 +4661,10 @@ async fn web_index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
-// --- /doc endpoint: returns OpenAPI-style documentation info ---
+// --- /doc endpoint: 未実装 (501) ---
 
-#[derive(Debug, Serialize)]
-struct DocInfo {
-    title: String,
-    version: String,
-    description: String,
-    openapi: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DocResponse {
-    info: DocInfo,
-}
-
-async fn get_doc() -> Json<DocResponse> {
-    Json(DocResponse {
-        info: DocInfo {
-            title: "opencode".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            description: "opencode api".to_string(),
-            openapi: "3.1.1".to_string(),
-        },
-    })
+async fn get_doc() -> Response {
+    not_implemented("doc")
 }
 
 // --- /log endpoint: accepts a log entry and writes it via tracing ---
@@ -4835,31 +4771,8 @@ async fn get_vcs_info() -> Response {
     not_implemented("vcs")
 }
 
-#[derive(Debug, Serialize)]
-struct CommandInfo {
-    id: String,
-    name: String,
-    description: Option<String>,
-}
-
-async fn list_commands() -> Result<Json<Vec<CommandInfo>>> {
-    Ok(Json(vec![
-        CommandInfo {
-            id: "build".to_string(),
-            name: "Build".to_string(),
-            description: Some("Build the project".to_string()),
-        },
-        CommandInfo {
-            id: "test".to_string(),
-            name: "Test".to_string(),
-            description: Some("Run tests".to_string()),
-        },
-        CommandInfo {
-            id: "lint".to_string(),
-            name: "Lint".to_string(),
-            description: Some("Run linter".to_string()),
-        },
-    ]))
+async fn list_commands() -> Response {
+    not_implemented("commands")
 }
 
 #[derive(Debug, Serialize)]
@@ -5591,6 +5504,36 @@ mod experimental_not_implemented_tests {
     #[tokio::test]
     async fn get_vcs_info_returns_501() {
         assert_not_implemented(get_vcs_info().await, "vcs").await;
+    }
+
+    // 以下、R2 で追加した固定値ハンドラの 501 化検証。
+
+    #[tokio::test]
+    async fn get_global_config_returns_501() {
+        let state = Arc::new(ServerState::new());
+        let response = get_global_config(State(state)).await;
+        assert_not_implemented(response, "global config").await;
+    }
+
+    #[tokio::test]
+    async fn list_tool_ids_returns_501() {
+        assert_not_implemented(list_tool_ids().await, "tool ids").await;
+    }
+
+    #[tokio::test]
+    async fn list_tools_returns_501() {
+        let response = list_tools(Query(HashMap::new())).await;
+        assert_not_implemented(response, "tools").await;
+    }
+
+    #[tokio::test]
+    async fn get_doc_returns_501() {
+        assert_not_implemented(get_doc().await, "doc").await;
+    }
+
+    #[tokio::test]
+    async fn list_commands_returns_501() {
+        assert_not_implemented(list_commands().await, "commands").await;
     }
 
     #[tokio::test]

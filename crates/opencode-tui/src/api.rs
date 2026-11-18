@@ -237,16 +237,6 @@ pub struct McpAuthStartInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LspStatusResponse {
-    servers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FormatterStatusResponse {
-    formatters: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareResponse {
     pub url: String,
 }
@@ -677,6 +667,8 @@ impl ApiClient {
         Ok(messages)
     }
 
+    /// `/lsp` はサーバ側で未実装（常に 501）のため、型付きレスポンスへの変換は行わない。
+    /// 501 は空結果へフォールバックし、それ以外の通信失敗は従来どおり Err を返す。
     pub fn get_lsp_servers(&self) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/lsp", self.base_url);
         let response = self.client.get(&url).send()?;
@@ -689,10 +681,12 @@ impl ApiClient {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to get LSP status: {} - {}", http_status, text);
         }
-        let status = response.json::<LspStatusResponse>()?;
-        Ok(status.servers)
+        // 到達不能な成功パス。解析すべきレスポンス型は存在しないため空結果を返す。
+        Ok(Vec::new())
     }
 
+    /// `/formatter` はサーバ側で未実装（常に 501）のため、型付きレスポンスへの変換は行わない。
+    /// 501 は空結果へフォールバックし、それ以外の通信失敗は従来どおり Err を返す。
     pub fn get_formatters(&self) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/formatter", self.base_url);
         let response = self.client.get(&url).send()?;
@@ -705,8 +699,8 @@ impl ApiClient {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to get formatter status: {} - {}", http_status, text);
         }
-        let status = response.json::<FormatterStatusResponse>()?;
-        Ok(status.formatters)
+        // 到達不能な成功パス。解析すべきレスポンス型は存在しないため空結果を返す。
+        Ok(Vec::new())
     }
 
     pub fn share_session(&self, session_id: &str) -> anyhow::Result<ShareResponse> {
