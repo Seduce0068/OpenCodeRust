@@ -307,6 +307,8 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI router Default 修正(1)・terminal(4)・todo_item/tool_call(24)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI border(8)・markdown parser(9)・status(3)・help(8)・alert(12)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
