@@ -3529,8 +3529,8 @@ async fn read_file(Query(query): Query<ListFilesQuery>) -> Result<Json<serde_jso
     let root = project_root()?;
     let path = resolve_input_path(&query.path, &root)?;
 
-    if path.is_file() {
-        match std::fs::read_to_string(&path) {
+    if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+        match tokio::fs::read_to_string(&path).await {
             Ok(content) => Ok(Json(
                 serde_json::json!({ "content": content, "path": query.path }),
             )),
@@ -3544,12 +3544,13 @@ async fn read_file(Query(query): Query<ListFilesQuery>) -> Result<Json<serde_jso
 async fn get_file_status() -> Result<Json<Vec<FileStatusInfo>>> {
     let cwd = std::env::current_dir()
         .map_err(|e| ApiError::BadRequest(format!("Failed to resolve current directory: {}", e)))?;
-    let output = std::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(&cwd)
         .arg("status")
         .arg("--porcelain")
         .output()
+        .await
         .map_err(|e| ApiError::BadRequest(format!("Failed to run git status: {}", e)))?;
 
     if !output.status.success() {
