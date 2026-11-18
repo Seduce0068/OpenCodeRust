@@ -751,6 +751,19 @@ pub enum ToolError {
     #[error("Execution error: {0}")]
     ExecutionError(String),
 
+    /// 下位エラーを `source()` チェーンとして保持する実行エラー。
+    ///
+    /// `ExecutionError` は原因を文字列へ平坦化するためチェーンが失われる。
+    /// 原因を保持したい呼び出し元は `ToolError::execution_with_source` を使う。
+    #[error("Execution error: {message}")]
+    ExecutionWithSource {
+        /// 利用者向けの説明文。
+        message: String,
+        /// 保持された下位エラー。
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 
@@ -774,6 +787,17 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    /// 実行エラーを、下位エラーを `source()` に保持した状態で構築する。
+    pub fn execution_with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::ExecutionWithSource {
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+
     pub fn with_suggestions(msg: impl Into<String>, suggestions: &[String]) -> Self {
         let msg = msg.into();
         if suggestions.is_empty() {
@@ -944,6 +968,20 @@ mod tests {
                 .to_string(),
         );
         assert!(missing_root.is_external_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn tool_error_execution_with_source_preserves_error_chain() {
+        let cause = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
+        let error = ToolError::execution_with_source("Failed to read file", cause);
+
+        assert_eq!(error.to_string(), "Execution error: Failed to read file");
+        let source = std::error::Error::source(&error).expect("source must be preserved");
+        assert_eq!(source.to_string(), "missing file");
+        assert!(matches!(
+            source.downcast_ref::<std::io::Error>(),
+            Some(io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     #[test]

@@ -49,8 +49,28 @@ pub enum ProviderError {
     #[error("API error: {0}")]
     ApiError(String),
 
+    /// 下位エラーを `source()` チェーンとして保持する API エラー。
+    #[error("API error: {message}")]
+    ApiErrorWithSource {
+        /// 利用者向けの説明文。
+        message: String,
+        /// 保持された下位エラー。
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("Network error: {0}")]
     NetworkError(String),
+
+    /// 下位エラーを `source()` チェーンとして保持するネットワークエラー。
+    #[error("Network error: {message}")]
+    NetworkErrorWithSource {
+        /// 利用者向けの説明文。
+        message: String,
+        /// 保持された下位エラー。
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[error("Authentication error: {0}")]
     AuthError(String),
@@ -86,6 +106,9 @@ impl crate::retry::IsRetryable for ProviderError {
             ProviderError::RateLimit => Some("Rate limited".to_string()),
             ProviderError::Timeout => Some("Request timed out".to_string()),
             ProviderError::NetworkError(msg) => Some(format!("Network error: {msg}")),
+            ProviderError::NetworkErrorWithSource { message, .. } => {
+                Some(format!("Network error: {message}"))
+            }
             ProviderError::ApiErrorWithStatus {
                 status_code,
                 message,
@@ -97,6 +120,7 @@ impl crate::retry::IsRetryable for ProviderError {
                 }
             }
             ProviderError::ApiError(_)
+            | ProviderError::ApiErrorWithSource { .. }
             | ProviderError::AuthError(_)
             | ProviderError::ModelNotFound(_)
             | ProviderError::InvalidRequest(_)
@@ -130,6 +154,28 @@ static NO_BODY_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^4(00|13)\s*(status code)?\s*\(no body\)").unwrap());
 
 impl ProviderError {
+    /// API エラーを、下位エラーを `source()` に保持した状態で構築する。
+    pub fn api_error_with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::ApiErrorWithSource {
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+
+    /// ネットワークエラーを、下位エラーを `source()` に保持した状態で構築する。
+    pub fn network_error_with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        ProviderError::NetworkErrorWithSource {
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+
     pub fn api_error_with_status(message: impl Into<String>, status_code: u16) -> Self {
         ProviderError::ApiErrorWithStatus {
             message: message.into(),
@@ -450,6 +496,44 @@ mod tests {
         if let ParsedAPICallError::ApiError { message, .. } = parsed {
             assert!(message.contains("reauthenticate"));
         }
+    }
+
+    #[test]
+    fn test_error_with_source_preserves_error_chain() {
+        let api = ProviderError::api_error_with_source(
+            "request failed",
+            std::io::Error::other("underlying API cause"),
+        );
+        assert_eq!(api.to_string(), "API error: request failed");
+        let source = std::error::Error::source(&api).expect("source must be preserved");
+        assert_eq!(source.to_string(), "underlying API cause");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+
+        let network = ProviderError::network_error_with_source(
+            "request failed",
+            std::io::Error::other("connection reset"),
+        );
+        assert_eq!(network.to_string(), "Network error: request failed");
+        let source = std::error::Error::source(&network).expect("source must be preserved");
+        assert_eq!(source.to_string(), "connection reset");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn test_network_error_with_source_keeps_retryability() {
+        use crate::retry::IsRetryable;
+
+        let error = ProviderError::network_error_with_source(
+            "request failed",
+            std::io::Error::other("connection reset"),
+        );
+        assert_eq!(
+            error.is_retryable().as_deref(),
+            Some("Network error: request failed")
+        );
+
+        let api = ProviderError::api_error_with_source("bad request", std::io::Error::other("bad"));
+        assert!(api.is_retryable().is_none());
     }
 
     #[test]
