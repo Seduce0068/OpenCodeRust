@@ -114,7 +114,7 @@ impl Provider for DeepInfraProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
@@ -124,7 +124,7 @@ impl Provider for DeepInfraProvider {
         let chat_response: ChatResponse = response
             .json()
             .await
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         Ok(chat_response)
     }
@@ -156,7 +156,7 @@ impl Provider for DeepInfraProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();

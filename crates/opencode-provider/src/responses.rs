@@ -1302,7 +1302,7 @@ impl OpenAIResponsesLanguageModel {
                 .body(request_body)
                 .send()
                 .await
-                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+                .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
             let status = response.status().as_u16();
             let body = response.text().await.map_err(|e| {
                 let mut msg = e.to_string();
@@ -1428,7 +1428,7 @@ impl OpenAIResponsesLanguageModel {
                     .body(request_body)
                     .send()
                     .await
-                    .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+                    .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
                 let status = response.status();
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();

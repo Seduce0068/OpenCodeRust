@@ -379,7 +379,7 @@ impl GitHubCopilotProvider {
             .json(&copilot_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -393,7 +393,7 @@ impl GitHubCopilotProvider {
         let copilot_response: CopilotResponse = response
             .json()
             .await
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         Ok(convert_copilot_response(copilot_response))
     }
@@ -419,7 +419,7 @@ impl GitHubCopilotProvider {
             .json(&copilot_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();

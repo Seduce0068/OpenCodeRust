@@ -72,7 +72,7 @@ impl Provider for DeepSeekProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -83,7 +83,7 @@ impl Provider for DeepSeekProvider {
         response
             .json()
             .await
-            .map_err(|e| ProviderError::ApiError(e.to_string()))
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))
     }
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<StreamResult, ProviderError> {
@@ -99,7 +99,7 @@ impl Provider for DeepSeekProvider {
             .json(&stream_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
