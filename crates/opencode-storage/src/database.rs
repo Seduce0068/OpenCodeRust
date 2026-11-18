@@ -11,7 +11,7 @@ use tracing::info;
 ///
 /// 既存 DB は `user_version = 0`（SQLite のデフォルト）なので、
 /// 初回起動時は必ずマイグレーションが実行される。
-const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -33,6 +33,86 @@ pub struct Database {
 }
 
 pub type SqliteTransaction<'a> = Transaction<'a, Sqlite>;
+
+/// 正規スキーマ（`schema::ALL_MIGRATIONS`）を `pool` に対して単一トランザクションで
+/// 適用する。適用済みバージョン（`PRAGMA user_version`）の確認と記録まで含め、
+/// `Database::run_migrations` と `Storage::migrate` の両経路がこの関数を共有する。
+///
+/// `SCHEMA_VERSION` はこの関数が唯一書き込むため、両経路で同じ定数が使われる。
+pub(crate) async fn migrate_pool(pool: &SqlitePool) -> Result<(), DatabaseError> {
+    info!("Running database migrations");
+
+    // 全スキーマ文を単一トランザクションで実行する。個別に auto-commit すると
+    // 途中失敗時に一部のテーブル/インデックスだけが残り、再起動時に
+    // 不整合なスキーマへ migration が走る恐れがある。
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DatabaseError::TransactionError(e.to_string()))?;
+
+    // 適用済みバージョンを確認する。user_version=0 の既存 DB は
+    // 初回移行の対象として扱い、SCHEMA_VERSION 以上ならスキップする。
+    let row = sqlx::query("PRAGMA user_version")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+    let current_version = row
+        .try_get::<i64, _>("user_version")
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+
+    if current_version >= i64::from(SCHEMA_VERSION) {
+        info!(
+            "Schema already at version {} (user_version={}), skipping migrations",
+            SCHEMA_VERSION, current_version
+        );
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+        return Ok(());
+    }
+
+    for migration in crate::schema::ALL_MIGRATIONS {
+        sqlx::raw_sql(*migration)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+    }
+
+    // metadata 列は CREATE_SESSION_INPUT_TABLE_WITH_METADATA に含まれている。
+    // 旧スキーマの DB だけに ALTER を適用する。SQLite のエラー文字列
+    // ("duplicate column name") を照合するのは版依存で脆いため、
+    // PRAGMA table_info で列の有無を構造的に判定する。
+    let input_columns = sqlx::query("PRAGMA table_info(session_input)")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+    let has_metadata = input_columns.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .map(|name| name == "metadata")
+            .unwrap_or(false)
+    });
+
+    if !has_metadata {
+        sqlx::raw_sql(crate::schema::MIGRATE_SESSION_INPUT_METADATA)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+    }
+
+    // バージョン記録も同じトランザクションに含め、DDL と原子的に確定させる。
+    // 埋め込む値はコード内定数だけ（外部入力なし）なので監査済みとして扱う。
+    let set_version = format!("PRAGMA user_version = {SCHEMA_VERSION};");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(set_version))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+
+    Ok(())
+}
 
 impl Database {
     pub async fn new() -> Result<Self, DatabaseError> {
@@ -105,75 +185,9 @@ impl Database {
     }
 
     async fn run_migrations(&self) -> Result<(), DatabaseError> {
-        info!("Running database migrations");
-
-        // 全スキーマ文を単一トランザクションで実行する。個別に auto-commit すると
-        // 途中失敗時に一部のテーブル/インデックスだけが残り、再起動時に
-        // 不整合なスキーマへ migration が走る恐れがある。
-        let mut tx = self.begin().await?;
-
-        // 適用済みバージョンを確認する。user_version=0 の既存 DB は
-        // 初回移行の対象として扱い、SCHEMA_VERSION 以上ならスキップする。
-        let row = sqlx::query("PRAGMA user_version")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-        let current_version = row
-            .try_get::<i64, _>("user_version")
-            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-
-        if current_version >= i64::from(SCHEMA_VERSION) {
-            info!(
-                "Schema already at version {} (user_version={}), skipping migrations",
-                SCHEMA_VERSION, current_version
-            );
-            tx.commit()
-                .await
-                .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-            return Ok(());
-        }
-
-        for migration in crate::schema::ALL_MIGRATIONS {
-            sqlx::raw_sql(*migration)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-        }
-
-        // metadata 列は CREATE_SESSION_INPUT_TABLE_WITH_METADATA に含まれている。
-        // 旧スキーマの DB だけに ALTER を適用する。SQLite のエラー文字列
-        // ("duplicate column name") を照合するのは版依存で脆いため、
-        // PRAGMA table_info で列の有無を構造的に判定する。
-        let input_columns = sqlx::query("PRAGMA table_info(session_input)")
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-        let has_metadata = input_columns.iter().any(|row| {
-            row.try_get::<String, _>("name")
-                .map(|name| name == "metadata")
-                .unwrap_or(false)
-        });
-
-        if !has_metadata {
-            sqlx::raw_sql(crate::schema::MIGRATE_SESSION_INPUT_METADATA)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-        }
-
-        // バージョン記録も同じトランザクションに含め、DDL と原子的に確定させる。
-        // 埋め込む値はコード内定数だけ（外部入力なし）なので監査済みとして扱う。
-        let set_version = format!("PRAGMA user_version = {SCHEMA_VERSION};");
-        sqlx::raw_sql(sqlx::AssertSqlSafe(set_version))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
-
-        Ok(())
+        // 単一の実装に委譲することで、Database 経路と Storage 経路の
+        // マイグレーション動作（user_version の確認・記録を含む）を完全に同一にする。
+        migrate_pool(&self.pool).await
     }
 
     fn get_database_path() -> Result<PathBuf, DatabaseError> {

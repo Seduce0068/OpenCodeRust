@@ -26,13 +26,10 @@ impl Storage {
     /// 以前は最小限の `sessions` テーブル（`id/title/time_created/time_updated`）
     /// だけを作る別経路だったため、`Database` 経由の DB とスキーマが食い違い、
     /// この DB に対して `SessionRepository` を使うと NOT NULL 列不足で失敗した。
-    /// スキーマ定義の単一ソースは `schema.rs` に統一する。
+    /// 現在は `database::migrate_pool` に委譲し、`Database::run_migrations` と
+    /// マイグレーション経路を完全に統一している（user_version の確認・記録含む）。
     pub async fn migrate(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        for migration in crate::schema::ALL_MIGRATIONS {
-            sqlx::raw_sql(*migration).execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
+        crate::database::migrate_pool(&self.pool).await?;
         Ok(())
     }
 }
@@ -96,6 +93,82 @@ mod tests {
             .expect("sqlite_master readable");
             assert_eq!(count, 1, "{table} table must exist");
         }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn migrate_records_user_version_like_database_path() {
+        let path = temp_db_path();
+        // Storage::new は mode=rwc を付けないため、事前ファイル作成が必要。
+        std::fs::write(&path, b"").expect("create temp db file");
+        let path_str = path.to_string_lossy().into_owned();
+        let storage = Storage::new(&path_str)
+            .await
+            .expect("storage connects to temp db");
+
+        storage.migrate().await.expect("migration succeeds");
+
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{path_str}"))
+            .await
+            .expect("reopen temp db");
+
+        // Database 経路と同じ SCHEMA_VERSION が Storage 経路でも記録される。
+        // これは両経路が database::migrate_pool を共有している直接的な証拠。
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("user_version readable");
+        assert_eq!(version, i64::from(crate::database::SCHEMA_VERSION));
+
+        // Database 経路のマイグレーションが補う metadata 列も同じく作られる。
+        let columns = column_names(&pool, "session_input").await;
+        assert!(
+            columns.contains(&"metadata".to_string()),
+            "session_input.metadata must exist after the unified migration"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn migrate_skips_when_user_version_is_current() {
+        let path = temp_db_path();
+        std::fs::write(&path, b"").expect("create temp db file");
+        let path_str = path.to_string_lossy().into_owned();
+        let storage = Storage::new(&path_str)
+            .await
+            .expect("storage connects to temp db");
+
+        storage.migrate().await.expect("first migration succeeds");
+
+        // 適用済みバージョンを進め、再実行で書き戻されないことを確認する。
+        // Database 経路と同じスキップ判定が効いている必要がある。
+        let advanced = i64::from(crate::database::SCHEMA_VERSION) + 1;
+        {
+            let mut conn = storage.pool.acquire().await.expect("acquire");
+            let sql = format!("PRAGMA user_version = {advanced};");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *conn)
+                .await
+                .expect("advance user_version");
+        }
+
+        storage.migrate().await.expect("second migration succeeds");
+
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{path_str}"))
+            .await
+            .expect("reopen temp db");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("user_version readable");
+        assert_eq!(
+            version, advanced,
+            "second run must not rewrite user_version"
+        );
 
         drop(pool);
         let _ = std::fs::remove_file(&path);
