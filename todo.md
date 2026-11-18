@@ -166,21 +166,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
-- [ ] **[H-19]** MCP OAuth が RFC 8707 resource インジケーターを送信しない
-  - `mcp/discovery.rs:38,68` / `oauth.rs:295`。resource をパースするだけで
-    認可リクエストへ渡さず confused deputy に無防備（confirmed）
-- [ ] **[H-21]** サブセッションが親の disabled_tools を継承しない
-  - `agent/executor.rs:439-477,498-500`。tool 引数の agent_name/model で別エージェントを
-    選べ、禁止ツールを迂回。深さ上限も無し（confirmed / R1-SV05）
-- [ ] **[H-22]** Anthropic SSE の content_block_stop でストリームを終了させる
-  - `provider/stream.rs:297-298`。複数ブロックの 2 個目以降が届かない。message_stop のみ
-    Done とし、ブロック終了は TextEnd 等へ（confirmed / R1-SV03）
-- [ ] **[H-23]** Anthropic ツール入力デルタが常に空 ID で発行される
-  - `provider/stream.rs:279-283`。index→id 状態マップを持ち tool_use を対応付ける（confirmed）
-- [ ] **[H-25]** LSP の JSON-RPC 読み取りが Content-Length を使わない
-  - `lsp/lib.rs:233-259`。lines() で 1 行ずつ読み整形済み JSON や複数メッセージで
-    フレーミングが壊れ 30 秒 Timeout。ヘッダー＋read_exact 方式へ（confirmed）
-
 ### 優先度: 中（残タスク調査で追加）
 
 - [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
@@ -242,6 +227,10 @@ status: current
 
 ## 完了
 
+- [x] **[H-19]** MCP OAuth に RFC 8707 resource を追加（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-21]** サブセッションへ disabled_tools を継承（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-22/H-23]** Anthropic SSE を状態付きパーサへ変更（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-25]** LSP を Content-Length フレーミングへ変更（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-16]** NetworkErrorWithSource をリトライ判定へ追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-17]** env 展開を JSON 文字列として安全に挿入（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-18]** MCP initialized を notification 送信へ変更（2026-11-19、swarm-coding R1-R6）
@@ -401,6 +390,13 @@ status: current
 
 ## メモ
 
+- H-19/H-21/H-22/H-23/H-25 の残存（2026-11-19、swarm-coding R2/R5 が申告、未修正）:
+  - `anthropic.rs` は bytes chunk 単位で `lines()` を切るため SSE フレームが chunk を
+    またぐと取りこぼす。今回は現状維持（従来と同等の空 TextDelta プレースホルダ）。
+  - サブセッションの深さ上限は未実装。`SubsectionState` への depth 追加と
+    ポリシー決定が必要なため提案のみ（禁止ツールの伝播は union で維持）。
+  - OAuth `refresh_token()` のトークンリクエストにも RFC 8707 の resource を付与すべき
+    （今回は start_auth / finish_auth のみ対応）。resource の永続化も未対応。
 - `is_retryable` と `parse_api_call_error` の既存差異（2026-11-19、swarm-coding R4 が発見、
   却下）: openai 系 `ApiErrorWithStatus(404)` は is_retryable 側が非対象
   （429/500/502/503/504 のみ）とし parse 側が retryable=true とするが、
