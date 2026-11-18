@@ -133,3 +133,220 @@ impl Default for ConfirmDialog {
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        // ratatui-core の Buffer は Display を実装しないため cell() で走査する。
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    // --- new / Default ---
+
+    #[test]
+    fn new_stores_title_message_defaults_and_starts_closed() {
+        let dialog = ConfirmDialog::new("Delete?", "Are you sure?");
+
+        assert_eq!(dialog.title, "Delete?");
+        assert_eq!(dialog.message, "Are you sure?");
+        assert_eq!(dialog.confirm_text, "Confirm");
+        assert_eq!(dialog.cancel_text, "Cancel");
+        assert!(!dialog.is_open());
+        assert!(!dialog.is_confirm());
+    }
+
+    #[test]
+    fn default_matches_new_with_confirm_title() {
+        let dialog = ConfirmDialog::default();
+
+        assert_eq!(dialog.title, "Confirm");
+        assert_eq!(dialog.message, "Are you sure?");
+        assert_eq!(dialog.confirm_text, "Confirm");
+        assert_eq!(dialog.cancel_text, "Cancel");
+        assert!(!dialog.is_open());
+        assert!(!dialog.is_confirm());
+    }
+
+    // --- open / close / is_open ---
+
+    #[test]
+    fn open_sets_open_state_resets_focus_and_preserves_data() {
+        let mut dialog = ConfirmDialog::new("Delete?", "Are you sure?");
+        dialog.toggle_focus();
+        assert!(dialog.is_confirm());
+
+        dialog.open();
+
+        assert!(dialog.is_open());
+        assert!(!dialog.is_confirm(), "open must reset focus to cancel");
+        assert_eq!(dialog.title, "Delete?");
+        assert_eq!(dialog.message, "Are you sure?");
+        assert_eq!(dialog.confirm_text, "Confirm");
+        assert_eq!(dialog.cancel_text, "Cancel");
+    }
+
+    #[test]
+    fn close_clears_open_state_and_preserves_data_and_focus() {
+        let mut dialog = ConfirmDialog::new("Delete?", "Are you sure?");
+        dialog.open();
+        dialog.toggle_focus();
+        assert!(dialog.is_confirm());
+
+        dialog.close();
+
+        assert!(!dialog.is_open());
+        assert!(dialog.is_confirm(), "close must not change focus");
+        assert_eq!(dialog.title, "Delete?");
+        assert_eq!(dialog.message, "Are you sure?");
+        assert_eq!(dialog.confirm_text, "Confirm");
+        assert_eq!(dialog.cancel_text, "Cancel");
+    }
+
+    #[test]
+    fn open_close_cycles_toggle_state() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+
+        for _ in 0..3 {
+            dialog.open();
+            assert!(dialog.is_open());
+            dialog.close();
+            assert!(!dialog.is_open());
+        }
+        assert_eq!(dialog.title, "Title");
+        assert_eq!(dialog.message, "Message");
+    }
+
+    #[test]
+    fn close_is_idempotent_from_new() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+
+        dialog.close();
+        dialog.close();
+
+        assert!(!dialog.is_open());
+        assert_eq!(dialog.title, "Title");
+    }
+
+    #[test]
+    fn open_is_idempotent() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+
+        dialog.open();
+        dialog.open();
+
+        assert!(dialog.is_open());
+        assert!(!dialog.is_confirm());
+    }
+
+    // --- toggle_focus / is_confirm / handle_left / handle_right ---
+
+    #[test]
+    fn toggle_focus_alternates_confirm_state() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+
+        assert!(!dialog.is_confirm());
+        dialog.toggle_focus();
+        assert!(dialog.is_confirm());
+        dialog.toggle_focus();
+        assert!(!dialog.is_confirm());
+        dialog.toggle_focus();
+        assert!(dialog.is_confirm());
+    }
+
+    #[test]
+    fn toggle_focus_preserves_open_state_and_data() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+        dialog.open();
+
+        dialog.toggle_focus();
+
+        assert!(dialog.is_open());
+        assert!(dialog.is_confirm());
+        assert_eq!(dialog.title, "Title");
+        assert_eq!(dialog.message, "Message");
+    }
+
+    #[test]
+    fn handle_left_selects_cancel_and_handle_right_selects_confirm() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+        dialog.open();
+        dialog.toggle_focus();
+        assert!(dialog.is_confirm());
+
+        dialog.handle_left();
+        assert!(!dialog.is_confirm(), "left must focus cancel");
+        assert!(dialog.is_open(), "focus change must not close dialog");
+
+        dialog.handle_right();
+        assert!(dialog.is_confirm(), "right must focus confirm");
+        assert!(dialog.is_open());
+    }
+
+    #[test]
+    fn handle_left_right_are_idempotent() {
+        let mut dialog = ConfirmDialog::new("Title", "Message");
+        dialog.open();
+
+        dialog.handle_left();
+        dialog.handle_left();
+        assert!(!dialog.is_confirm());
+
+        dialog.handle_right();
+        dialog.handle_right();
+        assert!(dialog.is_confirm());
+    }
+
+    // --- render ---
+
+    #[test]
+    fn render_when_closed_draws_nothing() {
+        let dialog = ConfirmDialog::new("Hidden", "Hidden message");
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.trim().is_empty(),
+            "closed confirm dialog must not draw any content"
+        );
+    }
+
+    #[test]
+    fn render_when_open_shows_title_message_and_buttons() {
+        let mut dialog = ConfirmDialog::new("Delete?", "Remove this item?");
+        dialog.open();
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("Delete?"), "dialog title");
+        assert!(text.contains("Remove this item?"), "message body");
+        assert!(text.contains("Confirm"), "confirm button label");
+        assert!(text.contains("Cancel"), "cancel button label");
+    }
+}
