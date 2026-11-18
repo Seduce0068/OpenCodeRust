@@ -182,3 +182,229 @@ impl Default for SlashCommandPopup {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stable (sorted) view of the built-in suggested command names.
+    fn suggested_names() -> Vec<String> {
+        let mut names: Vec<String> = CommandRegistry::new()
+            .suggested_commands()
+            .iter()
+            .map(|cmd| cmd.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn sorted(names: &[String]) -> Vec<String> {
+        let mut names = names.to_vec();
+        names.sort();
+        names
+    }
+
+    // --- new / Default ---
+
+    #[test]
+    fn new_starts_closed_with_empty_state() {
+        let popup = SlashCommandPopup::new();
+
+        assert!(!popup.is_open());
+        assert_eq!(popup.query(), "");
+        assert!(popup.filtered.is_empty());
+        assert_eq!(popup.state.selected(), None);
+        assert!(popup.selected_action.is_none());
+    }
+
+    #[test]
+    fn default_matches_new_initial_state() {
+        let new = SlashCommandPopup::new();
+        let default = SlashCommandPopup::default();
+
+        assert!(!default.is_open());
+        assert_eq!(default.query(), new.query());
+        assert_eq!(default.filtered, new.filtered);
+        assert_eq!(default.state.selected(), new.state.selected());
+        assert!(default.selected_action.is_none());
+    }
+
+    // --- open / is_open ---
+
+    #[test]
+    fn open_sets_open_state_and_lists_suggested_commands() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+
+        assert!(popup.is_open());
+        assert_eq!(popup.query(), "");
+        assert_eq!(sorted(&popup.filtered), suggested_names());
+        assert_eq!(popup.state.selected(), Some(0));
+        assert!(popup.selected_action.is_none());
+    }
+
+    #[test]
+    fn open_resets_previous_query_filter_and_action() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+
+        for c in "new".chars() {
+            popup.handle_input(c);
+        }
+        popup.selected_action = Some(CommandAction::Exit);
+        assert_ne!(popup.query(), "");
+
+        popup.open();
+
+        assert!(popup.is_open());
+        assert_eq!(popup.query(), "");
+        assert_eq!(sorted(&popup.filtered), suggested_names());
+        assert_eq!(popup.state.selected(), Some(0));
+        assert!(popup.selected_action.is_none());
+    }
+
+    // --- close ---
+
+    #[test]
+    fn close_clears_open_query_and_filter() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        popup.handle_input('n');
+
+        popup.close();
+
+        assert!(!popup.is_open());
+        assert_eq!(popup.query(), "");
+        assert!(popup.filtered.is_empty());
+    }
+
+    #[test]
+    fn close_is_idempotent_from_new() {
+        let mut popup = SlashCommandPopup::new();
+
+        popup.close();
+
+        assert!(!popup.is_open());
+        assert_eq!(popup.query(), "");
+        assert!(popup.filtered.is_empty());
+    }
+
+    // --- query / filtering ---
+
+    #[test]
+    fn handle_input_updates_query_and_filters_by_name() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+
+        for c in "new".chars() {
+            popup.handle_input(c);
+        }
+
+        assert_eq!(popup.query(), "new");
+        assert!(!popup.filtered.is_empty());
+        assert!(popup.filtered.contains(&"/new".to_string()));
+        assert!(!popup.filtered.contains(&"/exit".to_string()));
+        assert_eq!(popup.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn handle_input_with_no_match_empties_filter() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        assert!(!popup.filtered.is_empty());
+
+        for c in "qqqq".chars() {
+            popup.handle_input(c);
+        }
+
+        assert_eq!(popup.query(), "qqqq");
+        assert!(popup.filtered.is_empty());
+    }
+
+    #[test]
+    fn handle_backspace_restores_previous_filter() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let suggested = popup.filtered.clone();
+
+        popup.handle_input('z');
+        assert_eq!(popup.query(), "z");
+
+        assert!(popup.handle_backspace());
+        assert_eq!(popup.query(), "");
+        assert_eq!(sorted(&popup.filtered), sorted(&suggested));
+    }
+
+    #[test]
+    fn handle_backspace_on_empty_query_returns_false() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let suggested = popup.filtered.clone();
+
+        assert!(!popup.handle_backspace());
+        assert_eq!(popup.query(), "");
+        assert_eq!(sorted(&popup.filtered), sorted(&suggested));
+    }
+
+    // --- take_action / selection ---
+
+    #[test]
+    fn take_action_returns_action_once_then_clears() {
+        let mut popup = SlashCommandPopup::new();
+        assert!(popup.take_action().is_none());
+
+        popup.selected_action = Some(CommandAction::ShowHelp);
+
+        let action = popup.take_action().expect("selected action");
+        assert!(matches!(action, CommandAction::ShowHelp));
+        assert!(popup.selected_action.is_none());
+        assert!(popup.take_action().is_none());
+    }
+
+    #[test]
+    fn select_current_sets_action_and_closes_popup() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+
+        let name = popup.filtered[0].clone();
+        let expected = popup
+            .registry
+            .get(&name)
+            .expect("selected command exists")
+            .action
+            .clone();
+
+        popup.select_current();
+
+        assert!(!popup.is_open());
+        let action = popup
+            .take_action()
+            .expect("action captured by select_current");
+        assert_eq!(format!("{:?}", action), format!("{:?}", expected));
+    }
+
+    #[test]
+    fn navigation_clamps_to_filter_bounds() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let last = popup.filtered.len().saturating_sub(1);
+        assert!(
+            last >= 1,
+            "built-in registry should expose several suggestions"
+        );
+
+        popup.move_down();
+        assert_eq!(popup.state.selected(), Some(1));
+        for _ in 0..last + 2 {
+            popup.move_down();
+        }
+        assert_eq!(popup.state.selected(), Some(last));
+
+        popup.move_up();
+        assert_eq!(popup.state.selected(), Some(last - 1));
+        for _ in 0..last + 2 {
+            popup.move_up();
+        }
+        assert_eq!(popup.state.selected(), Some(0));
+    }
+}

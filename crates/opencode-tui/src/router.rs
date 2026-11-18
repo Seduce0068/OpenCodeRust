@@ -42,7 +42,7 @@ impl Router {
 
     pub fn navigate(&mut self, route: Route) {
         if self.current != route {
-            self.history.push(self.current.clone());
+            self.history.push(route.clone());
             self.current = route;
         }
     }
@@ -71,5 +71,165 @@ impl Router {
             Route::Session { session_id } => Some(session_id),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str) -> Route {
+        Route::Session {
+            session_id: id.to_string(),
+        }
+    }
+
+    // --- Route ---
+
+    #[test]
+    fn route_default_is_home() {
+        assert_eq!(Route::default(), Route::Home);
+    }
+
+    #[test]
+    fn route_display_formats_all_variants() {
+        assert_eq!(Route::Home.to_string(), "Home");
+        assert_eq!(session("abc-123").to_string(), "Session: abc-123");
+        assert_eq!(Route::Settings.to_string(), "Settings");
+        assert_eq!(Route::Help.to_string(), "Help");
+    }
+
+    // --- Router::new / current / is_home / is_session ---
+
+    #[test]
+    fn router_new_starts_at_home_with_home_in_history() {
+        let router = Router::new();
+
+        assert_eq!(router.current(), &Route::Home);
+        assert_eq!(router.history, [Route::Home]);
+        assert!(router.is_home());
+        assert!(!router.is_session());
+        assert_eq!(router.session_id(), None);
+    }
+
+    #[test]
+    fn router_default_current_is_home() {
+        let router = Router::default();
+
+        assert_eq!(router.current(), &Route::Home);
+        assert!(router.is_home());
+    }
+
+    // --- Router::navigate ---
+
+    #[test]
+    fn router_navigate_updates_current_and_records_history() {
+        let mut router = Router::new();
+        router.navigate(session("s-1"));
+
+        assert_eq!(router.current(), &session("s-1"));
+        assert!(router.is_session());
+        assert!(!router.is_home());
+        assert_eq!(router.session_id(), Some("s-1"));
+        assert_eq!(router.history, [Route::Home, session("s-1")]);
+    }
+
+    #[test]
+    fn router_navigate_to_same_route_is_no_op() {
+        let mut router = Router::new();
+        router.navigate(Route::Home);
+        assert_eq!(router.history, [Route::Home]);
+
+        router.navigate(session("same"));
+        router.navigate(session("same"));
+
+        assert_eq!(router.current(), &session("same"));
+        assert_eq!(router.history, [Route::Home, session("same")]);
+        assert!(router.go_back());
+        assert!(router.is_home());
+        assert!(!router.go_back());
+    }
+
+    // --- Router::go_back ---
+
+    #[test]
+    fn router_go_back_from_home_returns_false() {
+        let mut router = Router::new();
+
+        assert!(!router.go_back());
+        assert_eq!(router.current(), &Route::Home);
+        assert_eq!(router.history, [Route::Home]);
+    }
+
+    #[test]
+    fn router_go_back_restores_previous_route_and_returns_true() {
+        let mut router = Router::new();
+        router.navigate(session("s-1"));
+        router.navigate(Route::Settings);
+
+        assert_eq!(router.current(), &Route::Settings);
+        assert!(router.go_back());
+        assert_eq!(router.current(), &session("s-1"));
+        assert!(router.is_session());
+        assert_eq!(router.session_id(), Some("s-1"));
+    }
+
+    #[test]
+    fn router_go_back_walks_full_history_then_stops_at_home() {
+        let mut router = Router::new();
+        router.navigate(session("s-1"));
+        router.navigate(Route::Help);
+        router.navigate(Route::Settings);
+
+        assert!(router.go_back());
+        assert_eq!(router.current(), &Route::Help);
+        assert!(router.go_back());
+        assert_eq!(router.current(), &session("s-1"));
+        assert!(router.go_back());
+        assert_eq!(router.current(), &Route::Home);
+        assert!(router.is_home());
+        assert!(!router.go_back());
+        assert_eq!(router.history, [Route::Home]);
+    }
+
+    // --- is_home / is_session across route kinds ---
+
+    #[test]
+    fn router_flags_are_mutually_exclusive_across_route_kinds() {
+        let mut router = Router::new();
+        assert!(router.is_home());
+        assert!(!router.is_session());
+
+        router.navigate(session("s-1"));
+        assert!(!router.is_home());
+        assert!(router.is_session());
+
+        router.navigate(Route::Settings);
+        assert!(!router.is_home());
+        assert!(!router.is_session());
+        assert_eq!(router.session_id(), None);
+
+        router.navigate(Route::Help);
+        assert!(!router.is_home());
+        assert!(!router.is_session());
+
+        router.navigate(Route::Home);
+        assert!(router.is_home());
+        assert!(!router.is_session());
+    }
+
+    #[test]
+    fn router_session_id_tracks_only_the_current_session_route() {
+        let mut router = Router::new();
+        assert_eq!(router.session_id(), None);
+
+        router.navigate(session("session-42"));
+        assert_eq!(router.session_id(), Some("session-42"));
+
+        router.navigate(Route::Settings);
+        assert_eq!(router.session_id(), None);
+
+        assert!(router.go_back());
+        assert_eq!(router.session_id(), Some("session-42"));
     }
 }
