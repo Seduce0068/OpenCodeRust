@@ -11,9 +11,11 @@ impl fmt::Display for PtyID {
     }
 }
 
-/// セッションを識別する文字列ベースの ID。SQLx では透明型として扱われる。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(transparent)]
+/// セッションを識別する文字列ベースの ID。
+///
+/// DB へのバインドは storage 側で `.0`（`String`）を直接使用するため、
+/// ここでは SQLx のトレイトを実装しない。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionID(pub String);
 
 impl fmt::Display for SessionID {
