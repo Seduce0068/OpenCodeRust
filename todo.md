@@ -213,6 +213,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-45 フォロー]** 残り 5 ハンドラの 501 化と CLI/TUI の整理
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-44 一部]** 復元時 total_cost を 0.0 に修正（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-45]** 未実装 14 ハンドラを 501 化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-50 一部]** retry-after に RETRY_MAX_DELAY を適用（2026-11-19、swarm-coding R1-R6）
@@ -383,10 +385,11 @@ status: current
 ## メモ
 
 - M-44/M-45/M-50 の残存（2026-11-19、swarm-coding R4 が指摘）:
-  - CLI 統計（`opencode-cli/src/main.rs:2377,2409`）は total_cost += input + output
-    の placeholder のまま。サーバ復元側は 0.0 に修正済みだが diff 外のため未対応。
-  - 固定値ハンドラ list_commands / get_global_config / list_tool_ids / list_tools /
-    get_doc は 501 化していない（受け入れ条件の列挙外）。
+  - 2026-11-19 対応済み: CLI 統計の placeholder を撤去し Cost unavailable 表示へ、
+    固定値ハンドラ 5 件（list_commands / get_global_config / list_tool_ids /
+    list_tools / get_doc）も 501 化済み。TUI 旧レスポンス型も削除。
+  - 残存: 実コスト表示には TokenUsage への total_cost 追加と storage/session の
+    書き込み経路変更が必要（スキーマ変更、別タスク）。
   - 新規 501 テストはハンドラ直接呼び出しで、router() を通す HTTP 層の検証は未実施。
   - summary/metadata の永続化はスキーマ変更を伴うため別タスク。
 - M-43 の残存（2026-11-19、swarm-coding R4 が指摘、却下/未修正）:
