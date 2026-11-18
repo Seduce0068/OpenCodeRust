@@ -294,6 +294,8 @@ status: current
 - [x] **[M-11 一部]** opencode-types 4 ファイルに 16 テスト（2026-11-18、types-data-test-worker）
 - [x] **[M-11 一部]** plugin/subprocess/auth.rs に 10 テスト（2026-11-18、plugin-auth-test-worker）
 - [x] **[M-11 一部]** tool/edit/mod.rs に 7 テスト（2026-11-18、edit-test-worker）
+- [x] **[M-11 一部]** provider/message.rs に 14 テスト（2026-11-18、provider-message-test-worker）
+- [x] **[M-11 一部]** plugin/subprocess/runtime.rs に 6 テスト（2026-11-18、runtime-test-worker）
 
 ## メモ
 

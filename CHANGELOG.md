@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T17:34:33+09:00"
+  at: "2026-11-18T17:59:14+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1242 件
+  テスト総数 594 → 1262 件
 
 ### Changed
 
@@ -42,8 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 39.08% を計測
-  （opencode-types のテスト追加で初の 39% 台）
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 39.19% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -250,6 +249,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subprocess spawn なし、ダミー値のみ）(M-11)
 - `opencode-tool`: edit/mod.rs に 7 テストを追加（unified diff・trim_diff・
   改行正規化、既存 replacers テストと非重複）(M-11)
+- `opencode-provider`: message.rs に 14 テストを追加（serde 往復・wire format・
+  deserialize_content フォールバック。`ChatRequest.provider_options` の
+  snake_case は意図的設計と確認）(M-11)
+- `opencode-plugin`: subprocess/runtime.rs に 6 テストを追加（JS ランタイムの
+  コマンド/引数、PATH 検索の整合性。外部プロセス起動なし）(M-11)
+- convert.rs は未配線スタブであることを再確認（PromptPart 未定義のため配線即
+  compile error）。テスト追加を見送り差分ゼロ (M-11)
 
 ## [0.1.0]
 
