@@ -626,7 +626,9 @@ pub enum McpProtocol {
     /// Speak up to protocol revision 2025-11-25 (default).
     #[default]
     Legacy,
-    /// Probe for 2026-07-28 and fall back to legacy.
+    /// Intended to probe for 2026-07-28 and fall back to legacy, but the
+    /// probe/fallback is not implemented: `revision()` currently returns the
+    /// same legacy revision as [`McpProtocol::Legacy`].
     Auto,
     /// Require protocol revision 2026-07-28.
     #[serde(rename = "2026-07-28")]
@@ -635,6 +637,10 @@ pub enum McpProtocol {
 
 impl McpProtocol {
     /// The protocol revision string to send in `initialize`.
+    ///
+    /// [`McpProtocol::Auto`] currently returns the legacy revision, because
+    /// the capability-negotiation probe/fallback is not implemented. Only an
+    /// explicit [`McpProtocol::V20260728`] selects the newer revision.
     pub fn revision(&self) -> &'static str {
         match self {
             McpProtocol::Legacy | McpProtocol::Auto => "2025-11-25",
@@ -1856,6 +1862,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_protocol_revision_legacy_and_auto_share_legacy_revision() {
+        assert_eq!(McpProtocol::Legacy.revision(), "2025-11-25");
+        assert_eq!(McpProtocol::Auto.revision(), "2025-11-25");
+        assert_eq!(McpProtocol::V20260728.revision(), "2026-07-28");
+    }
 
     #[test]
     fn merges_nested_structs_without_losing_existing_fields() {
