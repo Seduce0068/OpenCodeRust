@@ -311,6 +311,8 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI confirm(13)・session_rename(20)・tag(28)・session_text(9)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI fork(18)・prompt_stash(27)・code_block(13)・command_palette(30)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 

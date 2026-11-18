@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T21:30:08+09:00"
+  at: "2026-11-18T21:51:14+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1539 件
+  テスト総数 594 → 1627 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 41.21% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 42.45% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -276,6 +276,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   に 40 テストを追加（swarm-coding R1-R6、R5 で unused_assignments を修正）(M-11)
 - `opencode-tui`: confirm(13) / session_rename(20) / tag(28) / session_text(9) に
   70 テストを追加（swarm-coding R1-R6、R5 で tag の選択前提を修正）(M-11)
+- `opencode-tui`: fork(18) / prompt_stash(27) / code_block(13) / command_palette(30)
+  に 88 テストを追加（swarm-coding R1-R6）(M-11)
 
 ## [0.1.0]
 
