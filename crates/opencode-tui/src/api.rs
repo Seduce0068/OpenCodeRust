@@ -284,6 +284,40 @@ struct UnsharedResponse {
     unshared: bool,
 }
 
+/// サーバが 501 Not Implemented を返した操作を表す型付きエラー。
+///
+/// TUI 側で `anyhow::Error::downcast_ref` により、通信失敗（500 等）ではなく
+/// 「この機能はサーバで利用不可」であるを識別するために使用する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedEndpointError {
+    /// 501 を返した操作名（例: `"skill list"`）。
+    pub operation: &'static str,
+}
+
+impl std::fmt::Display for UnsupportedEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is not supported by the server (501 Not Implemented)",
+            self.operation
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedEndpointError {}
+
+/// レスポンスが 501 Not Implemented かどうかを判定する純粋関数。
+///
+/// HTTP 通信を行わないため、単体テストで直接検証できる。
+fn is_not_implemented(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_IMPLEMENTED
+}
+
+/// 501 用の型付きエラーを構築する。
+fn unsupported(operation: &'static str) -> anyhow::Error {
+    anyhow::Error::new(UnsupportedEndpointError { operation })
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -465,8 +499,13 @@ impl ApiClient {
         let request = ExecuteShellRequest { command, workdir };
         let response = self.client.post(&url).json(&request).send()?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if is_not_implemented(status) {
+            // 501 = 明示的な unsupported。シェル実行は空結果へフォールバックできないため、
+            // 型付きエラーとして呼び出し側へ「利用不可」を伝える。
+            return Err(unsupported("shell execution"));
+        }
+        if !status.is_success() {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to execute shell command: {} - {}", status, text);
         }
@@ -521,8 +560,13 @@ impl ApiClient {
         let url = format!("{}/skill", self.base_url);
         let response = self.client.get(&url).send()?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if is_not_implemented(status) {
+            // 501 = 明示的な unsupported。一覧自体は空だが、TUI が「スキルなし」と
+            // 「機能自体が利用不可」を区別できるよう型付きエラーで伝える。
+            return Err(unsupported("skill list"));
+        }
+        if !status.is_success() {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to list skills: {} - {}", status, text);
         }
@@ -636,10 +680,14 @@ impl ApiClient {
     pub fn get_lsp_servers(&self) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/lsp", self.base_url);
         let response = self.client.get(&url).send()?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let http_status = response.status();
+        if is_not_implemented(http_status) {
+            // 501 = 明示的な unsupported。一覧系は空結果へフォールバックする。
+            return Ok(Vec::new());
+        }
+        if !http_status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get LSP status: {} - {}", status, text);
+            anyhow::bail!("Failed to get LSP status: {} - {}", http_status, text);
         }
         let status = response.json::<LspStatusResponse>()?;
         Ok(status.servers)
@@ -648,10 +696,14 @@ impl ApiClient {
     pub fn get_formatters(&self) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/formatter", self.base_url);
         let response = self.client.get(&url).send()?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let http_status = response.status();
+        if is_not_implemented(http_status) {
+            // 501 = 明示的な unsupported。一覧系は空結果へフォールバックする。
+            return Ok(Vec::new());
+        }
+        if !http_status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get formatter status: {} - {}", status, text);
+            anyhow::bail!("Failed to get formatter status: {} - {}", http_status, text);
         }
         let status = response.json::<FormatterStatusResponse>()?;
         Ok(status.formatters)
@@ -1539,5 +1591,46 @@ mod tests {
             serde_json::from_value::<UnsharedResponse>(json!({})).is_err(),
             "missing `unshared` must fail"
         );
+    }
+
+    // --- 501 (NOT_IMPLEMENTED) を unsupported として扱う（HTTP 通信なし） ---
+
+    #[test]
+    fn is_not_implemented_matches_only_501() {
+        assert!(is_not_implemented(reqwest::StatusCode::NOT_IMPLEMENTED));
+
+        // 501 以外は unsupported と判定しない（500 等は従来どおり bail する）。
+        assert!(!is_not_implemented(reqwest::StatusCode::OK));
+        assert!(!is_not_implemented(reqwest::StatusCode::NO_CONTENT));
+        assert!(!is_not_implemented(reqwest::StatusCode::NOT_FOUND));
+        assert!(!is_not_implemented(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!is_not_implemented(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!is_not_implemented(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    #[test]
+    fn unsupported_error_is_typed_downcastable_and_descriptive() {
+        let err: anyhow::Error = unsupported("skill list");
+
+        let typed = err
+            .downcast_ref::<UnsupportedEndpointError>()
+            .expect("unsupported() must produce a downcastable typed error");
+        assert_eq!(typed.operation, "skill list");
+
+        let message = err.to_string();
+        assert!(message.contains("skill list"), "message: {message}");
+        assert!(message.contains("not supported"), "message: {message}");
+        assert!(
+            message.contains("501 Not Implemented"),
+            "message: {message}"
+        );
+
+        // 一般エラー（500 等）は型付きエラーへ誤ってダウンキャストされない。
+        let generic = anyhow::anyhow!("Failed to list skills: 500 - boom");
+        assert!(generic.downcast_ref::<UnsupportedEndpointError>().is_none());
     }
 }

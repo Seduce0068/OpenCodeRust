@@ -608,7 +608,10 @@ impl ServerState {
                     reasoning_tokens: u.reasoning as u64,
                     cache_write_tokens: u.cache.write as u64,
                     cache_read_tokens: u.cache.read as u64,
-                    total_cost: u.input + u.output,
+                    // M-44: 永続化された input/output はトークン数でありコストではない。
+                    // 復元時にトークン数を total_cost として誤表示しないよう 0.0 で初期化する。
+                    // 実コストの永続化はスキーマ変更を伴うため本次スコープ外。
+                    total_cost: 0.0,
                 }),
                 status: match stored.status {
                     opencode_types::SessionStatus::Active => {
@@ -1215,6 +1218,73 @@ mod tests {
         assert_eq!(session.messages[1].created_at, assistant_created_at);
         assert_eq!(session.messages[0].get_text(), "hello");
         assert_eq!(session.messages[1].get_text(), "world");
+    }
+
+    #[tokio::test]
+    async fn storage_restore_sets_total_cost_to_zero() {
+        // M-44: 復元時に input/output のトークン数が total_cost として
+        // 誤設定されないことを検証する回帰テスト。
+        let db = Database::in_memory()
+            .await
+            .expect("in-memory db should initialize");
+        let pool = db.pool().clone();
+        let session_repo = SessionRepository::new(pool.clone());
+
+        let state = state_with_repos(
+            SessionRepository::new(pool.clone()),
+            MessageRepository::new(pool.clone()),
+        );
+        let session_id = {
+            let mut manager = state.sessions.lock().await;
+            manager.create("default", ".").id
+        };
+
+        state
+            .sync_sessions_to_storage()
+            .await
+            .expect("initial snapshot should sync");
+
+        // 永続化表現 (opencode_types::TokenUsage) に非ゼロのトークン数を設定する。
+        // opencode_session::SessionUsage とフィールド名が異なるため、
+        // リポジトリ経由で直接書き込む (実ユーザー DB は使わない)。
+        {
+            let mut stored = session_repo
+                .get(&session_id)
+                .await
+                .expect("get should succeed")
+                .expect("stored session should exist");
+            stored.usage = Some(opencode_types::TokenUsage {
+                input: 150.0,
+                output: 75.0,
+                reasoning: 0.0,
+                cache: opencode_types::CacheUsage {
+                    read: 0.0,
+                    write: 0.0,
+                },
+            });
+            session_repo
+                .update(&stored)
+                .await
+                .expect("update should succeed");
+        }
+
+        let reloaded = state_with_repos(
+            SessionRepository::new(pool.clone()),
+            MessageRepository::new(pool),
+        );
+        reloaded
+            .load_sessions_from_storage()
+            .await
+            .expect("sessions should reload from storage");
+
+        let manager = reloaded.sessions.lock().await;
+        let session = manager
+            .get(&session_id)
+            .expect("session should exist after reload");
+        let usage = session.usage.as_ref().expect("usage should be restored");
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 75);
+        assert_eq!(usage.total_cost, 0.0);
     }
 
     #[tokio::test]
