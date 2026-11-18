@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T09:57:09+09:00"
+  at: "2026-11-18T10:30:15+09:00"
 ---
 
 # Changelog
@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.91% を計測
-  （前回 36.93% から計測揺らぎの範囲で微減）
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.12% を計測
+  （未配線 dead code 削除で分母が減り、初めて 37% 台に到達）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -175,6 +175,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   解放後に呼び出すよう変更（順序保証なしの性质は不変）(L-01)
 - `MAPPING.md`: MCP list_changed が tools のみ対応で resources/prompts は
   debug ログのみであることを明記 (L-02)
+- Cargo: version/edition/authors/license を直書きしていた 7 クレートを workspace
+  継承へ統一（値は不変、Cargo.lock の実依存変更なし）(M-15)
+- `opencode-cli`: 起動時の `fmt::init()` を `opencode_util::init_tracing` へ置換し、
+  `config.logLevel` を実効化（RUST_LOG より優先、実 CLI で確認）(L-04)
+- `opencode-session`/`opencode-tui`: 未配線の `process_response` と自作 markdown
+  パーサ 6 関数（計約 400 行）と dead_code 抑制を削除 (L-03)
 
 ## [0.1.0]
 
