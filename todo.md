@@ -166,10 +166,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
-- [ ] **[H-15]** multiedit が権限確認なしでファイルを直接書き込む（critical）
-  - `tool/multiedit.rs:97,98,139` は `is_external_path` / `ask_permission` /
-    `do_file_time_assert` を一切呼ばず `base_path.join` へ直接 `fs::write`。edit/tool.rs
-    にはある。絶対パスでプロジェクト外を承認なしに上書き可能（confirmed / R1-SV04）
 - [ ] **[H-16]** NetworkErrorWithSource が再試行判定から漏れる
   - `provider.rs:109-113` は WithSource を retryable と判定するが
     `parse_api_call_error`（`:248-255`）は `NetworkError(_)` のみ拾い
@@ -194,9 +190,6 @@ status: current
     Done とし、ブロック終了は TextEnd 等へ（confirmed / R1-SV03）
 - [ ] **[H-23]** Anthropic ツール入力デルタが常に空 ID で発行される
   - `provider/stream.rs:279-283`。index→id 状態マップを持ち tool_use を対応付ける（confirmed）
-- [ ] **[H-24]** WebFetch が URL の http/https プレフィックスしか検証しない
-  - `tool/webfetch.rs:83,237,242`。127.0.0.1 / 169.254.169.254 等への SSRF が可能。
-    URL 解析＋IP 範囲拒否＋リダイレクト再検証（confirmed / R1-SV04）
 - [ ] **[H-25]** LSP の JSON-RPC 読み取りが Content-Length を使わない
   - `lsp/lib.rs:233-259`。lines() で 1 行ずつ読み整形済み JSON や複数メッセージで
     フレーミングが壊れ 30 秒 Timeout。ヘッダー＋read_exact 方式へ（confirmed）
@@ -259,11 +252,14 @@ status: current
   - `tui/api.rs:404,575,589,600,671`。削除・切断・認証解除の失敗が隠れる（confirmed）
 - [ ] **[M-53]** UTF-8 境界を無視したバイトスライスが多バイト文字で panic
   - `tool/read.rs:377-378` / `truncation.rs:50-53`。外部ファイル内容で再現可能な DoS（confirmed）
-- [ ] **[M-54]** multiedit / apply_patch Move で外部パス検証と file_time_assert が欠落
-  - `apply_patch.rs:106-109,212-222`。競合編集検出も不可（confirmed / R1-SV04）
 
 ## 完了
 
+- [x] **[H-15]** multiedit に権限確認（external_directory/edit/file_time_assert/
+  with_file_lock）を追加（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-54]** apply_patch Move の移送先検証を追加（2026-11-19、swarm-coding R1-R6）
+- [x] **[H-24]** WebFetch の SSRF 対策（IP 範囲・DNS 解決・リダイレクト再検証）
+  （2026-11-19、swarm-coding R1-R6）
 - [x] `todo.md` をプロジェクト内へ配置（2026-11-17）
 - [x] プロジェクト全体クロスレビュー 5 回＋第 6 回統合（2026-11-17）
 - [x] 残タスク・機能追加案の調査 5 回＋第 6 回重複吸収（2026-11-17）
@@ -414,6 +410,13 @@ status: current
 
 ## メモ
 
+- H-24/H-15/M-54 の残存リスク（2026-11-19、swarm-coding R4/R5）:
+  - DNS rebinding（WebFetch の検証時と実際の接続時で DNS 解決が別）は既知残存。
+  - パス検証と書込みの間の TOCTOU（symlink 差し替え）は残存。R4 指摘は却下
+    （検証時点の canonical パスを使う現設計で、完全対策には書込み直前の再検証が必要）。
+  - apply_patch の Add の移送元は `is_external_path` を直接呼ぶため、新規ファイルが
+    project_root 内でも external_directory が要求される（M-54 より前からの既存挙動、
+    R5 スコープ外）。`is_move_target_external` と同じフォールバックを適用する候補。
 - swarm review+discovery（2026-11-19）で採用見送った指摘:
   - `external_directory.rs:61-72` の prefix 比較は誤検知（絶対パスは H-02 で
     `Path::starts_with` のコンポーネント比較へ修正済み）。ただし相対パス `../` の
