@@ -178,3 +178,177 @@ pub struct SessionInput {
     /// 入力が作成された時刻（ミリ秒単位の UNIX タイムスタンプ）。
     pub created_at: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_time() -> TimeInfo {
+        TimeInfo {
+            created: 1_000,
+            updated: 2_000,
+            compacting: None,
+            archived: Some(3_000),
+        }
+    }
+
+    fn roundtrip<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(value).unwrap();
+        let decoded: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(&decoded, value);
+    }
+
+    #[test]
+    fn session_status_default_and_wire_format() {
+        assert_eq!(SessionStatus::default(), SessionStatus::Active);
+
+        // sqlx 側は #[sqlx(rename_all = "lowercase")] だが serde の rename は無いため
+        // JSON では PascalCase のバリアント名になる
+        assert_eq!(
+            serde_json::to_value(SessionStatus::Active).unwrap(),
+            json!("Active")
+        );
+        assert_eq!(
+            serde_json::to_value(SessionStatus::Completed).unwrap(),
+            json!("Completed")
+        );
+        assert_eq!(
+            serde_json::to_value(SessionStatus::Archived).unwrap(),
+            json!("Archived")
+        );
+        assert_eq!(
+            serde_json::to_value(SessionStatus::Compacting).unwrap(),
+            json!("Compacting")
+        );
+
+        assert_eq!(
+            serde_json::from_value::<SessionStatus>(json!("Active")).unwrap(),
+            SessionStatus::Active
+        );
+    }
+
+    #[test]
+    fn session_value_structs_roundtrip() {
+        roundtrip(&sample_time());
+        roundtrip(&SessionSummary {
+            additions: 3,
+            deletions: 1,
+            files: 2,
+            diffs: vec![FileDiff {
+                path: "src/main.rs".to_string(),
+                additions: 3,
+                deletions: 1,
+            }],
+        });
+        roundtrip(&SessionShareInfo {
+            url: "https://example.com/share".to_string(),
+        });
+        roundtrip(&TokenUsage {
+            input: 1.5,
+            output: 2.5,
+            reasoning: 0.5,
+            cache: CacheUsage {
+                read: 10.0,
+                write: 20.0,
+            },
+        });
+        roundtrip(&SessionRevert {
+            message_id: "msg_1".to_string(),
+            part_id: Some("prt_1".to_string()),
+            snapshot: None,
+            diff: Some("-old\n+new".to_string()),
+        });
+        roundtrip(&PermissionRuleset {
+            allow: vec!["read".to_string()],
+            deny: vec!["write".to_string()],
+            mode: Some("strict".to_string()),
+        });
+        roundtrip(&SessionInput {
+            id: "in_1".to_string(),
+            session_id: "sess_1".to_string(),
+            prompt: "hi".to_string(),
+            delivery: None,
+            metadata: Some(json!({"source": "test"})),
+            status: "pending".to_string(),
+            created_at: 1_700_000_000_000,
+        });
+    }
+
+    #[test]
+    fn session_serialize_skips_transient_fields() {
+        let session = Session {
+            id: crate::identifier::SessionID("sess_1".to_string()),
+            slug: "my-session".to_string(),
+            project_id: crate::project::ProjectID("proj_1".to_string()),
+            directory: "/work".to_string(),
+            parent_id: None,
+            title: "Title".to_string(),
+            version: "1".to_string(),
+            time: sample_time(),
+            messages: vec![crate::message::SessionMessage::user("sess_1", "hi")],
+            summary: None,
+            share: None,
+            revert: None,
+            permission: None,
+            usage: None,
+            status: SessionStatus::Active,
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let value = serde_json::to_value(&session).unwrap();
+
+        // #[serde(skip)] / skip_serializing のフィールドは JSON に現れない
+        assert!(value.get("messages").is_none());
+        assert!(value.get("created_at").is_none());
+        assert!(value.get("updated_at").is_none());
+        // None の Option は skip_serializing_if で省略される
+        assert!(value.get("parent_id").is_none());
+        assert!(value.get("summary").is_none());
+        // status / metadata は #[serde(default)] だがシリアライズはされる
+        assert_eq!(value["status"], json!("Active"));
+        assert_eq!(value["metadata"], json!({}));
+        assert_eq!(value["id"], json!("sess_1"));
+        assert_eq!(value["project_id"], json!("proj_1"));
+        assert_eq!(value["time"]["created"], json!(1_000));
+
+        // デシリアライズ時は skip 対象がデフォルト値に戻る
+        let decoded: Session = serde_json::from_value(value.clone()).unwrap();
+        assert!(decoded.messages.is_empty());
+        assert_eq!(decoded.id, session.id);
+        assert_eq!(decoded.project_id, session.project_id);
+        assert_eq!(decoded.time, session.time);
+        assert_eq!(decoded.status, SessionStatus::Active);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn session_deserialize_applies_defaults_for_absent_fields() {
+        let value = json!({
+            "id": "sess_x",
+            "slug": "slug",
+            "project_id": "proj_x",
+            "directory": "/d",
+            "title": "T",
+            "version": "1",
+            "time": { "created": 1, "updated": 2, "compacting": null, "archived": null }
+        });
+
+        let session: Session = serde_json::from_value(value).unwrap();
+
+        assert_eq!(session.status, SessionStatus::Active);
+        assert!(session.metadata.is_empty());
+        assert!(session.messages.is_empty());
+        assert!(session.parent_id.is_none());
+        assert!(session.summary.is_none());
+        assert!(session.share.is_none());
+        assert!(session.revert.is_none());
+        assert!(session.permission.is_none());
+        assert!(session.usage.is_none());
+    }
+}

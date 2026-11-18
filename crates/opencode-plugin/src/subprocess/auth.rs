@@ -243,3 +243,146 @@ pub struct PluginFetchStreamResponse {
     pub headers: HashMap<String, String>,
     pub chunks: mpsc::Receiver<Result<String, PluginSubprocessError>>,
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 実際の認証情報・トークン値・API キーは一切使わない。
+    // 以下の定数はすべて検証用のダミー文字列である。
+    const DUMMY_PLUGIN: &str = "test-plugin";
+    const DUMMY_KEY: &str = "dummy-placeholder-not-a-real-key";
+
+    #[test]
+    fn error_display_no_auth() {
+        let err = PluginAuthError::NoAuth(DUMMY_PLUGIN.to_string());
+        assert_eq!(err.to_string(), "plugin test-plugin does not provide auth");
+    }
+
+    #[test]
+    fn error_display_invalid_method_index() {
+        let err = PluginAuthError::InvalidMethodIndex {
+            plugin: DUMMY_PLUGIN.to_string(),
+            index: 3,
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid auth method index 3 for plugin test-plugin"
+        );
+    }
+
+    #[test]
+    fn error_display_no_custom_fetch() {
+        let err = PluginAuthError::NoCustomFetch(DUMMY_PLUGIN.to_string());
+        assert_eq!(
+            err.to_string(),
+            "no custom fetch available for plugin test-plugin"
+        );
+    }
+
+    #[test]
+    fn error_display_subprocess_wraps_inner_error() {
+        let err = PluginAuthError::from(PluginSubprocessError::NotRunning);
+        assert_eq!(
+            err.to_string(),
+            "plugin subprocess error: plugin subprocess not running"
+        );
+
+        let err = PluginAuthError::Subprocess(PluginSubprocessError::Rpc {
+            code: -32000,
+            message: "dummy rpc failure".to_string(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "plugin subprocess error: plugin RPC error (-32000): dummy rpc failure"
+        );
+    }
+
+    #[test]
+    fn from_subprocess_error_preserves_inner_variant() {
+        let err = PluginAuthError::from(PluginSubprocessError::NotRunning);
+        assert!(matches!(
+            err,
+            PluginAuthError::Subprocess(PluginSubprocessError::NotRunning)
+        ));
+    }
+
+    #[test]
+    fn auth_load_result_deserializes_camel_case_and_round_trips() {
+        let json = serde_json::json!({
+            "apiKey": DUMMY_KEY,
+            "hasCustomFetch": true,
+        });
+        let parsed: PluginAuthLoadResult = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed.api_key.as_deref(), Some(DUMMY_KEY));
+        assert!(parsed.has_custom_fetch);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn auth_load_result_allows_missing_api_key() {
+        let parsed: PluginAuthLoadResult =
+            serde_json::from_value(serde_json::json!({ "hasCustomFetch": false })).unwrap();
+        assert!(parsed.api_key.is_none());
+        assert!(!parsed.has_custom_fetch);
+
+        let value = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "apiKey": null, "hasCustomFetch": false })
+        );
+    }
+
+    #[test]
+    fn authorize_result_round_trips_with_dummy_values() {
+        let result = PluginAuthorizeResult {
+            url: Some("https://example.invalid/authorize".to_string()),
+            instructions: Some("dummy instructions".to_string()),
+            method: Some("oauth".to_string()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        let parsed: PluginAuthorizeResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.url, result.url);
+        assert_eq!(parsed.instructions, result.instructions);
+        assert_eq!(parsed.method, result.method);
+    }
+
+    #[test]
+    fn fetch_response_round_trips_with_dummy_values() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/plain".to_string());
+        let response = PluginFetchResponse {
+            status: 200,
+            headers,
+            body: "dummy body".to_string(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        let parsed: PluginFetchResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, "dummy body");
+        assert_eq!(
+            parsed.headers.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn fetch_request_holds_dummy_values_without_side_effects() {
+        let mut headers = HashMap::new();
+        headers.insert("accept".to_string(), "application/json".to_string());
+        let request = PluginFetchRequest {
+            url: "https://example.invalid/echo".to_string(),
+            method: "GET".to_string(),
+            headers: headers.clone(),
+            body: None,
+        };
+        assert_eq!(request.url, "https://example.invalid/echo");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.headers, headers);
+        assert!(request.body.is_none());
+    }
+}
