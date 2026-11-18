@@ -1,3 +1,15 @@
+//! 複数の LLM プロバイダへの接続とモデル情報の管理を提供するクレート。
+//!
+//! `Provider` トレイトを Anthropic / OpenAI / Google / Bedrock などの各サービスが
+//! 実装し、`ProviderRegistry` が ID 単位で登録・解決する。`models` は models.dev
+//! 由来のモデル情報（コンテキスト長・コストなど）を保持し、`auth` / `retry` /
+//! `stream` / `transform` が認証・再試行・ストリーミング・メッセージ変換を担う。
+//!
+//! # 使い方
+//!
+//! `create_default_registry()` でレジストリを組み立て、目的のプロバイダを
+//! 取得してチャットリクエストを送信する。
+
 #![allow(
     clippy::field_reassign_with_default,
     clippy::if_same_then_else,

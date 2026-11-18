@@ -1,3 +1,16 @@
+//! セッションのライフサイクルと会話処理を統合するクレート。
+//!
+//! `SessionManager` がセッションの作成・一覧・状態管理を行い、`prompt` が
+//! ユーザー入力から LLM リクエストを組み立ててストリーム処理する。
+//! `llm` / `compaction` / `summary` / `revert` / `retry` / `todo` はストリーム処理、
+//! 会話圧縮、要約、巻き戻し、再試行、Todo 管理を担い、`instruction` は
+//! AGENTS.md などの指示ファイルを解決する。
+//!
+//! # 使い方
+//!
+//! `SessionManager::new()` でマネージャーを作り、`SessionPrompt` に
+//! `PromptInput` を渡して会話を進める。
+
 #![allow(
     ambiguous_glob_reexports,
     clippy::too_many_arguments,
