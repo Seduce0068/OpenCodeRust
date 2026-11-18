@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T05:39:23+09:00"
+  at: "2026-11-19T06:14:07+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2079 件
+  テスト総数 594 → 2096 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 47.36% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 47.50% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -319,6 +319,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TUI 旧レスポンス型の削除（swarm-coding R1-R6、R4 findings 0 件）(M-45 フォロー)
 - `agent`: tool_result の ID/name/is_error 保持と tool_use の会話伝播
   （swarm-coding R1-R6、R4 の tool_use 不在/空 ID 指摘を R5 で修正）(M-48)
+- `agent` / `provider` / `session`: permission pattern の明示引数化（メタ文字・
+  traversal・ルール順序のバイパス对策を含む）、未使用 retry ヘルパー削除、
+  FreeUsageLimit の非リトライ化（swarm-coding R1-R6、R4 high 3 件を R5 で修正）
+  (M-47/M-49/M-50)
 
 ## [0.1.0]
 
