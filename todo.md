@@ -141,20 +141,15 @@ status: current
   - `init_tracing` を CLI 起動時に呼び出し `config.logLevel` を実効化済み。
     未対応は `logging.rs` の WorkerGuard 早期ドロップ（API 変更要）と rolling 未使用。
     起動時とハンドラで `load_config` が 2 回走る点は大規模変更のため据え置き
-- [ ] **[L-07 残り]** tokio `full` feature の削減
-  - 調査済み（2026-11-19、swarm-coding R2）: 使用 feature は fs/io-util/macros/net/
-    process/rt/rt-multi-thread/sync/time の9種。signal/io-std は未使用。
-    ルート plus plugin/lsp/watcher の4箇所が `full` を unify しており同時修正が必要。
-    14 クレートが features 無指定で個別ビルド（-p）時に不足リスク。rt-multi-thread
-    は bare `#[tokio::main]` に必須で落とせない。効果は未計測（性能施策）。
-  - 2026-11-19 対応済み: 未使用 workspace 依存 11 件（hyper / rustls / rustls-webpki /
-    h2 / time / tower / dashmap 等）を削除、cargo 警告 11→0 を確認。
-    regex / fancy-regex は用途分離（JS RegExp 互換）で維持。未使用 22 件の
-    クレート側直接指定の workspace 集約は M-15 と同一作業で残課題。
 - [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケ（clone は削除済み）
-  - stream_message の冗長な全履歴 clone は削除済み。未対応は list_messages の
-    全件 collect（1098-1113、外部契約のためページネーションは変更を伴う）と
-    Arc copy-on-write。O(n) の実害は未計測
+  - 調査済み（2026-11-19、swarm-coding R2）: list_messages（routes.rs:1094-1109）が
+    `session.messages.iter().map(message_to_info).collect()` で全件 deep clone し、
+    変換中セッション Mutex を保持。件数上限・ページネーションは無く compaction も
+    件数を減らさない。実害は未計測（構造上の O(n) のみ）。
+    推奨方針は後方互換な `ListMessagesQuery { limit, offset }` を追加し指定時のみ
+    skip/take、未指定時は従来の Vec を返す（routes.rs:144-151 の ListSessionsQuery
+    と同パターン、TUI 側変更不要）。Arc copy-on-write は残課題。
+- [ ] **[L-07 残り]** 未使用 22 件のクレート側直接指定の workspace 集約（M-15 と同一作業）
 
 ### 優先度: 高（残タスク調査で追加）
 
@@ -209,6 +204,7 @@ status: current
 
 ## 完了
 
+- [x] **[L-07]** tokio `full` を9 feature へ削減（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-07 一部]** 未使用 workspace 依存 11 件を削除（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-47]** permission pattern の明示引数化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-49]** provider の未使用 retry ヘルパーを削除（2026-11-19、swarm-coding R1-R6）
@@ -387,6 +383,14 @@ status: current
 ## メモ
 
 - M-47 の残存（2026-11-19、swarm-coding R4 が指摘、未修正）:
+  - 2026-11-19 調査（swarm-coding R2）: 推奨方針は `opencode_permission::evaluate`
+    に read かつ dotenv 保護対象（`.env` / `.env.*` / `*.env`、`.example` は除外）なら
+    Ask を返す不変チェックを追加（ruleset.rs:79-91、約15-30行）。contains を使わない
+    精密 matcher で過剰一致も同時解消し、explore の `read * = Allow` とユーザー
+    wildcard allow による上書きも順序に依存せず防ぐ。**ただしユーザーが明示許可した
+    .env を読めなくなる政策変更を伴うため、実施には判断が必要**。
+    既存テスト agent.rs:1216-1218（secrets.env.local = Allow）の期待値更新が必要。
+    target が `*` にフォールバックする経路（../.env 等）は残存。
   - ビルトイン `*.env.*` は contains 一致のため `src/app.env.mock` 等も Ask に該当し
     executor では PermissionDenied になる（過剰一致）。
   - `.env` 保護は default_ruleset のみで、explore エージェント（`read * = Allow`）や

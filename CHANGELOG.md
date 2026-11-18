@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T06:38:02+09:00"
+  at: "2026-11-19T06:48:31+09:00"
 ---
 
 # Changelog
@@ -325,6 +325,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (M-47/M-49/M-50)
 - `Cargo.toml`: 未使用 workspace 依存 11 件（hyper / rustls / rustls-webpki / h2 /
   time / tower / dashmap 等）を削除し cargo 警告 11→0（swarm-coding R1-R6）(L-07 一部)
+- `Cargo.toml` / `plugin` / `lsp` / `watcher`: tokio `full` を使用中の9 feature へ
+  削減（workspace = true で継承、個別ビルド 5 クレートも確認）(L-07)
 
 ## [0.1.0]
 
