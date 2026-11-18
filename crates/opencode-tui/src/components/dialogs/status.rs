@@ -171,3 +171,134 @@ impl Default for StatusDialog {
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_line_constructors_set_text() {
+        let cases = [
+            (StatusLine::title("title text"), "title text"),
+            (StatusLine::normal("normal text"), "normal text"),
+            (StatusLine::muted("muted text"), "muted text"),
+            (StatusLine::success("success text"), "success text"),
+            (StatusLine::warning("warning text"), "warning text"),
+            (StatusLine::error("error text"), "error text"),
+        ];
+
+        for (line, expected_text) in &cases {
+            assert_eq!(line.text.as_str(), *expected_text);
+        }
+    }
+
+    #[test]
+    fn status_line_constructors_set_expected_kind() {
+        // StatusLineKind は PartialEq を実装しないため matches! で検証する。
+        assert!(matches!(
+            &StatusLine::title("x").kind,
+            StatusLineKind::Title
+        ));
+        assert!(matches!(
+            &StatusLine::normal("x").kind,
+            StatusLineKind::Normal
+        ));
+        assert!(matches!(
+            &StatusLine::muted("x").kind,
+            StatusLineKind::Muted
+        ));
+        assert!(matches!(
+            &StatusLine::success("x").kind,
+            StatusLineKind::Success
+        ));
+        assert!(matches!(
+            &StatusLine::warning("x").kind,
+            StatusLineKind::Warning
+        ));
+        assert!(matches!(
+            &StatusLine::error("x").kind,
+            StatusLineKind::Error
+        ));
+    }
+
+    macro_rules! assert_kind_is_only {
+        ($line:expr, $expected:path, [$($other:path),+ $(,)?]) => {{
+            let line = $line;
+            assert!(matches!(&line.kind, $expected));
+            $(
+                assert!(!matches!(&line.kind, $other));
+            )+
+        }};
+    }
+
+    #[test]
+    fn status_line_kinds_are_distinct_across_constructors() {
+        // 各コンストラクタが固有の kind を持ち、他と混同されないことを検証する。
+        assert_kind_is_only!(
+            StatusLine::title("x"),
+            StatusLineKind::Title,
+            [
+                StatusLineKind::Normal,
+                StatusLineKind::Muted,
+                StatusLineKind::Success,
+                StatusLineKind::Warning,
+                StatusLineKind::Error,
+            ]
+        );
+        assert_kind_is_only!(
+            StatusLine::normal("x"),
+            StatusLineKind::Normal,
+            [
+                StatusLineKind::Title,
+                StatusLineKind::Muted,
+                StatusLineKind::Success,
+                StatusLineKind::Warning,
+                StatusLineKind::Error,
+            ]
+        );
+        assert_kind_is_only!(
+            StatusLine::muted("x"),
+            StatusLineKind::Muted,
+            [
+                StatusLineKind::Title,
+                StatusLineKind::Normal,
+                StatusLineKind::Success,
+                StatusLineKind::Warning,
+                StatusLineKind::Error,
+            ]
+        );
+        assert_kind_is_only!(
+            StatusLine::success("x"),
+            StatusLineKind::Success,
+            [
+                StatusLineKind::Title,
+                StatusLineKind::Normal,
+                StatusLineKind::Muted,
+                StatusLineKind::Warning,
+                StatusLineKind::Error,
+            ]
+        );
+        assert_kind_is_only!(
+            StatusLine::warning("x"),
+            StatusLineKind::Warning,
+            [
+                StatusLineKind::Title,
+                StatusLineKind::Normal,
+                StatusLineKind::Muted,
+                StatusLineKind::Success,
+                StatusLineKind::Error,
+            ]
+        );
+        assert_kind_is_only!(
+            StatusLine::error("x"),
+            StatusLineKind::Error,
+            [
+                StatusLineKind::Title,
+                StatusLineKind::Normal,
+                StatusLineKind::Muted,
+                StatusLineKind::Success,
+                StatusLineKind::Warning,
+            ]
+        );
+    }
+}

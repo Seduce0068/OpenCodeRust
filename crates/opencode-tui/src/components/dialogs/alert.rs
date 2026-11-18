@@ -171,3 +171,220 @@ impl Default for AlertDialog {
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        // ratatui-core の Buffer は Display を実装しないため cell() で走査する。
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    // --- new / Default ---
+
+    #[test]
+    fn new_stores_title_message_type_and_starts_closed() {
+        let alert = AlertDialog::new("Title", "Message", AlertType::Warning);
+
+        assert_eq!(alert.title, "Title");
+        assert_eq!(alert.message(), "Message");
+        // AlertType は PartialEq 未実装のため matches! で検証する。
+        assert!(matches!(alert.alert_type, AlertType::Warning));
+        assert!(!alert.is_open());
+    }
+
+    #[test]
+    fn default_matches_info_alert_with_message() {
+        let alert = AlertDialog::default();
+
+        assert_eq!(alert.title, "Info");
+        assert_eq!(alert.message(), "Message");
+        assert!(matches!(alert.alert_type, AlertType::Info));
+        assert!(!alert.is_open());
+    }
+
+    // --- convenience constructors ---
+
+    #[test]
+    fn convenience_constructors_set_expected_title_message_and_type() {
+        let info = AlertDialog::info("info text");
+        assert_eq!(info.title, "Info");
+        assert_eq!(info.message(), "info text");
+        assert!(matches!(info.alert_type, AlertType::Info));
+
+        let success = AlertDialog::success("success text");
+        assert_eq!(success.title, "Success");
+        assert_eq!(success.message(), "success text");
+        assert!(matches!(success.alert_type, AlertType::Success));
+
+        let warning = AlertDialog::warning("warning text");
+        assert_eq!(warning.title, "Warning");
+        assert_eq!(warning.message(), "warning text");
+        assert!(matches!(warning.alert_type, AlertType::Warning));
+
+        let error = AlertDialog::error("error text");
+        assert_eq!(error.title, "Error");
+        assert_eq!(error.message(), "error text");
+        assert!(matches!(error.alert_type, AlertType::Error));
+
+        for alert in [&info, &success, &warning, &error] {
+            assert!(!alert.is_open());
+        }
+    }
+
+    // --- open / close / is_open ---
+
+    #[test]
+    fn open_sets_open_state_and_preserves_data() {
+        let mut alert = AlertDialog::new("Title", "Message", AlertType::Error);
+
+        alert.open();
+
+        assert!(alert.is_open());
+        assert_eq!(alert.title, "Title");
+        assert_eq!(alert.message(), "Message");
+        assert!(matches!(alert.alert_type, AlertType::Error));
+    }
+
+    #[test]
+    fn close_clears_open_state_and_preserves_data() {
+        let mut alert = AlertDialog::new("Title", "Message", AlertType::Error);
+        alert.open();
+
+        alert.close();
+
+        assert!(!alert.is_open());
+        assert_eq!(alert.title, "Title");
+        assert_eq!(alert.message(), "Message");
+        assert!(matches!(alert.alert_type, AlertType::Error));
+    }
+
+    #[test]
+    fn open_close_cycles_toggle_state() {
+        let mut alert = AlertDialog::info("cycling");
+
+        for _ in 0..3 {
+            alert.open();
+            assert!(alert.is_open());
+            alert.close();
+            assert!(!alert.is_open());
+        }
+        assert_eq!(alert.message(), "cycling");
+    }
+
+    #[test]
+    fn close_is_idempotent_from_new() {
+        let mut alert = AlertDialog::info("message");
+
+        alert.close();
+
+        assert!(!alert.is_open());
+        assert_eq!(alert.message(), "message");
+    }
+
+    // --- set_message / message ---
+
+    #[test]
+    fn set_message_updates_message_only() {
+        let mut alert = AlertDialog::new("Title", "Old", AlertType::Warning);
+
+        alert.set_message("New");
+
+        assert_eq!(alert.message(), "New");
+        assert_eq!(alert.title, "Title");
+        assert!(matches!(alert.alert_type, AlertType::Warning));
+    }
+
+    #[test]
+    fn set_message_preserves_open_state() {
+        let mut alert = AlertDialog::error("before");
+        alert.open();
+
+        alert.set_message("after");
+
+        assert!(alert.is_open());
+        assert_eq!(alert.message(), "after");
+    }
+
+    #[test]
+    fn set_message_accepts_empty_and_multiline() {
+        let mut alert = AlertDialog::info("initial");
+
+        alert.set_message("");
+        assert_eq!(alert.message(), "");
+
+        alert.set_message("line1\nline2");
+        assert_eq!(alert.message(), "line1\nline2");
+    }
+
+    // --- render ---
+
+    #[test]
+    fn render_when_closed_draws_nothing() {
+        let alert = AlertDialog::error("invisible");
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            alert.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.trim().is_empty(),
+            "closed alert dialog must not draw any content"
+        );
+    }
+
+    #[test]
+    fn render_when_open_shows_icon_title_message_and_hint() {
+        let mut alert = AlertDialog::error("Something failed");
+        alert.open();
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            alert.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("✗"), "error icon");
+        assert!(text.contains("Error"), "dialog title");
+        assert!(text.contains("Something failed"), "message body");
+        assert!(text.contains("[Enter]"), "close hint key");
+        assert!(text.contains("Close"), "close hint label");
+        assert!(text.contains("[Ctrl+C]"), "copy hint key");
+        assert!(text.contains("[ OK ]"), "ok button");
+    }
+
+    #[test]
+    fn render_reflects_updated_message() {
+        let mut alert = AlertDialog::info("before");
+        alert.open();
+        alert.set_message("updated body");
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            alert.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("updated body"));
+        assert!(!text.contains("before"));
+    }
+}
