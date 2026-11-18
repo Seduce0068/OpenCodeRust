@@ -119,16 +119,17 @@ status: current
     PROJECT_METADATA、TODO_MANAGER、PTY_MANAGER。
     残存: MODEL_VARIANT_LOOKUP / MCP_OAUTH_MANAGER / PLUGIN_LOADER /
     EXTRA_CORS_WHITELIST（不変データまたは初期化一回の OnceCell／設定関数経由で実害限定的）
-- [ ] **[M-34]** CI ゲートの抜け（all-features・unsafe lint・依存監査・スクリプト）
-  - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
-    lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
-    `clippy_args` 追加、`unsafe_code = "deny"`、Renovate 設定
-- [ ] **[M-37]** async ハンドラ内の同期ファイル I/O（tool 側は対応済み）
-  - 事実確認済み（2026-11-18、routes-io-worker）: routes.rs の std::fs（3479/3522/
-    3623/3644/3688）と git subprocess（3536/3799）、canonicalize 多発（is_within_root）。
-    性能改善動機で未計測のため I/O 移行は見送り。推奨: ①find_text/find_files を
-    spawn_blocking → ②read_file を tokio::fs → ③list_files → ④git を tokio::process、
-    3836 は read guard を落としてから await（要計測）
+- [ ] **[M-34 残り]** 依存更新検知の Renovate 委譲とスクリプトゲート
+  - 2026-11-19 対応済み: ci.yml に all-features と unsafe lint ゲートを追加（`extra_gates`
+    / `clippy_args`、ローカルで両方 green、共通ワークフロー README で入力仕様確認）。
+    残存: cargo outdated は時間依存で time-bomb になるため CI に入れない方針。
+    依存更新検知は Renovate（renovate.json 追加＋GitHub App 有効化が別判断）へ委譲。
+    `scripts/opencode_llm_mcp.rs` は workspace member 外で `--locked` 再現性の観点から
+    ゲート化を見送り（恒久対策は member 化）。脆弱性監査は `audit: true` で既にゲート済み。
+- [ ] **[M-37 残り]** 他の同期 I/O（find 系は 2026-11-19 に spawn_blocking 化済み）
+  - 残存: read_file の tokio::fs 化、list_files、git subprocess（get_file_status /
+    current_project_info）、共通 canonicalize ヘルパ async 化、tool 側 glob/read の
+    WalkDir。性能改善の実測は未実施で効果量は speculative。
 - [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
   - `tx.closed()` の協調 break を実装済み。JoinHandle 保持は再調査（2026-11-18、
     stream-handle-worker）で「tokio の破棄はデタッチ、協調 break で十分、AbortHandle は
@@ -137,10 +138,12 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **[L-04]** tracing の残課題（level 反映・CLI 配線は対応済み）
-  - `init_tracing` を CLI 起動時に呼び出し `config.logLevel` を実効化済み。
-    未対応は `logging.rs` の WorkerGuard 早期ドロップ（API 変更要）と rolling 未使用。
-    起動時とハンドラで `load_config` が 2 回走る点は大規模変更のため据え置き
+- [ ] **[L-04 残り]** tracing の残課題
+  - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
+    TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
+    未対応: prompt/stream ハンドラの開始・完了・切断ログ、/log の extra 平坦化、
+    WorkerGuard 早期ドロップ、rolling 未使用、load_config 二重化、
+    TUI の stdout ログ（いずれも他クレート変更・API 変更・契約変更を伴う）。
 - [ ] **[L-14 残り]** Arc copy-on-write の見直し
   - list_messages の後方互換 pagination（limit/offset）は 2026-11-19 に対応済み。
     未指定時は従来どおり全件（wire format 不変）、TUI 変更不要。
@@ -195,6 +198,10 @@ status: current
 
 ## 完了
 
+- [x] **[M-34 一部]** CI に all-features / unsafe lint ゲートを追加
+  （2026-11-19、swarm-coding R1-R6）
+- [x] **[M-37 一部]** find 系走査の spawn_blocking 化（2026-11-19、swarm-coding R1-R6）
+- [x] **[L-04 一部]** http_request スパンを完成（2026-11-19、swarm-coding R1-R6）
 - [x] **[P-01 一部]** /api エイリアスを追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-46]** /stream の位置づけを MAPPING.md に明記（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-07]** 残り 20 件の workspace 依存へ集約（2026-11-19、swarm-coding R1-R6）
