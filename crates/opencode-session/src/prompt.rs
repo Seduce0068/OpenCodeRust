@@ -11,8 +11,8 @@ use futures::StreamExt;
 use opencode_plugin::{HookContext, HookEvent};
 use opencode_provider::transform::{apply_caching, ProviderType};
 use opencode_provider::{
-    get_model_context_limit, ChatRequest, ChatResponse, Content, ContentPart, Message, Provider,
-    Role, StreamEvent, ToolDefinition,
+    get_model_context_limit, ChatRequest, Content, ContentPart, Message, Provider, Role,
+    StreamEvent, ToolDefinition,
 };
 
 use crate::compaction::{
@@ -1978,87 +1978,6 @@ impl SessionPrompt {
             .collect();
 
         Content::Parts(content_parts)
-    }
-
-    #[allow(dead_code)]
-    fn process_response(response: &ChatResponse) -> SessionMessage {
-        let now = chrono::Utc::now();
-
-        let content = response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or(Content::Text(String::new()));
-
-        let finish_reason = response
-            .choices
-            .first()
-            .and_then(|c| c.finish_reason.clone());
-
-        let parts = match content {
-            Content::Text(text) => vec![crate::MessagePart {
-                id: format!("prt_{}", uuid::Uuid::new_v4()),
-                part_type: PartType::Text {
-                    text,
-                    synthetic: None,
-                    ignored: None,
-                },
-                created_at: now,
-                message_id: None,
-            }],
-            Content::Parts(content_parts) => content_parts
-                .into_iter()
-                .filter_map(|p| match p.content_type.as_str() {
-                    "text" => p.text.map(|text| crate::MessagePart {
-                        id: format!("prt_{}", uuid::Uuid::new_v4()),
-                        part_type: PartType::Text {
-                            text,
-                            synthetic: None,
-                            ignored: None,
-                        },
-                        created_at: now,
-                        message_id: None,
-                    }),
-                    "tool_use" => p.tool_use.map(|tu| crate::MessagePart {
-                        id: format!("prt_{}", uuid::Uuid::new_v4()),
-                        part_type: PartType::ToolCall {
-                            id: tu.id,
-                            name: tu.name,
-                            input: tu.input,
-                        },
-                        created_at: now,
-                        message_id: None,
-                    }),
-                    _ => None,
-                })
-                .collect(),
-        };
-
-        SessionMessage {
-            id: format!("msg_{}", uuid::Uuid::new_v4()),
-            session_id: String::new(),
-            role: MessageRole::Assistant,
-            parts,
-            created_at: now,
-            metadata: {
-                let mut m = HashMap::new();
-                if let Some(usage) = &response.usage {
-                    m.insert(
-                        "tokens_input".to_string(),
-                        serde_json::json!(usage.prompt_tokens),
-                    );
-                    m.insert(
-                        "tokens_output".to_string(),
-                        serde_json::json!(usage.completion_tokens),
-                    );
-                }
-                if let Some(reason) = finish_reason {
-                    m.insert("finish_reason".to_string(), serde_json::json!(reason));
-                }
-                m
-            },
-            usage: None,
-        }
     }
 
     fn collect_pending_subtasks(message: &SessionMessage) -> Vec<PendingSubtask> {
