@@ -317,6 +317,86 @@ mod tests {
         assert_eq!(count, 1, "expected a single coalesced event for the path");
     }
 
+    #[tokio::test]
+    async fn test_debounce_is_independent_per_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WatcherConfig {
+            debounce_ms: 5_000,
+            ..WatcherConfig::default()
+        };
+        let watcher = FileWatcher::new(config).unwrap();
+        let mut rx = watcher.subscribe();
+
+        watcher.watch(temp_dir.path()).unwrap();
+
+        let first = temp_dir.path().join("first.txt");
+        let second = temp_dir.path().join("second.txt");
+
+        // First writes on distinct paths must each be forwarded, while a
+        // repeated write on one path is coalesced by its own window.
+        fs::write(&first, "a").unwrap();
+        sleep(Duration::from_millis(50)).await;
+        fs::write(&second, "b").unwrap();
+        sleep(Duration::from_millis(50)).await;
+        fs::write(&first, "aa").unwrap();
+
+        let mut first_count = 0;
+        let mut second_count = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(event)) if event.file == first => first_count += 1,
+                Ok(Ok(event)) if event.file == second => second_count += 1,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            first_count, 1,
+            "repeat write on first path must be coalesced"
+        );
+        assert_eq!(
+            second_count, 1,
+            "first write on second path must be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_debounce_forwards_repeated_events() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WatcherConfig {
+            debounce_ms: 0,
+            ..WatcherConfig::default()
+        };
+        let watcher = FileWatcher::new(config).unwrap();
+        let mut rx = watcher.subscribe();
+
+        watcher.watch(temp_dir.path()).unwrap();
+
+        let test_file = temp_dir.path().join("no_debounce.txt");
+        fs::write(&test_file, "first").unwrap();
+        sleep(Duration::from_millis(80)).await;
+        fs::write(&test_file, "second").unwrap();
+
+        let mut count = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(event)) if event.file == test_file => count += 1,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        // A zero window has no lower bound to wait for, so assert only that
+        // repeated writes are not coalesced (inotify may emit extra events).
+        assert!(
+            count >= 2,
+            "debounce_ms=0 must forward repeated events, got {count}"
+        );
+    }
+
     #[test]
     fn test_watch_nonexistent_path() {
         let watcher = FileWatcher::new(WatcherConfig::default()).unwrap();
