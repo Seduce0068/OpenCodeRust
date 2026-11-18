@@ -145,16 +145,14 @@ status: current
   - list_messages の後方互換 pagination（limit/offset）は 2026-11-19 に対応済み。
     未指定時は従来どおり全件（wire format 不変）、TUI 変更不要。
     残るはメッセージ保持の Arc copy-on-write。実害は未計測。
-- [ ] **[L-07 残り]** 未使用 22 件のクレート側直接指定の workspace 集約（M-15 と同一作業）
 
 ### 優先度: 高（残タスク調査で追加）
 
-- [ ] **[P-01]** API パスの `/api` prefix 不一致（parity 構造問題）
-  - upstream の HTTP パス 126 種はすべて `/api/...`（例 `packages/protocol/src/groups/agent.ts:10`
-    の `/api/agent`）。Rust は `crates/opencode-server/src/routes.rs:49`
-    で `/agent` 等を直置きし、
-    `server.rs:932` にも prefix 層なし。公式 client をそのまま接続できない。実害は Rust 側に
-    JS client が無いため未確認だが、G-01 の generate 接続の前提となる。範囲と互換方針を ADR 化
+- [ ] **[P-01 残り]** upstream 126 パスの直接照合と ADR 化
+  - /api エイリアスは 2026-11-19 に追加済み（既存ルート維持、TUI/CLI 変更不要）。
+    残るは upstream checkout で 126 パスを直接照合し欠落を洗い出すこと、
+    `session_id_from_path()` の /api/session 対応（server.rs follow-up）、
+    および互換方針の ADR 化。upstream 側のパス情報はローカル間接引用のみで speculative。
 - [ ] **[P-02]** `/experimental/generate` の契約が upstream と完全に不一致
   - Rust は `{prompt?, context?}` → `{operation, status, message, ...}` の placeholder
     (`routes.rs:4423,4440,4462`)。upstream は `/api/experimental/generate/text` /
@@ -195,11 +193,11 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
-- [ ] **[M-46]** /session/{id}/stream がエージェント・ツールなしの生 chat_stream
-  - `routes.rs:1344-1355,1983-2051`。/prompt と応答品質・課金が異なる（confirmed）
-
 ## 完了
 
+- [x] **[P-01 一部]** /api エイリアスを追加（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-46]** /stream の位置づけを MAPPING.md に明記（2026-11-19、swarm-coding R1-R6）
+- [x] **[L-07]** 残り 20 件の workspace 依存へ集約（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-14 一部]** list_messages に後方互換 pagination を追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-07]** tokio `full` を9 feature へ削減（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-07 一部]** 未使用 workspace 依存 11 件を削除（2026-11-19、swarm-coding R1-R6）
@@ -379,6 +377,11 @@ status: current
 
 ## メモ
 
+- 子エージェントの誤記（2026-11-19、swarm-coding R4 が発見、親が grep で confirmed）:
+  M-46 調査担当は「/prompt は StreamProcessor を駆動する」と報告したが、
+  `StreamProcessor::new()` の参照は llm.rs:1873 のテストモジュールのみで本番配線 0 件。
+  実際は `prompt_with_update_hook` → `prompt.rs::loop_inner` → `provider.chat_stream()`。
+  MAPPING.md の誤記は R5 で修正済み。子のレポートは仮説として事実確認する好例。
 - M-46 調査結果（2026-11-19、swarm-coding R2）: 推奨は「現状維持＋ドキュメント
   明記」。/stream と /prompt はレスポンス契約（SSE vs JSON＋broadcast）、
   system prompt、tools/権限、StreamProcessor、キャンセル、永続化、キューがすべて
