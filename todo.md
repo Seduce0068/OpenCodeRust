@@ -313,9 +313,15 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI fork(18)・prompt_stash(27)・code_block(13)・command_palette(30)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI session_list(37)・model_select(32)・theme_list(30)・agent_select(21)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
+- `AgentSelectDialog::set_agents`（2026-11-18、swarm-coding R2-C が発見、未修正）:
+  選択インデックスをリセットしないため、新リストが現在選択より短いと
+  `selected_agent()` が None になる。現挙動はテストで固定済み。ThemeListDialog::filter()
+  のように 0 / None へクランプする修正は別タスク。
 - `session_text.rs:69-73` の到達不能コード（2026-11-18、swarm-coding R2-C が発見、未修正）:
   `visible_count = if collapsible && collapsed { preview_lines } else { ... }` は同条件が
   48-56 行目で早期 return するため到達不能。動作影響なし。単純化は別タスク。
