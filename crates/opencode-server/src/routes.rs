@@ -11,7 +11,6 @@ use axum::{
     Json, Router,
 };
 use futures::stream::Stream;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -29,7 +28,7 @@ use crate::mcp_oauth::{
     McpServerInfo as McpServerInfoStruct, McpServerLogEntry, RemoteMcpConfig, RemoteOAuthSettings,
 };
 use crate::oauth::{ProviderAuth, ProviderAuthError};
-use crate::pty::{PtyManager, PtySession as PtySessionStruct, PtySubscription};
+use crate::pty::{PtySession as PtySessionStruct, PtySubscription};
 use crate::worktree::{self, WorktreeInfo as WorktreeInfoStruct};
 use crate::{ApiError, Result, ServerState};
 use opencode_agent::{AgentInfo as AgentConfigInfo, AgentMode, AgentRegistry, BuiltinAgent};
@@ -457,9 +456,6 @@ pub struct TodoInfo {
     pub priority: String,
 }
 
-static TODO_MANAGER: Lazy<opencode_session::TodoManager> =
-    Lazy::new(opencode_session::TodoManager::new);
-
 async fn get_session_todos(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -470,7 +466,7 @@ async fn get_session_todos(
     }
     drop(sessions);
 
-    let todos = TODO_MANAGER.get(&id).await;
+    let todos = state.todo_manager.get(&id).await;
     let items = todos
         .into_iter()
         .enumerate()
@@ -3901,15 +3897,8 @@ impl From<PtySessionStruct> for PtyInfo {
     }
 }
 
-static PTY_MANAGER: std::sync::OnceLock<PtyManager> = std::sync::OnceLock::new();
-
-fn get_pty_manager() -> &'static PtyManager {
-    PTY_MANAGER.get_or_init(PtyManager::new)
-}
-
-async fn list_pty() -> Json<Vec<PtyInfo>> {
-    let manager = get_pty_manager();
-    let sessions = manager.list_sessions().await;
+async fn list_pty(State(state): State<Arc<ServerState>>) -> Json<Vec<PtyInfo>> {
+    let sessions = state.pty_manager.list_sessions().await;
     Json(sessions.into_iter().map(PtyInfo::from).collect())
 }
 
@@ -3920,18 +3909,24 @@ pub struct CreatePtyRequest {
     pub env: Option<HashMap<String, String>>,
 }
 
-async fn create_pty(Json(req): Json<CreatePtyRequest>) -> Result<Json<PtyInfo>> {
-    let manager = get_pty_manager();
-    let session = manager
+async fn create_pty(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CreatePtyRequest>,
+) -> Result<Json<PtyInfo>> {
+    let session = state
+        .pty_manager
         .create_session(&req.command, req.cwd.as_deref(), req.env)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(PtyInfo::from(session)))
 }
 
-async fn get_pty(Path(id): Path<String>) -> Result<Json<PtyInfo>> {
-    let manager = get_pty_manager();
-    let session = manager
+async fn get_pty(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<Json<PtyInfo>> {
+    let session = state
+        .pty_manager
         .get_session(&id)
         .await
         .ok_or_else(|| ApiError::NotFound("PTY session not found".to_string()))?;
@@ -3945,20 +3940,23 @@ pub struct UpdatePtyRequest {
 }
 
 async fn update_pty(
+    State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Json(req): Json<UpdatePtyRequest>,
 ) -> Result<Json<PtyInfo>> {
-    let manager = get_pty_manager();
-    let session = manager
+    let session = state
+        .pty_manager
         .update_session(&id, req.command.as_deref(), req.cwd.as_deref())
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
     Ok(Json(PtyInfo::from(session)))
 }
 
-async fn delete_pty(Path(id): Path<String>) -> Result<Json<bool>> {
-    let manager = get_pty_manager();
-    let deleted = manager.delete_session(&id).await;
+async fn delete_pty(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<Json<bool>> {
+    let deleted = state.pty_manager.delete_session(&id).await;
     Ok(Json(deleted))
 }
 
@@ -3978,14 +3976,13 @@ pub struct PtyConnectQuery {
 ///   2. Forward live PTY output to the client as binary frames.
 ///   3. Forward text/binary messages from the client into the PTY as input.
 async fn pty_connect(
+    State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Query(query): Query<PtyConnectQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let manager = get_pty_manager();
-
     // Validate the session exists before upgrading.
-    let subscription = match manager.subscribe(&id).await {
+    let subscription = match state.pty_manager.subscribe(&id).await {
         Ok(sub) => sub,
         Err(_) => {
             return axum::response::Response::builder()

@@ -38,6 +38,7 @@ use opencode_session::SessionManager;
 use opencode_storage::InputRepository;
 use opencode_storage::{Database, MessageRepository, SessionRepository};
 
+use crate::pty::PtyManager;
 use crate::routes;
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
@@ -413,6 +414,10 @@ pub struct ServerState {
     pub(crate) prompt_locks: TokioRwLock<HashMap<String, Arc<Mutex<()>>>>,
     /// プロジェクトごとのメタデータ（旧プロセス共有 static `PROJECT_METADATA`）。
     pub(crate) project_metadata: TokioRwLock<HashMap<String, routes::ProjectMetadata>>,
+    /// セッションごとの TODO リスト（旧プロセス共有 static `TODO_MANAGER`）。
+    pub(crate) todo_manager: opencode_session::TodoManager,
+    /// PTY セッション管理（旧プロセス共有 static `PTY_MANAGER`）。
+    pub(crate) pty_manager: PtyManager,
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
@@ -441,6 +446,8 @@ impl ServerState {
             session_run_status: TokioRwLock::new(HashMap::new()),
             prompt_locks: TokioRwLock::new(HashMap::new()),
             project_metadata: TokioRwLock::new(HashMap::new()),
+            todo_manager: opencode_session::TodoManager::new(),
+            pty_manager: PtyManager::new(),
             session_repo: None,
             message_repo: None,
             input_repo: None,
@@ -1456,5 +1463,39 @@ mod tests {
         assert!(first.prompt_locks.read().await.contains_key("session-a"));
         assert!(second.session_run_status.read().await.is_empty());
         assert!(second.prompt_locks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn todo_manager_is_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        first
+            .todo_manager
+            .update(
+                "session-a",
+                vec![opencode_session::TodoInfo {
+                    content: "first-only".to_string(),
+                    status: "pending".to_string(),
+                    priority: "high".to_string(),
+                }],
+            )
+            .await;
+
+        let first_todos = first.todo_manager.get("session-a").await;
+        let second_todos = second.todo_manager.get("session-a").await;
+        assert_eq!(first_todos.len(), 1);
+        assert_eq!(first_todos[0].content, "first-only");
+        assert!(second_todos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pty_manager_is_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        assert!(!std::ptr::eq(&first.pty_manager, &second.pty_manager));
+        assert!(first.pty_manager.list_sessions().await.is_empty());
+        assert!(second.pty_manager.list_sessions().await.is_empty());
     }
 }
