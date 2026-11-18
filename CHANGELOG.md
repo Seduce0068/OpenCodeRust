@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T11:30:36+09:00"
+  at: "2026-11-18T12:02:24+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1057 件
+  テスト総数 594 → 1068 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.28% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.63% を計測
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -190,6 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opencode-mcp`: oauth.rs に 8 件のテストを追加（CSRF state 一意性、設定検証、
   authorize URL 組み立て。外部通信なし）(M-11)
 - docs: 残り 12 クレートの lib.rs に `//!` モジュールドキュメントを追加 (L-08 第2段)
+- `opencode-provider`: models/bootstrap の純粋変換ロジックに 11 テストを追加
+  （ダミー値のみ、HTTP/ストリーミングなし）(M-11)
+- `opencode-command`: 公開 3 メソッドを `Result<_, CommandError>` 化し、charter
+  の「anyhow は境界のみ」に準拠（破壊的変更、CLI の `?` は From で互換）(M-04)
+- docs: opencode-types/core の個別 pub 型へ `///` を 280 行追加し `missing_docs`
+  残 276 件を 0 件へ解消 (L-08 第3段)
 
 ## [0.1.0]
 
