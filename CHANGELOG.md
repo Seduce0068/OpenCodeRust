@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T10:30:15+09:00"
+  at: "2026-11-18T11:00:05+09:00"
 ---
 
 # Changelog
@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.12% を計測
-  （未配線 dead code 削除で分母が減り、初めて 37% 台に到達）
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.08% を計測
+  （前回 37.12% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -181,6 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config.logLevel` を実効化（RUST_LOG より優先、実 CLI で確認）(L-04)
 - `opencode-session`/`opencode-tui`: 未配線の `process_response` と自作 markdown
   パーサ 6 関数（計約 400 行）と dead_code 抑制を削除 (L-03)
+- `opencode-storage`: `migrate_pool` を切り出し `Storage::migrate` と `Database`
+  の 2 経路を user_version 記録まで完全統一 (H-07)
+- `opencode-server`: ProviderAuthError の Display / source / From 変換を検証する
+  テスト 7 件を追加（ダミー値のみ）(M-11)
+- `opencode-types`/`opencode-core`: クレートドキュメントと主要 pub mod の `///`
+  を追加、ADR-0007 に段階進捗を記録 (L-08)
 
 ## [0.1.0]
 
