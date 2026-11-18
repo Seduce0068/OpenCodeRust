@@ -315,6 +315,8 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI session_list(37)・model_select(32)・theme_list(30)・agent_select(21)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI session_export(22)・timeline(19)・skill_list(27)・subagent(22)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
