@@ -62,10 +62,10 @@ status: current
   - pty／util／watcher／local-llm／codemode の 5 クレートが無依存（codemode は ADR-0006
     で既知の先送り）、server が portable-pty を直接依存し同名 PtyManager を再実装。配線または member 外し、
     server を opencode-pty 利用へ
-- [ ] **[M-04]** ライブラリ公開 API の `anyhow::Result`（CommandError は対応済み、残りに絞る）
-  - `command/lib.rs` の CommandError 追加と source 保持は完了。未対応は 3 メソッドの
-    シグネチャを `Result<_, CommandError>` 化（完全な charter 準拠、破壊的変更）、
-    ToolError／ApiError の String のみで `#[source]` なしの問題は他クレートの別タスク
+- [ ] **[M-04]** エラー型の残課題（command crate の charter 準拠は完了）
+  - command の 3 メソッドを `Result<_, CommandError>` 化済み（破壊的変更、CLI の `?` は
+    anyhow の From で互換を実証）。未対応は ToolError／ApiError の String のみで
+    `#[source]` なしの問題（他クレートの別タスク）
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
@@ -114,9 +114,6 @@ status: current
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
-- [ ] **[L-08]** 公開 API ドキュメント欠落（全クレートの //! は対応済み）
-  - types/core と残り 12 クレートの `//!` と主要 pub mod の `///` を追加、ADR-0007 に
-    進捗表を記録済み。未対応は個別 pub 型の `///`（types/core で `missing_docs` 残 276 件）
 - [ ] **[L-09]** LiteRT プロバイダの未実装 FFI の設定面への露出
   - `litert.rs:60-72` が TODO のままエラー、bootstrap が `LITERT_MODEL_PATH` で登録しモデルを広告、
     MAPPING.md に記載なし。feature gate するか MAPPING.md へ追加
@@ -259,6 +256,9 @@ status: current
 - [x] **[M-11 一部]** server/pty.rs に 6 テスト追加（2026-11-18、pty-test-worker）
 - [x] **[M-11 一部]** mcp/oauth.rs に 8 テスト追加（2026-11-18、mcp-oauth-test-worker）
 - [x] **[L-08 第2段]** 残り 12 クレートの lib.rs に //!（2026-11-18、apidoc2-worker）
+- [x] **[M-11 一部]** provider models/bootstrap に 11 テスト（2026-11-18、provider-test-worker）
+- [x] **[M-04]** 公開 3 メソッドを Result<_, CommandError> 化（2026-11-18、command-api-worker）
+- [x] **[L-08 第3段]** missing_docs 276 件を 0 件へ（2026-11-18、apidoc3-worker）
 
 ## メモ
 
