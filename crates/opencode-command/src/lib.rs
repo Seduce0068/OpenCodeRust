@@ -12,14 +12,11 @@ use std::path::{Path, PathBuf};
 
 /// Domain error produced by the command system.
 ///
-/// The public methods keep returning [`anyhow::Result`] so that existing
-/// callers remain source compatible (see M-04: a full switch to
-/// `Result<_, CommandError>` is a separate, breaking change). This error is
-/// converted into `anyhow::Error` at that boundary via anyhow's blanket
-/// `From<E>` impl. Lower-level failures are recorded in `source` fields and
-/// exposed through [`std::error::Error::source`], so the cause chain survives
-/// the conversion and callers can still recover the domain error with
-/// `anyhow::Error::downcast_ref`.
+/// The public methods return `Result<_, CommandError>`, exposing the domain
+/// error directly at the API boundary. Lower-level failures are recorded in
+/// `source` fields and exposed through [`std::error::Error::source`], so the
+/// cause chain is preserved. Callers that return `anyhow::Result` can still
+/// use `?` via anyhow's blanket `From<E>` impl.
 #[derive(Debug)]
 pub enum CommandError {
     /// No command with the requested name is registered.
@@ -180,7 +177,7 @@ impl CommandRegistry {
     }
 
     /// Load commands from .opencode/commands directory
-    pub fn load_from_directory(&mut self, project_dir: &Path) -> anyhow::Result<()> {
+    pub fn load_from_directory(&mut self, project_dir: &Path) -> Result<(), CommandError> {
         let commands_dir = project_dir.join(".opencode/commands");
 
         if !commands_dir.exists() {
@@ -241,7 +238,7 @@ impl CommandRegistry {
     }
 
     /// Execute a command and return the rendered template
-    pub fn execute(&self, name: &str, ctx: CommandContext) -> anyhow::Result<String> {
+    pub fn execute(&self, name: &str, ctx: CommandContext) -> Result<String, CommandError> {
         let command = self
             .commands
             .get(name)
@@ -257,7 +254,7 @@ impl CommandRegistry {
         &self,
         name: &str,
         ctx: CommandContext,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, CommandError> {
         let command = self
             .commands
             .get(name)
@@ -423,12 +420,9 @@ mod tests {
             .execute("missing", CommandContext::new(PathBuf::from("/tmp")))
             .expect_err("unknown command must fail");
 
-        let command_error = error
-            .downcast_ref::<CommandError>()
-            .expect("anyhow error should carry the CommandError domain error");
         assert!(matches!(
-            command_error,
-            CommandError::NotFound { name } if name == "missing"
+            error,
+            CommandError::NotFound { ref name } if name == "missing"
         ));
         assert_eq!(error.to_string(), "Command not found: missing");
     }
