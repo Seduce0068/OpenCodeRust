@@ -436,12 +436,27 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
 }
 
 /// Substitute `{env:VAR}` patterns with environment variable values.
-/// Works on the raw JSONC text before parsing.
+///
+/// Values are inserted as JSON string data, never as raw source text, so a
+/// value containing quotes, backslashes or newlines cannot terminate a string
+/// early or inject additional config keys. The insertion depends on context:
+///
+/// * Inside an existing JSON string literal (the documented `"{env:VAR}"`
+///   form), only the escaped contents are inserted. The surrounding quotes are
+///   already present, so the value keeps becoming the string's content as
+///   before -- values without special characters produce byte-identical
+///   output to the previous implementation.
+/// * As a bare token (e.g. `"key": {env:VAR}`), a complete JSON string literal
+///   is inserted, including quotes. This keeps such configs parseable instead
+///   of emitting invalid JSON or letting the value alter the object shape.
+///
+/// Works on the raw JSONC text before parsing so `{file:...}` references can
+/// still be resolved afterwards.
 fn substitute_env_vars(text: &str) -> String {
     let re = regex::Regex::new(r"\{env:([^}]+)\}").unwrap();
     re.replace_all(text, |caps: &regex::Captures| {
         let var_name = &caps[1];
-        match std::env::var(var_name) {
+        let value = match std::env::var(var_name) {
             Ok(value) => value,
             Err(_) => {
                 // Keep the existing empty-string expansion so startup is not
@@ -453,9 +468,85 @@ fn substitute_env_vars(text: &str) -> String {
                 );
                 String::new()
             }
+        };
+
+        // Serializing a String always yields a quoted JSON string whose first
+        // and last bytes are ASCII double quotes; slicing them off leaves the
+        // escaped contents used inside an existing string literal.
+        let quoted = serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string());
+        let match_start = caps.get(0).map_or(0, |m| m.start());
+        if inside_json_string_literal(text, match_start) {
+            quoted[1..quoted.len() - 1].to_string()
+        } else {
+            quoted
         }
     })
     .to_string()
+}
+
+/// Returns `true` when the byte offset `pos` in `text` is inside a JSON string
+/// literal.
+///
+/// Scans the preceding text and tracks string, escape and JSONC comment state.
+/// This keeps quotes in comments from misclassifying a later placeholder and
+/// prevents escaped quotes (`\"`) from toggling the string state. Checking
+/// only the character directly before the match would misclassify placeholders
+/// in the middle of a string such as `"prefix-{env:VAR}-suffix"`.
+fn inside_json_string_literal(text: &str, pos: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut i = 0;
+
+    while i < pos {
+        let byte = bytes[i];
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && i + 1 < pos && bytes[i + 1] == b'/' {
+                block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'/' if i + 1 < pos && bytes[i + 1] == b'/' => {
+                line_comment = true;
+                i += 2;
+                continue;
+            }
+            b'/' if i + 1 < pos && bytes[i + 1] == b'*' => {
+                block_comment = true;
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    in_string
 }
 
 /// Resolve `{file:path}` patterns by reading file contents.
@@ -1796,6 +1887,108 @@ mod tests {
     }
 
     #[test]
+    fn substitute_env_vars_token_escapes_quote_backslash_and_controls() {
+        const VAR: &str = "OPENCODE_H17_TOKEN_SPECIAL";
+        let value = "a\"b\\c\nd\re\tf";
+        std::env::set_var(VAR, value);
+        let result = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_TOKEN_SPECIAL}}"#);
+        std::env::remove_var(VAR);
+
+        // A bare token must become a complete JSON string literal.
+        let expected = serde_json::to_string(value).unwrap();
+        assert_eq!(result, format!(r#"{{"api_key": {expected}}}"#));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["api_key"].as_str(), Some(value));
+    }
+
+    #[test]
+    fn substitute_env_vars_string_literal_escapes_special_characters() {
+        const VAR: &str = "OPENCODE_H17_LITERAL_SPECIAL";
+        let value = "a\"b\\c\nd\re\tf";
+        std::env::set_var(VAR, value);
+        let result = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_LITERAL_SPECIAL}"}"#);
+        std::env::remove_var(VAR);
+
+        // The surrounding quotes are already present, so only escaped content
+        // is inserted; the final text still parses to the original value.
+        let expected = serde_json::to_string(value).unwrap();
+        assert_eq!(result, format!(r#"{{"api_key": {expected}}}"#));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["api_key"].as_str(), Some(value));
+    }
+
+    #[test]
+    fn substitute_env_vars_mid_string_placeholder_stays_a_string() {
+        const VAR: &str = "OPENCODE_H17_MID_STRING";
+        let value = "a\"b\\c\nd";
+        std::env::set_var(VAR, value);
+        let result =
+            substitute_env_vars(r#"{"api_key": "pre-{env:OPENCODE_H17_MID_STRING}-post"}"#);
+        std::env::remove_var(VAR);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let expected = format!("pre-{value}-post");
+        assert_eq!(parsed["api_key"].as_str(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn substitute_env_vars_cannot_inject_config_keys() {
+        const VAR: &str = "OPENCODE_H17_INJECTION";
+        // Classic injection payload: close the string, then add another key.
+        let value = "\" , \"theme\": \"injected";
+        std::env::set_var(VAR, value);
+        let token = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_INJECTION}}"#);
+        let literal = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_INJECTION}"}"#);
+        std::env::remove_var(VAR);
+
+        for result in [&token, &literal] {
+            let parsed: serde_json::Value = serde_json::from_str(result).unwrap();
+            let object = parsed.as_object().expect("result must stay an object");
+            assert_eq!(object.len(), 1, "injected a key into {result}");
+            assert!(
+                object.get("theme").is_none(),
+                "injected theme into {result}"
+            );
+            assert_eq!(object.get("api_key").and_then(|v| v.as_str()), Some(value));
+        }
+    }
+
+    #[test]
+    fn inside_json_string_literal_ignores_quotes_in_comments() {
+        let line = "// a \"quote\" {env:FIRST}\n{\"key\": \"pre-{env:SECOND}-post\"}";
+        let first = line.find("{env:FIRST}").unwrap();
+        let second = line.find("{env:SECOND}").unwrap();
+        assert!(!inside_json_string_literal(line, first));
+        assert!(inside_json_string_literal(line, second));
+
+        let block = "/* \"quote\" {env:FIRST} */ {\"key\": \"{env:SECOND}\"}";
+        let first = block.find("{env:FIRST}").unwrap();
+        let second = block.find("{env:SECOND}").unwrap();
+        assert!(!inside_json_string_literal(block, first));
+        assert!(inside_json_string_literal(block, second));
+    }
+
+    #[test]
+    fn load_from_file_parses_env_value_with_quotes_newlines_and_backslashes() {
+        const VAR: &str = "OPENCODE_H17_E2E";
+        let temp = TestDir::new("opencode_env_e2e");
+        let value = "line1\n\"quoted\"\\path";
+        fs::write(
+            temp.path.join("opencode.jsonc"),
+            r#"{"model": {env:OPENCODE_H17_E2E}}"#,
+        )
+        .unwrap();
+
+        std::env::set_var(VAR, value);
+        let mut loader = ConfigLoader::new().without_global_config();
+        let loaded = loader.load_from_file(temp.path.join("opencode.jsonc"));
+        std::env::remove_var(VAR);
+
+        loaded.expect("config with special env value must parse");
+        assert_eq!(loader.config().model.as_deref(), Some(value));
+    }
+
+    #[test]
     fn test_resolve_file_references() {
         let temp = TestDir::new("opencode_file_ref");
         let secret_path = temp.path.join("secret.txt");
@@ -2358,8 +2551,10 @@ mod provider_normalization_tests {
     #[test]
     fn substitute_env_vars_replaces_pattern() {
         std::env::set_var("OPENCODE_TEST_ENV_VAR", "resolved-value");
+        // A placeholder outside a JSON string literal is emitted as a complete
+        // JSON string literal (quotes included), not as raw source text.
         let result = substitute_env_vars("prefix:{env:OPENCODE_TEST_ENV_VAR}:suffix");
-        assert_eq!(result, "prefix:resolved-value:suffix");
+        assert_eq!(result, "prefix:\"resolved-value\":suffix");
         std::env::remove_var("OPENCODE_TEST_ENV_VAR");
     }
 }
