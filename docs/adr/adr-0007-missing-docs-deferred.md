@@ -2,7 +2,7 @@
 type: ADR
 title: 公開APIドキュメント (missing_docs) の一括対応保留
 description: 5,604 件の missing_docs 違反を確認し、一括修正を見送る判断を記録する。
-status: Accepted
+status: approved
 tags:
   - documentation
   - rustdoc

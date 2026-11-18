@@ -1,7 +1,7 @@
 ---
 type: ADR
 title: ツール実行権限フローの配線
-status: Approved
+status: approved
 date: "2026-01-12T00:00:00+09:00"
 deciders:
   - OpenCodeRust Team
@@ -10,6 +10,9 @@ tags:
   - server
   - prompt
   - permission
+generated:
+  by: OpenCodeRust Team
+  at: "2026-01-12T00:00:00+09:00"
 ---
 
 ## ADR-0002: ツール実行権限フローの配線

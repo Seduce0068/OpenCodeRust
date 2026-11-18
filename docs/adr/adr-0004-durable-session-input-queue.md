@@ -2,7 +2,7 @@
 type: ADR
 title: Durable session input queue
 description: Defines persistence, ordering, claiming, recovery, and operational limits for asynchronous session prompts.
-status: Accepted
+status: approved
 tags:
   - session
   - queue

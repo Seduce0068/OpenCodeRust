@@ -1,13 +1,17 @@
 ---
 type: Playbook
+title: Rust Build Notes for Termux/Android
 description: Termux/Android 環境での build 制約と回避策を記録する。
 tags: [termux, android, build]
+generated:
+  by: agent
+  at: "2026-10-16T00:30:00+09:00"
 verified:
   by: agent
   at: "2026-10-16T00:30:00+09:00"
 ---
 
-# Rust Build Notes for Termux/Android
+## Rust Build Notes for Termux/Android
 
 This document captures the specific workarounds required to build
 OpenCodeRust in Termux.

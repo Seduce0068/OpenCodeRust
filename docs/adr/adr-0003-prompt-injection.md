@@ -1,7 +1,7 @@
 ---
 type: ADR
 title: プロンプト経路へのツール・システムプロンプト注入
-status: Approved
+status: approved
 date: "2026-01-15T00:00:00+09:00"
 deciders:
   - OpenCodeRust Team
@@ -10,6 +10,9 @@ tags:
   - agent
   - tool
   - system-prompt
+generated:
+  by: OpenCodeRust Team
+  at: "2026-01-15T00:00:00+09:00"
 ---
 
 ## ADR-0003: プロンプト経路へのツール・システムプロンプト注入
