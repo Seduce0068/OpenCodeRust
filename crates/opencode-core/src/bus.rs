@@ -19,7 +19,7 @@ impl BusEventDef {
     }
 }
 
-type BoxedCallback = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+type BoxedCallback = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
 struct Subscription {
     id: u64,
@@ -54,16 +54,25 @@ impl Bus {
 
         let _ = self.tx.send(event.clone());
 
-        let subscribers = self.subscribers.read().await;
-        if let Some(subs) = subscribers.get(def.event_type) {
-            for sub in subs {
-                (sub.callback)(def.event_type, properties.clone());
-            }
+        // コールバック実行前に read guard を解放し、コールバックからの
+        // subscribe/unsubscribe による write lock 取得でデッドロックしないようにする。
+        let callbacks: Vec<BoxedCallback> = {
+            let subscribers = self.subscribers.read().await;
+            subscribers
+                .get(def.event_type)
+                .map(|subs| subs.iter().map(|s| Arc::clone(&s.callback)).collect())
+                .unwrap_or_default()
+        };
+        for callback in callbacks {
+            callback(def.event_type, properties.clone());
         }
 
-        let wildcard = self.wildcard_subscribers.read().await;
-        for sub in wildcard.iter() {
-            (sub.callback)(def.event_type, properties.clone());
+        let wildcard: Vec<BoxedCallback> = {
+            let wildcard = self.wildcard_subscribers.read().await;
+            wildcard.iter().map(|s| Arc::clone(&s.callback)).collect()
+        };
+        for callback in wildcard {
+            callback(def.event_type, properties.clone());
         }
     }
 
@@ -83,7 +92,7 @@ impl Bus {
             .or_insert_with(Vec::new);
         subs.push(Subscription {
             id,
-            callback: Box::new(callback),
+            callback: Arc::new(callback),
         });
 
         id
@@ -109,7 +118,7 @@ impl Bus {
         let mut wildcard = self.wildcard_subscribers.write().await;
         wildcard.push(Subscription {
             id,
-            callback: Box::new(callback),
+            callback: Arc::new(callback),
         });
 
         id
