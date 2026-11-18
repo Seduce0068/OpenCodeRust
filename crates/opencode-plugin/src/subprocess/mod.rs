@@ -40,3 +40,66 @@ pub fn hook_name_to_event(name: &str) -> Option<HookEvent> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_all_supported_hook_names() {
+        let cases = [
+            ("chat.headers", HookEvent::ChatHeaders),
+            ("chat.params", HookEvent::ChatParams),
+            ("chat.message", HookEvent::ChatMessage),
+            ("tool.execute.before", HookEvent::ToolExecuteBefore),
+            ("tool.execute.after", HookEvent::ToolExecuteAfter),
+            ("tool.definition", HookEvent::ToolDefinition),
+            ("permission.ask", HookEvent::PermissionAsk),
+            ("command.execute.before", HookEvent::CommandExecuteBefore),
+            ("shell.env", HookEvent::ShellEnv),
+            (
+                "experimental.chat.system.transform",
+                HookEvent::ChatSystemTransform,
+            ),
+            (
+                "experimental.chat.messages.transform",
+                HookEvent::ChatMessagesTransform,
+            ),
+            (
+                "experimental.session.compacting",
+                HookEvent::SessionCompacting,
+            ),
+            ("experimental.text.complete", HookEvent::TextComplete),
+        ];
+
+        // サポート対象の全マッピングを漏れなく検証していることを担保する。
+        assert_eq!(cases.len(), 13);
+        for (name, expected) in cases {
+            assert_eq!(
+                hook_name_to_event(name),
+                Some(expected),
+                "unexpected mapping for hook name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn returns_none_for_unsupported_or_malformed_names() {
+        for name in [
+            "",
+            "unknown.hook",
+            "Chat.Headers",  // 大文字小文字は区別される
+            "chat.headers ", // 末尾の空白は許容されない
+            " chat.headers", // 先頭の空白は許容されない
+            "chat.header",   // 類似だが不正な名前
+            "ToolCall",      // Rust のバリアント名は TS フック名ではない
+            "session.start", // 対応する HookEvent はあるが TS フック名のマッピングはない
+        ] {
+            assert_eq!(
+                hook_name_to_event(name),
+                None,
+                "unexpected mapping for hook name: {name}"
+            );
+        }
+    }
+}
