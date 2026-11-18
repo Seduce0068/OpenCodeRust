@@ -1302,14 +1302,17 @@ async fn stream_message(
         resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)?;
     drop(config);
 
-    let (history, msg_id, selected_variant) = {
+    let (provider_messages, msg_id, selected_variant) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
         session.add_user_message(&req.content);
-        let history = session.messages.clone();
+        // 全履歴を clone せず、ロック保持中に provider 用メッセージへ直接変換する。
+        // 変換結果は所有値なのでロック外へ持ち出せる。assistant プレースホルダー
+        // 追加前に変換するため、provider へ渡る履歴は従来と同一。
+        let provider_messages = session_messages_to_provider_messages(&session.messages);
         let selected_variant = req.variant.clone().or_else(|| {
             session
                 .metadata
@@ -1331,10 +1334,13 @@ async fn stream_message(
             .insert("model_id".to_string(), serde_json::json!(model_id.clone()));
 
         let assistant_msg = session.add_assistant_message();
-        (history, assistant_msg.id.clone(), selected_variant)
+        (
+            provider_messages,
+            assistant_msg.id.clone(),
+            selected_variant,
+        )
     };
 
-    let provider_messages = session_messages_to_provider_messages(&history);
     let variant = selected_variant.clone();
     let temperature = temperature_for_model(&model_id).or(Some(0.7));
     let top_p = top_p_for_model(&model_id);
