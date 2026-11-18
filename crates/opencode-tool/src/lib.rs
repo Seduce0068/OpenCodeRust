@@ -28,7 +28,7 @@ pub mod registry;
 pub mod skill;
 pub mod task;
 pub mod todo;
-pub mod tool;
+pub(crate) mod tool;
 pub mod truncation;
 pub mod webfetch;
 pub mod websearch;
