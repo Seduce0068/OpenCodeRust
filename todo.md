@@ -317,9 +317,15 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI session_export(22)・timeline(19)・skill_list(27)・subagent(22)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI mcp(28)・provider(24)・permission(20)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
+- `PermissionType::from_permission_str`（2026-11-18、swarm-coding R2-C が発見、未修正）:
+  `ExecuteCommand` / `NetworkRequest` に対応する arm が無く、これら 2 バリアントは
+  直接構築でしか到達できない。サーバが `"execute_command"` 等を送る想定なら
+  マッピング追加を検討（現挙動はテストで固定済み）。
 - `AgentSelectDialog::set_agents`（2026-11-18、swarm-coding R2-C が発見、未修正）:
   選択インデックスをリセットしないため、新リストが現在選択より短いと
   `selected_agent()` が None になる。現挙動はテストで固定済み。ThemeListDialog::filter()
