@@ -30,6 +30,22 @@ fn saturating_backoff(base: u64, factor: u64, exponent: u32) -> u64 {
     base.saturating_mul(power)
 }
 
+/// Convert a parsed `retry-after` value expressed in milliseconds into a
+/// bounded delay.
+///
+/// Returns `None` for negative, zero, NaN, or infinite values so the caller
+/// falls back to exponential backoff. Rust's `f64 -> u64` casts saturate
+/// (negative/NaN become `0`, infinity becomes `u64::MAX`), so validation must
+/// happen *before* the cast. Clamping is performed in `f64` space, which also
+/// covers `parsed_seconds * 1000.0` overflowing to infinity.
+fn clamp_retry_after_ms(ms: f64) -> Option<u64> {
+    if !ms.is_finite() || ms <= 0.0 {
+        return None;
+    }
+    let bounded = ms.min(RETRY_MAX_DELAY as f64);
+    Some(bounded.ceil() as u64)
+}
+
 pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
     // `attempt` is 1-based at every call site; saturating_sub also keeps this
     // safe if a future caller passes 0.
@@ -39,20 +55,24 @@ pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
         if let Some(ref headers) = err.response_headers {
             if let Some(retry_after_ms) = headers.get("retry-after-ms") {
                 if let Ok(parsed_ms) = retry_after_ms.parse::<f64>() {
-                    return parsed_ms as u64;
+                    if let Some(delay_ms) = clamp_retry_after_ms(parsed_ms) {
+                        return delay_ms;
+                    }
                 }
             }
 
             if let Some(retry_after) = headers.get("retry-after") {
                 if let Ok(parsed_seconds) = retry_after.parse::<f64>() {
-                    return (parsed_seconds * 1000.0).ceil() as u64;
+                    if let Some(delay_ms) = clamp_retry_after_ms(parsed_seconds * 1000.0) {
+                        return delay_ms;
+                    }
                 }
 
                 if let Ok(parsed_date) = chrono::DateTime::parse_from_rfc2822(retry_after) {
                     let now = chrono::Utc::now();
                     let diff = parsed_date.with_timezone(&chrono::Utc) - now;
-                    if diff.num_milliseconds() > 0 {
-                        return diff.num_milliseconds() as u64;
+                    if let Some(delay_ms) = clamp_retry_after_ms(diff.num_milliseconds() as f64) {
+                        return delay_ms;
                     }
                 }
             }
@@ -221,6 +241,73 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("retry-after".to_owned(), "not-a-number".to_owned());
         assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000);
+    }
+
+    #[test]
+    fn delay_retry_after_ms_at_max_is_exact() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after-ms".to_owned(), RETRY_MAX_DELAY.to_string());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn delay_retry_after_ms_over_max_is_clamped() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "retry-after-ms".to_owned(),
+            (RETRY_MAX_DELAY + 1).to_string(),
+        );
+        assert_eq!(delay(1, Some(&info(Some(headers)))), RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn delay_retry_after_ms_huge_is_clamped() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after-ms".to_owned(), "1e18".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn delay_retry_after_ms_non_positive_falls_back() {
+        for value in ["-1", "0", "-0.5"] {
+            let mut headers = HashMap::new();
+            headers.insert("retry-after-ms".to_owned(), value.to_owned());
+            assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000, "value={value}");
+        }
+    }
+
+    #[test]
+    fn delay_retry_after_ms_non_finite_falls_back() {
+        for value in ["NaN", "nan", "inf", "Infinity", "-inf"] {
+            let mut headers = HashMap::new();
+            headers.insert("retry-after-ms".to_owned(), value.to_owned());
+            assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000, "value={value}");
+        }
+    }
+
+    #[test]
+    fn delay_retry_after_seconds_is_clamped() {
+        let mut headers = HashMap::new();
+        // 1e9 seconds -> 1e12 ms, far above RETRY_MAX_DELAY.
+        headers.insert("retry-after".to_owned(), "1e9".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn delay_retry_after_seconds_overflow_to_inf_falls_back() {
+        let mut headers = HashMap::new();
+        // 1e308 * 1000.0 overflows f64 to infinity; must not become u64::MAX.
+        headers.insert("retry-after".to_owned(), "1e308".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000);
+    }
+
+    #[test]
+    fn delay_retry_after_seconds_invalid_falls_back() {
+        for value in ["-2.5", "NaN", "inf"] {
+            let mut headers = HashMap::new();
+            headers.insert("retry-after".to_owned(), value.to_owned());
+            assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000, "value={value}");
+        }
     }
 
     #[test]

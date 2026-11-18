@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::api::{
     ApiClient, McpStatusInfo, MessageInfo, QuestionRequestInfo, SessionInfo, SessionRevertInfo,
+    UnsupportedEndpointError,
 };
 use crate::app::state::AppState;
 use crate::app::terminal;
@@ -1948,10 +1949,20 @@ impl App {
     }
 
     fn open_skill_list_dialog(&mut self) {
-        if let Err(err) = self.refresh_skill_list_dialog() {
-            self.alert_dialog
-                .set_message(&format!("Failed to refresh skills:\n{}", err));
-            self.alert_dialog.open();
+        match self.refresh_skill_list_dialog() {
+            Ok(()) => {}
+            Err(err) if err.downcast_ref::<UnsupportedEndpointError>().is_some() => {
+                // 501 (unsupported) は通信エラーではないためアラートを出さない。
+                // SkillListDialog は空リストを "No skills available" として描画するため、
+                // 候補を空にしてダイアログを開くことで「利用不可」を表現する。
+                self.skill_list_dialog.set_skills(Vec::new());
+                self.prompt.set_skill_suggestions(Vec::new());
+            }
+            Err(err) => {
+                self.alert_dialog
+                    .set_message(&format!("Failed to refresh skills:\n{}", err));
+                self.alert_dialog.open();
+            }
         }
         self.skill_list_dialog.open();
     }

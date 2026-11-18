@@ -2327,27 +2327,11 @@ pub struct ExecuteShellRequest {
 }
 
 async fn execute_shell(
-    State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
-    Json(req): Json<ExecuteShellRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions
-        .get_mut(&id)
-        .ok_or_else(|| ApiError::SessionNotFound(id.clone()))?;
-    session.add_user_message(format!("$ {}", req.command));
-    let assistant = session.add_assistant_message();
-    assistant.add_text(format!("Shell command queued: {}", req.command));
-    let assistant_id = assistant.id.clone();
-    drop(sessions);
-    persist_sessions_if_enabled(&state).await;
-
-    Ok(Json(serde_json::json!({
-        "executed": true,
-        "command": req.command,
-        "workdir": req.workdir,
-        "message_id": assistant_id,
-    })))
+    State(_state): State<Arc<ServerState>>,
+    Path(_id): Path<String>,
+    Json(_req): Json<ExecuteShellRequest>,
+) -> Response {
+    not_implemented("shell")
 }
 
 #[derive(Debug, Deserialize)]
@@ -2465,13 +2449,8 @@ pub struct InitSessionRequest {
     pub force: Option<bool>,
 }
 
-async fn init_session(
-    Path(_id): Path<String>,
-    Json(_req): Json<InitSessionRequest>,
-) -> Result<Json<serde_json::Value>> {
-    Ok(Json(
-        serde_json::json!({ "initialized": true, "message": "Session initialized successfully" }),
-    ))
+async fn init_session(Path(_id): Path<String>, Json(_req): Json<InitSessionRequest>) -> Response {
+    not_implemented("init")
 }
 
 #[derive(Debug, Deserialize)]
@@ -2483,16 +2462,12 @@ pub struct SummarizeSessionRequest {
 async fn summarize_session(
     Path(_id): Path<String>,
     Json(_req): Json<SummarizeSessionRequest>,
-) -> Result<Json<serde_json::Value>> {
-    Ok(Json(
-        serde_json::json!({ "summarized": true, "message": "Session summarized successfully" }),
-    ))
+) -> Response {
+    not_implemented("summarize")
 }
 
-async fn session_unrevert(Path(_id): Path<String>) -> Result<Json<serde_json::Value>> {
-    Ok(Json(
-        serde_json::json!({ "unreverted": true, "message": "Session unreverted successfully" }),
-    ))
+async fn session_unrevert(Path(_id): Path<String>) -> Response {
+    not_implemented("unrevert")
 }
 
 #[derive(Debug, Deserialize)]
@@ -3716,8 +3691,8 @@ pub struct SymbolInfo {
     pub line: usize,
 }
 
-async fn find_symbols(Query(_query): Query<FindSymbolsQuery>) -> Result<Json<Vec<SymbolInfo>>> {
-    Ok(Json(Vec::new()))
+async fn find_symbols(Query(_query): Query<FindSymbolsQuery>) -> Response {
+    not_implemented("find_symbols")
 }
 
 fn permission_routes() -> Router<Arc<ServerState>> {
@@ -4476,8 +4451,8 @@ async fn get_global_config(
     Ok(Json(config_for_response(&AppConfig::default())))
 }
 
-async fn dispose_all() -> Json<bool> {
-    Json(true)
+async fn dispose_all() -> Response {
+    not_implemented("dispose")
 }
 
 fn experimental_routes() -> Router<Arc<ServerState>> {
@@ -4511,16 +4486,16 @@ pub struct ExperimentalFeature {
     pub enabled: bool,
 }
 
-async fn list_experimental() -> Json<Vec<ExperimentalFeature>> {
-    Json(Vec::new())
+async fn list_experimental() -> Response {
+    not_implemented("experimental list")
 }
 
-async fn enable_experimental(Path(_feature): Path<String>) -> Result<Json<bool>> {
-    Ok(Json(true))
+async fn enable_experimental(Path(_feature): Path<String>) -> Response {
+    not_implemented("experimental enable")
 }
 
-async fn disable_experimental(Path(_feature): Path<String>) -> Result<Json<bool>> {
-    Ok(Json(true))
+async fn disable_experimental(Path(_feature): Path<String>) -> Response {
+    not_implemented("experimental disable")
 }
 
 #[derive(Debug, Deserialize)]
@@ -4538,6 +4513,20 @@ pub struct ExperimentalTaskResponse {
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Value>,
+}
+
+/// 未実装の一般エンドポイントであることを明示する 501 レスポンスを生成する。
+fn not_implemented(operation: &str) -> Response {
+    let body = Json(serde_json::json!({
+        "error": {
+            "message": format!(
+                "Endpoint `{}` is not implemented in the Rust server.",
+                operation
+            ),
+            "type": "not_implemented"
+        }
+    }));
+    (StatusCode::NOT_IMPLEMENTED, body).into_response()
 }
 
 /// 未実装の experimental エンドポイントであることを明示する 501 レスポンスを生成する。
@@ -4695,8 +4684,8 @@ pub struct ResourceInfo {
     pub description: Option<String>,
 }
 
-async fn list_resources() -> Json<Vec<ResourceInfo>> {
-    Json(Vec::new())
+async fn list_resources() -> Response {
+    not_implemented("resource")
 }
 
 #[derive(Debug, Serialize)]
@@ -4842,19 +4831,8 @@ struct PathQuery {
     directory: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct VcsInfo {
-    system: Option<String>,
-    branch: Option<String>,
-    root: Option<String>,
-}
-
-async fn get_vcs_info() -> Result<Json<VcsInfo>> {
-    Ok(Json(VcsInfo {
-        system: Some("git".to_string()),
-        branch: None,
-        root: None,
-    }))
+async fn get_vcs_info() -> Response {
+    not_implemented("vcs")
 }
 
 #[derive(Debug, Serialize)]
@@ -4959,30 +4937,16 @@ async fn apply_plugin_config_hooks(loader: &Arc<PluginLoader>, config: &mut AppC
     }
 }
 
-async fn list_skills() -> Result<Json<Vec<String>>> {
-    Ok(Json(Vec::new()))
+async fn list_skills() -> Response {
+    not_implemented("skill")
 }
 
-#[derive(Debug, Serialize)]
-struct LspStatus {
-    servers: Vec<String>,
+async fn get_lsp_status() -> Response {
+    not_implemented("lsp status")
 }
 
-async fn get_lsp_status() -> Result<Json<LspStatus>> {
-    Ok(Json(LspStatus {
-        servers: Vec::new(),
-    }))
-}
-
-#[derive(Debug, Serialize)]
-struct FormatterStatus {
-    formatters: Vec<String>,
-}
-
-async fn get_formatter_status() -> Result<Json<FormatterStatus>> {
-    Ok(Json(FormatterStatus {
-        formatters: Vec::new(),
-    }))
+async fn get_formatter_status() -> Response {
+    not_implemented("formatter status")
 }
 
 #[derive(Debug, Deserialize)]
@@ -5525,6 +5489,141 @@ mod experimental_not_implemented_tests {
             context: None,
         };
         assert_not_implemented(experimental_test(Json(payload)).await, "test").await;
+    }
+
+    // 以下、固定値・キュー投入のみで実処理がないハンドラの 501 化検証。
+
+    #[tokio::test]
+    async fn execute_shell_returns_501() {
+        let state = Arc::new(ServerState::new());
+        let response = execute_shell(
+            State(state),
+            Path("session-1".to_string()),
+            Json(ExecuteShellRequest {
+                command: "echo hi".to_string(),
+                workdir: None,
+            }),
+        )
+        .await;
+        assert_not_implemented(response, "shell").await;
+    }
+
+    #[tokio::test]
+    async fn init_session_returns_501() {
+        let response = init_session(
+            Path("session-1".to_string()),
+            Json(InitSessionRequest { force: Some(true) }),
+        )
+        .await;
+        assert_not_implemented(response, "init").await;
+    }
+
+    #[tokio::test]
+    async fn summarize_session_returns_501() {
+        let response = summarize_session(
+            Path("session-1".to_string()),
+            Json(SummarizeSessionRequest {
+                provider_id: None,
+                model_id: None,
+            }),
+        )
+        .await;
+        assert_not_implemented(response, "summarize").await;
+    }
+
+    #[tokio::test]
+    async fn session_unrevert_returns_501() {
+        let response = session_unrevert(Path("session-1".to_string())).await;
+        assert_not_implemented(response, "unrevert").await;
+    }
+
+    #[tokio::test]
+    async fn find_symbols_returns_501() {
+        let response = find_symbols(Query(FindSymbolsQuery {
+            query: "needle".to_string(),
+        }))
+        .await;
+        assert_not_implemented(response, "find_symbols").await;
+    }
+
+    #[tokio::test]
+    async fn dispose_all_returns_501() {
+        assert_not_implemented(dispose_all().await, "dispose").await;
+    }
+
+    #[tokio::test]
+    async fn list_experimental_returns_501() {
+        assert_not_implemented(list_experimental().await, "experimental list").await;
+    }
+
+    #[tokio::test]
+    async fn enable_experimental_returns_501() {
+        let response = enable_experimental(Path("feature".to_string())).await;
+        assert_not_implemented(response, "experimental enable").await;
+    }
+
+    #[tokio::test]
+    async fn disable_experimental_returns_501() {
+        let response = disable_experimental(Path("feature".to_string())).await;
+        assert_not_implemented(response, "experimental disable").await;
+    }
+
+    #[tokio::test]
+    async fn list_resources_returns_501() {
+        assert_not_implemented(list_resources().await, "resource").await;
+    }
+
+    #[tokio::test]
+    async fn list_skills_returns_501() {
+        assert_not_implemented(list_skills().await, "skill").await;
+    }
+
+    #[tokio::test]
+    async fn get_lsp_status_returns_501() {
+        assert_not_implemented(get_lsp_status().await, "lsp status").await;
+    }
+
+    #[tokio::test]
+    async fn get_formatter_status_returns_501() {
+        assert_not_implemented(get_formatter_status().await, "formatter status").await;
+    }
+
+    #[tokio::test]
+    async fn get_vcs_info_returns_501() {
+        assert_not_implemented(get_vcs_info().await, "vcs").await;
+    }
+
+    #[tokio::test]
+    async fn not_implemented_message_distinguishes_generic_and_experimental() {
+        // 一般ルートは "Experimental endpoint" と誤表示しない。
+        let generic = get_vcs_info().await;
+        assert_eq!(generic.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = axum::body::to_bytes(generic.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body should be JSON");
+        assert_eq!(
+            value["error"]["message"]
+                .as_str()
+                .expect("message should be a string"),
+            "Endpoint `vcs` is not implemented in the Rust server."
+        );
+        assert_eq!(value["error"]["type"], "not_implemented");
+
+        // /experimental/* は従来の "Experimental endpoint" 表記を維持。
+        let experimental = experimental_not_implemented("analyze");
+        assert_eq!(experimental.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = axum::body::to_bytes(experimental.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body should be JSON");
+        assert_eq!(
+            value["error"]["message"]
+                .as_str()
+                .expect("message should be a string"),
+            "Experimental endpoint `analyze` is not implemented in the Rust server."
+        );
+        assert_eq!(value["error"]["type"], "not_implemented");
     }
 }
 
