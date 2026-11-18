@@ -81,7 +81,7 @@ status: current
   - 残り 22 件の workspace バイパス＋9 件の未集約依存は段階的集約が必要。特に serde_json は
     `preserve_order` feature の挙動影響を事前評価。厳密ピン拡充（8/61）は複数バージョン併存
     リスクの精査が必要（Cargo.lock コミット＋CI locked で再現性は担保済み）
-  - 別課題: 7 クレートが version.workspace を使わず authors/license 欠如
+  - version/edition/authors/license の workspace 継承は 7 クレートとも完了済み
 - [ ] **[M-16]** 依存方向の逆転と ADR／アーキテクチャ方針との矛盾
   - charter の依存方向と逆に permission→plugin、tool→permission/plugin、session→
     provider/tool/mcp/lsp、types が sqlx::Type を derive（循環なし、feature 分割は皆無）。ADR
@@ -111,13 +111,10 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **[L-03]** 未配線コードの dead_code 抑制と CHANGELOG の矛盾
-  - `prompt.rs:1961-1962` が定義のみ、`markdown/parser.rs` が 363 行全体を抑制、
-    CHANGELOG.md:61-63 の「のみ」と矛盾。配線または削除し CHANGELOG を修正
-- [ ] **[L-04]** tracing 初期化の未配線（level 反映は対応済み、残りに絞る）
-  - `build_filter(level)` で logLevel 反映は実装済み。未対応は `logging.rs` の
-    WorkerGuard 早期ドロップ、rolling 未使用、`init_tracing` 呼び出し 0 件、
-    CLI が `fmt::init()` で `config.log_level` 未参照。Guard 延伸＋rolling＋呼出配線
+- [ ] **[L-04]** tracing の残課題（level 反映・CLI 配線は対応済み）
+  - `init_tracing` を CLI 起動時に呼び出し `config.logLevel` を実効化済み。
+    未対応は `logging.rs` の WorkerGuard 早期ドロップ（API 変更要）と rolling 未使用。
+    起動時とハンドラで `load_config` が 2 回走る点は大規模変更のため据え置き
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
@@ -257,6 +254,9 @@ status: current
 - [x] **[L-01]** Event Bus のコールバックをロック解放後に実行（2026-11-18、eventbus-worker）
 - [x] **[L-02]** MCP list_changed の非対称を MAPPING.md へ明記
   （2026-11-18、listchanged-worker + 親）
+- [x] **[M-15]** 7 クレートの version 等を workspace 継承へ（2026-11-18、workspace-version-worker）
+- [x] **[L-04]** init_tracing を CLI へ配線し logLevel を実効化（2026-11-18、tracing-wire-worker）
+- [x] **[L-03]** 未配線 dead code 約 400 行と抑制属性を削除（2026-11-18、deadcode-worker）
 
 ## メモ
 
