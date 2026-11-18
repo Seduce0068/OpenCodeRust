@@ -22,7 +22,7 @@ impl std::fmt::Display for Route {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Router {
     history: Vec<Route>,
     current: Route,
@@ -74,6 +74,12 @@ impl Router {
     }
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +124,17 @@ mod tests {
 
         assert_eq!(router.current(), &Route::Home);
         assert!(router.is_home());
+    }
+
+    #[test]
+    fn router_default_matches_new_history_and_current() {
+        let from_default = Router::default();
+        let from_new = Router::new();
+
+        assert_eq!(from_default.history, [Route::Home]);
+        assert_eq!(from_default.current(), &Route::Home);
+        assert_eq!(from_default.history, from_new.history);
+        assert_eq!(from_default.current(), from_new.current());
     }
 
     // --- Router::navigate ---
