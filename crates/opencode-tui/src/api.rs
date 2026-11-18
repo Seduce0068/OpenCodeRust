@@ -1179,6 +1179,183 @@ mod tests {
     }
 
     #[test]
+    fn message_info_deserializes_server_list_messages_payload() {
+        // サーバ `list_messages`（routes.rs）は `message_to_info` が組み立てた
+        // `MessageInfo` を serde 既定の snake_case キーで直列化した配列を返す。
+        // 具体的には `session_id` / `created_at` / `completed_at` と、トークンの
+        // `cache_read` / `cache_write` 等がそのまま wire キーになる。
+        // なお同一 routes.rs の `get_message` が返す
+        // `{"info": {"sessionID", "createdAt", ...}, "parts": [...]}` は手組みの
+        // 別契約で、この `MessageInfo` のデシリアライズ対象外（`createdAt` の
+        // alias も持たない）。
+        let messages: Vec<MessageInfo> = serde_json::from_value(json!([
+            {
+                "id": "msg-list-1",
+                "session_id": "ses-list-1",
+                "role": "assistant",
+                "parts": [
+                    {
+                        "id": "prt-text",
+                        "type": "text",
+                        "text": "dummy reply",
+                        "file": null,
+                        "tool_call": null,
+                        "tool_result": null
+                    },
+                    {
+                        "id": "prt-call",
+                        "type": "tool_call",
+                        "text": null,
+                        "file": null,
+                        "tool_call": {
+                            "id": "call-1",
+                            "name": "dummy-tool",
+                            "input": { "path": "/tmp/x" }
+                        },
+                        "tool_result": null
+                    },
+                    {
+                        "id": "prt-result",
+                        "type": "tool_result",
+                        "text": null,
+                        "file": null,
+                        "tool_call": null,
+                        "tool_result": {
+                            "tool_call_id": "call-1",
+                            "content": "done",
+                            "is_error": false
+                        }
+                    }
+                ],
+                "created_at": 1700000000123i64,
+                "completed_at": 1700000000456i64,
+                "agent": "dummy-agent",
+                "model": "dummy-provider/dummy-model",
+                "mode": "primary",
+                "finish": "stop",
+                "error": null,
+                "cost": 0.125,
+                "tokens": {
+                    "input": 10,
+                    "output": 20,
+                    "reasoning": 5,
+                    "cache_read": 3,
+                    "cache_write": 4
+                }
+            },
+            {
+                "id": "msg-list-2",
+                "session_id": "ses-list-1",
+                "role": "user",
+                "parts": [
+                    {
+                        "id": "prt-file",
+                        "type": "file",
+                        "text": null,
+                        "file": {
+                            "url": "https://example.invalid/dummy.png",
+                            "filename": "dummy.png",
+                            "mime": "image/png"
+                        },
+                        "tool_call": null,
+                        "tool_result": null
+                    }
+                ],
+                "created_at": 1700000001000i64,
+                "completed_at": null,
+                "agent": null,
+                "model": null,
+                "mode": null,
+                "finish": null,
+                "error": null,
+                "cost": 0.0,
+                "tokens": {
+                    "input": 0,
+                    "output": 0,
+                    "reasoning": 0,
+                    "cache_read": 0,
+                    "cache_write": 0
+                }
+            }
+        ]))
+        .expect("server list_messages payload should deserialize into Vec<MessageInfo>");
+
+        assert_eq!(messages.len(), 2);
+
+        // MessageInfo / MessagePart 等は PartialEq を実装しないため、フィールド単位で検証する。
+        let first = &messages[0];
+        assert_eq!(first.id, "msg-list-1");
+        assert_eq!(first.session_id, "ses-list-1");
+        assert_eq!(first.role, "assistant");
+        assert_eq!(first.created_at, 1_700_000_000_123);
+        assert_eq!(first.completed_at, Some(1_700_000_000_456));
+        assert_eq!(first.agent.as_deref(), Some("dummy-agent"));
+        assert_eq!(first.model.as_deref(), Some("dummy-provider/dummy-model"));
+        assert_eq!(first.mode.as_deref(), Some("primary"));
+        assert_eq!(first.finish.as_deref(), Some("stop"));
+        assert!(first.error.is_none());
+        assert_eq!(first.cost, 0.125);
+        assert_eq!(first.tokens.input, 10);
+        assert_eq!(first.tokens.output, 20);
+        assert_eq!(first.tokens.reasoning, 5);
+        assert_eq!(first.tokens.cache_read, 3);
+        assert_eq!(first.tokens.cache_write, 4);
+
+        assert_eq!(first.parts.len(), 3);
+        assert_eq!(first.parts[0].part_type, "text");
+        assert_eq!(first.parts[0].text.as_deref(), Some("dummy reply"));
+        assert!(first.parts[0].file.is_none());
+        assert!(first.parts[0].tool_call.is_none());
+        assert!(first.parts[0].tool_result.is_none());
+
+        let call = first.parts[1]
+            .tool_call
+            .as_ref()
+            .expect("tool_call part should carry a ToolCall");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "dummy-tool");
+        assert_eq!(call.input, json!({ "path": "/tmp/x" }));
+        assert!(first.parts[1].tool_result.is_none());
+
+        let result = first.parts[2]
+            .tool_result
+            .as_ref()
+            .expect("tool_result part should carry a ToolResult");
+        assert_eq!(result.tool_call_id, "call-1");
+        assert_eq!(result.content, "done");
+        assert!(!result.is_error);
+        assert!(first.parts[2].tool_call.is_none());
+
+        let second = &messages[1];
+        assert_eq!(second.id, "msg-list-2");
+        assert_eq!(second.session_id, "ses-list-1");
+        assert_eq!(second.role, "user");
+        assert_eq!(second.created_at, 1_700_000_001_000);
+        assert!(second.completed_at.is_none());
+        assert!(second.agent.is_none());
+        assert!(second.model.is_none());
+        assert!(second.mode.is_none());
+        assert!(second.finish.is_none());
+        assert!(second.error.is_none());
+        assert_eq!(second.cost, 0.0);
+        assert_eq!(second.tokens.input, 0);
+        assert_eq!(second.tokens.output, 0);
+        assert_eq!(second.tokens.reasoning, 0);
+        assert_eq!(second.tokens.cache_read, 0);
+        assert_eq!(second.tokens.cache_write, 0);
+
+        assert_eq!(second.parts.len(), 1);
+        assert_eq!(second.parts[0].part_type, "file");
+        let file = second.parts[0]
+            .file
+            .as_ref()
+            .expect("file part should carry a FileInfo");
+        assert_eq!(file.url, "https://example.invalid/dummy.png");
+        assert_eq!(file.filename, "dummy.png");
+        assert_eq!(file.mime, "image/png");
+    }
+
+    #[test]
     fn message_tokens_info_cache_aliases_and_snake_case_wire_format() {
         let tokens: MessageTokensInfo = serde_json::from_value(json!({
             "input": 1,

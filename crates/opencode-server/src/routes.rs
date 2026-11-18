@@ -5573,3 +5573,117 @@ mod project_metadata_tests {
         assert_ne!(baseline_b.name, "instance-a-name");
     }
 }
+
+#[cfg(test)]
+mod message_info_wire_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_message_info(parts: Vec<PartInfo>) -> MessageInfo {
+        MessageInfo {
+            id: "msg-1".to_string(),
+            session_id: "ses-1".to_string(),
+            role: "assistant".to_string(),
+            parts,
+            created_at: 1000,
+            completed_at: Some(2000),
+            agent: Some("dummy-agent".to_string()),
+            model: Some("dummy-model".to_string()),
+            mode: Some("primary".to_string()),
+            finish: Some("stop".to_string()),
+            error: Some("dummy error".to_string()),
+            cost: 0.125,
+            tokens: MessageTokensInfo {
+                input: 10,
+                output: 20,
+                reasoning: 5,
+                cache_read: 3,
+                cache_write: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn message_info_serializes_snake_case_keys() {
+        let value = serde_json::to_value(sample_message_info(Vec::new()))
+            .expect("MessageInfo should serialize");
+
+        // MessageInfo には rename_all 指定がなく、Rust フィールド名がそのまま wire キーになる。
+        assert_eq!(value.get("id"), Some(&json!("msg-1")));
+        assert_eq!(value.get("session_id"), Some(&json!("ses-1")));
+        assert_eq!(value.get("role"), Some(&json!("assistant")));
+        assert_eq!(value.get("created_at"), Some(&json!(1000)));
+        assert_eq!(value.get("completed_at"), Some(&json!(2000)));
+        assert_eq!(value.get("agent"), Some(&json!("dummy-agent")));
+        assert_eq!(value.get("model"), Some(&json!("dummy-model")));
+        assert_eq!(value.get("mode"), Some(&json!("primary")));
+        assert_eq!(value.get("finish"), Some(&json!("stop")));
+        assert_eq!(value.get("error"), Some(&json!("dummy error")));
+        assert_eq!(value.get("cost"), Some(&json!(0.125)));
+
+        let parts = value
+            .get("parts")
+            .and_then(|parts| parts.as_array())
+            .expect("parts should be an array");
+        assert!(parts.is_empty());
+
+        // camelCase の wire キーは出力されない（list_messages の応答契約）。
+        assert!(value.get("sessionId").is_none());
+        assert!(value.get("createdAt").is_none());
+        assert!(value.get("completedAt").is_none());
+
+        let tokens = value.get("tokens").expect("tokens should be present");
+        assert_eq!(tokens.get("input"), Some(&json!(10)));
+        assert_eq!(tokens.get("output"), Some(&json!(20)));
+        assert_eq!(tokens.get("reasoning"), Some(&json!(5)));
+        assert_eq!(tokens.get("cache_read"), Some(&json!(3)));
+        assert_eq!(tokens.get("cache_write"), Some(&json!(4)));
+        assert!(tokens.get("cacheRead").is_none());
+        assert!(tokens.get("cacheWrite").is_none());
+    }
+
+    #[test]
+    fn message_info_parts_serialize_snake_case_keys() {
+        let part = PartInfo {
+            id: "part-1".to_string(),
+            part_type: "tool_result".to_string(),
+            text: None,
+            file: None,
+            tool_call: None,
+            tool_result: Some(ToolResultInfo {
+                tool_call_id: "call-1".to_string(),
+                content: "done".to_string(),
+                is_error: false,
+            }),
+            synthetic: None,
+            ignored: Some(true),
+        };
+
+        let value = serde_json::to_value(sample_message_info(vec![part]))
+            .expect("MessageInfo with parts should serialize");
+        let parts = value
+            .get("parts")
+            .and_then(|parts| parts.as_array())
+            .expect("parts should be an array");
+        assert_eq!(parts.len(), 1);
+        let first = &parts[0];
+
+        // PartInfo.part_type は rename = "type" で出力される。
+        assert_eq!(first.get("type"), Some(&json!("tool_result")));
+        assert!(first.get("part_type").is_none());
+        assert_eq!(first.get("id"), Some(&json!("part-1")));
+
+        let result = first
+            .get("tool_result")
+            .expect("tool_result should be present");
+        assert_eq!(result.get("tool_call_id"), Some(&json!("call-1")));
+        assert_eq!(result.get("content"), Some(&json!("done")));
+        assert_eq!(result.get("is_error"), Some(&json!(false)));
+        assert!(result.get("toolCallId").is_none());
+        assert!(result.get("isError").is_none());
+
+        // synthetic は skip_serializing_if、ignored は Some のまま出力される。
+        assert!(first.get("synthetic").is_none());
+        assert_eq!(first.get("ignored"), Some(&json!(true)));
+    }
+}
