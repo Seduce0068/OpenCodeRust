@@ -2327,6 +2327,18 @@ async fn handle_db_command(
     Ok(())
 }
 
+/// stats コマンドの合計コスト表示を組み立てる純粋関数。
+///
+/// `total_cost` が `Some` の有限値ならドル表記へ整形する。`None` または
+/// 非有限値（NaN / 無限大）なら "Cost unavailable" を返し、`$` や数値を
+/// 一切含まないようにしてトークン数をコストとして誤表示しない。
+fn format_stats_total_cost(total_cost: Option<f64>) -> String {
+    match total_cost {
+        Some(cost) if cost.is_finite() => format!("${:.4}", cost),
+        _ => "Cost unavailable".to_string(),
+    }
+}
+
 async fn handle_stats_command(
     days: Option<i64>,
     tools_limit: Option<usize>,
@@ -2363,7 +2375,12 @@ async fn handle_stats_command(
     }
 
     let mut total_messages = 0usize;
-    let mut total_cost = 0.0f64;
+    // `session.usage` は opencode_types::TokenUsage（f64 のトークン数のみ）で
+    // total_cost フィールドを持たない。DB の usage_total_cost 列も input+output の
+    // トークン数を書き込む placeholder であり実コストではないため、
+    // トークン数をドル表示せずコスト利用不可として扱う。
+    // 実コストが永続化されるようになった段階で Some(合計) を渡す。
+    let persisted_total_cost: Option<f64> = None;
     let mut total_input = 0u64;
     let mut total_output = 0u64;
     let mut total_reasoning = 0u64;
@@ -2374,7 +2391,9 @@ async fn handle_stats_command(
 
     for session in &sessions {
         if let Some(usage) = &session.usage {
-            total_cost += usage.input + usage.output; // Placeholder: use input+output as total cost
+            // TokenUsage には total_cost が無いため、ここではトークン数のみ集計する。
+            // 旧実装の `total_cost += usage.input + usage.output` はトークン数を
+            // コストとして誤表示する placeholder だったため削除した。
             total_input += usage.input as u64;
             total_output += usage.output as u64;
             total_reasoning += usage.reasoning as u64;
@@ -2406,7 +2425,10 @@ async fn handle_stats_command(
 
     println!("Sessions: {}", sessions.len());
     println!("Messages: {}", total_messages);
-    println!("Total Cost: ${:.4}", total_cost);
+    println!(
+        "Total Cost: {}",
+        format_stats_total_cost(persisted_total_cost)
+    );
     println!(
         "Tokens: input={} output={} reasoning={} cache_read={} cache_write={}",
         total_input, total_output, total_reasoning, total_cache_read, total_cache_write
@@ -5636,5 +5658,32 @@ mod tests {
     #[test]
     fn rejects_unknown_subcommand() {
         assert!(Cli::try_parse_from(["opencoderust", "unknown-cmd"]).is_err());
+    }
+
+    #[test]
+    fn stats_cost_unavailable_when_no_persisted_cost() {
+        // session.usage (TokenUsage) に total_cost が無い現状では None が渡り、
+        // トークン数をドル表示せず利用不可を通知する。
+        let rendered = format_stats_total_cost(None);
+        assert_eq!(rendered, "Cost unavailable");
+        assert!(!rendered.contains('$'));
+        assert!(!rendered.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn stats_cost_formats_persisted_f64_cost_as_dollars() {
+        // 実コストが f64 で永続化された場合の表示書式（小数 4 桁）。
+        assert_eq!(format_stats_total_cost(Some(1.23456)), "$1.2346");
+        assert_eq!(format_stats_total_cost(Some(0.0)), "$0.0000");
+    }
+
+    #[test]
+    fn stats_cost_treats_non_finite_as_unavailable() {
+        // NaN / 無限大は実コストとして無効なのでフォールバックする。
+        assert_eq!(format_stats_total_cost(Some(f64::NAN)), "Cost unavailable");
+        assert_eq!(
+            format_stats_total_cost(Some(f64::INFINITY)),
+            "Cost unavailable"
+        );
     }
 }
