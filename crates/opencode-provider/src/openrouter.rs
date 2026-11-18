@@ -246,3 +246,195 @@ impl Provider for OpenRouterProvider {
         Ok(Box::pin(stream))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 外部 HTTP を呼ばず、ダミー値だけで検証できる純粋ロジックに限定する。
+    // 実 API キー・実サイト URL は一切使用しない。
+    fn provider() -> OpenRouterProvider {
+        OpenRouterProvider::new("dummy-openrouter-key-for-tests")
+    }
+
+    fn configured_provider() -> OpenRouterProvider {
+        OpenRouterProvider::with_config(OpenRouterConfig {
+            api_key: "dummy-openrouter-key-for-tests".to_string(),
+            base_url: Some("https://dummy-openrouter.invalid/v1/chat/completions".to_string()),
+            site_url: Some("https://dummy-site.invalid/".to_string()),
+            site_name: Some("dummy-site-name".to_string()),
+        })
+    }
+
+    fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .expect("expected header should be present")
+            .to_str()
+            .expect("header value should be UTF-8")
+            .to_string()
+    }
+
+    #[test]
+    fn id_and_name_identify_openrouter() {
+        let provider = provider();
+        assert_eq!(provider.id(), "openrouter");
+        assert_eq!(provider.name(), "OpenRouter");
+    }
+
+    #[test]
+    fn new_stores_dummy_key_and_default_openrouter_config() {
+        let provider = provider();
+
+        assert_eq!(provider.config.api_key, "dummy-openrouter-key-for-tests");
+        assert!(provider.config.base_url.is_none());
+        assert!(provider.config.site_url.is_none());
+        assert!(provider.config.site_name.is_none());
+    }
+
+    #[test]
+    fn with_config_keeps_openrouter_specific_options() {
+        let provider = configured_provider();
+
+        assert_eq!(
+            provider.config.base_url.as_deref(),
+            Some("https://dummy-openrouter.invalid/v1/chat/completions")
+        );
+        assert_eq!(
+            provider.config.site_url.as_deref(),
+            Some("https://dummy-site.invalid/")
+        );
+        assert_eq!(
+            provider.config.site_name.as_deref(),
+            Some("dummy-site-name")
+        );
+    }
+
+    #[test]
+    fn models_expose_namespaced_openrouter_ids() {
+        let provider = provider();
+        let models = provider.models();
+
+        assert_eq!(models.len(), 8);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-3.5-sonnet",
+                "openai/gpt-4o",
+                "openai/gpt-4o-mini",
+                "google/gemini-2.5-pro-preview",
+                "google/gemini-2.0-flash-001",
+                "deepseek/deepseek-chat",
+                "meta-llama/llama-3.3-70b-instruct",
+            ]
+        );
+        assert!(models.iter().all(|m| {
+            m.provider == "openrouter" && m.id.contains('/') && m.name.ends_with(" (OpenRouter)")
+        }));
+    }
+
+    #[test]
+    fn get_model_returns_anthropic_premium_pricing_and_limits() {
+        let provider = provider();
+        let model = provider
+            .get_model("anthropic/claude-sonnet-4")
+            .expect("claude-sonnet-4 should be present");
+
+        assert_eq!(model.id, "anthropic/claude-sonnet-4");
+        assert_eq!(model.name, "Claude Sonnet 4 (OpenRouter)");
+        assert_eq!(model.provider, "openrouter");
+        assert_eq!(model.context_window, 200_000);
+        assert_eq!(model.max_output_tokens, 16_000);
+        assert!(model.supports_vision);
+        assert!(model.supports_tools);
+        assert_eq!(model.cost_per_million_input, 3.0);
+        assert_eq!(model.cost_per_million_output, 15.0);
+    }
+
+    #[test]
+    fn get_model_distinguishes_vision_capability_by_model_family() {
+        let provider = provider();
+
+        let gpt_4o = provider
+            .get_model("openai/gpt-4o")
+            .expect("gpt-4o should be present");
+        assert!(gpt_4o.supports_vision);
+        assert!(gpt_4o.supports_tools);
+
+        let deepseek = provider
+            .get_model("deepseek/deepseek-chat")
+            .expect("deepseek-chat should be present");
+        assert!(!deepseek.supports_vision);
+        assert!(deepseek.supports_tools);
+
+        let llama = provider
+            .get_model("meta-llama/llama-3.3-70b-instruct")
+            .expect("llama should be present");
+        assert!(!llama.supports_vision);
+        assert!(llama.supports_tools);
+    }
+
+    #[test]
+    fn get_model_reflects_low_cost_openrouter_models() {
+        let provider = provider();
+
+        let mini = provider
+            .get_model("openai/gpt-4o-mini")
+            .expect("gpt-4o-mini should be present");
+        assert_eq!(mini.cost_per_million_input, 0.15);
+        assert_eq!(mini.cost_per_million_output, 0.6);
+
+        let flash = provider
+            .get_model("google/gemini-2.0-flash-001")
+            .expect("gemini-2.0-flash-001 should be present");
+        assert_eq!(flash.cost_per_million_input, 0.1);
+        assert_eq!(flash.cost_per_million_output, 0.4);
+        assert_eq!(flash.context_window, 1_000_000);
+        assert_eq!(flash.max_output_tokens, 8192);
+    }
+
+    #[test]
+    fn get_model_returns_none_for_unknown_namespaced_id() {
+        let provider = provider();
+        assert!(provider.get_model("openai/gpt-4o-unknown").is_none());
+        assert!(provider.get_model("gpt-4o").is_none());
+        assert!(provider.get_model("").is_none());
+    }
+
+    #[test]
+    fn models_returns_owned_snapshot_of_full_catalog() {
+        let provider = provider();
+        let mut models = provider.models();
+        models.clear();
+
+        assert!(models.is_empty());
+        assert_eq!(provider.models().len(), 8);
+    }
+
+    #[test]
+    fn build_headers_are_openrouter_specific_with_dummy_values() {
+        let default_headers = provider().build_headers();
+        assert_eq!(
+            header_value(&default_headers, "authorization"),
+            "Bearer dummy-openrouter-key-for-tests"
+        );
+        assert_eq!(
+            header_value(&default_headers, "content-type"),
+            "application/json"
+        );
+        assert_eq!(
+            header_value(&default_headers, "http-referer"),
+            "https://opencode.ai/"
+        );
+        assert_eq!(header_value(&default_headers, "x-title"), "opencode");
+
+        let custom_headers = configured_provider().build_headers();
+        assert_eq!(
+            header_value(&custom_headers, "http-referer"),
+            "https://dummy-site.invalid/"
+        );
+        assert_eq!(header_value(&custom_headers, "x-title"), "dummy-site-name");
+    }
+}
