@@ -150,6 +150,15 @@ pub struct ListSessionsQuery {
     pub limit: Option<usize>,
 }
 
+/// `GET /session/{id}/message` の後方互換な pagination クエリ。
+///
+/// 両フィールドとも任意で、未指定の場合は全件を返す（旧 wire format を維持）。
+#[derive(Debug, Deserialize)]
+pub struct ListMessagesQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -1094,18 +1103,34 @@ async fn send_message(
 async fn list_messages(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<String>,
+    Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<Vec<MessageInfo>>> {
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
-    Ok(Json(
-        session
-            .messages
-            .iter()
+
+    // offset/limit が指定されたときだけ skip/take を適用する。
+    // 未指定時は従来どおり全件を返し、wire format を維持する。
+    // limit=0 は take(0)、範囲外 offset は skip(len 超) により空結果になる。
+    let messages = session.messages.iter();
+    let infos: Vec<MessageInfo> = match (query.offset, query.limit) {
+        (Some(offset), Some(limit)) => messages
+            .skip(offset)
+            .take(limit)
             .map(|m| message_to_info(&session_id, m))
             .collect(),
-    ))
+        (Some(offset), None) => messages
+            .skip(offset)
+            .map(|m| message_to_info(&session_id, m))
+            .collect(),
+        (None, Some(limit)) => messages
+            .take(limit)
+            .map(|m| message_to_info(&session_id, m))
+            .collect(),
+        (None, None) => messages.map(|m| message_to_info(&session_id, m)).collect(),
+    };
+    Ok(Json(infos))
 }
 
 async fn delete_message(
@@ -5727,5 +5752,152 @@ mod message_info_wire_format_tests {
         // synthetic は skip_serializing_if、ignored は Some のまま出力される。
         assert!(first.get("synthetic").is_none());
         assert_eq!(first.get("ignored"), Some(&json!(true)));
+    }
+}
+
+#[cfg(test)]
+mod list_messages_pagination_tests {
+    use super::*;
+
+    /// 指定件数のメッセージを持つセッションを用意し、(state, session_id) を返す。
+    async fn state_with_messages(count: usize) -> (Arc<ServerState>, String) {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            let session_id = sessions.create("default", ".").id.clone();
+            {
+                // create は Session を値で返すため、格納済みの実体を get_mut で更新する。
+                let session = sessions
+                    .get_mut(&session_id)
+                    .expect("created session should exist");
+                for i in 0..count {
+                    session.add_user_message(format!("message-{i}"));
+                }
+            }
+            session_id
+        };
+        (state, session_id)
+    }
+
+    /// ハンドラを通さず、格納済みセッションから全メッセージ id を取り出す（フィルタ無しベースライン）。
+    async fn all_stored_message_ids(state: &Arc<ServerState>, session_id: &str) -> Vec<String> {
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(session_id).expect("session should exist");
+        session.messages.iter().map(|m| m.id.clone()).collect()
+    }
+
+    /// 実クエリ文字列を axum の Query エクストラクタと同じ経路でデシリアライズする。
+    fn parse_list_messages_query(uri: &str) -> ListMessagesQuery {
+        let uri: axum::http::Uri = uri.parse().expect("valid URI");
+        Query::<ListMessagesQuery>::try_from_uri(&uri)
+            .expect("query should deserialize into ListMessagesQuery")
+            .0
+    }
+
+    /// list_messages ハンドラを直接呼び、結果の id 列を順序付きで返す。
+    async fn list_ids(
+        state: &Arc<ServerState>,
+        session_id: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Vec<String> {
+        let response = list_messages(
+            State(state.clone()),
+            Path(session_id.to_string()),
+            Query(ListMessagesQuery { limit, offset }),
+        )
+        .await
+        .expect("list_messages should succeed");
+        response.0.into_iter().map(|info| info.id).collect()
+    }
+
+    #[tokio::test]
+    async fn no_query_params_returns_all_messages() {
+        let (state, session_id) = state_with_messages(5).await;
+        let expected = all_stored_message_ids(&state, &session_id).await;
+        let ids = list_ids(&state, &session_id, None, None).await;
+        assert_eq!(
+            ids, expected,
+            "未指定時はフィルタ無しベースラインと完全一致（wire format 維持）"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_only_skips_first_messages() {
+        let (state, session_id) = state_with_messages(5).await;
+        let all = list_ids(&state, &session_id, None, None).await;
+        let ids = list_ids(&state, &session_id, None, Some(2)).await;
+        assert_eq!(ids, all[2..].to_vec(), "offset のみ指定時は先頭をスキップ");
+    }
+
+    #[tokio::test]
+    async fn limit_only_takes_first_messages() {
+        let (state, session_id) = state_with_messages(5).await;
+        let all = list_ids(&state, &session_id, None, None).await;
+        let ids = list_ids(&state, &session_id, Some(3), None).await;
+        assert_eq!(ids, all[..3].to_vec(), "limit のみ指定時は先頭から指定件数");
+    }
+
+    #[tokio::test]
+    async fn offset_and_limit_slice_messages() {
+        let (state, session_id) = state_with_messages(5).await;
+        let all = list_ids(&state, &session_id, None, None).await;
+        let ids = list_ids(&state, &session_id, Some(2), Some(1)).await;
+        assert_eq!(ids, all[1..3].to_vec(), "offset と limit の両方を適用");
+    }
+
+    #[tokio::test]
+    async fn offset_beyond_range_returns_empty() {
+        let (state, session_id) = state_with_messages(3).await;
+        let ids = list_ids(&state, &session_id, None, Some(10)).await;
+        assert!(ids.is_empty(), "範囲外 offset は空結果");
+    }
+
+    #[tokio::test]
+    async fn limit_zero_returns_empty() {
+        let (state, session_id) = state_with_messages(3).await;
+        let ids = list_ids(&state, &session_id, Some(0), None).await;
+        assert!(ids.is_empty(), "limit=0 は空結果");
+    }
+
+    // --- Query エクストラクタのデシリアライズ経路（実 HTTP サーバは起動しない） ---
+
+    #[test]
+    fn query_empty_string_deserializes_to_all_none() {
+        let query = parse_list_messages_query("http://example.com/session/ses-1/message");
+        assert_eq!(query.limit, None);
+        assert_eq!(query.offset, None);
+    }
+
+    #[test]
+    fn query_offset_only_deserializes() {
+        let query = parse_list_messages_query("http://example.com/session/ses-1/message?offset=2");
+        assert_eq!(query.limit, None);
+        assert_eq!(query.offset, Some(2));
+    }
+
+    #[test]
+    fn query_limit_only_deserializes() {
+        let query = parse_list_messages_query("http://example.com/session/ses-1/message?limit=3");
+        assert_eq!(query.limit, Some(3));
+        assert_eq!(query.offset, None);
+    }
+
+    #[test]
+    fn query_limit_and_offset_deserializes() {
+        let query =
+            parse_list_messages_query("http://example.com/session/ses-1/message?limit=2&offset=1");
+        assert_eq!(query.limit, Some(2));
+        assert_eq!(query.offset, Some(1));
+    }
+
+    #[test]
+    fn query_unknown_keys_are_ignored() {
+        // deny_unknown_fields を付けていないため、未知キーが混在しても既存キーは解析される。
+        let query = parse_list_messages_query(
+            "http://example.com/session/ses-1/message?limit=2&offset=1&unknown=ignored&foo=bar",
+        );
+        assert_eq!(query.limit, Some(2));
+        assert_eq!(query.offset, Some(1));
     }
 }
