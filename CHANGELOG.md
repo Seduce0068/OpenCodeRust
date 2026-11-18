@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T13:12:38+09:00"
+  at: "2026-11-18T13:47:03+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1075 件
+  テスト総数 594 → 1101 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.60% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.64% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -208,6 +208,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 テストを追加 (M-11)
 - `opencode-server`: stream_message の冗長な全履歴 clone を廃止し、ロック保持中に
   provider 用メッセージへ直接変換（provider へ渡る履歴は不変）(L-14)
+- `opencode-mcp`: protocol.rs に 17 テストを追加し、`listChanged` / `isError` /
+  ContentBlock の `mimeType` の camelCase wire format を修正・固定 (M-11)
+- `opencode-plugin`: subprocess/protocol.rs に RPC エンベロープの serde 境界
+  8 テストを追加（subprocess spawn なし）(M-11)
 
 ## [0.1.0]
 

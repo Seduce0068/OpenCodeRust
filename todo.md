@@ -69,10 +69,13 @@ status: current
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
-- [ ] **[M-11]** 重要パスのテストカバレッジ空白（database.rs / mcp_oauth.rs は対応済み）
-  - storage/database.rs に 3 件、server/mcp_oauth.rs に 14 件追加済み。未対応は
-    mcp/oauth.rs・server/oauth.rs・server/pty.rs と provider 統合テストの
-    HTTP／ストリーミング／認証フロー（モック OAuth／callback／PtyManager）
+- [ ] **[M-11]** 重要パスのテストカバレッジ空白（多数対応済み）
+  - 対応済み: storage/database.rs、server/mcp_oauth.rs・oauth.rs・pty.rs、mcp/oauth.rs・
+    protocol.rs、plugin/subprocess/protocol.rs、provider/models.rs・bootstrap.rs、
+    watcher、codemode/tools.rs など。未対応は provider 統合テストの
+    HTTP／ストリーミング／認証フロー（モック OAuth／callback）
+  - 補足: provider/convert.rs は lib.rs から未配線のスタブで、テストを追加しても
+    本クレートでは実行されない（2026-11-18 発見、追加は差し戻し済み）
 - [ ] **[M-15]** 依存ピン留めの残課題（CI locked と集約 6 件は対応済み）
   - 残り 22 件の workspace バイパス＋9 件の未集約依存は段階的集約が必要。特に serde_json は
     `preserve_order` feature の挙動影響を事前評価。厳密ピン拡充（8/61）は複数バージョン併存
@@ -266,6 +269,10 @@ status: current
 - [x] **[M-11 一部]** watcher に debounce 対照テスト 2 件（2026-11-18、watcher-test-worker）
 - [x] **[M-11 一部]** codemode/tools.rs に 4 テスト（2026-11-18、codemode-test-worker）
 - [x] **[L-14]** stream_message の冗長な全履歴 clone を削除（2026-11-18、routes-io-worker）
+- [x] **[M-11 一部]** mcp/protocol.rs に 17 テスト＋camelCase 修正
+  （2026-11-18、mcp-protocol-test-worker + 親）
+- [x] **[M-11 一部]** plugin/subprocess/protocol.rs に 8 テスト
+  （2026-11-18、plugin-protocol-test-worker）
 
 ## メモ
 
