@@ -116,13 +116,13 @@ impl CommandPalette {
             Command {
                 action: CommandAction::ToggleThinking,
                 title: "Toggle thinking".to_string(),
-                keybind: None,
+                keybind: Some("ctrl+t".to_string()),
                 category: "View".to_string(),
             },
             Command {
                 action: CommandAction::ToggleToolDetails,
                 title: "Toggle tool details".to_string(),
-                keybind: None,
+                keybind: Some("alt+t".to_string()),
                 category: "View".to_string(),
             },
             Command {
@@ -170,7 +170,7 @@ impl CommandPalette {
             Command {
                 action: CommandAction::CycleVariant,
                 title: "Cycle model variant".to_string(),
-                keybind: Some("ctrl+v".to_string()),
+                keybind: Some("alt+v".to_string()),
                 category: "Session".to_string(),
             },
             Command {
@@ -582,6 +582,23 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(&c.action, CommandAction::ShowHelp) && c.title == "Show help"));
+    }
+
+    #[test]
+    fn new_uses_current_keybinds_for_view_toggles_and_variant() {
+        let palette = CommandPalette::new();
+        let keybind_of = |title: &str| {
+            palette
+                .commands
+                .iter()
+                .find(|c| c.title == title)
+                .and_then(|c| c.keybind.as_deref())
+        };
+
+        // R5: keybind.rs の割当と表示を一致させる（alt+v / ctrl+t / alt+t）。
+        assert_eq!(keybind_of("Cycle model variant"), Some("alt+v"));
+        assert_eq!(keybind_of("Toggle thinking"), Some("ctrl+t"));
+        assert_eq!(keybind_of("Toggle tool details"), Some("alt+t"));
     }
 
     // --- new / Default ---

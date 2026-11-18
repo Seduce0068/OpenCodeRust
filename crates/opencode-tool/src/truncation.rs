@@ -8,6 +8,19 @@ pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
 pub const CLEANUP_RETENTION_DAYS: u64 = 7;
 
+/// Largest byte index `<= index` that is a valid UTF-8 character boundary in `s`.
+///
+/// Equivalent to `str::floor_char_boundary`, implemented locally so the crate does
+/// not depend on a specific MSRV for that method's stabilization. `- 1` steps never
+/// underflow because the loop stops at `0`, which is always a character boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TruncationResult {
     pub truncated: bool,
@@ -50,6 +63,11 @@ impl Truncate {
         if truncated_content.len() > MAX_BYTES {
             let bytes_to_take = MAX_BYTES.saturating_sub(100);
             let start = truncated_content.len().saturating_sub(bytes_to_take);
+            // Round the start down to a valid UTF-8 boundary so a multibyte character
+            // is never split. Floor (rather than ceil) also keeps the tail slice
+            // non-empty: `start` is strictly below `len` here, and the adjustment
+            // moves it further down by at most 3 bytes.
+            let start = floor_char_boundary(&truncated_content, start);
             truncated_content = format!("... [truncated]\n{}", &truncated_content[start..]);
         }
 
@@ -161,6 +179,39 @@ mod tests {
         assert!(result.truncated_bytes <= MAX_BYTES);
         let saved = std::fs::read_to_string(result.saved_to.unwrap()).unwrap();
         assert!(saved.starts_with("... [truncated]\n"));
+    }
+
+    #[test]
+    fn floor_char_boundary_respects_multibyte_boundaries() {
+        // 'あ' is 3 bytes; make the raw start index land on its continuation byte.
+        let s = format!("{}あ{}", "x".repeat(100), "x".repeat(51098));
+        let start = s.len() - (MAX_BYTES - 100);
+        assert!(!s.is_char_boundary(start));
+        let boundary = floor_char_boundary(&s, start);
+        assert!(boundary < start);
+        assert!(s.is_char_boundary(boundary));
+        assert!(s[boundary..].starts_with('あ'));
+    }
+
+    #[tokio::test]
+    async fn test_truncation_by_bytes_with_multibyte_boundary() {
+        // One line of MAX_BYTES + 1 bytes with a 3-byte 'あ' placed so the
+        // computed slice start falls on its middle byte. The old
+        // `&truncated_content[start..]` slice panicked here.
+        let content = format!("{}あ{}", "x".repeat(100), "x".repeat(51098));
+        assert_eq!(content.len(), MAX_BYTES + 1);
+        let start = content.len() - (MAX_BYTES - 100);
+        assert!(!content.is_char_boundary(start));
+
+        let dir = tempdir().unwrap();
+        let result = Truncate::output(&content, dir.path()).await.unwrap();
+
+        assert!(result.truncated);
+        assert!(result.truncated_bytes <= MAX_BYTES);
+        let saved = std::fs::read_to_string(result.saved_to.unwrap()).unwrap();
+        assert!(saved.starts_with("... [truncated]\n"));
+        // The multibyte character must survive intact, not be split mid-codepoint.
+        assert!(saved.contains('あ'));
     }
 
     #[tokio::test]

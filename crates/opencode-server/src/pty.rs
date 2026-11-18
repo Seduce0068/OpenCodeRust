@@ -37,7 +37,16 @@ pub struct PtyOutput {
 struct PtySessionInner {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
-    child: Mutex<Box<dyn portable_pty::Child + Send>>,
+    /// Shared child handle: the reader thread reaps it on EOF/error, and
+    /// `delete_session` reaps it again after a forced kill.
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    /// Independent signal handle. `ChildKiller::clone_killer` exists exactly
+    /// so the child can be signalled from another thread while the reader is
+    /// blocked in `wait()` holding the `child` lock.
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    /// Terminal status published by the reader thread on EOF/error. Read
+    /// paths copy this into the returned `PtySession` (M-43).
+    status: Arc<Mutex<PtyStatus>>,
     /// Retained output buffer for replay on WebSocket connect.
     output_buffer: Arc<Mutex<Vec<u8>>>,
     /// Cumulative byte count of all output ever produced (including trimmed bytes).
@@ -46,6 +55,13 @@ struct PtySessionInner {
     /// Broadcast channel for live PTY output to WebSocket subscribers.
     output_tx: broadcast::Sender<Vec<u8>>,
     reader_handle: JoinHandle<()>,
+}
+
+/// Copy the reader-published terminal status into the snapshot returned to
+/// callers. `PtySession.status` stays a plain serde value field, while the
+/// live value is shared with the blocking reader via `Arc<Mutex<..>>` (M-43).
+fn apply_live_status(session: &mut PtySession, status: &Arc<Mutex<PtyStatus>>) {
+    session.status = status.lock().unwrap().clone();
 }
 
 pub struct PtyManager {
@@ -106,6 +122,16 @@ impl PtyManager {
         .await
         .map_err(|e| PtyError::SpawnFailed(e.to_string()))??;
 
+        // Split off an independent killer before wrapping the child in a
+        // Mutex, so `delete_session` can signal it even while the reader is
+        // blocked in `wait()` holding that Mutex (M-43).
+        let killer = child.clone_killer();
+        // Drop the `Sync` auto trait so the child can be shared through a
+        // plain `Box<dyn Child + Send>` inside the Arc<Mutex<..>>.
+        let child: Box<dyn portable_pty::Child + Send> = child;
+        let child = Arc::new(Mutex::new(child));
+        let status: Arc<Mutex<PtyStatus>> = Arc::new(Mutex::new(PtyStatus::Running));
+
         let writer = master
             .take_writer()
             .map_err(|e| PtyError::IoError(e.to_string()))?;
@@ -118,15 +144,19 @@ impl PtyManager {
         let buffer_clone = output_buffer.clone();
         let cursor_clone = cursor.clone();
         let tx_clone = output_tx.clone();
+        let child_clone = child.clone();
+        let status_clone = status.clone();
 
         // Spawn a blocking task to continuously read PTY output, buffer it,
-        // and broadcast to any connected WebSocket subscribers.
+        // and broadcast to any connected WebSocket subscribers. Once the
+        // reader reaches EOF (normal exit) or errors, it reaps the child via
+        // `wait()` and publishes the terminal status (M-43).
         let reader_handle = tokio::task::spawn_blocking(move || {
             let mut reader = reader;
             let mut buf = [0u8; 4096];
-            loop {
+            let final_status = loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => break PtyStatus::Exited,
                     Ok(n) => {
                         let chunk = buf[..n].to_vec();
                         {
@@ -143,8 +173,16 @@ impl PtyManager {
                         // Best-effort broadcast; receivers may lag and miss frames.
                         let _ = tx_clone.send(chunk);
                     }
-                    Err(_) => break,
+                    Err(_) => break PtyStatus::Error,
                 }
+            };
+            // Publish the terminal status through the shared handle before
+            // reaping: `wait()` below may block, and the end status must
+            // already be visible to `PtyInfo` read paths when that happens.
+            *status_clone.lock().unwrap() = final_status;
+            // Reap the child so it does not linger as a zombie.
+            if let Ok(mut child) = child_clone.lock() {
+                let _ = child.wait();
             }
         });
 
@@ -160,7 +198,9 @@ impl PtyManager {
         let inner = PtySessionInner {
             master: Mutex::new(master),
             writer,
-            child: Mutex::new(child),
+            child,
+            killer: Mutex::new(killer),
+            status,
             output_buffer,
             cursor,
             output_tx,
@@ -176,7 +216,11 @@ impl PtyManager {
     }
 
     pub async fn get_session(&self, id: &str) -> Option<PtySession> {
-        self.sessions.read().await.get(id).map(|(s, _)| s.clone())
+        let sessions = self.sessions.read().await;
+        let (session, inner) = sessions.get(id)?;
+        let mut session = session.clone();
+        apply_live_status(&mut session, &inner.status);
+        Some(session)
     }
 
     pub async fn list_sessions(&self) -> Vec<PtySession> {
@@ -184,7 +228,11 @@ impl PtyManager {
             .read()
             .await
             .values()
-            .map(|(s, _)| s.clone())
+            .map(|(session, inner)| {
+                let mut session = session.clone();
+                apply_live_status(&mut session, &inner.status);
+                session
+            })
             .collect()
     }
 
@@ -196,13 +244,14 @@ impl PtyManager {
     ) -> Result<PtySession, PtyError> {
         let mut sessions = self.sessions.write().await;
 
-        if let Some((session, _)) = sessions.get_mut(id) {
+        if let Some((session, inner)) = sessions.get_mut(id) {
             if let Some(cmd) = command {
                 session.command = cmd.to_string();
             }
             if let Some(dir) = cwd {
                 session.cwd = dir.to_string();
             }
+            apply_live_status(session, &inner.status);
             Ok(session.clone())
         } else {
             Err(PtyError::SessionNotFound(id.to_string()))
@@ -210,12 +259,27 @@ impl PtyManager {
     }
 
     pub async fn delete_session(&self, id: &str) -> bool {
-        let mut sessions = self.sessions.write().await;
-        if let Some((_, inner)) = sessions.remove(id) {
-            // Abort the background reader task
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(id)
+        };
+        if let Some((_, inner)) = removed {
+            // Best-effort cancellation only: `JoinHandle::abort` cannot
+            // interrupt a `spawn_blocking` closure that is already running.
+            // In practice it is `kill()` below that unblocks the reader's
+            // blocking `read()`.
             inner.reader_handle.abort();
-            // Kill the child process
-            let _ = inner.child.lock().unwrap().kill();
+            // Signal via the independent killer: this works even while the
+            // reader is blocked in `wait()` holding the `child` lock (M-43).
+            let _ = inner.killer.lock().unwrap().kill();
+            // Reap on a blocking thread so the killed child is not left as a
+            // zombie (this covers the forced-kill path above).
+            let child = inner.child.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.wait();
+                }
+            });
             true
         } else {
             false
@@ -484,5 +548,32 @@ mod tests {
         assert_eq!(decoded.session_id, output.session_id);
         assert_eq!(decoded.data, output.data);
         assert!(!decoded.is_error);
+    }
+
+    #[test]
+    fn shared_terminal_status_is_reflected_in_session_snapshot() {
+        // Pure test: no real PTY process is spawned. It verifies the path the
+        // reader thread uses to publish Exited/Error and read paths use to
+        // surface it through `PtySession.status` (M-43).
+        let mut session = PtySession {
+            id: "pty_dummy_0003".to_string(),
+            command: "dummy-command".to_string(),
+            cwd: "/dummy/cwd".to_string(),
+            status: PtyStatus::Running,
+            env: HashMap::new(),
+            created_at: 1_700_000_000,
+        };
+        let status: Arc<Mutex<PtyStatus>> = Arc::new(Mutex::new(PtyStatus::Running));
+
+        apply_live_status(&mut session, &status);
+        assert_eq!(session.status, PtyStatus::Running);
+
+        *status.lock().unwrap() = PtyStatus::Exited;
+        apply_live_status(&mut session, &status);
+        assert_eq!(session.status, PtyStatus::Exited);
+
+        *status.lock().unwrap() = PtyStatus::Error;
+        apply_live_status(&mut session, &status);
+        assert_eq!(session.status, PtyStatus::Error);
     }
 }

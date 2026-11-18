@@ -266,6 +266,24 @@ pub struct RevertResponse {
     pub success: bool,
 }
 
+/// `DELETE /session/{id}` の応答。キー欠落・型不一致はデシリアライズ失敗とする（M-52）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeletedResponse {
+    deleted: bool,
+}
+
+/// `{"success": bool}` 形式の応答（MCP 認証解除など）。緩やかなデフォルト値は持たない（M-52）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SuccessResponse {
+    success: bool,
+}
+
+/// `DELETE /session/{id}/share` の応答。サーバは `unshared` を返す（M-52）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UnsharedResponse {
+    unshared: bool,
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -400,11 +418,11 @@ impl ApiClient {
                 text
             );
         }
-        let value = response.json::<serde_json::Value>()?;
-        Ok(value
-            .get("deleted")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true))
+        // M-52: 旧実装は Value::get(...).unwrap_or(true) で、
+        // キー欠落や型不一致を「削除成功」として報告していた。
+        // 厳密な型付きデシリアライズで解析失敗を Err として返す。
+        let result: DeletedResponse = response.json()?;
+        Ok(result.deleted)
     }
 
     pub fn send_prompt(
@@ -571,11 +589,9 @@ impl ApiClient {
                 text
             );
         }
-        let value = response.json::<serde_json::Value>()?;
-        Ok(value
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true))
+        // M-52: `success` の欠落・型不一致は Err として返す。
+        let result: SuccessResponse = response.json()?;
+        Ok(result.success)
     }
 
     pub fn connect_mcp(&self, name: &str) -> anyhow::Result<bool> {
@@ -586,7 +602,8 @@ impl ApiClient {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to connect MCP `{}`: {} - {}", name, status, text);
         }
-        Ok(response.json::<bool>().unwrap_or(true))
+        // M-52: サーバは Json<bool> を返す。解析失敗は Err として返す。
+        Ok(response.json::<bool>()?)
     }
 
     pub fn disconnect_mcp(&self, name: &str) -> anyhow::Result<bool> {
@@ -597,7 +614,8 @@ impl ApiClient {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to disconnect MCP `{}`: {} - {}", name, status, text);
         }
-        Ok(response.json::<bool>().unwrap_or(true))
+        // M-52: サーバは Json<bool> を返す。解析失敗は Err として返す。
+        Ok(response.json::<bool>()?)
     }
 
     pub fn get_messages(&self, session_id: &str) -> anyhow::Result<Vec<MessageInfo>> {
@@ -668,11 +686,11 @@ impl ApiClient {
                 text
             );
         }
-        let value = response.json::<serde_json::Value>()?;
-        Ok(value
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true))
+        // M-52: サーバの unshare_session は `{"unshared": true}` を返す。
+        // 旧実装は `success` を読んで unwrap_or(true) に逃げており、
+        // キー名の不一致が成功報告として隠れていた。
+        let result: UnsharedResponse = response.json()?;
+        Ok(result.unshared)
     }
 
     pub fn compact_session(&self, session_id: &str) -> anyhow::Result<CompactResponse> {
@@ -1451,6 +1469,75 @@ mod tests {
             }))
             .is_err(),
             "`default_model` must not be accepted as the wire key"
+        );
+    }
+
+    // --- M-52: bool 応答の厳密デシリアライズ（実 HTTP 通信は行わない） ---
+
+    #[test]
+    fn deleted_response_requires_bool_deleted_key() {
+        let ok: DeletedResponse = serde_json::from_value(json!({ "deleted": true }))
+            .expect("deleted response should deserialize");
+        assert!(ok.deleted);
+
+        let negative: DeletedResponse = serde_json::from_value(json!({ "deleted": false }))
+            .expect("explicit false should deserialize");
+        assert!(!negative.deleted);
+
+        // 旧 unwrap_or(true) が成功と見なした入力はすべて Err になること。
+        assert!(
+            serde_json::from_value::<DeletedResponse>(json!({})).is_err(),
+            "missing `deleted` must fail"
+        );
+        assert!(
+            serde_json::from_value::<DeletedResponse>(json!({ "deleted": "true" })).is_err(),
+            "non-bool `deleted` must fail"
+        );
+        assert!(
+            serde_json::from_value::<DeletedResponse>(json!({ "success": true })).is_err(),
+            "a different key must not silently count as success"
+        );
+    }
+
+    #[test]
+    fn success_response_requires_bool_success_key() {
+        let ok: SuccessResponse = serde_json::from_value(json!({ "success": true }))
+            .expect("success response should deserialize");
+        assert!(ok.success);
+
+        let negative: SuccessResponse = serde_json::from_value(json!({ "success": false }))
+            .expect("explicit false should deserialize");
+        assert!(!negative.success);
+
+        assert!(
+            serde_json::from_value::<SuccessResponse>(json!({})).is_err(),
+            "missing `success` must fail"
+        );
+        assert!(
+            serde_json::from_value::<SuccessResponse>(json!({ "success": 1 })).is_err(),
+            "non-bool `success` must fail"
+        );
+    }
+
+    #[test]
+    fn unshared_response_uses_the_servers_unshared_key() {
+        let ok: UnsharedResponse = serde_json::from_value(json!({ "unshared": true }))
+            .expect("unshare response should deserialize via the server wire key");
+        assert!(ok.unshared);
+
+        let negative: UnsharedResponse = serde_json::from_value(json!({ "unshared": false }))
+            .expect("explicit false should deserialize");
+        assert!(!negative.unshared);
+
+        // 旧実装は `success` を読んでいたが、サーバは `unshared` を返す。
+        // 誤ったキーでは暗黙に成功させず、解析失敗として扱う。
+        assert!(
+            serde_json::from_value::<UnsharedResponse>(json!({ "success": true })).is_err(),
+            "the old `success` key must not be accepted"
+        );
+        assert!(
+            serde_json::from_value::<UnsharedResponse>(json!({})).is_err(),
+            "missing `unshared` must fail"
         );
     }
 }

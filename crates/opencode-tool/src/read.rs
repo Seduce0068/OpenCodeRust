@@ -19,6 +19,19 @@ const INSTRUCTION_FILES: &[&str] = &[
     ".opencoderules",
 ];
 
+/// Largest byte index `<= index` that is a valid UTF-8 character boundary in `s`.
+///
+/// Equivalent to `str::floor_char_boundary`, implemented locally so the crate does
+/// not depend on a specific MSRV for that method's stabilization. `- 1` steps never
+/// underflow because the loop stops at `0`, which is always a character boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub struct ReadTool {
     directory: PathBuf,
 }
@@ -375,7 +388,8 @@ async fn read_file_content(
 
     for i in start..std::cmp::min(lines.len(), start + limit) {
         let line = if lines[i].len() > MAX_LINE_LENGTH {
-            format!("{}...", &lines[i][..MAX_LINE_LENGTH])
+            let end = floor_char_boundary(lines[i], MAX_LINE_LENGTH);
+            format!("{}...", &lines[i][..end])
         } else {
             lines[i].to_string()
         };
@@ -610,6 +624,41 @@ mod tests {
         // instead of claiming a line was consumed ("beyond line 0").
         assert!(result.output.contains("0 lines read"));
         assert!(!result.output.contains("beyond line 0"));
+    }
+
+    #[test]
+    fn floor_char_boundary_respects_multibyte_boundaries() {
+        // 'あ' is 3 bytes; place it so byte offset 2000 lands on its middle byte.
+        let s = "a".repeat(1999) + "あ";
+        assert!(!s.is_char_boundary(MAX_LINE_LENGTH));
+        let end = floor_char_boundary(&s, MAX_LINE_LENGTH);
+        assert_eq!(end, 1999);
+        assert!(s.is_char_boundary(end));
+        assert_eq!(&s[..end], "a".repeat(1999).as_str());
+    }
+
+    #[tokio::test]
+    async fn read_file_content_truncates_long_multibyte_line_without_panic() {
+        // 1999 ASCII bytes + a 3-byte 'あ' whose middle byte sits at offset 2000,
+        // followed by more content. The old `&lines[i][..2000]` slice panicked here.
+        let line = format!("{}あ{}", "a".repeat(1999), "tail");
+        assert!(line.len() > MAX_LINE_LENGTH);
+        assert!(!line.is_char_boundary(MAX_LINE_LENGTH));
+
+        let result = read_file_content(
+            std::path::Path::new("/tmp/utf8.txt"),
+            "/tmp/utf8.txt",
+            line.as_bytes(),
+            1,
+            1,
+            "test".to_string(),
+            "/tmp",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.output.contains("..."));
+        assert!(result.output.contains("a".repeat(1999).as_str()));
     }
 
     #[test]
