@@ -141,14 +141,10 @@ status: current
   - `init_tracing` を CLI 起動時に呼び出し `config.logLevel` を実効化済み。
     未対応は `logging.rs` の WorkerGuard 早期ドロップ（API 変更要）と rolling 未使用。
     起動時とハンドラで `load_config` が 2 回走る点は大規模変更のため据え置き
-- [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケ（clone は削除済み）
-  - 調査済み（2026-11-19、swarm-coding R2）: list_messages（routes.rs:1094-1109）が
-    `session.messages.iter().map(message_to_info).collect()` で全件 deep clone し、
-    変換中セッション Mutex を保持。件数上限・ページネーションは無く compaction も
-    件数を減らさない。実害は未計測（構造上の O(n) のみ）。
-    推奨方針は後方互換な `ListMessagesQuery { limit, offset }` を追加し指定時のみ
-    skip/take、未指定時は従来の Vec を返す（routes.rs:144-151 の ListSessionsQuery
-    と同パターン、TUI 側変更不要）。Arc copy-on-write は残課題。
+- [ ] **[L-14 残り]** Arc copy-on-write の見直し
+  - list_messages の後方互換 pagination（limit/offset）は 2026-11-19 に対応済み。
+    未指定時は従来どおり全件（wire format 不変）、TUI 変更不要。
+    残るはメッセージ保持の Arc copy-on-write。実害は未計測。
 - [ ] **[L-07 残り]** 未使用 22 件のクレート側直接指定の workspace 集約（M-15 と同一作業）
 
 ### 優先度: 高（残タスク調査で追加）
@@ -204,6 +200,7 @@ status: current
 
 ## 完了
 
+- [x] **[L-14 一部]** list_messages に後方互換 pagination を追加（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-07]** tokio `full` を9 feature へ削減（2026-11-19、swarm-coding R1-R6）
 - [x] **[L-07 一部]** 未使用 workspace 依存 11 件を削除（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-47]** permission pattern の明示引数化（2026-11-19、swarm-coding R1-R6）
@@ -382,6 +379,20 @@ status: current
 
 ## メモ
 
+- M-46 調査結果（2026-11-19、swarm-coding R2）: 推奨は「現状維持＋ドキュメント
+  明記」。/stream と /prompt はレスポンス契約（SSE vs JSON＋broadcast）、
+  system prompt、tools/権限、StreamProcessor、キャンセル、永続化、キューがすべて
+  異なり、経路統合は破壊的変更（5〜7 ファイル、見積りは speculative）。
+  M-38 で AbortHandle 保持が既に見送り済みで、H-10/H-11 未完領域への変更もリスク。
+  最小 follow-up は MAPPING.md と stream_message の doc comment に
+  「agent/tool なし・生 chat_stream・/prompt と品質/課金が異なる」と明記すること。
+- P-01 調査結果（2026-11-19、swarm-coding R2）: 「サーバ↔クライアントの不一致」は
+  存在せず（両者とも /api なし）、不一致は upstream の /api/... 契約との間にある
+  （upstream 側はローカル間接引用のみで speculative）。推奨は routes.rs の router を
+  api_routes() へ切り出し既存ルートを維持したまま `.nest("/api", ...)` を追加する
+  A 案。クライアント変更は不要。follow-up: session_id_from_path() の /api 対応、
+  "/" の web_index を /api 下に置くかの方針、upstream 126 パスの直接照合、
+  todo.md:156-161 と docs/investigation-final-report.md の根拠行更新。
 - M-47 の残存（2026-11-19、swarm-coding R4 が指摘、未修正）:
   - 2026-11-19 調査（swarm-coding R2）: 推奨方針は `opencode_permission::evaluate`
     に read かつ dotenv 保護対象（`.env` / `.env.*` / `*.env`、`.example` は除外）なら
