@@ -291,9 +291,17 @@ status: current
 - [x] **[P-06]** timezone 追加と他キーの未対応を明記（2026-11-18、p06-worker）
 - [x] **[L-01 一部]** core/bus.rs に 8 テスト（L-01 の中核も検証）（2026-11-18、bus-test-worker）
 - [x] **[M-11 一部]** plugin/subprocess/mod.rs に 2 テスト（2026-11-18、plugin-subproc-test-worker）
+- [x] **[M-11 一部]** opencode-types 4 ファイルに 16 テスト（2026-11-18、types-data-test-worker）
+- [x] **[M-11 一部]** plugin/subprocess/auth.rs に 10 テスト（2026-11-18、plugin-auth-test-worker）
+- [x] **[M-11 一部]** tool/edit/mod.rs に 7 テスト（2026-11-18、edit-test-worker）
 
 ## メモ
 
+- serde wire format 不整合（2026-11-18、types-data-test-worker が発見、未修正）:
+  `PartType` は `rename_all="camelCase"` がタグ値のみに効き内部フィールド（tool_call_id /
+  is_error 等）は snake_case のまま。`SessionStatus` は sqlx rename のみで serde は
+  PascalCase（"Active" 等）、`MessageRole` も PascalCase。上流仕様との照合が必要
+  （M-02 の共有型整理と関連）。現状はテストで固定済み。
 - グローバルTODO: `~/.config/opencode/todo.md`（複数プロジェクト横断のタスク用）。
 - クロスレビュー方法: 5 回 × 4 観点 = 20 レビュア（read-only）＋第 6 回で重複排除とコード照合（6 バリデータ）。95 件 → 66
   グループ（High 14 / Medium 38 / Low 14）、false-positive／unconfirmed 0 件、「要確認」6 件。
