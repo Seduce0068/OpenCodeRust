@@ -165,3 +165,307 @@ impl Default for ForkDialog {
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// テスト用 ForkEntry を構築するヘルパー。
+    fn entry(message_id: &str, role: &str, preview: &str, timestamp: &str) -> ForkEntry {
+        ForkEntry {
+            message_id: message_id.to_string(),
+            role: role.to_string(),
+            preview: preview.to_string(),
+            timestamp: timestamp.to_string(),
+        }
+    }
+
+    /// テスト用の 3 件のエントリを返すヘルパー。
+    fn sample_entries() -> Vec<ForkEntry> {
+        vec![
+            entry("m1", "user", "first question", "10-01 09:00"),
+            entry("m2", "assistant", "first answer", "10-01 09:01"),
+            entry("m3", "system", "context note", "10-01 09:02"),
+        ]
+    }
+
+    // --- ForkEntry データ保持 ---
+
+    #[test]
+    fn entry_stores_all_fields() {
+        let e = entry("m1", "user", "first question", "10-01 09:00");
+
+        assert_eq!(e.message_id, "m1");
+        assert_eq!(e.role, "user");
+        assert_eq!(e.preview, "first question");
+        assert_eq!(e.timestamp, "10-01 09:00");
+    }
+
+    #[test]
+    fn entry_clone_preserves_all_fields() {
+        let original = entry("m2", "assistant", "first answer", "10-01 09:01");
+
+        let cloned = original.clone();
+
+        assert_eq!(cloned.message_id, original.message_id);
+        assert_eq!(cloned.role, original.role);
+        assert_eq!(cloned.preview, original.preview);
+        assert_eq!(cloned.timestamp, original.timestamp);
+    }
+
+    // --- new / Default ---
+
+    #[test]
+    fn new_starts_empty_and_closed() {
+        let dialog = ForkDialog::new();
+
+        assert!(dialog.entries.is_empty());
+        assert!(dialog.session_id().is_none());
+        assert_eq!(dialog.state.selected(), None);
+        assert!(!dialog.is_open());
+    }
+
+    #[test]
+    fn default_starts_empty_and_closed() {
+        let dialog = ForkDialog::default();
+
+        assert!(dialog.entries.is_empty());
+        assert!(dialog.session_id().is_none());
+        assert_eq!(dialog.state.selected(), None);
+        assert!(!dialog.is_open());
+    }
+
+    // --- open / close / is_open ---
+
+    #[test]
+    fn open_sets_open_state_session_and_selects_first() {
+        let mut dialog = ForkDialog::new();
+        assert!(!dialog.is_open());
+
+        dialog.open("s1".to_string(), sample_entries());
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.session_id(), Some("s1"));
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(matches!(dialog.selected_entry(), Some(e) if e.message_id == "m1"));
+        assert_eq!(dialog.selected_message_id(), Some("m1"));
+    }
+
+    #[test]
+    fn open_with_empty_entries_selects_none() {
+        let mut dialog = ForkDialog::new();
+
+        dialog.open("s-empty".to_string(), Vec::new());
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.session_id(), Some("s-empty"));
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_entry().is_none());
+        assert_eq!(dialog.selected_message_id(), None);
+    }
+
+    #[test]
+    fn move_down_after_open_with_empty_entries_stays_clamped() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s-empty".to_string(), Vec::new());
+        assert_eq!(dialog.state.selected(), None);
+
+        dialog.move_down();
+
+        // 空 entries では選択が None のまま（直近ラウンドで失敗したパターン）。
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_entry().is_none());
+        assert_eq!(dialog.selected_message_id(), None);
+    }
+
+    #[test]
+    fn close_clears_open_state_and_preserves_data() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s1".to_string(), sample_entries());
+        dialog.move_down();
+        assert_eq!(dialog.state.selected(), Some(1));
+
+        dialog.close();
+
+        assert!(!dialog.is_open());
+        assert_eq!(dialog.session_id(), Some("s1"));
+        assert_eq!(dialog.entries.len(), 3);
+        assert_eq!(dialog.state.selected(), Some(1));
+        assert_eq!(dialog.selected_message_id(), Some("m2"));
+    }
+
+    #[test]
+    fn open_close_cycles_toggle_state() {
+        let mut dialog = ForkDialog::new();
+
+        for _ in 0..3 {
+            dialog.open("s1".to_string(), sample_entries());
+            assert!(dialog.is_open());
+            dialog.close();
+            assert!(!dialog.is_open());
+        }
+    }
+
+    #[test]
+    fn close_is_idempotent_from_new() {
+        let mut dialog = ForkDialog::new();
+
+        dialog.close();
+        dialog.close();
+
+        assert!(!dialog.is_open());
+        assert!(dialog.session_id().is_none());
+    }
+
+    #[test]
+    fn open_replaces_entries_and_resets_selection() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s1".to_string(), sample_entries());
+        dialog.move_down();
+        assert_eq!(dialog.state.selected(), Some(1));
+
+        dialog.open(
+            "s2".to_string(),
+            vec![entry("x1", "user", "only", "10-02 00:00")],
+        );
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.session_id(), Some("s2"));
+        assert_eq!(dialog.entries.len(), 1);
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert_eq!(dialog.selected_message_id(), Some("x1"));
+    }
+
+    // --- 選択状態遷移 (move_up / move_down) ---
+
+    #[test]
+    fn move_down_advances_selection_and_selected_entry() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s1".to_string(), sample_entries());
+        assert_eq!(dialog.state.selected(), Some(0));
+
+        dialog.move_down();
+
+        assert_eq!(dialog.state.selected(), Some(1));
+        assert_eq!(dialog.selected_message_id(), Some("m2"));
+        assert!(matches!(dialog.selected_entry(), Some(e) if e.role == "assistant"));
+    }
+
+    #[test]
+    fn move_down_clamps_at_last_item() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s1".to_string(), sample_entries());
+
+        for _ in 0..10 {
+            dialog.move_down();
+        }
+
+        assert_eq!(dialog.state.selected(), Some(2));
+        assert_eq!(dialog.selected_message_id(), Some("m3"));
+    }
+
+    #[test]
+    fn move_up_moves_back_and_clamps_at_zero() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s1".to_string(), sample_entries());
+        dialog.move_down();
+        dialog.move_down();
+        assert_eq!(dialog.state.selected(), Some(2));
+
+        dialog.move_up();
+        assert_eq!(dialog.state.selected(), Some(1));
+        dialog.move_up();
+        assert_eq!(dialog.state.selected(), Some(0));
+        dialog.move_up();
+        assert_eq!(dialog.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn move_up_and_move_down_are_noop_without_selection() {
+        let mut dialog = ForkDialog::new();
+        assert_eq!(dialog.state.selected(), None);
+
+        dialog.move_up();
+        dialog.move_down();
+
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_entry().is_none());
+    }
+
+    // --- render ---
+
+    #[test]
+    fn render_when_closed_draws_nothing() {
+        let dialog = ForkDialog::new();
+        let theme = Theme::default();
+        assert!(!dialog.is_open());
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.trim().is_empty(),
+            "closed fork dialog must not draw any content"
+        );
+    }
+
+    #[test]
+    fn render_when_open_without_entries_shows_empty_message() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s-empty".to_string(), Vec::new());
+        let theme = Theme::default();
+        assert!(dialog.is_open());
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("Fork Session"), "dialog title");
+        assert!(text.contains("No messages to fork from"), "empty message");
+    }
+
+    #[test]
+    fn render_when_open_shows_entries_and_role_icons() {
+        let mut dialog = ForkDialog::new();
+        dialog.open("s1".to_string(), sample_entries());
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("Fork Session"), "dialog title");
+        assert!(text.contains("[U]"), "user role icon");
+        assert!(text.contains("[A]"), "assistant role icon");
+        assert!(text.contains("[S]"), "system role icon");
+        assert!(text.contains("first question"), "first preview");
+        assert!(text.contains("first answer"), "second preview");
+        assert!(text.contains("context note"), "third preview");
+        assert!(text.contains("10-01 09:00"), "timestamp");
+        assert!(text.contains("Enter to confirm"), "hint text");
+    }
+}

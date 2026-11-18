@@ -472,3 +472,546 @@ impl Default for CommandPalette {
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        // ratatui-core の Buffer は Display を実装しないため cell() で走査する。
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// テスト用 Command を構築するヘルパー。
+    fn command(
+        action: CommandAction,
+        title: &str,
+        keybind: Option<&str>,
+        category: &str,
+    ) -> Command {
+        Command {
+            action,
+            title: title.to_string(),
+            keybind: keybind.map(str::to_string),
+            category: category.to_string(),
+        }
+    }
+
+    /// 確実に一致しないクエリ（fuzzy_match が None を返す）を順に入力するヘルパー。
+    fn type_no_match(palette: &mut CommandPalette) {
+        for c in "zzz_qqq_xxx".chars() {
+            palette.handle_input(c);
+        }
+    }
+
+    // --- Command データ保持 ---
+
+    #[test]
+    fn command_stores_all_fields() {
+        let cmd = command(
+            CommandAction::SubmitPrompt,
+            "Submit prompt",
+            Some("enter"),
+            "Prompt",
+        );
+
+        assert_eq!(cmd.title, "Submit prompt");
+        assert_eq!(cmd.keybind.as_deref(), Some("enter"));
+        assert_eq!(cmd.category, "Prompt");
+        assert!(matches!(&cmd.action, CommandAction::SubmitPrompt));
+    }
+
+    #[test]
+    fn command_allows_missing_keybind() {
+        let cmd = command(
+            CommandAction::PromptStashPush,
+            "Stash prompt",
+            None,
+            "Prompt",
+        );
+
+        assert!(cmd.keybind.is_none());
+        assert_eq!(cmd.title, "Stash prompt");
+        assert!(matches!(&cmd.action, CommandAction::PromptStashPush));
+    }
+
+    #[test]
+    fn command_clone_preserves_all_fields() {
+        let original = command(CommandAction::Exit, "Exit", Some("ctrl+c"), "App");
+
+        let cloned = original.clone();
+
+        assert_eq!(cloned.title, original.title);
+        assert_eq!(cloned.keybind, original.keybind);
+        assert_eq!(cloned.category, original.category);
+        assert!(matches!(&cloned.action, CommandAction::Exit));
+    }
+
+    #[test]
+    fn new_populates_expected_default_commands() {
+        let palette = CommandPalette::new();
+
+        assert!(palette.commands.len() > 20);
+        assert!(palette.commands.iter().any(|c| {
+            matches!(&c.action, CommandAction::SubmitPrompt) && c.title == "Submit prompt"
+        }));
+        assert!(palette
+            .commands
+            .iter()
+            .any(|c| matches!(&c.action, CommandAction::Exit) && c.title == "Exit"));
+        assert!(palette
+            .commands
+            .iter()
+            .any(|c| matches!(&c.action, CommandAction::ShowHelp) && c.title == "Show help"));
+    }
+
+    // --- new / Default ---
+
+    #[test]
+    fn new_starts_with_full_filter_and_first_selected_and_closed() {
+        let palette = CommandPalette::new();
+
+        assert!(palette.query.is_empty());
+        assert_eq!(palette.filtered.len(), palette.commands.len());
+        assert_eq!(palette.filtered.first().copied(), Some(0));
+        assert_eq!(palette.state.selected(), Some(0));
+        assert!(!palette.is_open());
+    }
+
+    #[test]
+    fn default_matches_new_state() {
+        let palette = CommandPalette::default();
+
+        assert!(palette.query.is_empty());
+        assert_eq!(palette.filtered.len(), palette.commands.len());
+        assert_eq!(palette.state.selected(), Some(0));
+        assert!(!palette.is_open());
+    }
+
+    // --- open / close / is_open ---
+
+    #[test]
+    fn open_sets_open_state_and_resets_query_filter_and_selection() {
+        let mut palette = CommandPalette::new();
+        for c in "exit".chars() {
+            palette.handle_input(c);
+        }
+        palette.move_down();
+        assert!(palette.filtered.len() < palette.commands.len());
+        assert!(!palette.is_open());
+
+        palette.open();
+
+        assert!(palette.is_open());
+        assert!(palette.query.is_empty());
+        assert_eq!(palette.filtered.len(), palette.commands.len());
+        assert_eq!(palette.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn close_clears_open_state_and_preserves_data() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        palette.move_down();
+        assert!(palette.is_open());
+        assert_eq!(palette.state.selected(), Some(1));
+
+        palette.close();
+
+        assert!(!palette.is_open());
+        assert_eq!(palette.state.selected(), Some(1));
+        assert_eq!(palette.filtered.len(), palette.commands.len());
+    }
+
+    #[test]
+    fn open_close_cycles_toggle_state() {
+        let mut palette = CommandPalette::new();
+
+        for _ in 0..3 {
+            palette.open();
+            assert!(palette.is_open());
+            palette.close();
+            assert!(!palette.is_open());
+        }
+    }
+
+    #[test]
+    fn close_is_idempotent_from_new() {
+        let mut palette = CommandPalette::new();
+
+        palette.close();
+        palette.close();
+
+        assert!(!palette.is_open());
+        assert!(palette.query.is_empty());
+    }
+
+    #[test]
+    fn open_is_idempotent() {
+        let mut palette = CommandPalette::new();
+
+        palette.open();
+        palette.open();
+
+        assert!(palette.is_open());
+        assert_eq!(palette.state.selected(), Some(0));
+        assert!(palette.query.is_empty());
+    }
+
+    // --- クエリ入力とフィルタ (handle_input / handle_backspace) ---
+
+    #[test]
+    fn handle_input_appends_chars_to_query() {
+        let mut palette = CommandPalette::new();
+
+        for c in "exit".chars() {
+            palette.handle_input(c);
+        }
+
+        assert_eq!(palette.query, "exit");
+    }
+
+    #[test]
+    fn handle_input_filters_to_matching_command() {
+        let mut palette = CommandPalette::new();
+        let total = palette.commands.len();
+
+        for c in "exit".chars() {
+            palette.handle_input(c);
+        }
+
+        assert!(palette.filtered.len() < total);
+        assert!(!palette.filtered.is_empty());
+        let selected = palette.selected_command().expect("a command should match");
+        assert_eq!(selected.title, "Exit");
+        assert!(matches!(&selected.action, CommandAction::Exit));
+    }
+
+    #[test]
+    fn handle_input_with_no_match_empties_filter_and_selection() {
+        let mut palette = CommandPalette::new();
+
+        type_no_match(&mut palette);
+
+        assert_eq!(palette.query, "zzz_qqq_xxx");
+        assert!(palette.filtered.is_empty());
+        assert_eq!(palette.state.selected(), None);
+        assert!(palette.selected_command().is_none());
+        assert!(palette.selected_action().is_none());
+    }
+
+    #[test]
+    fn handle_backspace_removes_last_char_and_refilters() {
+        let mut palette = CommandPalette::new();
+
+        for c in "exit".chars() {
+            palette.handle_input(c);
+        }
+        assert_eq!(palette.query, "exit");
+        let narrow_len = palette.filtered.len();
+
+        palette.handle_backspace();
+
+        assert_eq!(palette.query, "exi");
+        assert!(palette.filtered.len() >= narrow_len);
+        assert_eq!(palette.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn handle_backspace_until_empty_restores_full_list() {
+        let mut palette = CommandPalette::new();
+        let total = palette.commands.len();
+
+        for c in "exit".chars() {
+            palette.handle_input(c);
+        }
+        assert!(palette.filtered.len() < total);
+
+        for _ in 0..4 {
+            palette.handle_backspace();
+        }
+
+        assert!(palette.query.is_empty());
+        assert_eq!(palette.filtered.len(), total);
+        assert_eq!(palette.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn handle_backspace_on_empty_query_is_noop() {
+        let mut palette = CommandPalette::new();
+        let total = palette.commands.len();
+
+        palette.handle_backspace();
+
+        assert!(palette.query.is_empty());
+        assert_eq!(palette.filtered.len(), total);
+        assert_eq!(palette.state.selected(), Some(0));
+    }
+
+    // --- 選択移動の状態遷移 (move_up / move_down / selected_command / selected_action) ---
+
+    #[test]
+    fn move_down_advances_selection_and_selected_command() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        assert_eq!(palette.state.selected(), Some(0));
+        let first_title = palette
+            .selected_command()
+            .expect("first command should be selected")
+            .title
+            .clone();
+
+        palette.move_down();
+
+        assert_eq!(palette.state.selected(), Some(1));
+        let second_title = palette
+            .selected_command()
+            .expect("second command should be selected")
+            .title
+            .clone();
+        assert_ne!(second_title, first_title);
+    }
+
+    #[test]
+    fn move_down_clamps_at_last_item() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        let last = palette.commands.len().saturating_sub(1);
+
+        for _ in 0..(palette.commands.len() + 5) {
+            palette.move_down();
+        }
+
+        assert_eq!(palette.state.selected(), Some(last));
+    }
+
+    #[test]
+    fn move_up_moves_back_and_clamps_at_zero() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        palette.move_down();
+        palette.move_down();
+        assert_eq!(palette.state.selected(), Some(2));
+
+        palette.move_up();
+        assert_eq!(palette.state.selected(), Some(1));
+        palette.move_up();
+        assert_eq!(palette.state.selected(), Some(0));
+        palette.move_up();
+        assert_eq!(palette.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn move_up_and_move_down_are_noop_without_selection() {
+        let mut palette = CommandPalette::new();
+        type_no_match(&mut palette);
+        assert!(palette.filtered.is_empty());
+        assert_eq!(palette.state.selected(), None);
+
+        palette.move_up();
+        palette.move_down();
+
+        assert_eq!(
+            palette.state.selected(),
+            None,
+            "empty list must not gain a selection"
+        );
+        assert!(palette.selected_command().is_none());
+    }
+
+    #[test]
+    fn move_down_is_noop_when_filtered_is_empty_even_with_selection() {
+        let mut palette = CommandPalette::new();
+        palette.state.select(Some(0));
+        palette.filtered.clear();
+        assert_eq!(palette.state.selected(), Some(0));
+        assert!(palette.filtered.is_empty());
+
+        palette.move_down();
+
+        // filtered が空のとき saturating_sub(1) == 0 となり、選択はクランプされ据え置きになる。
+        assert_eq!(palette.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn selected_action_matches_selected_command() {
+        let palette = CommandPalette::new();
+
+        let cmd = palette
+            .selected_command()
+            .expect("a command should be selected");
+        assert_eq!(cmd.title, "Submit prompt");
+        assert!(matches!(&cmd.action, CommandAction::SubmitPrompt));
+        assert!(matches!(
+            palette.selected_action(),
+            Some(CommandAction::SubmitPrompt)
+        ));
+    }
+
+    #[test]
+    fn selected_action_changes_after_move() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        assert!(matches!(
+            palette.selected_action(),
+            Some(CommandAction::SubmitPrompt)
+        ));
+
+        palette.move_down();
+
+        assert!(matches!(
+            palette.selected_action(),
+            Some(CommandAction::ClearPrompt)
+        ));
+    }
+
+    #[test]
+    fn selected_command_and_action_follow_filter() {
+        let mut palette = CommandPalette::new();
+        for c in "exit".chars() {
+            palette.handle_input(c);
+        }
+
+        let cmd = palette.selected_command().expect("filtered command");
+        assert_eq!(cmd.title, "Exit");
+        assert!(matches!(&cmd.action, CommandAction::Exit));
+        assert!(matches!(
+            palette.selected_action(),
+            Some(CommandAction::Exit)
+        ));
+    }
+
+    #[test]
+    fn selected_command_and_action_none_without_selection() {
+        let mut palette = CommandPalette::new();
+        type_no_match(&mut palette);
+
+        assert!(palette.selected_command().is_none());
+        assert!(palette.selected_action().is_none());
+    }
+
+    // --- sync_visibility_labels ---
+
+    #[test]
+    fn sync_visibility_labels_updates_titles_and_refilters() {
+        let mut palette = CommandPalette::new();
+
+        let mode = MessageDensity::Cozy;
+        palette.sync_visibility_labels(false, false, mode, false, false, true, true);
+
+        let header = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleHeader))
+            .expect("ToggleHeader command exists");
+        assert_eq!(header.title, "Show header");
+
+        let density = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleDensity))
+            .expect("ToggleDensity command exists");
+        assert_eq!(density.title, "Switch to compact density");
+
+        let scrollbar = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleScrollbar))
+            .expect("ToggleScrollbar command exists");
+        assert_eq!(scrollbar.title, "Hide scrollbar");
+
+        let tips = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleTips))
+            .expect("ToggleTips command exists");
+        assert_eq!(tips.title, "Show tips");
+
+        assert_eq!(palette.state.selected(), Some(0));
+        assert_eq!(palette.filtered.len(), palette.commands.len());
+    }
+
+    #[test]
+    fn sync_visibility_labels_compact_density_and_thinking_titles() {
+        let mut palette = CommandPalette::new();
+
+        let mode = MessageDensity::Compact;
+        palette.sync_visibility_labels(true, true, mode, true, true, false, false);
+
+        let thinking = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleThinking))
+            .expect("ToggleThinking command exists");
+        assert_eq!(thinking.title, "Hide thinking");
+
+        let density = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleDensity))
+            .expect("ToggleDensity command exists");
+        assert_eq!(density.title, "Switch to cozy density");
+
+        let semantic = palette
+            .commands
+            .iter()
+            .find(|c| matches!(&c.action, CommandAction::ToggleSemanticHighlight))
+            .expect("ToggleSemanticHighlight command exists");
+        assert_eq!(semantic.title, "Disable semantic highlight");
+    }
+
+    // --- render ---
+
+    #[test]
+    fn render_when_closed_draws_nothing() {
+        let palette = CommandPalette::new();
+        let theme = Theme::default();
+        assert!(!palette.is_open());
+
+        let text = render_to_string(80, 24, |frame| {
+            palette.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.trim().is_empty(),
+            "closed command palette must not draw any content"
+        );
+    }
+
+    #[test]
+    fn render_when_open_shows_query_and_command_titles() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        for c in "help".chars() {
+            palette.handle_input(c);
+        }
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            palette.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("Commands"), "dialog title");
+        assert!(text.contains("help"), "query text");
+        assert!(text.contains("Show help"), "filtered command title");
+    }
+}
