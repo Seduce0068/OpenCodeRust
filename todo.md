@@ -62,10 +62,11 @@ status: current
   - pty／util／watcher／local-llm／codemode の 5 クレートが無依存（codemode は ADR-0006
     で既知の先送り）、server が portable-pty を直接依存し同名 PtyManager を再実装。配線または member 外し、
     server を opencode-pty 利用へ
-- [ ] **[M-04]** エラー型の残課題（command crate の charter 準拠は完了）
-  - command の 3 メソッドを `Result<_, CommandError>` 化済み（破壊的変更、CLI の `?` は
-    anyhow の From で互換を実証）。未対応は ToolError／ApiError の String のみで
-    `#[source]` なしの問題（他クレートの別タスク）
+- [ ] **[M-04]** エラー型の残課題（source 付きバリアント追加は完了）
+  - command の 3 メソッドと、ToolError/ProviderError の source 付きバリアント追加済み。
+    未対応は約 30 ファイルの呼び出し元（`map_err(|e| X(e.to_string()))`）を新コンストラクタへ
+    置換する作業（優先: tool の read/write/apply_patch/edit/bash/webfetch、provider 各ファイルの
+    reqwest 近傍）。新バリアントは_enum 非 non_exhaustive_ のため下流列挙には破壊的変更になりうる
 - [ ] **[M-05]** Todo 状態の未配線（要確認、配線には他クレート変更が必須）
   - 事実確認済み（2026-11-18、todo-wire-worker）: 本番 update 0 件、todo_update/todo_get
     None。配線には ①session/prompt.rs へコールバック注入 API、②server.rs へ TodoManager
@@ -96,9 +97,10 @@ status: current
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
-  - 補足（2026-11-18、event-test-worker）: TUI の `EventBus::new()` は `let (tx, _rx) =
-    channel()` で受信側を即破棄 → new()/default() 経由の send は常に Err（握り潰される）。
-    AppContext::new() がこれを使う。本来の配送経路が意図通りか確認が必要
+  - 補足（2026-11-18、eventbus-tui-worker）: TUI の `EventBus::new()` は受信側を即破棄するが、
+    本番で `event_bus.send*` 呼び出しは 0 件。実際の配送は app.rs:102 の別 mpsc チャネルで
+    動作しており実害なし。receiver 保持は読む event loop が無くキュー蓄積リスクがあるため
+    見送り。真に統合するなら app.rs 改修（EventBus を app のチャネルへ統合、または削除）が必要
 - [ ] **[M-21]** ServerState 外のグローバル static（CONFIG_STATE／TUI キュー／実行状態は対応済み）
   - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS。
     未対応: PROJECT_METADATA（cwd キーで実害限定的、ハンドラ 4 箇所のシグネチャ変更要）、
@@ -285,6 +287,8 @@ status: current
 - [x] **[M-11 一部]** agent/message.rs に 7 テスト（2026-11-18、agent-message-test-worker）
 - [x] **[M-11 一部]** tui/event.rs に 12 テスト（2026-11-18、event-test-worker）
 - [x] **[M-17 一部]** 7 モジュールを pub(crate) 化（2026-11-18、pubmod-worker）
+- [x] **[M-11 一部]** tui/session_context.rs に 11 テスト（2026-11-18、session-ctx-test-worker）
+- [x] **[M-04 一部]** source 付きエラーバリアントを追加（2026-11-18、error-source-worker）
 
 ## メモ
 
