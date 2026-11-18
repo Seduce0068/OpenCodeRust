@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::protocol::{JsonRpcMessage, JsonRpcRequest};
+use crate::protocol::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use crate::McpClientError;
 
 // ---------------------------------------------------------------------------
@@ -15,6 +15,24 @@ use crate::McpClientError;
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError>;
+
+    /// Send a JSON-RPC notification. Notifications carry no `id` and compliant
+    /// servers never answer them, so this must not wait for a response.
+    ///
+    /// The default returns an error so that out-of-tree implementations keep
+    /// compiling without silently claiming the notification was delivered.
+    /// Returning `Ok(())` would be a false success, and routing through `send`
+    /// would attach an `id` and violate the JSON-RPC notification format.
+    /// In-tree transports all override this with a real implementation.
+    async fn send_notification(
+        &self,
+        _notification: &JsonRpcNotification,
+    ) -> Result<(), McpClientError> {
+        Err(McpClientError::ProtocolError(
+            "transport does not support JSON-RPC notifications".to_string(),
+        ))
+    }
+
     async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError>;
     async fn close(&self) -> Result<(), McpClientError>;
 }
@@ -72,19 +90,14 @@ impl StdioTransport {
             stdout: Mutex::new(Some(BufReader::new(stdout))),
         })
     }
-}
 
-#[async_trait]
-impl McpTransport for StdioTransport {
-    async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+    /// Write one Content-Length framed JSON body to the child process.
+    /// Shared by request and notification sends; framing is identical.
+    async fn write_frame(&self, content: &str) -> Result<(), McpClientError> {
         let mut stdin_guard = self.stdin.lock().await;
         let stdin = stdin_guard
             .as_mut()
             .ok_or_else(|| McpClientError::TransportError("Process not running".to_string()))?;
-
-        let content = serde_json::to_string(request).map_err(|e| {
-            McpClientError::ProtocolError(format!("Failed to serialize request: {}", e))
-        })?;
 
         let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
@@ -99,6 +112,26 @@ impl McpTransport for StdioTransport {
             .map_err(|e| McpClientError::TransportError(format!("Failed to flush: {}", e)))?;
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for StdioTransport {
+    async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+        let content = serde_json::to_string(request).map_err(|e| {
+            McpClientError::ProtocolError(format!("Failed to serialize request: {}", e))
+        })?;
+        self.write_frame(&content).await
+    }
+
+    async fn send_notification(
+        &self,
+        notification: &JsonRpcNotification,
+    ) -> Result<(), McpClientError> {
+        let content = serde_json::to_string(notification).map_err(|e| {
+            McpClientError::ProtocolError(format!("Failed to serialize notification: {}", e))
+        })?;
+        self.write_frame(&content).await
     }
 
     async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
@@ -188,11 +221,10 @@ impl HttpTransport {
             response_tx: tx,
         }
     }
-}
 
-#[async_trait]
-impl McpTransport for HttpTransport {
-    async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+    /// POST a serialized JSON-RPC body and return the HTTP response so the
+    /// caller can decide whether to consume it. Shared by both send paths.
+    async fn post_body(&self, body: String) -> Result<reqwest::Response, McpClientError> {
         let mut builder = self
             .client
             .post(&self.url)
@@ -202,10 +234,6 @@ impl McpTransport for HttpTransport {
         for (key, value) in &self.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
-
-        let body = serde_json::to_string(request).map_err(|e| {
-            McpClientError::ProtocolError(format!("Failed to serialize request: {}", e))
-        })?;
 
         let resp =
             builder.body(body).send().await.map_err(|e| {
@@ -221,6 +249,18 @@ impl McpTransport for HttpTransport {
                 resp.status()
             )));
         }
+
+        Ok(resp)
+    }
+}
+
+#[async_trait]
+impl McpTransport for HttpTransport {
+    async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+        let body = serde_json::to_string(request).map_err(|e| {
+            McpClientError::ProtocolError(format!("Failed to serialize request: {}", e))
+        })?;
+        let resp = self.post_body(body).await?;
 
         let content_type = resp
             .headers()
@@ -259,6 +299,20 @@ impl McpTransport for HttpTransport {
             }
         }
 
+        Ok(())
+    }
+
+    async fn send_notification(
+        &self,
+        notification: &JsonRpcNotification,
+    ) -> Result<(), McpClientError> {
+        let body = serde_json::to_string(notification).map_err(|e| {
+            McpClientError::ProtocolError(format!("Failed to serialize notification: {}", e))
+        })?;
+        // A notification has no id and produces no JSON-RPC response. Do not
+        // parse/buffer the HTTP body into `response_rx`, or the next request
+        // would consume a stale message.
+        let _resp = self.post_body(body).await?;
         Ok(())
     }
 
@@ -358,11 +412,10 @@ impl SseTransport {
 
         Ok(())
     }
-}
 
-#[async_trait]
-impl McpTransport for SseTransport {
-    async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+    /// POST a serialized JSON-RPC body to the message endpoint. Shared by both
+    /// send paths; incoming messages still arrive via the SSE listener.
+    async fn post_body(&self, body: String) -> Result<(), McpClientError> {
         let mut builder = self
             .client
             .post(&self.url)
@@ -371,10 +424,6 @@ impl McpTransport for SseTransport {
         for (key, value) in &self.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
-
-        let body = serde_json::to_string(request).map_err(|e| {
-            McpClientError::ProtocolError(format!("Failed to serialize request: {}", e))
-        })?;
 
         let resp = builder
             .body(body)
@@ -393,6 +442,26 @@ impl McpTransport for SseTransport {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for SseTransport {
+    async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+        let body = serde_json::to_string(request).map_err(|e| {
+            McpClientError::ProtocolError(format!("Failed to serialize request: {}", e))
+        })?;
+        self.post_body(body).await
+    }
+
+    async fn send_notification(
+        &self,
+        notification: &JsonRpcNotification,
+    ) -> Result<(), McpClientError> {
+        let body = serde_json::to_string(notification).map_err(|e| {
+            McpClientError::ProtocolError(format!("Failed to serialize notification: {}", e))
+        })?;
+        self.post_body(body).await
     }
 
     async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {

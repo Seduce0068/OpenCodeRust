@@ -472,6 +472,23 @@ impl McpClient {
     async fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::SeqCst) + 1
     }
+
+    /// Send a JSON-RPC notification (no `id`, no response expected).
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpClientError> {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+        };
+        let guard = self.transport.lock().await;
+        let transport = guard.as_ref().ok_or(McpClientError::NotInitialized)?;
+        transport.send_notification(&notification).await
+    }
+
     async fn send_request(
         &self,
         method: &str,
@@ -604,9 +621,14 @@ impl McpClient {
             *caps = Some(result.capabilities);
         }
 
+        // `notifications/initialized` is a JSON-RPC notification: it has no id
+        // and compliant servers never reply, so we do NOT wait for a response.
+        // The send itself is still bounded, because reqwest has no default
+        // request timeout and an unresponsive server could otherwise block the
+        // HTTP/SSE POST forever. Failure and timeout remain best-effort.
         let _ = tokio::time::timeout(
             Duration::from_millis(self.startup_timeout_ms),
-            self.send_request("notifications/initialized", None),
+            self.send_notification("notifications/initialized", None),
         )
         .await;
 
@@ -1108,6 +1130,13 @@ mod tests {
             Ok(())
         }
 
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
         async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
             let next = self.messages.lock().await.pop_front();
             match next {
@@ -1231,6 +1260,13 @@ mod tests {
     #[async_trait]
     impl McpTransport for HangingTransport {
         async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
             Ok(())
         }
 

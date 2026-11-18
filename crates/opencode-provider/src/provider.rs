@@ -252,6 +252,7 @@ pub fn parse_api_call_error(provider_id: &str, error: &ProviderError) -> ParsedA
         ProviderError::RateLimit => (Some(429), true),
         ProviderError::Timeout => (None, true),
         ProviderError::NetworkError(_) => (None, true),
+        ProviderError::NetworkErrorWithSource { .. } => (None, true),
         _ => (None, false),
     };
 
@@ -534,6 +535,42 @@ mod tests {
 
         let api = ProviderError::api_error_with_source("bad request", std::io::Error::other("bad"));
         assert!(api.is_retryable().is_none());
+    }
+
+    #[test]
+    fn test_parse_api_call_error_network_with_source_is_retryable() {
+        let network = ProviderError::network_error_with_source(
+            "request failed",
+            std::io::Error::other("connection reset"),
+        );
+        let parsed = parse_api_call_error("some-provider", &network);
+        match parsed {
+            ParsedAPICallError::ApiError {
+                is_retryable,
+                status_code,
+                ..
+            } => {
+                assert!(
+                    is_retryable,
+                    "source 保持版のネットワークエラーは retryable であるべき"
+                );
+                assert_eq!(status_code, None);
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+
+        // ApiErrorWithSource は is_retryable() と同様に非リトライのままであること。
+        let api = ProviderError::api_error_with_source("bad request", std::io::Error::other("bad"));
+        let parsed = parse_api_call_error("some-provider", &api);
+        match parsed {
+            ParsedAPICallError::ApiError { is_retryable, .. } => {
+                assert!(
+                    !is_retryable,
+                    "ApiErrorWithSource は非リトライのままであるべき"
+                );
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
     }
 
     #[test]
