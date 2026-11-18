@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::future::Future;
 use tokio::sync::watch;
-use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Constants (ported from SessionRetry namespace)
@@ -13,35 +11,10 @@ pub const RETRY_MAX_DELAY_NO_HEADERS: u64 = 30_000;
 pub const RETRY_MAX_DELAY: u64 = 2_147_483_647;
 
 // ---------------------------------------------------------------------------
-// RetryConfig
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    pub max_attempts: u32,
-    pub initial_delay: u64,
-    pub backoff_factor: u64,
-    pub max_delay_no_headers: u64,
-    pub max_delay: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_attempts: 5,
-            initial_delay: RETRY_INITIAL_DELAY,
-            backoff_factor: RETRY_BACKOFF_FACTOR,
-            max_delay_no_headers: RETRY_MAX_DELAY_NO_HEADERS,
-            max_delay: RETRY_MAX_DELAY,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // IsRetryable trait
 // ---------------------------------------------------------------------------
 
-/// Implement this on error types so the retry helpers know whether to retry.
+/// Implement this on error types to expose whether an error is transient.
 /// Return `Some(message)` when the error is retryable, `None` otherwise.
 pub trait IsRetryable {
     fn is_retryable(&self) -> Option<String>;
@@ -132,92 +105,6 @@ pub fn delay(attempt: u32, response_headers: Option<&HashMap<String, String>>) -
 fn exponential_backoff(attempt: u32, initial: u64, factor: u64, max: u64) -> u64 {
     let exp = factor.saturating_pow(attempt.saturating_sub(1));
     initial.saturating_mul(exp).min(max)
-}
-// ---------------------------------------------------------------------------
-// with_retry – generic retry wrapper
-// ---------------------------------------------------------------------------
-
-/// Retry an async operation up to `config.max_attempts` times.
-///
-/// The closure `f` is called on each attempt. If it returns `Err(e)` and
-/// `e.is_retryable()` returns `Some(_)`, the helper sleeps for the computed
-/// delay and tries again. Otherwise the error is returned immediately.
-pub async fn with_retry<F, Fut, T, E>(config: &RetryConfig, mut f: F) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: IsRetryable + std::fmt::Debug,
-{
-    let mut attempt: u32 = 0;
-
-    loop {
-        attempt += 1;
-        match f().await {
-            Ok(val) => return Ok(val),
-            Err(e) => {
-                if attempt >= config.max_attempts {
-                    return Err(e);
-                }
-                match e.is_retryable() {
-                    Some(msg) => {
-                        let delay_ms = delay(attempt, None);
-                        warn!(
-                            attempt,
-                            max = config.max_attempts,
-                            delay_ms,
-                            reason = %msg,
-                            "retrying after transient error"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                    None => return Err(e),
-                }
-            }
-        }
-    }
-}
-
-/// Same as [`with_retry`] but calls `hook(attempt, &error, delay_ms)` before
-/// each retry sleep, giving the caller a chance to log or update UI.
-pub async fn with_retry_and_hook<F, Fut, T, E, H>(
-    config: &RetryConfig,
-    mut f: F,
-    mut hook: H,
-) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: IsRetryable + std::fmt::Debug,
-    H: FnMut(u32, &E, u64),
-{
-    let mut attempt: u32 = 0;
-
-    loop {
-        attempt += 1;
-        match f().await {
-            Ok(val) => return Ok(val),
-            Err(e) => {
-                if attempt >= config.max_attempts {
-                    return Err(e);
-                }
-                match e.is_retryable() {
-                    Some(msg) => {
-                        let delay_ms = delay(attempt, None);
-                        hook(attempt, &e, delay_ms);
-                        warn!(
-                            attempt,
-                            max = config.max_attempts,
-                            delay_ms,
-                            reason = %msg,
-                            "retrying after transient error"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                    None => return Err(e),
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

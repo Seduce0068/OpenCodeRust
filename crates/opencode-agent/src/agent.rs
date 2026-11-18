@@ -108,7 +108,13 @@ pub enum PermissionDecision {
 pub struct PermissionNext;
 
 impl PermissionNext {
-    pub fn evaluate(agent: &AgentInfo, tool_name: &str) -> PermissionDecision {
+    /// Evaluate a tool call against an agent's permission rules.
+    ///
+    /// `pattern` is the concrete target value (e.g. `file_path` for edit tools,
+    /// `command` for bash) that is matched against each rule's configured
+    /// pattern. Pass `"*"` when no target can be extracted; wildcard rules keep
+    /// matching in that case, which preserves the previous behaviour.
+    pub fn evaluate(agent: &AgentInfo, tool_name: &str, pattern: &str) -> PermissionDecision {
         if !agent.allowed_tools.is_empty()
             && !agent.allowed_tools.iter().any(|tool| tool == tool_name)
         {
@@ -116,12 +122,20 @@ impl PermissionNext {
         }
 
         let permission = tool_to_permission(tool_name);
-        let rule = evaluate_permission(permission, "*", &[agent.permission.clone()]);
+        let rule = evaluate_permission(permission, pattern, &[agent.permission.clone()]);
         match rule.action {
             PermissionAction::Allow => PermissionDecision::Allow,
             PermissionAction::Ask => PermissionDecision::Ask,
             PermissionAction::Deny => PermissionDecision::Deny,
         }
+    }
+
+    /// Backward-compatible entry point that evaluates with the wildcard target.
+    ///
+    /// Equivalent to `evaluate(agent, tool_name, "*")`, i.e. the pre-M-47
+    /// behaviour where pattern-specific rules could never match.
+    pub fn evaluate_any(agent: &AgentInfo, tool_name: &str) -> PermissionDecision {
+        Self::evaluate(agent, tool_name, "*")
     }
 }
 
@@ -441,15 +455,27 @@ impl AgentInfo {
         self
     }
 
-    pub fn tool_permission_decision(&self, tool_name: &str) -> PermissionDecision {
-        PermissionNext::evaluate(self, tool_name)
+    /// Decide whether `tool_name` is allowed for the given target `pattern`.
+    pub fn tool_permission_decision(&self, tool_name: &str, pattern: &str) -> PermissionDecision {
+        PermissionNext::evaluate(self, tool_name, pattern)
     }
 
-    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
+    /// Backward-compatible decision helper using the wildcard target `"*"`.
+    pub fn tool_permission_decision_any(&self, tool_name: &str) -> PermissionDecision {
+        self.tool_permission_decision(tool_name, "*")
+    }
+
+    /// Whether `tool_name` is allowed for the given target `pattern`.
+    pub fn is_tool_allowed(&self, tool_name: &str, pattern: &str) -> bool {
         matches!(
-            self.tool_permission_decision(tool_name),
+            self.tool_permission_decision(tool_name, pattern),
             PermissionDecision::Allow
         )
+    }
+
+    /// Backward-compatible allow check using the wildcard target `"*"`.
+    pub fn is_tool_allowed_any(&self, tool_name: &str) -> bool {
+        self.is_tool_allowed(tool_name, "*")
     }
 }
 
@@ -781,6 +807,21 @@ fn permission_rules_from_config(permission: &LoadedPermissionConfig) -> Permissi
             }
         }
     }
+
+    // `opencode_permission::evaluate` scans rules in reverse (Vec::rev), so a
+    // wildcard rule must come first in this Vec; otherwise HashMap iteration
+    // order could place `"*"` last and shadow every specific Object pattern.
+    // Among specific rules, longer (more specific) patterns are placed later
+    // so they win over broader prefixes such as `*.env`.
+    rules.sort_by(|a, b| {
+        let a_wildcard = a.pattern == "*";
+        let b_wildcard = b.pattern == "*";
+        b_wildcard
+            .cmp(&a_wildcard)
+            .then_with(|| a.pattern.len().cmp(&b.pattern.len()))
+            .then_with(|| a.permission.cmp(&b.permission))
+            .then_with(|| a.pattern.cmp(&b.pattern))
+    });
     rules
 }
 
@@ -875,32 +916,32 @@ mod tests {
     fn explore_agent_permission_is_restricted_to_read_search_and_bash() {
         let explore = AgentInfo::explore();
         assert_eq!(
-            PermissionNext::evaluate(&explore, "grep"),
+            PermissionNext::evaluate_any(&explore, "grep"),
             PermissionDecision::Allow
         );
         assert_eq!(
-            PermissionNext::evaluate(&explore, "glob"),
+            PermissionNext::evaluate_any(&explore, "glob"),
             PermissionDecision::Allow
         );
         assert_eq!(
-            PermissionNext::evaluate(&explore, "read"),
+            PermissionNext::evaluate_any(&explore, "read"),
             PermissionDecision::Allow
         );
         assert_eq!(
-            PermissionNext::evaluate(&explore, "bash"),
+            PermissionNext::evaluate_any(&explore, "bash"),
             PermissionDecision::Allow
         );
 
         assert_eq!(
-            PermissionNext::evaluate(&explore, "write"),
+            PermissionNext::evaluate_any(&explore, "write"),
             PermissionDecision::Deny
         );
         assert_eq!(
-            PermissionNext::evaluate(&explore, "ls"),
+            PermissionNext::evaluate_any(&explore, "ls"),
             PermissionDecision::Deny
         );
         assert_eq!(
-            PermissionNext::evaluate(&explore, "websearch"),
+            PermissionNext::evaluate_any(&explore, "websearch"),
             PermissionDecision::Deny
         );
     }
@@ -1019,5 +1060,202 @@ mod tests {
             .get("investigate")
             .expect("investigate should be created from deprecated mode config");
         assert!(matches!(agent.mode, AgentMode::Primary));
+    }
+
+    #[test]
+    fn evaluate_uses_concrete_pattern_for_pattern_specific_rules() {
+        // Object(patterns)-style rules: the target value must decide the action.
+        // Wildcard rule is placed first in the vec so the reversed scan in
+        // opencode_permission::evaluate reaches the specific rules first.
+        let agent = AgentInfo::custom("review").with_permission(vec![
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Ask,
+            },
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "*.env".to_string(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "src/main.rs".to_string(),
+                action: PermissionAction::Allow,
+            },
+        ]);
+
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "write", "src/main.rs"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "write", "config.env"),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "write", "README.md"),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn object_patterns_from_config_are_honoured_by_evaluate() {
+        // Object(patterns) config is converted into per-pattern PermissionRules;
+        // verify the concrete target reaches evaluate through that path.
+        let config = LoadedPermissionConfig::Map(HashMap::from([(
+            "edit".to_string(),
+            LoadedPermissionRule::Object(HashMap::from([
+                ("*.env".to_string(), LoadedPermissionAction::Deny),
+                ("src/main.rs".to_string(), LoadedPermissionAction::Allow),
+            ])),
+        )]));
+        let rules = permission_rules_from_config(&config);
+        let agent = AgentInfo::custom("review").with_permission(rules);
+
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "write", "src/main.rs"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "write", "secrets.env"),
+            PermissionDecision::Deny
+        );
+        // No matching rule: opencode_permission::evaluate defaults to Ask.
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "write", "README.md"),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn object_patterns_with_wildcard_are_deterministic() {
+        // Object(patterns) comes from a HashMap; the generated Vec must put the
+        // wildcard rule first so the reversed scan in evaluate gives specific
+        // patterns priority regardless of HashMap iteration order.
+        for _ in 0..8 {
+            let config = LoadedPermissionConfig::Map(HashMap::from([(
+                "edit".to_string(),
+                LoadedPermissionRule::Object(HashMap::from([
+                    ("*".to_string(), LoadedPermissionAction::Ask),
+                    ("*.env".to_string(), LoadedPermissionAction::Deny),
+                ])),
+            )]));
+            let rules = permission_rules_from_config(&config);
+
+            let wildcard_pos = rules
+                .iter()
+                .position(|rule| rule.pattern == "*")
+                .expect("wildcard rule should exist");
+            let specific_pos = rules
+                .iter()
+                .position(|rule| rule.pattern == "*.env")
+                .expect("specific rule should exist");
+            assert!(
+                wildcard_pos < specific_pos,
+                "wildcard must precede specific rules in the Vec"
+            );
+
+            let agent = AgentInfo::custom("review").with_permission(rules);
+            assert_eq!(
+                PermissionNext::evaluate(&agent, "write", "secrets.env"),
+                PermissionDecision::Deny
+            );
+            assert_eq!(
+                PermissionNext::evaluate(&agent, "write", "README.md"),
+                PermissionDecision::Ask
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_uses_command_target_for_bash_rules() {
+        let agent = AgentInfo::custom("review").with_permission(vec![
+            PermissionRule {
+                permission: "bash".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                permission: "bash".to_string(),
+                pattern: "git*".to_string(),
+                action: PermissionAction::Allow,
+            },
+        ]);
+
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "bash", "git status"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "bash", "rm -rf /tmp/build"),
+            PermissionDecision::Deny
+        );
+    }
+
+    #[test]
+    fn evaluate_keeps_wildcard_rules_working_with_any_target() {
+        let agent = AgentInfo::custom("reader").with_permission(vec![
+            PermissionRule {
+                permission: "read".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Allow,
+            },
+            PermissionRule {
+                permission: "read".to_string(),
+                pattern: "*.env".to_string(),
+                action: PermissionAction::Ask,
+            },
+        ]);
+
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "read", ".env"),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "read", "secrets.env.local"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            PermissionNext::evaluate(&agent, "read", "notes.txt"),
+            PermissionDecision::Allow
+        );
+        // The backward-compatible wrapper still yields the wildcard-rule result.
+        assert_eq!(
+            PermissionNext::evaluate_any(&agent, "read"),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn agent_permission_helpers_accept_target_pattern() {
+        let agent = AgentInfo::custom("reviewer").with_permission(vec![
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Ask,
+            },
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "src/*".to_string(),
+                action: PermissionAction::Allow,
+            },
+        ]);
+
+        assert_eq!(
+            agent.tool_permission_decision("write", "src/lib.rs"),
+            PermissionDecision::Allow
+        );
+        assert!(agent.is_tool_allowed("write", "src/lib.rs"));
+        assert_eq!(
+            agent.tool_permission_decision("write", "docs/readme.md"),
+            PermissionDecision::Ask
+        );
+        assert!(!agent.is_tool_allowed("write", "docs/readme.md"));
+        assert_eq!(
+            agent.tool_permission_decision_any("write"),
+            PermissionDecision::Ask
+        );
+        assert!(!agent.is_tool_allowed_any("write"));
     }
 }

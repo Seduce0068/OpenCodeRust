@@ -93,6 +93,22 @@ pub struct ApiErrorInfo {
     pub response_body: Option<String>,
 }
 
+/// Detect the free-usage-limit error without a dedicated error variant.
+///
+/// The provider reports this as a plain string in `response_body`, often
+/// embedded in a JSON error payload, so detection stays string-based. The
+/// body is normalized to upper-case ASCII alphanumerics to tolerate case and
+/// separator differences (`FreeUsageLimitError`, `free_usage_limit_error`,
+/// `Free Usage Limit Error`, ...).
+fn body_mentions_free_usage_limit(body: &str) -> bool {
+    let normalized: String = body
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    normalized.contains("FREEUSAGELIMITERROR")
+}
+
 pub fn retryable(error: &crate::MessageError) -> Option<String> {
     match error {
         crate::MessageError::ContextOverflowError { .. } => None,
@@ -106,11 +122,12 @@ pub fn retryable(error: &crate::MessageError) -> Option<String> {
                 return None;
             }
 
+            // M-50: exhausted free credits cannot be restored by waiting.
+            // Returning None makes the llm.rs retry loop skip the entire retry
+            // branch (no backoff sleep, no additional attempts).
             if let Some(body) = response_body {
-                if body.contains("FreeUsageLimitError") {
-                    return Some(
-                        "Free usage exceeded, add credits https://opencode.ai/zen".to_string(),
-                    );
+                if body_mentions_free_usage_limit(body) {
+                    return None;
                 }
             }
 
@@ -334,6 +351,9 @@ mod tests {
 
     #[test]
     fn retryable_free_usage_limit_returns_hint() {
+        // M-50: the historical test name is kept for traceability, but the
+        // expectation changed from a retry hint (Some) to non-retryable (None)
+        // because waiting cannot restore exhausted free credits.
         let error = crate::MessageError::ApiError {
             message: "limit".to_owned(),
             status_code: None,
@@ -342,10 +362,96 @@ mod tests {
             response_body: Some("FreeUsageLimitError".to_owned()),
             metadata: None,
         };
-        assert_eq!(
-            retryable(&error).as_deref(),
-            Some("Free usage exceeded, add credits https://opencode.ai/zen")
-        );
+        assert!(retryable(&error).is_none());
+    }
+
+    #[test]
+    fn retryable_free_usage_limit_detection_is_normalized() {
+        // Case and separator variants must all be treated as non-retryable.
+        for body in [
+            "FreeUsageLimitError",
+            "freeusagelimiterror",
+            "FREEUSAGELIMITERROR",
+            "free_usage_limit_error",
+            "Free-Usage-Limit-Error",
+            "Free Usage Limit Error",
+        ] {
+            let error = crate::MessageError::ApiError {
+                message: "request failed".to_owned(),
+                status_code: None,
+                is_retryable: true,
+                response_headers: None,
+                response_body: Some(body.to_owned()),
+                metadata: None,
+            };
+            assert!(retryable(&error).is_none(), "body={body}");
+        }
+    }
+
+    #[test]
+    fn retryable_free_usage_limit_inside_json_body_is_non_retryable() {
+        // Real payloads embed the error name in JSON with surrounding text.
+        let body = r#"{"type":"error","error":{"type":"FreeUsageLimitError"}}"#;
+        let error = crate::MessageError::ApiError {
+            message: "API call failed".to_owned(),
+            status_code: None,
+            is_retryable: true,
+            response_headers: None,
+            response_body: Some(body.to_owned()),
+            metadata: None,
+        };
+        assert!(retryable(&error).is_none());
+    }
+
+    #[test]
+    fn retryable_unrelated_body_keeps_retry_hint() {
+        // Boundary: normalization must not swallow unrelated error bodies, and
+        // the Overloaded classification must stay intact when a body is present.
+        for body in ["", "{}", "daily request limit reached", "free tier"] {
+            let error = crate::MessageError::ApiError {
+                message: "Provider Overloaded now".to_owned(),
+                status_code: None,
+                is_retryable: true,
+                response_headers: None,
+                response_body: Some(body.to_owned()),
+                metadata: None,
+            };
+            assert_eq!(
+                retryable(&error).as_deref(),
+                Some("Provider is overloaded"),
+                "body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_free_usage_marker_outside_body_stays_retryable() {
+        // Boundary: M-50 scopes detection to response_body only; a marker in
+        // `message` alone does not change the ApiError classification.
+        let error = crate::MessageError::ApiError {
+            message: "FreeUsageLimitError".to_owned(),
+            status_code: None,
+            is_retryable: true,
+            response_headers: None,
+            response_body: None,
+            metadata: None,
+        };
+        assert_eq!(retryable(&error).as_deref(), Some("FreeUsageLimitError"));
+    }
+
+    #[test]
+    fn retryable_free_usage_with_non_retryable_flag_returns_none() {
+        // is_retryable=false short-circuits before body inspection; confirm the
+        // new early return does not alter that existing behavior.
+        let error = crate::MessageError::ApiError {
+            message: "limit".to_owned(),
+            status_code: None,
+            is_retryable: false,
+            response_headers: None,
+            response_body: Some("FreeUsageLimitError".to_owned()),
+            metadata: None,
+        };
+        assert!(retryable(&error).is_none());
     }
 
     #[test]

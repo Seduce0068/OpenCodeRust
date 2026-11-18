@@ -377,7 +377,8 @@ impl AgentExecutor {
                 tool_call.name
             )));
         }
-        self.ensure_tool_allowed(&tool_call.name)?;
+        let target = permission_target_from_args(&tool_call.name, &tool_call.arguments);
+        self.ensure_tool_allowed(&tool_call.name, &target)?;
 
         let directory = std::env::current_dir()
             .unwrap_or_default()
@@ -412,7 +413,8 @@ impl AgentExecutor {
                 tool_call.name
             )));
         }
-        self.ensure_tool_allowed(&tool_call.name)?;
+        let target = permission_target_from_args(&tool_call.name, &tool_call.arguments);
+        self.ensure_tool_allowed(&tool_call.name, &target)?;
 
         let directory = std::env::current_dir()
             .unwrap_or_default()
@@ -543,8 +545,8 @@ impl AgentExecutor {
         Some(format!("{}:{}", provider.id(), model_id))
     }
 
-    fn ensure_tool_allowed(&self, tool_name: &str) -> Result<(), ToolError> {
-        match self.agent.tool_permission_decision(tool_name) {
+    fn ensure_tool_allowed(&self, tool_name: &str, pattern: &str) -> Result<(), ToolError> {
+        match self.agent.tool_permission_decision(tool_name, pattern) {
             crate::PermissionDecision::Allow => Ok(()),
             crate::PermissionDecision::Ask => Err(ToolError::PermissionDenied(format!(
                 "Tool '{}' requires explicit approval for agent '{}'",
@@ -571,6 +573,82 @@ fn parse_model_string(raw: Option<&str>) -> Option<(String, String)> {
     }
 
     Some((provider.to_string(), model.to_string()))
+}
+
+/// Shell metacharacters that make a command string unsafe for literal
+/// permission-pattern matching (chaining, redirection, expansion, substitution).
+const UNSAFE_COMMAND_CHARS: &[char] = &[
+    '&', ';', '|', '>', '<', '$', '`', '\n', '\r', '\0', '(', ')', '{', '}', '\\',
+];
+
+/// Resolve `.` / `..` lexically and express the result as a project-relative
+/// path with `/` separators.
+///
+/// Returns `None` when the path escapes the project root (or cannot be made
+/// relative to it), so the caller can fall back to `"*"` instead of matching an
+/// allowlist prefix such as `src/*` against a path that actually writes outside.
+fn normalized_file_pattern(raw: &str) -> Option<String> {
+    let path = std::path::Path::new(raw);
+    let relative = if path.is_absolute() {
+        let root = std::env::current_dir().ok()?;
+        path.strip_prefix(&root).ok()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                parts.push(part.to_string_lossy().into_owned());
+            }
+            // `None` means the path traverses above the project root.
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            // CurDir / RootDir / Prefix carry no target information here.
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Extract the value a tool acts on, used as the target of permission matching.
+///
+/// Tool argument names differ by tool: edit-like tools and `read` use
+/// `file_path`, `bash` uses `command`, and the search/list tools use `path`.
+/// File paths are normalized before matching, and bash commands containing
+/// shell metacharacters are treated as unmatchable. In every unmatchable case
+/// `"*"` is returned so wildcard rules keep their previous behaviour while
+/// specific allowlist rules cannot be bypassed (fail-safe fallback).
+fn permission_target_from_args(tool_name: &str, args: &serde_json::Value) -> String {
+    let key = match tool_name {
+        "write" | "edit" | "multiedit" | "patch" | "apply_patch" | "read" => "file_path",
+        "bash" => "command",
+        "grep" | "glob" | "ls" => "path",
+        _ => return "*".to_string(),
+    };
+
+    let Some(raw) = args.get(key).and_then(serde_json::Value::as_str) else {
+        return "*".to_string();
+    };
+
+    match key {
+        "command" => {
+            if raw.chars().any(|c| UNSAFE_COMMAND_CHARS.contains(&c)) {
+                "*".to_string()
+            } else {
+                raw.to_string()
+            }
+        }
+        "file_path" | "path" => normalized_file_pattern(raw).unwrap_or_else(|| "*".to_string()),
+        _ => "*".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -655,10 +733,10 @@ mod tests {
     fn executor_enforces_explore_allowlist() {
         let executor = build_executor(AgentInfo::explore());
 
-        assert!(executor.ensure_tool_allowed("grep").is_ok());
+        assert!(executor.ensure_tool_allowed("grep", "*").is_ok());
 
         let denied = executor
-            .ensure_tool_allowed("write")
+            .ensure_tool_allowed("write", "*")
             .expect_err("write should be denied for explore");
         assert!(
             matches!(denied, ToolError::PermissionDenied(_)),
@@ -676,11 +754,217 @@ mod tests {
         let executor = build_executor(agent);
 
         let denied = executor
-            .ensure_tool_allowed("bash")
+            .ensure_tool_allowed("bash", "*")
             .expect_err("ask should block direct execution");
         assert!(
             matches!(denied, ToolError::PermissionDenied(_)),
             "expected permission denied, got: {denied}"
+        );
+    }
+
+    #[test]
+    fn permission_target_extraction_uses_tool_specific_keys() {
+        assert_eq!(
+            permission_target_from_args(
+                "edit",
+                &serde_json::json!({"file_path": "src/main.rs", "old_string": "x"})
+            ),
+            "src/main.rs"
+        );
+        assert_eq!(
+            permission_target_from_args("write", &serde_json::json!({"file_path": "docs/a.md"})),
+            "docs/a.md"
+        );
+        assert_eq!(
+            permission_target_from_args("read", &serde_json::json!({"file_path": "a.env"})),
+            "a.env"
+        );
+        assert_eq!(
+            permission_target_from_args("bash", &serde_json::json!({"command": "git status"})),
+            "git status"
+        );
+        assert_eq!(
+            permission_target_from_args("grep", &serde_json::json!({"path": "src"})),
+            "src"
+        );
+
+        // Unavailable or non-string targets fall back to the wildcard.
+        assert_eq!(
+            permission_target_from_args("bash", &serde_json::json!({})),
+            "*"
+        );
+        assert_eq!(
+            permission_target_from_args("edit", &serde_json::json!({"file_path": 42})),
+            "*"
+        );
+        assert_eq!(
+            permission_target_from_args("webfetch", &serde_json::json!({"url": "https://x"})),
+            "*"
+        );
+    }
+
+    #[test]
+    fn executor_enforces_pattern_specific_rules_from_args() {
+        let agent = AgentInfo::custom("review").with_permission(vec![
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "src/*".to_string(),
+                action: PermissionAction::Allow,
+            },
+            PermissionRule {
+                permission: "bash".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                permission: "bash".to_string(),
+                pattern: "git*".to_string(),
+                action: PermissionAction::Allow,
+            },
+        ]);
+        let executor = build_executor(agent);
+
+        let args = serde_json::json!({"file_path": "src/lib.rs"});
+        let target = permission_target_from_args("edit", &args);
+        assert!(executor.ensure_tool_allowed("edit", &target).is_ok());
+
+        let args = serde_json::json!({"file_path": "docs/lib.rs"});
+        let target = permission_target_from_args("edit", &args);
+        assert!(executor.ensure_tool_allowed("edit", &target).is_err());
+
+        let args = serde_json::json!({"command": "git status"});
+        let target = permission_target_from_args("bash", &args);
+        assert!(executor.ensure_tool_allowed("bash", &target).is_ok());
+
+        let args = serde_json::json!({"command": "curl https://example.com"});
+        let target = permission_target_from_args("bash", &args);
+        assert!(executor.ensure_tool_allowed("bash", &target).is_err());
+    }
+
+    #[test]
+    fn bash_commands_with_shell_metacharacters_fall_back_to_wildcard() {
+        for command in [
+            "git status && curl http://evil",
+            "git status; curl http://evil",
+            "git status | tee /tmp/out",
+            "git status > /tmp/out",
+            "git status < /tmp/in",
+            "echo $HOME",
+            "echo `id`",
+            "git status\ncurl http://evil",
+            "git status || curl http://evil",
+            "git status $(id)",
+        ] {
+            assert_eq!(
+                permission_target_from_args("bash", &serde_json::json!({"command": command})),
+                "*",
+                "command with shell metacharacters must not be pattern-matched: {command}"
+            );
+        }
+
+        // A plain command is still passed through for literal pattern matching.
+        assert_eq!(
+            permission_target_from_args("bash", &serde_json::json!({"command": "git status"})),
+            "git status"
+        );
+    }
+
+    #[test]
+    fn executor_rejects_bash_metacharacter_bypass_of_git_allowlist() {
+        let agent = AgentInfo::custom("review").with_permission(vec![
+            PermissionRule {
+                permission: "bash".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                permission: "bash".to_string(),
+                pattern: "git*".to_string(),
+                action: PermissionAction::Allow,
+            },
+        ]);
+        let executor = build_executor(agent);
+
+        let args = serde_json::json!({"command": "git status && curl http://evil"});
+        let target = permission_target_from_args("bash", &args);
+        assert_eq!(target, "*");
+        assert!(
+            executor.ensure_tool_allowed("bash", &target).is_err(),
+            "chained command must not inherit the git* allow rule"
+        );
+    }
+
+    #[test]
+    fn file_paths_are_normalized_before_permission_matching() {
+        assert_eq!(
+            permission_target_from_args(
+                "edit",
+                &serde_json::json!({"file_path": "src/../../etc/passwd"})
+            ),
+            "*",
+            "a path that escapes the project root must fall back to the wildcard"
+        );
+        assert_eq!(
+            permission_target_from_args(
+                "write",
+                &serde_json::json!({"file_path": "src/../lib.rs"})
+            ),
+            "lib.rs",
+            "in-project .. segments must be resolved before matching"
+        );
+        assert_eq!(
+            permission_target_from_args("read", &serde_json::json!({"file_path": "./src/main.rs"})),
+            "src/main.rs"
+        );
+
+        let cwd = std::env::current_dir().expect("current dir should be available");
+        let inside = cwd.join("src/lib.rs").to_string_lossy().into_owned();
+        assert_eq!(
+            permission_target_from_args("edit", &serde_json::json!({"file_path": inside})),
+            "src/lib.rs",
+            "absolute paths under the project root become project-relative"
+        );
+
+        let outside = cwd
+            .parent()
+            .expect("current dir should have a parent")
+            .join("outside-project.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            permission_target_from_args("edit", &serde_json::json!({"file_path": outside})),
+            "*",
+            "absolute paths outside the project root must fall back to the wildcard"
+        );
+    }
+
+    #[test]
+    fn executor_rejects_traversal_paths_outside_allowlist() {
+        let agent = AgentInfo::custom("review").with_permission(vec![
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                permission: "edit".to_string(),
+                pattern: "src/*".to_string(),
+                action: PermissionAction::Allow,
+            },
+        ]);
+        let executor = build_executor(agent);
+
+        let args = serde_json::json!({"file_path": "src/../../etc/passwd"});
+        let target = permission_target_from_args("edit", &args);
+        assert_eq!(target, "*");
+        assert!(
+            executor.ensure_tool_allowed("edit", &target).is_err(),
+            "a path escaping the project root must not inherit the src/* allow rule"
         );
     }
 }
