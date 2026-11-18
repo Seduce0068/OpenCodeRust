@@ -68,6 +68,9 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 8. `/experimental/*` (analyze / generate / refactor / test) — Rust サーバーでは
    未実装であり、2026-11-18 以降は 501 Not Implemented を返す
    (`opencode-server` の routes)。以前の `"accepted"` placeholder レスポンスは廃止。
+9. LiteRT-LM プロバイダ — ネイティブ FFI が未リンクで推論不可。2026-11-18 以降は
+   `bootstrap.rs` が `litert` を登録せず、`LITERT_MODEL_PATH` / `LITERT_BACKEND`
+   は無視される（feature gate なし、FFI 実装後に再有効化が必要）。
 
 ## 設定スキーマの追随状況 (2026-11-15)
 
