@@ -169,13 +169,19 @@ impl Tool for ApplyPatchTool {
                 PatchOperation::Add => {
                     if let Some(parent) = file_path.parent() {
                         tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                            ToolError::ExecutionError(format!("Failed to create directory: {}", e))
+                            ToolError::execution_with_source(
+                                format!("Failed to create directory: {}", e),
+                                e,
+                            )
                         })?;
                     }
                     tokio::fs::write(&file_path, &change.new_content)
                         .await
                         .map_err(|e| {
-                            ToolError::ExecutionError(format!("Failed to write file: {}", e))
+                            ToolError::execution_with_source(
+                                format!("Failed to write file: {}", e),
+                                e,
+                            )
                         })?;
                     updates.push((change.relative_path.clone(), "add".to_string()));
                     summary_lines.push(format!("A {}", change.relative_path));
@@ -186,7 +192,10 @@ impl Tool for ApplyPatchTool {
                     tokio::fs::write(&file_path, &change.new_content)
                         .await
                         .map_err(|e| {
-                            ToolError::ExecutionError(format!("Failed to write file: {}", e))
+                            ToolError::execution_with_source(
+                                format!("Failed to write file: {}", e),
+                                e,
+                            )
                         })?;
                     updates.push((change.relative_path.clone(), "change".to_string()));
                     summary_lines.push(format!("M {}", change.relative_path));
@@ -195,7 +204,7 @@ impl Tool for ApplyPatchTool {
                 }
                 PatchOperation::Delete => {
                     tokio::fs::remove_file(&file_path).await.map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to delete file: {}", e))
+                        ToolError::execution_with_source(format!("Failed to delete file: {}", e), e)
                     })?;
                     updates.push((change.relative_path.clone(), "unlink".to_string()));
                     summary_lines.push(format!("D {}", change.relative_path));
@@ -204,16 +213,25 @@ impl Tool for ApplyPatchTool {
                     let move_full_path = base_path.join(move_path);
                     if let Some(parent) = move_full_path.parent() {
                         tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                            ToolError::ExecutionError(format!("Failed to create directory: {}", e))
+                            ToolError::execution_with_source(
+                                format!("Failed to create directory: {}", e),
+                                e,
+                            )
                         })?;
                     }
                     tokio::fs::write(&move_full_path, &change.new_content)
                         .await
                         .map_err(|e| {
-                            ToolError::ExecutionError(format!("Failed to write file: {}", e))
+                            ToolError::execution_with_source(
+                                format!("Failed to write file: {}", e),
+                                e,
+                            )
                         })?;
                     tokio::fs::remove_file(&file_path).await.map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to remove old file: {}", e))
+                        ToolError::execution_with_source(
+                            format!("Failed to remove old file: {}", e),
+                            e,
+                        )
                     })?;
                     updates.push((change.relative_path.clone(), "unlink".to_string()));
                     updates.push((move_path.clone(), "add".to_string()));
@@ -595,9 +613,9 @@ async fn process_file_patch(
             })
         }
         PatchOperation::Update | PatchOperation::Move { .. } => {
-            let old_content = tokio::fs::read_to_string(&file_path)
-                .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+            let old_content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+            })?;
 
             let new_content = apply_hunks(&old_content, &file_patch.hunks)?;
 
@@ -612,9 +630,9 @@ async fn process_file_patch(
             })
         }
         PatchOperation::Delete => {
-            let old_content = tokio::fs::read_to_string(&file_path)
-                .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+            let old_content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+            })?;
 
             let diff = format!(
                 "--- a/{}\n+++ /dev/null\n{}",

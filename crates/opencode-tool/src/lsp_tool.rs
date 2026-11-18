@@ -168,7 +168,7 @@ async fn execute_with_lsp(
             // Touch the file to open/refresh it in all matching LSP clients,
             // waiting for diagnostics (mirrors TS LSP.touchFile(file, true))
             registry.touch_file(path, true).await.map_err(|e| {
-                ToolError::ExecutionError(format!("Failed to touch file in LSP: {}", e))
+                ToolError::execution_with_source(format!("Failed to touch file in LSP: {}", e), e)
             })?;
 
             let language = detect_language(path);

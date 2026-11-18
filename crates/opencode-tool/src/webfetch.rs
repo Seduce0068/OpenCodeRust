@@ -141,7 +141,7 @@ impl Tool for WebFetchTool {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| ToolError::execution_with_source("Failed to read response", e))?;
 
         if bytes.len() > MAX_RESPONSE_SIZE {
             return Err(ToolError::ExecutionError(
@@ -241,7 +241,7 @@ impl WebFetchTool {
             .header("Accept-Language", "en-US,en;q=0.9")
             .send()
             .await
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to fetch URL: {}", e)))?;
+            .map_err(|e| ToolError::execution_with_source("Failed to fetch URL", e))?;
 
         if response.status() == 403 {
             let cf_mitigated = response
@@ -257,7 +257,7 @@ impl WebFetchTool {
                     .header("User-Agent", "opencode")
                     .send()
                     .await
-                    .map_err(|e| ToolError::ExecutionError(format!("Failed to fetch URL: {}", e)));
+                    .map_err(|e| ToolError::execution_with_source("Failed to fetch URL", e));
             }
         }
 

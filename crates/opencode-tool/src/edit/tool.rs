@@ -126,9 +126,9 @@ impl Tool for EditTool {
         let new_string_clone = new_string.clone();
 
         with_file_lock(&path_str, || async {
-            let content = fs::read_to_string(&path_clone)
-                .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+            let content = fs::read_to_string(&path_clone).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+            })?;
 
             let content = normalize_line_endings(&content);
 
@@ -154,7 +154,7 @@ impl Tool for EditTool {
                 fs::write(&path_clone, &new_string_normalized)
                     .await
                     .map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to write file: {}", e))
+                        ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
                     })?;
 
                 ctx_clone
@@ -235,9 +235,9 @@ impl Tool for EditTool {
                 1
             };
 
-            fs::write(&path_clone, &new_content)
-                .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+            fs::write(&path_clone, &new_content).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
+            })?;
 
             ctx_clone
                 .do_publish_bus(
