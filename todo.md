@@ -197,12 +197,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
-- [ ] **[M-44]** ストレージ復元で summary/metadata が失われ total_cost にトークン数が入る
-  - `server.rs:588-627`。`/session/{id}/diff` が空になりコスト表示が壊れる（confirmed）
-- [ ] **[M-45]** 未実装ハンドラが 501 ではなく成功レスポンスを返す
-  - `routes.rs:2329-2351,2468-2496,3719-3721` 等。execute_shell / lsp status /
-    vcs 情報
-    等が固定値で success。501 化または実装（confirmed / R1-SV01）
 - [ ] **[M-46]** /session/{id}/stream がエージェント・ツールなしの生 chat_stream
   - `routes.rs:1344-1355,1983-2051`。/prompt と応答品質・課金が異なる（confirmed）
 - [ ] **[M-47]** PermissionNext::evaluate がパターンを常に "*" で評価
@@ -212,12 +206,16 @@ status: current
 - [ ] **[M-49]** retry ヘルパーが未配線で Retry-After も効かない
   - `provider/retry.rs:145-205`。with_retry は定義・re-export のみで呼び出し 0 件、
     delay にヘッダを渡さず固定バックオフ（confirmed / R1-SV03）
-- [ ] **[M-50]** 再試行がクレジット枯渇を対象とし retry-after に上限がない
-  - `session/retry.rs:40-95`。FreeUsageLimitError が Some を返し無駄な再試行、
-    ヘッダ由来遅延がクランプされない（confirmed / R1-SV05）
+- [ ] **[M-50 残り]** FreeUsageLimitError が retry 対象のまま
+  - `session/retry.rs:109-115`。response_body の文字列一致で検出し Some を返すため
+    無料枠超過で最大試行回数まで無駄な待機。専用エラー型導入が必要（未対応）。
+    retry-after の clamp（RETRY_MAX_DELAY）は 2026-11-19 に解消済み
 
 ## 完了
 
+- [x] **[M-44 一部]** 復元時 total_cost を 0.0 に修正（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-45]** 未実装 14 ハンドラを 501 化（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-50 一部]** retry-after に RETRY_MAX_DELAY を適用（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-43]** PTY の status 遷移と child 回収（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-51/M-52]** キーバインド登録と bool 応答の厳密化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-53]** UTF-8 境界を尊重するスライス（2026-11-19、swarm-coding R1-R6）
@@ -384,6 +382,13 @@ status: current
 
 ## メモ
 
+- M-44/M-45/M-50 の残存（2026-11-19、swarm-coding R4 が指摘）:
+  - CLI 統計（`opencode-cli/src/main.rs:2377,2409`）は total_cost += input + output
+    の placeholder のまま。サーバ復元側は 0.0 に修正済みだが diff 外のため未対応。
+  - 固定値ハンドラ list_commands / get_global_config / list_tool_ids / list_tools /
+    get_doc は 501 化していない（受け入れ条件の列挙外）。
+  - 新規 501 テストはハンドラ直接呼び出しで、router() を通す HTTP 層の検証は未実施。
+  - summary/metadata の永続化はスキーマ変更を伴うため別タスク。
 - M-43 の残存（2026-11-19、swarm-coding R4 が指摘、却下/未修正）:
   - Linux の PTY master は EOF が EIO（Err）として表面化することがあり、
     `Ok(0)=Exited / Err(_)=Error` の二分だと正常終了が error と報告され得る
