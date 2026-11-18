@@ -10,7 +10,7 @@ description = "LSP client for opencode"
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["full", "process", "io-util"] }
+tokio = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

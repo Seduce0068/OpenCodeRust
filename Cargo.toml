@@ -47,7 +47,17 @@ oxc_parser = "=0.154.0"
 oxc_span = "=0.154.0"
 oxc_syntax = "=0.154.0"
 indexmap = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = { version = "1", features = [] }
