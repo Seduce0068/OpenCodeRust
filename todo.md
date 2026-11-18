@@ -39,10 +39,10 @@ status: current
   - `Storage::migrate()` は schema.rs の ALL_MIGRATIONS 経路へ統一済み。未対応は
     SCHEMA_VERSION / user_version の共有（database.rs に pub(crate) の migrate_pool を
     切り出すリファクタ）と runbook 化
-- [ ] **[H-10]** セッション永続化のトランザクション境界と並行制御（移行は対応済み、残りに絞る）
-  - `database.rs` の移行は単一トランザクション化済み。未対応は `server.rs:553-588` の
-    非アトミック書き出し（delete＋1 件ずつ create）と単一ライタ persist キュー。
-    古い snapshot の遅延 commit による更新喪失は推測のまま
+- [ ] **[H-10]** セッション永続化の並行制御（トランザクション化は対応済み）
+  - 移行と delete+create（`replace_for_session`）は原子化済み。未対応は単一ライタ
+    persist キュー、session_repo.update/create とメッセージ置換の同一トランザクション化、
+    古い snapshot の遅延 commit による更新喪失（推測のまま）
 - [ ] **[H-11]** キュー冪等性の完全化（終端化・相関 ID は対応済み）
   - promote 失敗時 failed 化と assistant への queue_id 付与は完了。未対応は
     セッション永続化と promoted 更新の同一トランザクション化（repository.rs 変更要）と、
@@ -73,8 +73,8 @@ status: current
 - [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
   - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
     が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
-- [ ] **[M-11]** 重要パスのテストカバレッジ空白（database.rs は対応済み）
-  - storage/database.rs に rollback/commit/分離テスト 3 件を追加済み。未対応は
+- [ ] **[M-11]** 重要パスのテストカバレッジ空白（database.rs / mcp_oauth.rs は対応済み）
+  - storage/database.rs に 3 件、server/mcp_oauth.rs に 14 件追加済み。未対応は
     mcp/oauth.rs・server/oauth.rs・server/pty.rs と provider 統合テストの
     HTTP／ストリーミング／認証フロー（モック OAuth／callback／PtyManager）
 - [ ] **[M-15]** 依存ピン留めの残課題（CI locked と集約 6 件は対応済み）
@@ -105,9 +105,10 @@ status: current
     問題の実体は `opencode-tool/src/grep_tool.rs:140-195`（async 内で WalkDir/File::open）と
     `server/routes.rs` の std::fs 混在箇所。レイテンシ悪化は未計測。
     推奨: 走査部分を所有値クロージャへ切り出し `spawn_blocking(...).await` で逃がす
-- [ ] **[M-38]** ストリーミング応答のタスク寿命・キャンセル安全性（要確認）
-  - `routes.rs:1365` が spawn するがハンドル未保持、`:1295` が `let _ = tx.send`
-    で切断後も処理継続（切断頻度・課金規模は未計測）。`tx.closed()` を select で監視し AbortHandle を紐付け
+- [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
+  - `tx.closed()` を select で監視する協調 break を実装済み（AbortHandle は循环的リーク
+    リスクで不採択）。未対応は spawn の JoinHandle 保持、初期 `chat_stream()` 呼び出し中の
+    切断検知、provider 実装側の上流生成キャンセル（routes.rs 外・未検証）
 
 ### 優先度: 低
 
@@ -252,7 +253,13 @@ status: current
 - [x] **[M-11 一部]** database.rs に rollback/commit/分離テスト追加（2026-11-18、db-test-worker）
 - [x] **[H-07]** Storage::migrate を schema.rs の ALL_MIGRATIONS へ統一（2026-11-18、storage-path-worker）
 - [x] **[H-11]** promote 失敗時 failed 化と assistant へ queue_id 付与（2026-11-18、queue-idem-worker）
-- [x] **[M-33]** ADR の status/generated と TERMUX_BUILD title を OKF 準拠化（2026-11-18、okf2-worker）
+- [x] **[M-33]** ADR の status/generated と TERMUX_BUILD title を OKF 準拠化
+  （2026-11-18、okf2-worker）
+- [x] **[H-10]** replace_for_session で delete+create を原子化＋server.rs へ配線
+  （2026-11-18、atomic-helper-worker + 親）
+- [x] **[M-38]** SSE 切断を tx.closed() で検知し早期停止
+  （2026-11-18、stream-cancel-worker）
+- [x] **[M-11 一部]** mcp_oauth.rs に 14 テスト追加（2026-11-18、oauth-test-worker）
 
 ## メモ
 
