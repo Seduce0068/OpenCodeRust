@@ -107,6 +107,36 @@ SSE transport、OAuth の token exchange、MCP オプションの `codemode` /
 イベント発行は未実装（capability も `tools.listChanged` のみを宣言）。
 未マッピングのキーも parse を失敗させない。
 
+### 未配線の設定フィールド (2026-11-18)
+
+`Config` (`crates/opencode-config/src/schema.rs`) の下記フィールドは
+serde による parse、`known_config_keys()` での既知キー扱い、`DeepMerge`
+でのマージには参加する。しかし 2026-11-18 時点で、これらを読み取る
+runtime 消費箇所は schema.rs 外に 0 件である (grep による事実確認)。
+設定ファイルに記述しても起動は失敗しないが、挙動には反映されない。
+
+- `keybinds` (`KeybindsConfig`) — TUI の `KeybindRegistry::new()`
+  (`opencode-tui/src/context/keybind.rs:148`) が `register_defaults()`
+  でキーをハードコードし、`AppContext::new()`
+  (`opencode-tui/src/context/app_context.rs:132`) も引数なしで生成する。
+  `Config.keybinds` を渡す経路はない。
+- `snapshot` (`Option<bool>`) — schema.rs 外の参照 0 件。
+- `autoupdate` (`AutoUpdateMode`) — schema.rs 外の参照 0 件。
+- `enterprise` (`EnterpriseConfig`) — schema.rs 外の参照 0 件。
+- `experimental` (`ExperimentalConfig`) — schema.rs 外の参照 0 件。
+
+`ExperimentalConfig` のサブフィールド 6 件も同様に未配線である:
+`disable_paste_summary`、`batch_tool`、`open_telemetry` (alias
+`openTelemetry`)、`primary_tools`、`continue_loop_on_deny`、`mcp_timeout`。
+いずれも schema.rs の定義と `DeepMerge` 実装以外に参照がない。
+
+混同注意: セッション／revert の `snapshot` (`Option<String>` の git
+snapshot ハッシュ)、provider 側の `enable_experimental` /
+`experimental_over_200k`、MCP の `mcp.timeout` は別フィールドであり、
+上記 config キーの消費箇所ではない。
+
+配線そのものは本タスクの scope 外のため、ここでは現状を明記するのみとする。
+
 ## 命名差
 
 - upstream `core` = v2 engine 全体、Rust `opencode-core` = bus / fs /

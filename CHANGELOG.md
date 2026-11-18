@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T15:49:14+09:00"
+  at: "2026-11-18T16:19:44+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1177 件
+  テスト総数 594 → 1194 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 38.54% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 38.79% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -228,6 +228,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 ハンドラへ State extractor を追加（ルート登録は不変、分離テスト追加）(M-21)
 - `opencode-storage`: schema.rs の DDL 定数を文字列レベルで検証する 7 テストを追加 (M-11)
 - `opencode-mcp`: tool.rs のレジストリ（登録/検索/削除/サーバー別フィルタ）8 テストを追加 (M-11)
+- `opencode-provider`: tools.rs のツール変換・tool_choice・serde wire format 17 テストを追加 (M-11)
+- `opencode-provider`: no-op の `normalize_interleaved_field` と呼び出しを削除（挙動不変）(P-04)
+- MAPPING.md: 未配線の設定フィールド群（keybinds / snapshot / autoupdate /
+  enterprise / experimental と ExperimentalConfig 6 サブフィールド）を明記 (P-03)
 
 ## [0.1.0]
 
