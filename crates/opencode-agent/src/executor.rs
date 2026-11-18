@@ -177,8 +177,11 @@ impl AgentExecutor {
                 break;
             }
 
-            self.conversation
-                .add_assistant_message(response, Some(reasoning));
+            self.conversation.add_assistant_message_with_tools(
+                response,
+                Some(reasoning),
+                tool_calls.clone(),
+            );
 
             for tool_call in tool_calls {
                 let result = self.execute_tool(&tool_call).await;
@@ -242,8 +245,11 @@ impl AgentExecutor {
                 break;
             }
 
-            self.conversation
-                .add_assistant_message(response, Some(reasoning));
+            self.conversation.add_assistant_message_with_tools(
+                response,
+                Some(reasoning),
+                tool_calls.clone(),
+            );
 
             for tool_call in tool_calls {
                 let result = self.execute_tool_without_subsessions(&tool_call).await;
