@@ -559,3 +559,209 @@ impl Default for OAuthRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // Test basis: M-11 (this module previously had zero tests).
+    // Risk tier: T1 (authentication / CSRF state). Design techniques: uniqueness
+    // property, valid/invalid equivalence classes, and in-memory state transitions
+    // (ISO/IEC/IEEE 29119-4). All values below are dummy or freshly generated
+    // non-secret randomness; no real token, credential, or network I/O is used.
+
+    const DUMMY_AUTH_URL: &str = "https://example.invalid/authorize";
+    const DUMMY_TOKEN_URL: &str = "https://example.invalid/token";
+    const DUMMY_SERVER_URL: &str = "https://example.invalid";
+    const DUMMY_REDIRECT_URI: &str = "http://127.0.0.1:19876/mcp/oauth/callback";
+
+    fn dummy_config() -> McpOAuthConfig {
+        McpOAuthConfig {
+            client_id: Some("dummy-client".to_string()),
+            client_secret: Some("dummy-secret".to_string()),
+            auth_url: DUMMY_AUTH_URL.to_string(),
+            token_url: DUMMY_TOKEN_URL.to_string(),
+            scopes: vec!["dummy:read".to_string(), "dummy:write".to_string()],
+            redirect_uri: DUMMY_REDIRECT_URI.to_string(),
+        }
+    }
+
+    fn manager_with(config: McpOAuthConfig) -> McpOAuthManager {
+        McpOAuthManager::new(
+            "dummy-server".to_string(),
+            DUMMY_SERVER_URL.to_string(),
+            config,
+        )
+    }
+
+    #[test]
+    fn csrf_state_is_unique_and_non_empty() {
+        const N: usize = 32;
+        let states: Vec<String> = (0..N)
+            .map(|_| CsrfToken::new_random().secret().clone())
+            .collect();
+
+        assert!(
+            states.iter().all(|state| !state.is_empty()),
+            "generated CSRF state must never be empty"
+        );
+        let unique: HashSet<&str> = states.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            N,
+            "each authorization request must receive a distinct CSRF state"
+        );
+    }
+
+    #[test]
+    fn default_config_is_safe_and_uses_loopback_redirect() {
+        let config = McpOAuthConfig::default();
+        assert!(config.client_id.is_none());
+        assert!(config.client_secret.is_none());
+        assert!(config.auth_url.is_empty());
+        assert!(config.token_url.is_empty());
+        assert!(config.scopes.is_empty());
+        assert_eq!(config.redirect_uri, DUMMY_REDIRECT_URI);
+    }
+
+    #[test]
+    fn parsed_config_requires_client_id() {
+        let manager = manager_with(McpOAuthConfig::default());
+        let err = manager
+            .parsed_config(&McpOAuthConfig::default())
+            .expect_err("a missing client_id must be rejected");
+        assert!(matches!(err, OAuthError::Config(_)));
+    }
+
+    #[test]
+    fn parsed_config_rejects_invalid_urls() {
+        let manager = manager_with(dummy_config());
+        let cases = [
+            (
+                "auth_url",
+                McpOAuthConfig {
+                    auth_url: "not a url".to_string(),
+                    ..dummy_config()
+                },
+            ),
+            (
+                "token_url",
+                McpOAuthConfig {
+                    token_url: "not a url".to_string(),
+                    ..dummy_config()
+                },
+            ),
+            (
+                "redirect_uri",
+                McpOAuthConfig {
+                    redirect_uri: "not a url".to_string(),
+                    ..dummy_config()
+                },
+            ),
+        ];
+
+        for (field, config) in cases {
+            let err = manager
+                .parsed_config(&config)
+                .expect_err("an invalid URL must be rejected");
+            assert!(matches!(err, OAuthError::Config(_)), "{field} should fail");
+        }
+    }
+
+    #[test]
+    fn parsed_config_builds_expected_authorize_url() {
+        // Mirrors start_auth's pure URL construction without its disk writes.
+        let config = dummy_config();
+        let manager = manager_with(config.clone());
+        let (client_id, client_secret, auth_url, token_url, redirect_url) = manager
+            .parsed_config(&config)
+            .expect("dummy config must parse");
+
+        let mut client = oauth2::basic::BasicClient::new(client_id)
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(redirect_url);
+        if let Some(secret) = client_secret {
+            client = client.set_client_secret(secret);
+        }
+
+        let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut request = client.authorize_url(CsrfToken::new_random);
+        for scope in &config.scopes {
+            request = request.add_scope(Scope::new(scope.clone()));
+        }
+        let (url, state) = request.set_pkce_challenge(challenge).url();
+
+        assert!(!state.secret().is_empty());
+        assert!(!verifier.secret().is_empty());
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("example.invalid"));
+
+        let params: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        let has = |key: &str, value: &str| params.iter().any(|(k, v)| k == key && v == value);
+        assert!(has("client_id", "dummy-client"));
+        assert!(has("redirect_uri", DUMMY_REDIRECT_URI));
+        assert!(has("response_type", "code"));
+        assert!(has("code_challenge_method", "S256"));
+        assert!(has("state", state.secret()));
+        assert!(params
+            .iter()
+            .any(|(k, v)| k == "code_challenge" && !v.is_empty()));
+        // oauth2 encodes all scopes as one space-separated `scope` parameter.
+        let scopes: Vec<&str> = params
+            .iter()
+            .filter(|(k, _)| k == "scope")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(scopes, vec!["dummy:read dummy:write"]);
+    }
+
+    #[tokio::test]
+    async fn set_endpoints_updates_only_in_memory_config() {
+        let manager = manager_with(McpOAuthConfig::default());
+        manager
+            .set_endpoints(
+                "https://example.invalid/auth2",
+                "https://example.invalid/token2",
+            )
+            .await;
+
+        let config = manager.config.read().await;
+        assert_eq!(config.auth_url, "https://example.invalid/auth2");
+        assert_eq!(config.token_url, "https://example.invalid/token2");
+    }
+
+    #[tokio::test]
+    async fn ensure_endpoints_is_noop_when_configured() {
+        let manager = manager_with(dummy_config());
+        let scopes_before = manager.config.read().await.scopes.clone();
+
+        manager
+            .ensure_endpoints()
+            .await
+            .expect("configured endpoints must not trigger discovery");
+
+        let config = manager.config.read().await;
+        assert_eq!(config.auth_url, DUMMY_AUTH_URL);
+        assert_eq!(config.token_url, DUMMY_TOKEN_URL);
+        assert_eq!(config.scopes, scopes_before);
+    }
+
+    #[tokio::test]
+    async fn registry_register_get_remove_uses_memory_only() {
+        let registry = OAuthRegistry::new();
+        let manager = manager_with(dummy_config());
+        let registered = registry.register(manager).await;
+        assert_eq!(registered.mcp_name(), "dummy-server");
+
+        let fetched = registry
+            .get("dummy-server")
+            .await
+            .expect("registered manager must be retrievable");
+        assert_eq!(fetched.server_url(), DUMMY_SERVER_URL);
+
+        registry.remove("dummy-server").await;
+        assert!(registry.get("dummy-server").await.is_none());
+    }
+}
