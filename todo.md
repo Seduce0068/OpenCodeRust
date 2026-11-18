@@ -141,9 +141,16 @@ status: current
   - `init_tracing` を CLI 起動時に呼び出し `config.logLevel` を実効化済み。
     未対応は `logging.rs` の WorkerGuard 早期ドロップ（API 変更要）と rolling 未使用。
     起動時とハンドラで `load_config` が 2 回走る点は大規模変更のため据え置き
-- [ ] **[L-07]** 依存 feature の過剰指定
-  - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
-    の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
+- [ ] **[L-07 残り]** tokio `full` feature の削減
+  - 調査済み（2026-11-19、swarm-coding R2）: 使用 feature は fs/io-util/macros/net/
+    process/rt/rt-multi-thread/sync/time の9種。signal/io-std は未使用。
+    ルート plus plugin/lsp/watcher の4箇所が `full` を unify しており同時修正が必要。
+    14 クレートが features 無指定で個別ビルド（-p）時に不足リスク。rt-multi-thread
+    は bare `#[tokio::main]` に必須で落とせない。効果は未計測（性能施策）。
+  - 2026-11-19 対応済み: 未使用 workspace 依存 11 件（hyper / rustls / rustls-webpki /
+    h2 / time / tower / dashmap 等）を削除、cargo 警告 11→0 を確認。
+    regex / fancy-regex は用途分離（JS RegExp 互換）で維持。未使用 22 件の
+    クレート側直接指定の workspace 集約は M-15 と同一作業で残課題。
 - [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケ（clone は削除済み）
   - stream_message の冗長な全履歴 clone は削除済み。未対応は list_messages の
     全件 collect（1098-1113、外部契約のためページネーションは変更を伴う）と
@@ -202,6 +209,7 @@ status: current
 
 ## 完了
 
+- [x] **[L-07 一部]** 未使用 workspace 依存 11 件を削除（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-47]** permission pattern の明示引数化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-49]** provider の未使用 retry ヘルパーを削除（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-50]** FreeUsageLimit の非リトライ化（2026-11-19、swarm-coding R1-R6）
