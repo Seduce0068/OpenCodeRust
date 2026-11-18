@@ -350,3 +350,139 @@ pub enum PtyError {
     #[error("IO error: {0}")]
     IoError(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NOTE: `create_session` calls `native_pty_system()` and spawns a real
+    // process, so these tests deliberately never call it. Only the value types'
+    // serde behaviour and the lookup/error paths of an empty `PtyManager` are
+    // exercised. All values below are dummies, never real credentials or tokens.
+
+    #[tokio::test]
+    async fn new_manager_starts_with_no_sessions() {
+        let manager = PtyManager::new();
+        assert!(manager.list_sessions().await.is_empty());
+        assert!(manager.get_session("pty_dummy_missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_session_paths_return_not_found_without_spawning() {
+        let manager = PtyManager::default();
+        let missing = "pty_dummy_missing";
+
+        assert!(!manager.delete_session(missing).await);
+        assert!(matches!(
+            manager
+                .update_session(missing, Some("dummy-command"), Some("/dummy/cwd"))
+                .await,
+            Err(PtyError::SessionNotFound(ref id)) if id == missing
+        ));
+        assert!(matches!(
+            manager.resize_session(missing, 80, 24).await,
+            Err(PtyError::SessionNotFound(ref id)) if id == missing
+        ));
+        assert!(matches!(
+            manager.write_to_session(missing, b"dummy input").await,
+            Err(PtyError::SessionNotFound(ref id)) if id == missing
+        ));
+        assert!(matches!(
+            manager.read_from_session(missing).await,
+            Err(PtyError::SessionNotFound(ref id)) if id == missing
+        ));
+        assert!(matches!(
+            manager.subscribe(missing).await,
+            Err(PtyError::SessionNotFound(ref id)) if id == missing
+        ));
+    }
+
+    #[test]
+    fn pty_error_messages_are_stable() {
+        assert_eq!(
+            PtyError::SessionNotFound("pty_dummy_1".to_string()).to_string(),
+            "PTY session not found: pty_dummy_1"
+        );
+        assert_eq!(
+            PtyError::SpawnFailed("dummy spawn failure".to_string()).to_string(),
+            "Failed to spawn process: dummy spawn failure"
+        );
+        assert_eq!(
+            PtyError::IoError("dummy io failure".to_string()).to_string(),
+            "IO error: dummy io failure"
+        );
+    }
+
+    #[test]
+    fn pty_status_uses_lowercase_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&PtyStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PtyStatus::Exited).unwrap(),
+            "\"exited\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PtyStatus::Error).unwrap(),
+            "\"error\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<PtyStatus>("\"running\"").unwrap(),
+            PtyStatus::Running
+        );
+        assert_eq!(
+            serde_json::from_str::<PtyStatus>("\"exited\"").unwrap(),
+            PtyStatus::Exited
+        );
+        assert_eq!(
+            serde_json::from_str::<PtyStatus>("\"error\"").unwrap(),
+            PtyStatus::Error
+        );
+    }
+
+    #[test]
+    fn pty_session_serde_round_trip_with_dummy_values() {
+        let mut env = HashMap::new();
+        env.insert("DUMMY_KEY".to_string(), "dummy-value".to_string());
+        let session = PtySession {
+            id: "pty_dummy_0001".to_string(),
+            command: "dummy-command".to_string(),
+            cwd: "/dummy/cwd".to_string(),
+            status: PtyStatus::Running,
+            env,
+            created_at: 1_700_000_000,
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"status\":\"running\""));
+        let decoded: PtySession = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.id, session.id);
+        assert_eq!(decoded.command, session.command);
+        assert_eq!(decoded.cwd, session.cwd);
+        assert_eq!(decoded.status, PtyStatus::Running);
+        assert_eq!(
+            decoded.env.get("DUMMY_KEY").map(String::as_str),
+            Some("dummy-value")
+        );
+        assert_eq!(decoded.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn pty_output_serde_round_trip_with_dummy_values() {
+        let output = PtyOutput {
+            session_id: "pty_dummy_0002".to_string(),
+            data: "dummy output line\n".to_string(),
+            is_error: false,
+        };
+
+        let json = serde_json::to_string(&output).unwrap();
+        let decoded: PtyOutput = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.session_id, output.session_id);
+        assert_eq!(decoded.data, output.data);
+        assert!(!decoded.is_error);
+    }
+}
