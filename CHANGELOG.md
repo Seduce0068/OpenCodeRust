@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T03:28:18+09:00"
+  at: "2026-11-19T04:07:00+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2028 件
+  テスト総数 594 → 2040 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 47.01% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 47.04% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -308,6 +308,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabled_tools 継承、Anthropic SSE の状態付きパーサ（tool id 対応）、LSP の
   Content-Length フレーミングを追加（swarm-coding R1-R6、R5 で型/`mut`/clippy 修正）
   (H-19/H-21/H-22/H-23/H-25)
+- `server` / `tool` / `tui`: PTY の status 遷移と child 回収、UTF-8 境界を尊重する
+  スライス、キーバインド登録と bool 応答の厳密化（swarm-coding R1-R6、
+  R4 の status 順序/キー表示指摘を R5 で修正）(M-43/M-51/M-52/M-53)
 
 ## [0.1.0]
 
