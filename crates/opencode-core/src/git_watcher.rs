@@ -3,13 +3,18 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+/// Git リポジトリ内で発生した変更種別。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GitEvent {
+    /// ブランチが切り替わった。
     BranchChanged,
+    /// 新しいコミットが作られた。
     CommitMade,
+    /// インデックスが変更された。
     IndexChanged,
 }
 
+/// `.git` ディレクトリを監視して変更をブロードキャストするウォッチャー。
 pub struct GitWatcher {
     _repo: Repository,
     event_tx: broadcast::Sender<GitEvent>,
@@ -17,6 +22,7 @@ pub struct GitWatcher {
 }
 
 impl GitWatcher {
+    /// 対象リポジトリの `.git` ディレクトリ監視を開始する。
     pub fn new(repo: Repository) -> anyhow::Result<Self> {
         let (event_tx, _) = broadcast::channel(100);
         let event_tx_clone = event_tx.clone();
@@ -38,6 +44,7 @@ impl GitWatcher {
         })
     }
 
+    /// Git 変更イベントを受信するためのレシーバーを作成する。
     pub fn subscribe(&self) -> broadcast::Receiver<GitEvent> {
         self.event_tx.subscribe()
     }

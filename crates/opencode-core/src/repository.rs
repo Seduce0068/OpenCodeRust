@@ -1,35 +1,52 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+/// リモート／ファイル参照に共通するリポジトリ情報。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BaseReference {
+    /// ホスト名（小文字化済み）。
     pub host: String,
+    /// リポジトリのパス（`owner/repo` 形式）。
     pub path: String,
+    /// パスを `/` で分割した各要素。
     pub segments: Vec<String>,
+    /// セグメントが 2 つの場合の先頭要素（オーナー）。
     pub owner: Option<String>,
+    /// リポジトリ名（パスの最後の要素）。
     pub repo: String,
+    /// リモート URL。元入力に含まれる場合はその値、なければ生成した HTTPS URL。
     pub remote: String,
+    /// 表示用のラベル。
     pub label: String,
 }
 
+/// リモートリポジトリへの参照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteReference {
+    /// リポジトリの共通情報（フラット化してシリアライズ）。
     #[serde(flatten)]
     pub base: BaseReference,
+    /// 明示的に指定されたプロトコル。
     pub protocol: Option<String>,
 }
 
+/// ローカルファイルパスによるリポジトリ参照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileReference {
+    /// リポジトリの共通情報（フラット化してシリアライズ）。
     #[serde(flatten)]
     pub base: BaseReference,
+    /// ファイル参照のプロトコル。
     pub protocol: String,
 }
 
+/// リポジトリ参照の種別。`serde(untagged)` により内容から判別される。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Reference {
+    /// リモートリポジトリへの参照。
     Remote(RemoteReference),
+    /// ローカルファイルによる参照。
     File(FileReference),
 }
 
@@ -112,6 +129,9 @@ fn build_remote(
     })
 }
 
+/// `github:owner/repo`・SCP 形式の SSH・`owner/repo` などの文字列をリポジトリ参照に解析する。
+///
+/// ホスト名やパス要素に不正な文字が含まれるなど、安全でない入力は `None` を返す。
 pub fn parse(input: &str) -> Option<Reference> {
     let cleaned = normalize_input(input);
 

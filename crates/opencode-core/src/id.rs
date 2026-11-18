@@ -4,15 +4,24 @@ use std::sync::Mutex;
 const BASE62_CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const LENGTH: usize = 26;
 
+/// 生成する ID の種別を示し、ID 文字列の接頭辞として使われる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prefix {
+    /// セッション（`ses`）。
     Session,
+    /// メッセージ（`msg`）。
     Message,
+    /// 権限（`per`）。
     Permission,
+    /// 質問（`que`）。
     Question,
+    /// ユーザー（`usr`）。
     User,
+    /// メッセージ部分（`prt`）。
     Part,
+    /// PTY（`pty`）。
     Pty,
+    /// ツール（`tool`）。
     Tool,
 }
 
@@ -57,6 +66,9 @@ fn next_counter(current_timestamp: u64) -> u32 {
     clock.1
 }
 
+/// 種別接頭辞・タイムスタンプ・カウンタ・ランダム文字列から一意な ID を生成する。
+///
+/// `timestamp` に `None` を渡すと現在時刻（ミリ秒）を使用する。
 pub fn create(prefix: Prefix, _descending: bool, timestamp: Option<u64>) -> String {
     let current_timestamp = timestamp.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -74,6 +86,7 @@ pub fn create(prefix: Prefix, _descending: bool, timestamp: Option<u64>) -> Stri
     format!("{}_{}{}", prefix.as_str(), hex_time, random_part)
 }
 
+/// ID 文字列に埋め込まれたタイムスタンプ（ミリ秒）を取り出す。形式が不正なら `None`。
 pub fn timestamp(id: &str) -> Option<u64> {
     let parts: Vec<&str> = id.split('_').collect();
     if parts.len() != 2 {
@@ -85,6 +98,7 @@ pub fn timestamp(id: &str) -> Option<u64> {
     Some(encoded / 0x1000)
 }
 
+/// ID が指定した種別の接頭辞で始まるかを判定する。
 pub fn validate_prefix(id: &str, expected: Prefix) -> bool {
     id.starts_with(expected.as_str())
 }

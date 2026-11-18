@@ -1,30 +1,46 @@
 use serde::{Deserialize, Serialize};
 
+/// Todo の本文と状態・優先度を表す情報。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoInfo {
+    /// Todo の本文。
     pub content: String,
+    /// 状態を表す文字列。
     pub status: String,
+    /// 優先度を表す文字列。
     pub priority: String,
 }
 
+/// セッションに紐付いた Todo 項目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
+    /// 紐付先のセッション ID。
     pub session_id: String,
+    /// Todo の本文。
     pub content: String,
+    /// 状態を表す文字列。
     pub status: String,
+    /// 優先度を表す文字列。
     pub priority: String,
+    /// 一覧内での並び順を表す位置。
     pub position: u32,
 }
 
+/// Todo の実行状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TodoStatus {
+    /// 未着手。
     Pending,
+    /// 進行中。
     InProgress,
+    /// 完了。
     Completed,
+    /// キャンセル済み。
     Cancelled,
 }
 
 impl TodoStatus {
+    /// 状態を対応する小文字の文字列に変換する。
     pub fn as_str(&self) -> &'static str {
         match self {
             TodoStatus::Pending => "pending",
@@ -41,14 +57,19 @@ impl std::fmt::Display for TodoStatus {
     }
 }
 
+/// Todo の優先度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TodoPriority {
+    /// 高。
     High,
+    /// 中。
     Medium,
+    /// 低。
     Low,
 }
 
 impl TodoPriority {
+    /// 優先度を対応する小文字の文字列に変換する。
     pub fn as_str(&self) -> &'static str {
         match self {
             TodoPriority::High => "high",
@@ -64,6 +85,7 @@ impl std::fmt::Display for TodoPriority {
     }
 }
 
+/// 文字列を [`TodoStatus`] に変換する。未知の値は [`TodoStatus::Pending`] となる。
 pub fn parse_status(status: &str) -> TodoStatus {
     match status.to_lowercase().as_str() {
         "pending" => TodoStatus::Pending,
@@ -74,6 +96,7 @@ pub fn parse_status(status: &str) -> TodoStatus {
     }
 }
 
+/// 文字列を [`TodoPriority`] に変換する。未知の値は [`TodoPriority::Medium`] となる。
 pub fn parse_priority(priority: &str) -> TodoPriority {
     match priority.to_lowercase().as_str() {
         "high" => TodoPriority::High,
