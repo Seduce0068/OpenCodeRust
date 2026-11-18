@@ -459,3 +459,215 @@ fn ui_kv_path() -> Option<PathBuf> {
             })
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ProviderInfo / ModelInfo: データ保持 ---
+
+    #[test]
+    fn model_info_retains_all_fields() {
+        let model = ModelInfo {
+            id: "model-1".to_string(),
+            name: "Test Model".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            supports_vision: true,
+            supports_tools: false,
+        };
+
+        assert_eq!(model.id, "model-1");
+        assert_eq!(model.name, "Test Model");
+        assert_eq!(model.context_window, 128_000);
+        assert_eq!(model.max_output_tokens, 8_192);
+        assert!(model.supports_vision);
+        assert!(!model.supports_tools);
+    }
+
+    #[test]
+    fn provider_info_retains_fields_and_models() {
+        let model = ModelInfo {
+            id: "model-1".to_string(),
+            name: "Test Model".to_string(),
+            context_window: 4_096,
+            max_output_tokens: 1_024,
+            supports_vision: false,
+            supports_tools: true,
+        };
+        let provider = ProviderInfo {
+            id: "provider-1".to_string(),
+            name: "Test Provider".to_string(),
+            models: vec![model],
+        };
+
+        assert_eq!(provider.id, "provider-1");
+        assert_eq!(provider.name, "Test Provider");
+        assert_eq!(provider.models.len(), 1);
+        assert_eq!(provider.models[0].id, "model-1");
+        assert_eq!(provider.models[0].name, "Test Model");
+        assert_eq!(provider.models[0].context_window, 4_096);
+        assert_eq!(provider.models[0].max_output_tokens, 1_024);
+        assert!(!provider.models[0].supports_vision);
+        assert!(provider.models[0].supports_tools);
+    }
+
+    // --- McpServerStatus / LspStatus: データ保持 ---
+
+    #[test]
+    fn mcp_server_status_retains_connected_state() {
+        let server = McpServerStatus {
+            name: "mcp-example".to_string(),
+            status: McpConnectionStatus::Connected,
+            error: None,
+        };
+
+        assert_eq!(server.name, "mcp-example");
+        assert!(matches!(server.status, McpConnectionStatus::Connected));
+        assert!(server.error.is_none());
+    }
+
+    #[test]
+    fn mcp_server_status_retains_failed_state_with_error() {
+        let server = McpServerStatus {
+            name: "mcp-broken".to_string(),
+            status: McpConnectionStatus::Failed,
+            error: Some("handshake failed".to_string()),
+        };
+
+        assert_eq!(server.name, "mcp-broken");
+        assert!(matches!(server.status, McpConnectionStatus::Failed));
+        assert_eq!(server.error.as_deref(), Some("handshake failed"));
+    }
+
+    #[test]
+    fn lsp_status_retains_fields_and_connected_state() {
+        let status = LspStatus {
+            id: "rust-analyzer".to_string(),
+            root: "/workspace/project".to_string(),
+            status: LspConnectionStatus::Connected,
+        };
+
+        assert_eq!(status.id, "rust-analyzer");
+        assert_eq!(status.root, "/workspace/project");
+        assert!(matches!(status.status, LspConnectionStatus::Connected));
+    }
+
+    #[test]
+    fn lsp_status_retains_fields_and_error_state() {
+        let status = LspStatus {
+            id: "pyright".to_string(),
+            root: "/workspace/other".to_string(),
+            status: LspConnectionStatus::Error,
+        };
+
+        assert_eq!(status.id, "pyright");
+        assert_eq!(status.root, "/workspace/other");
+        assert!(matches!(status.status, LspConnectionStatus::Error));
+    }
+
+    // --- 列挙型の識別 (PartialEq 未実装型は matches! で判定) ---
+
+    #[test]
+    fn mcp_connection_status_variants_are_distinguishable() {
+        let connected = McpConnectionStatus::Connected;
+        let disconnected = McpConnectionStatus::Disconnected;
+        let failed = McpConnectionStatus::Failed;
+        let needs_auth = McpConnectionStatus::NeedsAuth;
+        let needs_registration = McpConnectionStatus::NeedsClientRegistration;
+        let disabled = McpConnectionStatus::Disabled;
+
+        assert!(matches!(connected, McpConnectionStatus::Connected));
+        assert!(matches!(disconnected, McpConnectionStatus::Disconnected));
+        assert!(matches!(failed, McpConnectionStatus::Failed));
+        assert!(matches!(needs_auth, McpConnectionStatus::NeedsAuth));
+        assert!(matches!(
+            needs_registration,
+            McpConnectionStatus::NeedsClientRegistration
+        ));
+        assert!(matches!(disabled, McpConnectionStatus::Disabled));
+
+        // 別バリアントとは一致しない（識別可能であることの確認）。
+        assert!(!matches!(connected, McpConnectionStatus::Failed));
+        assert!(!matches!(disabled, McpConnectionStatus::NeedsAuth));
+    }
+
+    #[test]
+    fn lsp_connection_status_variants_are_distinguishable() {
+        let connected = LspConnectionStatus::Connected;
+        let error = LspConnectionStatus::Error;
+
+        assert!(matches!(connected, LspConnectionStatus::Connected));
+        assert!(matches!(error, LspConnectionStatus::Error));
+        assert!(!matches!(connected, LspConnectionStatus::Error));
+        assert!(!matches!(error, LspConnectionStatus::Connected));
+    }
+
+    #[test]
+    fn sidebar_mode_variants_are_distinguishable() {
+        let auto = SidebarMode::Auto;
+        let show = SidebarMode::Show;
+        let hide = SidebarMode::Hide;
+
+        // Clone 後も元の値を使うため、clone() は必要（redundant_clone 回避）。
+        let cloned = show.clone();
+        assert_eq!(cloned, SidebarMode::Show);
+
+        assert_eq!(auto, SidebarMode::Auto);
+        assert_eq!(show, SidebarMode::Show);
+        assert_eq!(hide, SidebarMode::Hide);
+        assert_ne!(auto, show);
+        assert_ne!(auto, hide);
+        assert_ne!(show, hide);
+    }
+
+    #[test]
+    fn message_density_variants_are_distinguishable() {
+        let compact = MessageDensity::Compact;
+        let cozy = MessageDensity::Cozy;
+
+        assert_eq!(compact, MessageDensity::Compact);
+        assert_eq!(cozy, MessageDensity::Cozy);
+        assert_ne!(compact, cozy);
+    }
+
+    // --- MessageDensity: from_str_lossy / as_str の往復 ---
+    // 期待値は実装から導出: from_str_lossy は "cozy" の大小文字無視一致のみを判定し、
+    // それ以外の全入力は Compact を返す。as_str は Compact => "compact", Cozy => "cozy"。
+
+    #[test]
+    fn message_density_as_str_returns_implementation_literals() {
+        assert_eq!(MessageDensity::Compact.as_str(), "compact");
+        assert_eq!(MessageDensity::Cozy.as_str(), "cozy");
+    }
+
+    #[test]
+    fn message_density_from_str_lossy_matches_cozy_case_insensitively() {
+        assert_eq!(MessageDensity::from_str_lossy("cozy"), MessageDensity::Cozy);
+        assert_eq!(MessageDensity::from_str_lossy("COZY"), MessageDensity::Cozy);
+        assert_eq!(MessageDensity::from_str_lossy("CoZy"), MessageDensity::Cozy);
+    }
+
+    #[test]
+    fn message_density_from_str_lossy_falls_back_to_compact() {
+        // "compact" の明示分岐は無く、"cozy" でない全入力が Compact になる。
+        for input in [
+            "compact", "", "COMPACT", " cozy", "cozy ", "dense", "Compact",
+        ] {
+            assert_eq!(
+                MessageDensity::from_str_lossy(input),
+                MessageDensity::Compact,
+                "input={input}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_density_round_trip_through_str() {
+        for density in [MessageDensity::Compact, MessageDensity::Cozy] {
+            let serialized = density.as_str();
+            let parsed = MessageDensity::from_str_lossy(serialized);
+            assert_eq!(parsed, density, "serialized={serialized}");
+        }
+    }
+}

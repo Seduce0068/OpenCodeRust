@@ -93,15 +93,26 @@ impl Clipboard {
     }
 }
 
-fn write_osc52(text: &str) {
+/// Build the OSC 52 clipboard-write sequence for `text`.
+///
+/// Pure string construction only: base64-encode the payload and wrap it in the
+/// OSC 52 `]52;c;...BEL` control sequence, optionally nested in a tmux
+/// `DCS ... ST` wrapper. Kept free of environment access and I/O so it can be
+/// tested without touching the terminal or launching clipboard commands.
+fn build_osc52_sequence(text: &str, wrap_for_tmux: bool) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let osc52 = format!("\x1b]52;c;{encoded}\x07");
 
-    let sequence = if std::env::var("TMUX").is_ok() || std::env::var("STY").is_ok() {
+    if wrap_for_tmux {
         format!("\x1bPtmux;\x1b{osc52}\x1b\\")
     } else {
         osc52
-    };
+    }
+}
+
+fn write_osc52(text: &str) {
+    let wrap_for_tmux = std::env::var("TMUX").is_ok() || std::env::var("STY").is_ok();
+    let sequence = build_osc52_sequence(text, wrap_for_tmux);
 
     let _ = std::io::stdout()
         .write_all(sequence.as_bytes())
@@ -268,4 +279,63 @@ fn read_image_windows() -> anyhow::Result<String> {
     }
 
     Ok(b64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_content_holds_data_and_mime() {
+        let content = ClipboardContent {
+            data: "hello".to_string(),
+            mime: "text/plain".to_string(),
+        };
+        assert_eq!(content.data.as_str(), "hello");
+        assert_eq!(content.mime.as_str(), "text/plain");
+    }
+
+    #[test]
+    fn clipboard_content_preserves_base64_image_payload() {
+        let content = ClipboardContent {
+            data: "aGVsbG8=".to_string(),
+            mime: "image/png".to_string(),
+        };
+        assert_eq!(content.data.as_str(), "aGVsbG8=");
+        assert_eq!(content.mime.as_str(), "image/png");
+    }
+
+    #[test]
+    fn osc52_sequence_encodes_text_without_tmux_wrapping() {
+        let sequence = build_osc52_sequence("hello", false);
+        assert_eq!(sequence, "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_sequence_handles_empty_text() {
+        assert_eq!(build_osc52_sequence("", false), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn osc52_sequence_uses_standard_base64_padding() {
+        assert_eq!(
+            build_osc52_sequence("foobar", false),
+            "\x1b]52;c;Zm9vYmFy\x07"
+        );
+        assert_eq!(build_osc52_sequence("f", false), "\x1b]52;c;Zg==\x07");
+    }
+
+    #[test]
+    fn osc52_sequence_wraps_for_tmux() {
+        let sequence = build_osc52_sequence("hello", true);
+        assert_eq!(sequence, "\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\");
+    }
+
+    #[test]
+    fn osc52_sequence_tmux_wrapping_of_empty_text() {
+        assert_eq!(
+            build_osc52_sequence("", true),
+            "\x1bPtmux;\x1b\x1b]52;c;\x07\x1b\\"
+        );
+    }
 }

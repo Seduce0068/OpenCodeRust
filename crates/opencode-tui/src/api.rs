@@ -796,3 +796,484 @@ impl ApiClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- SessionInfo / SessionTimeInfo / SessionRevertInfo ---
+
+    #[test]
+    fn session_info_deserializes_all_fields_from_wire_json() {
+        let session: SessionInfo = serde_json::from_value(json!({
+            "id": "ses-1",
+            "slug": "dummy-slug",
+            "project_id": "proj-1",
+            "directory": "/tmp/dummy",
+            "parent_id": "ses-parent",
+            "title": "dummy title",
+            "version": "v1",
+            "time": {
+                "created": 1000,
+                "updated": 2000,
+                "compacting": 1500,
+                "archived": null
+            },
+            "revert": {
+                "message_id": "msg-1",
+                "part_id": "part-1",
+                "snapshot": "snap-1",
+                "diff": "dummy diff"
+            }
+        }))
+        .expect("session payload should deserialize");
+
+        assert_eq!(session.id, "ses-1");
+        assert_eq!(session.slug, "dummy-slug");
+        assert_eq!(session.project_id, "proj-1");
+        assert_eq!(session.directory, "/tmp/dummy");
+        assert_eq!(session.parent_id.as_deref(), Some("ses-parent"));
+        assert_eq!(session.title, "dummy title");
+        assert_eq!(session.version, "v1");
+        assert_eq!(session.time.created, 1000);
+        assert_eq!(session.time.updated, 2000);
+        assert_eq!(session.time.compacting, Some(1500));
+        assert!(session.time.archived.is_none());
+
+        // SessionInfo は PartialEq を実装しないため、フィールド単位で検証する。
+        let revert = session.revert.as_ref().expect("revert should be present");
+        assert_eq!(revert.message_id, "msg-1");
+        assert_eq!(revert.part_id.as_deref(), Some("part-1"));
+        assert_eq!(revert.snapshot.as_deref(), Some("snap-1"));
+        assert_eq!(revert.diff.as_deref(), Some("dummy diff"));
+    }
+
+    #[test]
+    fn session_info_defaults_revert_and_optional_time_fields() {
+        let session: SessionInfo = serde_json::from_value(json!({
+            "id": "ses-2",
+            "slug": "slug-2",
+            "project_id": "proj-2",
+            "directory": "/tmp/dummy2",
+            "parent_id": null,
+            "title": "title-2",
+            "version": "v2",
+            "time": { "created": 1, "updated": 2 }
+        }))
+        .expect("session without revert should deserialize");
+
+        assert!(session.revert.is_none());
+        assert!(session.time.compacting.is_none());
+        assert!(session.time.archived.is_none());
+
+        let partial: SessionInfo = serde_json::from_value(json!({
+            "id": "ses-3",
+            "slug": "slug-3",
+            "project_id": "proj-3",
+            "directory": "/tmp/dummy3",
+            "parent_id": null,
+            "title": "title-3",
+            "version": "v3",
+            "time": { "created": 3, "updated": 4 },
+            "revert": { "message_id": "msg-3" }
+        }))
+        .expect("partial revert should deserialize");
+
+        let revert = partial.revert.as_ref().expect("revert should be present");
+        assert_eq!(revert.message_id, "msg-3");
+        assert!(revert.part_id.is_none());
+        assert!(revert.snapshot.is_none());
+        assert!(revert.diff.is_none());
+    }
+
+    #[test]
+    fn session_info_requires_time_field() {
+        let result = serde_json::from_value::<SessionInfo>(json!({
+            "id": "ses-x",
+            "slug": "slug-x",
+            "project_id": "proj-x",
+            "directory": "/tmp/x",
+            "parent_id": null,
+            "title": "title-x",
+            "version": "v-x"
+        }));
+        assert!(result.is_err(), "session without `time` must fail");
+    }
+
+    // --- SessionStatusInfo ---
+
+    #[test]
+    fn session_status_info_deserializes_and_defaults_optional_fields() {
+        let status: SessionStatusInfo = serde_json::from_value(json!({
+            "status": "busy",
+            "idle": false,
+            "busy": true,
+            "attempt": 2,
+            "message": "dummy message",
+            "next": 1234
+        }))
+        .expect("status should deserialize");
+
+        assert_eq!(status.status, "busy");
+        assert!(!status.idle);
+        assert!(status.busy);
+        assert_eq!(status.attempt, Some(2));
+        assert_eq!(status.message.as_deref(), Some("dummy message"));
+        assert_eq!(status.next, Some(1234));
+
+        let minimal: SessionStatusInfo = serde_json::from_value(json!({
+            "status": "idle",
+            "idle": true,
+            "busy": false
+        }))
+        .expect("minimal status should deserialize");
+
+        assert_eq!(minimal.status, "idle");
+        assert!(minimal.idle);
+        assert!(!minimal.busy);
+        assert!(minimal.attempt.is_none());
+        assert!(minimal.message.is_none());
+        assert!(minimal.next.is_none());
+    }
+
+    // --- MessagePart / FileInfo / ToolCall / ToolResult ---
+
+    #[test]
+    fn message_part_type_uses_rename_type_on_wire() {
+        let part: MessagePart = serde_json::from_value(json!({
+            "id": "part-1",
+            "type": "text",
+            "text": "dummy text",
+            "file": null,
+            "toolCall": null,
+            "toolResult": null
+        }))
+        .expect("text part should deserialize from the `type` key");
+
+        assert_eq!(part.id, "part-1");
+        assert_eq!(part.part_type, "text");
+        assert_eq!(part.text.as_deref(), Some("dummy text"));
+        assert!(part.file.is_none());
+        assert!(part.tool_call.is_none());
+        assert!(part.tool_result.is_none());
+        assert!(part.synthetic.is_none());
+        assert!(part.ignored.is_none());
+
+        // `part_type` は rename = "type" のため、元のフィールド名では読めない。
+        assert!(
+            serde_json::from_value::<MessagePart>(json!({
+                "id": "part-x",
+                "part_type": "text"
+            }))
+            .is_err(),
+            "`part_type` must not be accepted as the wire key"
+        );
+
+        // シリアライズは rename 後の `type` を出し、`part_type` は出さない。
+        let value = serde_json::to_value(&part).expect("part should serialize");
+        assert_eq!(value.get("type"), Some(&json!("text")));
+        assert!(value.get("part_type").is_none());
+    }
+
+    #[test]
+    fn message_part_deserializes_tool_call_alias_and_defaults() {
+        let part: MessagePart = serde_json::from_value(json!({
+            "id": "part-2",
+            "type": "tool-call",
+            "toolCall": {
+                "id": "call-1",
+                "name": "dummy-tool",
+                "input": { "path": "/tmp/x" }
+            },
+            "synthetic": true
+        }))
+        .expect("tool call part should deserialize from the `toolCall` alias");
+
+        assert_eq!(part.part_type, "tool-call");
+        assert_eq!(part.synthetic, Some(true));
+        assert!(part.ignored.is_none());
+        let call = part
+            .tool_call
+            .as_ref()
+            .expect("tool call should be present");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "dummy-tool");
+        assert_eq!(call.input, json!({ "path": "/tmp/x" }));
+        assert!(part.tool_result.is_none());
+
+        // 元の snake_case キーも受け付ける。
+        let snake: MessagePart = serde_json::from_value(json!({
+            "id": "part-3",
+            "type": "tool-call",
+            "tool_call": { "id": "call-2", "name": "dummy", "input": {} }
+        }))
+        .expect("snake_case tool_call should also deserialize");
+        assert_eq!(
+            snake.tool_call.as_ref().map(|c| c.id.as_str()),
+            Some("call-2")
+        );
+
+        // シリアライズは alias ではなく元のフィールド名 `tool_call` を使う。
+        let value = serde_json::to_value(&part).expect("part should serialize");
+        assert!(value.get("tool_call").is_some());
+        assert!(value.get("toolCall").is_none());
+    }
+
+    #[test]
+    fn message_part_deserializes_tool_result_alias() {
+        let part: MessagePart = serde_json::from_value(json!({
+            "id": "part-4",
+            "type": "tool-result",
+            "toolResult": {
+                "toolCallId": "call-1",
+                "content": "done",
+                "isError": false
+            },
+            "ignored": true
+        }))
+        .expect("toolResult alias should deserialize");
+
+        assert_eq!(part.part_type, "tool-result");
+        assert_eq!(part.ignored, Some(true));
+        let result = part
+            .tool_result
+            .as_ref()
+            .expect("tool result should be present");
+        assert_eq!(result.tool_call_id, "call-1");
+        assert_eq!(result.content, "done");
+        assert!(!result.is_error);
+        assert!(part.tool_call.is_none());
+
+        let value = serde_json::to_value(&part).expect("part should serialize");
+        assert!(value.get("tool_result").is_some());
+        assert!(value.get("toolResult").is_none());
+    }
+
+    #[test]
+    fn message_part_deserializes_file_field() {
+        let part: MessagePart = serde_json::from_value(json!({
+            "id": "part-5",
+            "type": "file",
+            "file": {
+                "url": "https://example.invalid/dummy.png",
+                "filename": "dummy.png",
+                "mime": "image/png"
+            }
+        }))
+        .expect("file part should deserialize");
+
+        let file = part.file.as_ref().expect("file should be present");
+        assert_eq!(file.url, "https://example.invalid/dummy.png");
+        assert_eq!(file.filename, "dummy.png");
+        assert_eq!(file.mime, "image/png");
+    }
+
+    #[test]
+    fn tool_result_uses_camel_case_aliases_and_snake_case_on_serialize() {
+        let result: ToolResult = serde_json::from_value(json!({
+            "toolCallId": "call-1",
+            "content": "dummy output",
+            "isError": false
+        }))
+        .expect("camelCase tool result should deserialize via aliases");
+
+        assert_eq!(result.tool_call_id, "call-1");
+        assert_eq!(result.content, "dummy output");
+        assert!(!result.is_error);
+
+        let snake: ToolResult = serde_json::from_value(json!({
+            "tool_call_id": "call-2",
+            "content": "oops",
+            "is_error": true
+        }))
+        .expect("snake_case tool result should deserialize");
+        assert_eq!(snake.tool_call_id, "call-2");
+        assert!(snake.is_error);
+
+        let value = serde_json::to_value(&result).expect("tool result should serialize");
+        assert_eq!(value.get("tool_call_id"), Some(&json!("call-1")));
+        assert_eq!(value.get("is_error"), Some(&json!(false)));
+        assert!(value.get("toolCallId").is_none());
+        assert!(value.get("isError").is_none());
+    }
+
+    // --- MessageInfo / MessageTokensInfo ---
+
+    #[test]
+    fn message_info_deserializes_aliases_defaults_and_nested_parts() {
+        let message: MessageInfo = serde_json::from_value(json!({
+            "id": "msg-1",
+            "sessionId": "ses-1",
+            "role": "assistant",
+            "created_at": 1000,
+            "completedAt": 2000,
+            "agent": "dummy-agent",
+            "model": "dummy-model",
+            "mode": "primary",
+            "finish": "stop",
+            "error": null,
+            "cost": 0.125,
+            "tokens": {
+                "input": 10,
+                "output": 20,
+                "reasoning": 5,
+                "cacheRead": 3,
+                "cacheWrite": 4
+            },
+            "parts": [
+                { "id": "part-1", "type": "text", "text": "dummy reply" }
+            ]
+        }))
+        .expect("message should deserialize");
+
+        assert_eq!(message.id, "msg-1");
+        assert_eq!(message.session_id, "ses-1");
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.created_at, 1000);
+        assert_eq!(message.completed_at, Some(2000));
+        assert_eq!(message.agent.as_deref(), Some("dummy-agent"));
+        assert_eq!(message.model.as_deref(), Some("dummy-model"));
+        assert_eq!(message.mode.as_deref(), Some("primary"));
+        assert_eq!(message.finish.as_deref(), Some("stop"));
+        assert!(message.error.is_none());
+        assert_eq!(message.cost, 0.125);
+        assert_eq!(message.tokens.input, 10);
+        assert_eq!(message.tokens.output, 20);
+        assert_eq!(message.tokens.reasoning, 5);
+        assert_eq!(message.tokens.cache_read, 3);
+        assert_eq!(message.tokens.cache_write, 4);
+        assert_eq!(message.parts.len(), 1);
+        assert_eq!(message.parts[0].part_type, "text");
+        assert_eq!(message.parts[0].text.as_deref(), Some("dummy reply"));
+
+        // alias はデシリアライズ専用。シリアライズは snake_case を出す。
+        let value = serde_json::to_value(&message).expect("message should serialize");
+        assert_eq!(value.get("session_id"), Some(&json!("ses-1")));
+        assert!(value.get("sessionId").is_none());
+        assert_eq!(value.get("completed_at"), Some(&json!(2000)));
+        assert!(value.get("completedAt").is_none());
+    }
+
+    #[test]
+    fn message_info_accepts_snake_case_keys_and_applies_defaults() {
+        let message: MessageInfo = serde_json::from_value(json!({
+            "id": "msg-2",
+            "session_id": "ses-2",
+            "role": "user",
+            "created_at": 3000
+        }))
+        .expect("minimal message should deserialize");
+
+        assert_eq!(message.session_id, "ses-2");
+        assert!(message.completed_at.is_none());
+        assert!(message.agent.is_none());
+        assert!(message.model.is_none());
+        assert!(message.mode.is_none());
+        assert!(message.finish.is_none());
+        assert!(message.error.is_none());
+        assert_eq!(message.cost, 0.0);
+        assert_eq!(message.tokens.input, 0);
+        assert_eq!(message.tokens.cache_read, 0);
+        assert!(message.parts.is_empty());
+    }
+
+    #[test]
+    fn message_tokens_info_cache_aliases_and_snake_case_wire_format() {
+        let tokens: MessageTokensInfo = serde_json::from_value(json!({
+            "input": 1,
+            "output": 2,
+            "reasoning": 3,
+            "cacheRead": 4,
+            "cacheWrite": 5
+        }))
+        .expect("tokens should deserialize from camelCase aliases");
+
+        assert_eq!(tokens.input, 1);
+        assert_eq!(tokens.output, 2);
+        assert_eq!(tokens.reasoning, 3);
+        assert_eq!(tokens.cache_read, 4);
+        assert_eq!(tokens.cache_write, 5);
+
+        let value = serde_json::to_value(&tokens).expect("tokens should serialize");
+        assert_eq!(value.get("cache_read"), Some(&json!(4)));
+        assert_eq!(value.get("cache_write"), Some(&json!(5)));
+        assert!(value.get("cacheRead").is_none());
+        assert!(value.get("cacheWrite").is_none());
+
+        let empty: MessageTokensInfo =
+            serde_json::from_value(json!({})).expect("empty tokens object should deserialize");
+        assert_eq!(empty.input, 0);
+        assert_eq!(empty.output, 0);
+        assert_eq!(empty.reasoning, 0);
+        assert_eq!(empty.cache_read, 0);
+        assert_eq!(empty.cache_write, 0);
+    }
+
+    // --- ProviderListResponse / ProviderModelInfo ---
+
+    #[test]
+    fn provider_list_response_default_model_uses_rename_default() {
+        let response: ProviderListResponse = serde_json::from_value(json!({
+            "providers": [
+                {
+                    "id": "dummy-provider",
+                    "name": "Dummy Provider",
+                    "models": [
+                        {
+                            "id": "dummy-model",
+                            "name": "Dummy Model",
+                            "provider": "dummy-provider",
+                            "contextWindow": 128000
+                        },
+                        {
+                            "id": "dummy-model-2",
+                            "name": "Dummy Model 2",
+                            "provider": "dummy-provider",
+                            "contextLength": 64000
+                        }
+                    ]
+                }
+            ],
+            "default": { "dummy-provider": "dummy-model" }
+        }))
+        .expect("provider list should deserialize with the `default` key");
+
+        assert_eq!(response.providers.len(), 1);
+        assert_eq!(response.providers[0].id, "dummy-provider");
+        assert_eq!(response.providers[0].name, "Dummy Provider");
+        assert_eq!(response.providers[0].models.len(), 2);
+        let first = &response.providers[0].models[0];
+        assert_eq!(first.id, "dummy-model");
+        assert_eq!(first.name, "Dummy Model");
+        assert_eq!(first.provider, "dummy-provider");
+        assert!(first.variants.is_empty());
+        assert_eq!(first.context_window, Some(128000));
+        let second = &response.providers[0].models[1];
+        assert_eq!(second.context_window, Some(64000));
+        assert_eq!(
+            response
+                .default_model
+                .get("dummy-provider")
+                .map(String::as_str),
+            Some("dummy-model")
+        );
+
+        let value = serde_json::to_value(&response).expect("provider list should serialize");
+        assert_eq!(
+            value.get("default"),
+            Some(&json!({ "dummy-provider": "dummy-model" }))
+        );
+        assert!(value.get("default_model").is_none());
+
+        // rename = "default" のため、`default_model` は wire キーとして読めない。
+        assert!(
+            serde_json::from_value::<ProviderListResponse>(json!({
+                "providers": [],
+                "default_model": {}
+            }))
+            .is_err(),
+            "`default_model` must not be accepted as the wire key"
+        );
+    }
+}
