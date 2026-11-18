@@ -2,29 +2,40 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+/// ディレクトリ走査で見つかった項目の種別。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EntryType {
+    /// 通常のファイル。
     File,
+    /// ディレクトリ。
     Directory,
 }
 
+/// ルートディレクトリからの相対パスと項目種別を表すエントリ。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
+    /// ルートからの相対パス。
     pub path: PathBuf,
+    /// 項目の種別。
     pub entry_type: EntryType,
 }
 
+/// ファイルの読み取りとディレクトリ一覧取得を提供する非同期インターフェース。
 #[async_trait::async_trait]
 pub trait FileSystem {
+    /// 指定したパスのファイル内容をバイト列として読み込む。
     async fn read(&self, path: &Path) -> anyhow::Result<Vec<u8>>;
+    /// 指定したディレクトリ直下の項目を列挙する。
     async fn list(&self, path: &Path) -> anyhow::Result<Vec<Entry>>;
 }
 
+/// 指定したルートディレクトリを基点にファイルシステム操作を行う実装。
 pub struct FileSystemImpl {
     root: PathBuf,
 }
 
 impl FileSystemImpl {
+    /// 基点となるルートディレクトリを指定してインスタンスを生成する。
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }

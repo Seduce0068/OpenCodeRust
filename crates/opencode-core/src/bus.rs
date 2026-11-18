@@ -3,17 +3,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+/// 発行されたイベントの種別とプロパティ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusEvent {
+    /// イベント種別を表す文字列。
     pub event_type: String,
+    /// イベントに付随する JSON プロパティ。
     pub properties: serde_json::Value,
 }
 
+/// イベント種別を定義し、購読・発行時の識別に使うハンドル。
 pub struct BusEventDef {
+    /// イベント種別の静的文字列。
     pub event_type: &'static str,
 }
 
 impl BusEventDef {
+    /// 指定したイベント種別で定義を作成する（const コンテキストで利用可能）。
     pub const fn new(event_type: &'static str) -> Self {
         Self { event_type }
     }
@@ -26,6 +32,7 @@ struct Subscription {
     callback: BoxedCallback,
 }
 
+/// イベントの発行とコールバック／チャネルによる購読を仲介するバス。
 pub struct Bus {
     next_id: Arc<RwLock<u64>>,
     subscribers: Arc<RwLock<HashMap<String, Vec<Subscription>>>>,
@@ -34,6 +41,7 @@ pub struct Bus {
 }
 
 impl Bus {
+    /// 空のイベントバスを生成する。
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
@@ -44,6 +52,7 @@ impl Bus {
         }
     }
 
+    /// イベントを発行し、該当するコールバックとチャネル購読者へ届ける。
     pub async fn publish(&self, def: &BusEventDef, properties: serde_json::Value) {
         tracing::info!(event_type = def.event_type, "publishing event");
 
@@ -76,6 +85,7 @@ impl Bus {
         }
     }
 
+    /// 指定したイベント種別にコールバックを登録し、登録 ID を返す。
     pub async fn subscribe<F>(&self, def: &BusEventDef, callback: F) -> u64
     where
         F: Fn(&str, serde_json::Value) + Send + Sync + 'static,
@@ -98,6 +108,7 @@ impl Bus {
         id
     }
 
+    /// 指定したイベント種別から、登録 ID でコールバックを解除する。
     pub async fn unsubscribe(&self, event_type: &str, id: u64) {
         let mut subscribers = self.subscribers.write().await;
         if let Some(subs) = subscribers.get_mut(event_type) {
@@ -105,6 +116,7 @@ impl Bus {
         }
     }
 
+    /// すべてのイベント種別を受け取るコールバックを登録し、登録 ID を返す。
     pub async fn subscribe_all<F>(&self, callback: F) -> u64
     where
         F: Fn(&str, serde_json::Value) + Send + Sync + 'static,
@@ -124,11 +136,13 @@ impl Bus {
         id
     }
 
+    /// 登録 ID で、全イベント購読のコールバックを解除する。
     pub async fn unsubscribe_all(&self, id: u64) {
         let mut wildcard = self.wildcard_subscribers.write().await;
         wildcard.retain(|s| s.id != id);
     }
 
+    /// 発行されたイベントを受信する broadcast レシーバーを作成する。
     pub fn subscribe_channel(&self) -> broadcast::Receiver<BusEvent> {
         self.tx.subscribe()
     }
@@ -140,6 +154,7 @@ impl Default for Bus {
     }
 }
 
+/// 指定したイベント種別の [`BusEventDef`] を生成する。
 pub fn define_event(event_type: &'static str) -> BusEventDef {
     BusEventDef::new(event_type)
 }

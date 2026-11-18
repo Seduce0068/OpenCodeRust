@@ -2,18 +2,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::process::Command;
 
+/// Git リポジトリのディレクトリ構成を表す情報。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Repository {
+    /// 作業ツリーのディレクトリ。
     pub worktree: PathBuf,
+    /// `.git` ディレクトリのパス。
     pub git_directory: PathBuf,
+    /// 共有される Git ディレクトリのパス。
     pub common_directory: PathBuf,
 }
 
+/// 特定のリポジトリに対して Git コマンドを実行するクライアント。
 pub struct GitClient {
+    /// 操作対象のリポジトリ。
     pub repository: Repository,
 }
 
 impl GitClient {
+    /// 対象リポジトリを指定してクライアントを生成する。
     pub fn new(repository: Repository) -> Self {
         Self { repository }
     }
@@ -38,6 +45,7 @@ impl GitClient {
         ))
     }
 
+    /// `HEAD` が指すコミットのハッシュを返す。未コミットの場合は `None`。
     pub async fn head(&self) -> anyhow::Result<Option<String>> {
         let (exit_code, stdout, _) = self.run(&["rev-parse", "HEAD"]).await?;
         if exit_code == 0 {
@@ -47,6 +55,7 @@ impl GitClient {
         }
     }
 
+    /// 現在 checkout されているブランチの短い名前を返す。detached HEAD の場合は `None`。
     pub async fn branch(&self) -> anyhow::Result<Option<String>> {
         let (exit_code, stdout, _) = self
             .run(&["symbolic-ref", "--quiet", "--short", "HEAD"])
