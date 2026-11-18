@@ -160,3 +160,120 @@ impl Provider for TogetherProvider {
         Ok(Box::pin(stream))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 外部 HTTP を呼ばず、ダミーキーだけで検証できる純粋ロジックに限定する。
+    fn provider() -> TogetherProvider {
+        TogetherProvider::new("dummy-together-key-for-tests")
+    }
+
+    #[test]
+    fn id_and_name_are_stable() {
+        let provider = provider();
+        assert_eq!(provider.id(), "together");
+        assert_eq!(provider.name(), "Together AI");
+    }
+
+    #[test]
+    fn models_are_prepopulated_with_expected_ids() {
+        let provider = provider();
+        let models = provider.models();
+
+        assert_eq!(models.len(), 5);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo",
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "Qwen/Qwen2.5-72B-Instruct-Turbo",
+                "deepseek-ai/DeepSeek-V3",
+            ]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.provider == "together" && !m.name.is_empty()));
+    }
+
+    #[test]
+    fn get_model_returns_known_model_fields() {
+        let provider = provider();
+        let model = provider
+            .get_model("meta-llama/Llama-3.3-70B-Instruct-Turbo")
+            .expect("known model should be present");
+
+        assert_eq!(model.id, "meta-llama/Llama-3.3-70B-Instruct-Turbo");
+        assert_eq!(model.name, "Llama 3.3 70B (Together)");
+        assert_eq!(model.provider, "together");
+        assert_eq!(model.context_window, 131_072);
+        assert_eq!(model.max_output_tokens, 8192);
+        assert!(!model.supports_vision);
+        assert!(model.supports_tools);
+        assert_eq!(model.cost_per_million_input, 0.88);
+        assert_eq!(model.cost_per_million_output, 0.88);
+    }
+
+    #[test]
+    fn get_model_reflects_together_capability_flags() {
+        let provider = provider();
+
+        // Together のカタログで唯一 vision 対応のモデル。
+        let vision = provider
+            .get_model("meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo")
+            .expect("vision model should be present");
+        assert!(vision.supports_vision);
+        assert!(vision.supports_tools);
+        assert_eq!(vision.name, "Llama 3.2 90B Vision (Together)");
+
+        let all_models = provider.models();
+        let vision_models: Vec<&ModelInfo> =
+            all_models.iter().filter(|m| m.supports_vision).collect();
+        assert_eq!(vision_models.len(), 1);
+        assert_eq!(
+            vision_models[0].id,
+            "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"
+        );
+
+        // Together のカタログで唯一 tools 非対応のモデル。
+        let mixtral = provider
+            .get_model("mistralai/Mixtral-8x7B-Instruct-v0.1")
+            .expect("mixtral should be present");
+        assert!(!mixtral.supports_vision);
+        assert!(!mixtral.supports_tools);
+        assert_eq!(mixtral.context_window, 32_768);
+        assert_eq!(mixtral.max_output_tokens, 4096);
+        assert_eq!(mixtral.cost_per_million_input, 0.6);
+
+        // 最も高価なモデルは DeepSeek V3。
+        let deepseek = provider
+            .get_model("deepseek-ai/DeepSeek-V3")
+            .expect("deepseek should be present");
+        assert_eq!(deepseek.cost_per_million_input, 1.25);
+        assert_eq!(deepseek.cost_per_million_output, 1.25);
+        assert!(deepseek.supports_tools);
+        assert!(!deepseek.supports_vision);
+    }
+
+    #[test]
+    fn get_model_returns_none_for_unknown_id() {
+        let provider = provider();
+        assert!(provider
+            .get_model("meta-llama/Llama-3.3-70B-Instruct-Turbo-unknown")
+            .is_none());
+        assert!(provider.get_model("").is_none());
+    }
+
+    #[test]
+    fn models_returns_owned_snapshot() {
+        let provider = provider();
+        let mut models = provider.models();
+        models.clear();
+
+        assert!(models.is_empty());
+        assert_eq!(provider.models().len(), 5);
+    }
+}
