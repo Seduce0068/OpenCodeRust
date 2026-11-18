@@ -3787,13 +3787,10 @@ pub struct ProjectInfo {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ProjectMetadata {
+pub(crate) struct ProjectMetadata {
     name: Option<String>,
     icon: Option<String>,
 }
-
-static PROJECT_METADATA: Lazy<RwLock<HashMap<String, ProjectMetadata>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 
 fn is_git_repository(path: &FsPath) -> bool {
     let output = std::process::Command::new("git")
@@ -3808,7 +3805,7 @@ fn is_git_repository(path: &FsPath) -> bool {
     }
 }
 
-async fn current_project_info() -> Result<ProjectInfo> {
+async fn current_project_info(state: &Arc<ServerState>) -> Result<ProjectInfo> {
     let cwd = std::env::current_dir()
         .map_err(|e| ApiError::BadRequest(format!("Failed to resolve current directory: {}", e)))?;
     let canonical = cwd
@@ -3822,7 +3819,7 @@ async fn current_project_info() -> Result<ProjectInfo> {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "project".to_string());
 
-    let metadata = PROJECT_METADATA.read().await;
+    let metadata = state.project_metadata.read().await;
     let name = metadata
         .get(&project_id)
         .and_then(|m| m.name.clone())
@@ -3837,12 +3834,12 @@ async fn current_project_info() -> Result<ProjectInfo> {
     })
 }
 
-async fn list_projects() -> Result<Json<Vec<ProjectInfo>>> {
-    Ok(Json(vec![current_project_info().await?]))
+async fn list_projects(State(state): State<Arc<ServerState>>) -> Result<Json<Vec<ProjectInfo>>> {
+    Ok(Json(vec![current_project_info(&state).await?]))
 }
 
-async fn get_current_project() -> Result<Json<ProjectInfo>> {
-    Ok(Json(current_project_info().await?))
+async fn get_current_project(State(state): State<Arc<ServerState>>) -> Result<Json<ProjectInfo>> {
+    Ok(Json(current_project_info(&state).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3852,15 +3849,16 @@ pub struct UpdateProjectRequest {
 }
 
 async fn update_project(
+    State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateProjectRequest>,
 ) -> Result<Json<ProjectInfo>> {
-    let current = current_project_info().await?;
+    let current = current_project_info(&state).await?;
     if id != current.id {
         return Err(ApiError::NotFound(format!("Project not found: {}", id)));
     }
 
-    let mut metadata = PROJECT_METADATA.write().await;
+    let mut metadata = state.project_metadata.write().await;
     let entry = metadata.entry(id).or_default();
     if let Some(name) = req.name {
         entry.name = Some(name);
@@ -3870,7 +3868,7 @@ async fn update_project(
     }
     drop(metadata);
 
-    Ok(Json(current_project_info().await?))
+    Ok(Json(current_project_info(&state).await?))
 }
 
 fn pty_routes() -> Router<Arc<ServerState>> {
@@ -5530,5 +5528,51 @@ mod experimental_not_implemented_tests {
             context: None,
         };
         assert_not_implemented(experimental_test(Json(payload)).await, "test").await;
+    }
+}
+
+#[cfg(test)]
+mod project_metadata_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn project_metadata_is_scoped_to_server_state_instance() {
+        let state_a = Arc::new(ServerState::new());
+        let state_b = Arc::new(ServerState::new());
+
+        let project_id = get_current_project(State(state_a.clone()))
+            .await
+            .expect("current project should resolve")
+            .0
+            .id;
+
+        let updated = update_project(
+            State(state_a.clone()),
+            Path(project_id.clone()),
+            Json(UpdateProjectRequest {
+                name: Some("instance-a-name".to_string()),
+                icon: None,
+            }),
+        )
+        .await
+        .expect("update should succeed");
+        assert_eq!(updated.0.name, "instance-a-name");
+
+        assert_eq!(
+            state_a
+                .project_metadata
+                .read()
+                .await
+                .get(&project_id)
+                .and_then(|m| m.name.clone()),
+            Some("instance-a-name".to_string())
+        );
+        assert!(state_b.project_metadata.read().await.is_empty());
+
+        let baseline_b = get_current_project(State(state_b))
+            .await
+            .expect("current project should resolve")
+            .0;
+        assert_ne!(baseline_b.name, "instance-a-name");
     }
 }

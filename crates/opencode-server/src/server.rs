@@ -411,6 +411,8 @@ pub struct ServerState {
     pub(crate) session_run_status: TokioRwLock<HashMap<String, routes::SessionRunStatus>>,
     /// セッションごとのプロンプト直列化ロック（旧プロセス共有 static `PROMPT_LOCKS`）。
     pub(crate) prompt_locks: TokioRwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// プロジェクトごとのメタデータ（旧プロセス共有 static `PROJECT_METADATA`）。
+    pub(crate) project_metadata: TokioRwLock<HashMap<String, routes::ProjectMetadata>>,
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
@@ -438,6 +440,7 @@ impl ServerState {
             running_prompt_tasks: StdMutex::new(HashMap::new()),
             session_run_status: TokioRwLock::new(HashMap::new()),
             prompt_locks: TokioRwLock::new(HashMap::new()),
+            project_metadata: TokioRwLock::new(HashMap::new()),
             session_repo: None,
             message_repo: None,
             input_repo: None,
