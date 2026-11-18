@@ -435,11 +435,20 @@ impl AgentExecutor {
         let subsessions = self.subsessions.clone();
         let providers = self.providers.clone();
         let tools = self.tools.clone();
+        // 親セッションの無効ツールを子セッションへ継承するためのスナップショット。
+        let parent_disabled_tools = self.disabled_tools.clone();
 
         ctx.with_create_subsession({
             let subsessions = subsessions.clone();
+            let parent_disabled_tools = parent_disabled_tools.clone();
             move |agent_name, _title, model, disabled_tools| {
                 let subsessions = subsessions.clone();
+                // ツール側指定と親の制限の union を取り、親の制限が子で緩和されないようにする。
+                // コールバックは Fn なので、捕捉した親 set は呼び出しごとに clone して borrow する。
+                let merged_disabled_tools: HashSet<String> = disabled_tools
+                    .into_iter()
+                    .chain(parent_disabled_tools.iter().cloned())
+                    .collect();
                 async move {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let registry = crate::AgentRegistry::from_project_dir(&cwd);
@@ -468,7 +477,7 @@ impl AgentExecutor {
                         SubsessionState {
                             agent,
                             conversation,
-                            disabled_tools: disabled_tools.into_iter().collect(),
+                            disabled_tools: merged_disabled_tools,
                         },
                     );
                     Ok(session_id)
@@ -602,6 +611,38 @@ mod tests {
         let mut disabled = state.disabled_tools.clone();
         disabled.sort();
         assert_eq!(disabled, vec!["edit".to_string(), "write".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn create_subsession_merges_parent_disabled_tools() {
+        let executor = build_executor(AgentInfo::general())
+            .with_disabled_tools(["write".to_string(), "bash".to_string()]);
+        let ctx = executor.with_subsession_callbacks(ToolContext::new(
+            "session".to_string(),
+            "message".to_string(),
+            ".".to_string(),
+        ));
+
+        let session_id = ctx
+            .do_create_subsession(
+                "general".to_string(),
+                None,
+                None,
+                vec!["edit".to_string(), "bash".to_string()],
+            )
+            .await
+            .expect("create subsession should succeed");
+
+        let exported = executor.export_subsessions().await;
+        let state = exported
+            .get(&session_id)
+            .expect("expected persisted subsession");
+        let mut disabled: Vec<String> = state.disabled_tools.to_vec();
+        disabled.sort();
+        assert_eq!(
+            disabled,
+            vec!["bash".to_string(), "edit".to_string(), "write".to_string()]
+        );
     }
 
     #[test]

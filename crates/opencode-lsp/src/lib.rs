@@ -26,7 +26,7 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -167,6 +167,74 @@ pub struct LspServerConfig {
 /// crashed or ignores the method) would wait forever on the oneshot channel.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// LSP ベースプロトコル 1 メッセージの本文サイズ上限。
+///
+/// サーバー stdout は外部入力のため、異常に大きな `Content-Length` を
+/// 受け取った際の大量メモリ確保を防ぐ。
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// `reader` から LSP ベースプロトコルの 1 メッセージを読み取る。
+///
+/// ヘッダーは空行まで読み、`Content-Length` 以外のヘッダー
+/// （`Content-Type` 等）は無視する。ヘッダー終了後、宣言されたバイト数を
+/// `read_exact` で読み、UTF-8 文字列として返す。本文は改行を含む
+/// 整形済み JSON でありうるため、行単位には分割しない。
+///
+/// - どのヘッダーも読まずに EOF に達した場合は `Ok(None)`（正常終了）。
+/// - `Content-Length` の欠落・不正値・上限超過、本文の途中 EOF、
+///   UTF-8 として不正な本文はエラー。
+async fn read_lsp_message<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<Option<String>, LspError> {
+    let mut content_length: Option<usize> = None;
+    let mut saw_header = false;
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            if !saw_header {
+                return Ok(None);
+            }
+            return Err(LspError::JsonRpcError(
+                "Unexpected EOF while reading LSP headers".to_string(),
+            ));
+        }
+        saw_header = true;
+
+        // CRLF と LF のどちらの改行にも対応する。
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                let len = value.trim().parse::<usize>().map_err(|e| {
+                    LspError::JsonRpcError(format!("Invalid Content-Length: {}", e))
+                })?;
+                content_length = Some(len);
+            }
+            // Content-Length 以外のヘッダーは無視する。
+        }
+    }
+
+    let len = content_length
+        .ok_or_else(|| LspError::JsonRpcError("Missing Content-Length header".to_string()))?;
+    if len > MAX_MESSAGE_BYTES {
+        return Err(LspError::JsonRpcError(format!(
+            "Content-Length {} exceeds limit {}",
+            len, MAX_MESSAGE_BYTES
+        )));
+    }
+
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    let body = String::from_utf8(buf)
+        .map_err(|e| LspError::JsonRpcError(format!("Invalid UTF-8 in LSP body: {}", e)))?;
+
+    Ok(Some(body))
+}
+
 pub struct LspClient {
     root: PathBuf,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -227,15 +295,20 @@ impl LspClient {
         let event_tx_clone = client.event_tx.clone();
 
         client.reader_handle = Some(tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
+            let mut reader = BufReader::new(stdout);
 
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.is_empty() || line.starts_with("Content-Length:") {
-                    continue;
-                }
+            loop {
+                let body = match read_lsp_message(&mut reader).await {
+                    Ok(Some(body)) => body,
+                    // Clean EOF: the server closed stdout.
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Failed to read LSP message: {}", e);
+                        break;
+                    }
+                };
 
-                if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(&line) {
+                if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(&body) {
                     if notification.method == "textDocument/publishDiagnostics" {
                         if let Some(params) = notification.params {
                             if let Ok(diag_params) = serde_json::from_value::<
@@ -256,7 +329,7 @@ impl LspClient {
                             }
                         }
                     }
-                } else if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
+                } else if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&body) {
                     if let Some(sender) = pending.write().await.remove(&response.id) {
                         let result = if let Some(error) = response.error {
                             Err(LspError::JsonRpcError(error.message))
@@ -999,6 +1072,7 @@ pub fn detect_language(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_detect_language() {
@@ -1123,5 +1197,108 @@ mod tests {
             "pending entry leaked after timeout"
         );
         // Dropping the client kills the child via `Drop::drop`.
+    }
+
+    // --- Content-Length framing tests (pure Cursor/BufReader, no server) ---
+
+    #[tokio::test]
+    async fn read_message_ignores_non_content_length_headers() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        let message = format!(
+            "Content-Length: {}\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\nX-Custom: ignored\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut reader = BufReader::new(Cursor::new(message.into_bytes()));
+
+        let payload = read_lsp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(payload, body);
+
+        let response: JsonRpcResponse = serde_json::from_str(&payload).unwrap();
+        assert_eq!(response.id, 1);
+        assert!(response.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_message_consecutive_messages() {
+        let body1 = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///tmp/a.rs","diagnostics":[]}}"#;
+        let body2 = r#"{"jsonrpc":"2.0","id":7,"result":null}"#;
+        let message = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            body1.len(),
+            body1,
+            body2.len(),
+            body2
+        );
+        let mut reader = BufReader::new(Cursor::new(message.into_bytes()));
+
+        let first = read_lsp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(first, body1);
+        let notification: JsonRpcNotification = serde_json::from_str(&first).unwrap();
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+
+        let second = read_lsp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(second, body2);
+        let response: JsonRpcResponse = serde_json::from_str(&second).unwrap();
+        assert_eq!(response.id, 7);
+
+        assert!(read_lsp_message(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_message_pretty_printed_json() {
+        let body = "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 42,\n  \"result\": {\n    \"capabilities\": {}\n  }\n}";
+        let message = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut reader = BufReader::new(Cursor::new(message.into_bytes()));
+
+        let payload = read_lsp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(payload, body);
+
+        let response: JsonRpcResponse = serde_json::from_str(&payload).unwrap();
+        assert_eq!(response.id, 42);
+        assert!(response.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_message_lf_only_and_lowercase_header() {
+        let body = r#"{"jsonrpc":"2.0","id":9,"result":null}"#;
+        let message = format!("content-length: {}\n\n{}", body.len(), body);
+        let mut reader = BufReader::new(Cursor::new(message.into_bytes()));
+
+        let payload = read_lsp_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(payload, body);
+    }
+
+    #[tokio::test]
+    async fn read_message_truncated_body_is_error() {
+        let body = "{}";
+        let declared = body.len() + 64;
+        let message = format!("Content-Length: {}\r\n\r\n{}", declared, body);
+        let mut reader = BufReader::new(Cursor::new(message.into_bytes()));
+
+        assert!(read_lsp_message(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_message_invalid_content_length_is_error() {
+        let message = "Content-Length: not-a-number\r\n\r\n{}";
+        let mut reader = BufReader::new(Cursor::new(message.as_bytes().to_vec()));
+
+        assert!(read_lsp_message(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_message_missing_content_length_is_error() {
+        let message = "Content-Type: application/vscode-jsonrpc\r\n\r\n{}";
+        let mut reader = BufReader::new(Cursor::new(message.as_bytes().to_vec()));
+
+        assert!(read_lsp_message(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_message_clean_eof_is_none() {
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+
+        assert!(read_lsp_message(&mut reader).await.unwrap().is_none());
     }
 }

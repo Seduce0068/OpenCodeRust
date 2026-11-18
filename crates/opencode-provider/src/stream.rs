@@ -267,57 +267,129 @@ pub struct AnthropicUsage {
     pub output_tokens: u64,
 }
 
-pub fn parse_anthropic_sse(data: &str) -> Option<StreamEvent> {
-    let event: AnthropicEvent = serde_json::from_str(data).ok()?;
+/// content block 1 つ分の最小限の状態。
+#[derive(Debug)]
+struct AnthropicBlockState {
+    block_type: String,
+    id: Option<String>,
+}
 
-    match event.event_type.as_str() {
-        "content_block_delta" => {
-            if let Some(delta) = event.delta {
-                if let Some(text) = delta.text {
-                    return Some(StreamEvent::TextDelta(text));
-                }
-                if let Some(json) = delta.partial_json {
-                    return Some(StreamEvent::ToolCallDelta {
-                        id: String::new(),
-                        input: json,
-                    });
-                }
-            }
+/// Anthropic SSE ストリームの状態を保持するパーサ。
+///
+/// `content_block_start` で得た tool_use の id を content block の index ごとに
+/// 記憶し、後続の `content_block_delta` の `partial_json` へ正しい id を付与する。
+/// また、`content_block_stop` ではストリームを終了させず、`message_stop` または
+/// `message_delta` の `stop_reason` でのみ `Done` を返す。
+#[derive(Debug, Default)]
+pub struct AnthropicSseParser {
+    /// content block index ごとのブロック種別と tool_use id。
+    blocks: std::collections::HashMap<u32, AnthropicBlockState>,
+    /// すでに `Done` を返したかどうか。終端イベントの重複を抑制する。
+    finished: bool,
+}
+
+impl AnthropicSseParser {
+    /// 空の状態でパーサを生成する。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// SSE の `data:` 行（JSON 文字列）を 1 つ取り込み、対応する `StreamEvent` を返す。
+    ///
+    /// 終端イベントの後に呼び出された場合は `None` を返す。
+    pub fn push(&mut self, data: &str) -> Option<StreamEvent> {
+        if self.finished {
+            return None;
         }
-        "content_block_start" => {
-            if let Some(block) = event.content_block {
-                if block.block_type == "tool_use" {
-                    return Some(StreamEvent::ToolCallStart {
-                        id: block.id.unwrap_or_default(),
-                        name: block.name.unwrap_or_default(),
-                    });
-                }
-            }
-        }
-        "content_block_stop" => {
-            return Some(StreamEvent::Done);
-        }
-        "message_delta" => {
-            if let Some(delta) = event.delta {
-                if delta.stop_reason.is_some() {
-                    return Some(StreamEvent::Done);
-                }
-            }
-        }
-        "message_start" => {
-            if let Some(msg) = event.message {
-                if let Some(usage) = msg.usage {
+
+        let event: AnthropicEvent = serde_json::from_str(data).ok()?;
+
+        match event.event_type.as_str() {
+            "message_start" => {
+                if let Some(usage) = event.message.and_then(|message| message.usage) {
                     return Some(StreamEvent::Usage {
                         prompt_tokens: usage.input_tokens,
                         completion_tokens: usage.output_tokens,
                     });
                 }
             }
-        }
-        _ => {}
-    }
+            "content_block_start" => {
+                if let Some(block) = event.content_block {
+                    let index = event.index.unwrap_or(0);
+                    self.blocks.insert(
+                        index,
+                        AnthropicBlockState {
+                            block_type: block.block_type.clone(),
+                            id: block.id.clone(),
+                        },
+                    );
 
-    None
+                    if block.block_type == "tool_use" {
+                        return Some(StreamEvent::ToolCallStart {
+                            id: block.id.unwrap_or_default(),
+                            name: block.name.unwrap_or_default(),
+                        });
+                    }
+                }
+            }
+            "content_block_delta" => {
+                if let Some(delta) = event.delta {
+                    if let Some(text) = delta.text {
+                        return Some(StreamEvent::TextDelta(text));
+                    }
+                    if let Some(json) = delta.partial_json {
+                        let id = event
+                            .index
+                            .and_then(|index| self.blocks.get(&index))
+                            .and_then(|block| block.id.clone())
+                            .unwrap_or_default();
+                        return Some(StreamEvent::ToolCallDelta { id, input: json });
+                    }
+                }
+            }
+            "content_block_stop" => {
+                let index = event.index.unwrap_or(0);
+                return self.blocks.remove(&index).and_then(|block| {
+                    let AnthropicBlockState { block_type, id } = block;
+                    match block_type.as_str() {
+                        "tool_use" => Some(StreamEvent::ToolInputEnd {
+                            id: id.unwrap_or_default(),
+                        }),
+                        "text" => Some(StreamEvent::TextEnd),
+                        _ => None,
+                    }
+                });
+            }
+            "message_delta" => {
+                if event
+                    .delta
+                    .as_ref()
+                    .and_then(|delta| delta.stop_reason.as_deref())
+                    .is_some()
+                {
+                    self.finished = true;
+                    return Some(StreamEvent::Done);
+                }
+            }
+            "message_stop" => {
+                self.finished = true;
+                return Some(StreamEvent::Done);
+            }
+            _ => {}
+        }
+
+        None
+    }
+}
+
+/// 既存互換の純粋関数ラッパー。
+///
+/// 1 回の呼び出しで 1 つの SSE データ行のみを処理し、呼び出しをまたぐ状態を保持しない。
+/// そのため `content_block_delta` の `partial_json` に対応する tool_use id は空文字列と
+/// なる。複数ブロック／複数 tool_use を正しく対応付けるには `AnthropicSseParser::push`
+/// を用いること（呼び出し側 `anthropic.rs` の変更が必要）。
+pub fn parse_anthropic_sse(data: &str) -> Option<StreamEvent> {
+    AnthropicSseParser::new().push(data)
 }
 
 #[cfg(test)]
@@ -346,6 +418,134 @@ mod tests {
             StreamEvent::ToolCallDelta { id, input } => {
                 assert_eq!(id, "tool-call-2");
                 assert_eq!(input, "{\"x\":1}");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    /// SSE データ行の列を状態付きパーサへ通し、発行されたイベント列を返す。
+    fn anthropic_events(lines: &[&str]) -> Vec<StreamEvent> {
+        let mut parser = AnthropicSseParser::new();
+        lines.iter().filter_map(|line| parser.push(line)).collect()
+    }
+
+    #[test]
+    fn anthropic_parser_maps_partial_json_to_tool_use_id_across_blocks() {
+        let lines = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_2","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"/tmp\"}"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"Done"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":1},"usage":{"output_tokens":20}}"#,
+        ];
+
+        let events = anthropic_events(&lines);
+
+        // Done は末尾の 1 回だけ。content_block_stop で早期終了しないこと。
+        let done_indices: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, event)| matches!(event, StreamEvent::Done).then_some(i))
+            .collect();
+        assert_eq!(done_indices.len(), 1);
+        assert_eq!(done_indices[0], events.len() - 1);
+
+        // 2 つの tool_use の id が partial_json に正しく対応付くこと。
+        let tool_deltas: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallDelta { id, input } => Some((id.as_str(), input.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_deltas,
+            vec![
+                ("toolu_1", "{\"cmd\":"),
+                ("toolu_1", "\"ls\"}"),
+                ("toolu_2", "{\"path\":"),
+                ("toolu_2", "\"/tmp\"}"),
+            ]
+        );
+
+        // ブロック終了イベントが content_block_stop ごとに発行されること。
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextEnd)));
+        let tool_input_ends: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolInputEnd { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_input_ends, vec!["toolu_1", "toolu_2"]);
+
+        // 後続ブロックのテキストも届くこと（早期 Done の回帰検証）。
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Hello", "Done"]);
+    }
+
+    #[test]
+    fn anthropic_wrapper_only_finishes_on_terminal_events() {
+        let block_stop = r#"{"type":"content_block_stop","index":0}"#;
+        assert!(
+            !matches!(parse_anthropic_sse(block_stop), Some(StreamEvent::Done)),
+            "content_block_stop は Done を返さないこと"
+        );
+
+        let message_delta_stop = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
+        assert!(matches!(
+            parse_anthropic_sse(message_delta_stop),
+            Some(StreamEvent::Done)
+        ));
+
+        let message_stop = r#"{"type":"message_stop"}"#;
+        assert!(matches!(
+            parse_anthropic_sse(message_stop),
+            Some(StreamEvent::Done)
+        ));
+    }
+
+    #[test]
+    fn anthropic_stateful_parser_suppresses_duplicate_done() {
+        let mut parser = AnthropicSseParser::new();
+        let stop = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
+        assert!(matches!(parser.push(stop), Some(StreamEvent::Done)));
+        assert!(parser.push(r#"{"type":"message_stop"}"#).is_none());
+    }
+
+    #[test]
+    fn anthropic_wrapper_retains_existing_text_and_tool_start_events() {
+        let text =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        assert!(matches!(
+            parse_anthropic_sse(text),
+            Some(StreamEvent::TextDelta(ref s)) if s.as_str() == "hi"
+        ));
+
+        let start = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_x","name":"bash"}}"#;
+        match parse_anthropic_sse(start) {
+            Some(StreamEvent::ToolCallStart { id, name }) => {
+                assert_eq!(id, "toolu_x");
+                assert_eq!(name, "bash");
             }
             other => panic!("unexpected event: {:?}", other),
         }
