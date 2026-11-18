@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{Executor, FromRow, SqlitePool};
 use std::collections::HashMap;
 
 use opencode_types::{MessagePart, MessageRole, Session, SessionMessage, SessionStatus};
@@ -305,7 +305,17 @@ impl MessageRepository {
         Self { pool }
     }
 
-    pub async fn create(&self, message: &SessionMessage) -> Result<(), DatabaseError> {
+    /// 指定した executor にメッセージを 1 件挿入する内部ヘルパー。
+    ///
+    /// `create` と `replace_for_session` が同じ INSERT 文を共有し、
+    /// 片方だけが修正されることによる不整合を防ぐ。
+    async fn insert_message<'e, E>(
+        executor: E,
+        message: &SessionMessage,
+    ) -> Result<(), DatabaseError>
+    where
+        E: Executor<'e, Database = sqlx::Sqlite>,
+    {
         let data_json = serde_json::to_string(&message.parts)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
@@ -327,11 +337,16 @@ impl MessageRepository {
         .bind(role_str)
         .bind(message.created_at.timestamp_millis())
         .bind(&data_json)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// メッセージを 1 件挿入する（従来 API と同じ動作）。
+    pub async fn create(&self, message: &SessionMessage) -> Result<(), DatabaseError> {
+        Self::insert_message(&self.pool, message).await
     }
 
     pub async fn upsert(&self, message: &SessionMessage) -> Result<(), DatabaseError> {
@@ -489,6 +504,39 @@ impl MessageRepository {
             .execute(&self.pool)
             .await
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 指定セッションのメッセージを `messages` の内容で原子的に置き換える。
+    ///
+    /// DELETE と各 INSERT を単一トランザクションで実行する。途中でエラーが
+    /// 発生した場合は既存メッセージの削除を含む変更全体がロールバックされる。
+    /// `server.rs` の `delete_for_session` + 1 件ずつ `create` の置き換えを想定する。
+    pub async fn replace_for_session(
+        &self,
+        session_id: &str,
+        messages: &[SessionMessage],
+    ) -> Result<(), DatabaseError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseError::TransactionError(e.to_string()))?;
+
+        sqlx::query("DELETE FROM messages WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        for message in messages {
+            Self::insert_message(&mut *tx, message).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::TransactionError(e.to_string()))?;
 
         Ok(())
     }
@@ -814,6 +862,117 @@ mod message_repository_tests {
             .expect("list works");
         let texts: Vec<String> = messages.iter().map(|m| m.get_text()).collect();
         assert_eq!(texts, ["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn replace_for_session_swaps_messages_atomically() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+
+        for text in ["old-first", "old-second"] {
+            repository
+                .create(&SessionMessage::user("session-1", text))
+                .await
+                .expect("old message created");
+        }
+
+        let replacement = vec![
+            SessionMessage::user("session-1", "new-first"),
+            SessionMessage::user("session-1", "new-second"),
+        ];
+        repository
+            .replace_for_session("session-1", &replacement)
+            .await
+            .expect("replace succeeds");
+
+        let texts: Vec<String> = repository
+            .list_for_session("session-1")
+            .await
+            .expect("list works")
+            .iter()
+            .map(|m| m.get_text())
+            .collect();
+        assert_eq!(texts, ["new-first", "new-second"]);
+    }
+
+    #[tokio::test]
+    async fn replace_for_session_rolls_back_on_insert_failure() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+
+        repository
+            .create(&SessionMessage::user("session-1", "original"))
+            .await
+            .expect("original message created");
+
+        // 2 件目の id を 1 件目と衝突させ、2 回目の INSERT を PK 違反で失敗させる。
+        // DELETE は先行して成功しているため、ロールバックされなければ
+        // "original" は消えたままになる。
+        let first = SessionMessage::user("session-1", "replacement-1");
+        let mut second = SessionMessage::user("session-1", "replacement-2");
+        second.id = first.id.clone();
+        assert!(
+            repository
+                .replace_for_session("session-1", &[first, second])
+                .await
+                .is_err(),
+            "duplicate id must fail the transaction"
+        );
+
+        let texts: Vec<String> = repository
+            .list_for_session("session-1")
+            .await
+            .expect("list works")
+            .iter()
+            .map(|m| m.get_text())
+            .collect();
+        assert_eq!(
+            texts,
+            ["original"],
+            "failed replace must roll back both DELETE and INSERT"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_for_session_with_empty_slice_deletes_all_messages() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+
+        repository
+            .create(&SessionMessage::user("session-1", "stale"))
+            .await
+            .expect("message created");
+        repository
+            .replace_for_session("session-1", &[])
+            .await
+            .expect("empty replace succeeds");
+
+        assert!(
+            repository
+                .list_for_session("session-1")
+                .await
+                .expect("list works")
+                .is_empty(),
+            "empty replacement must clear the session"
+        );
     }
 }
 
