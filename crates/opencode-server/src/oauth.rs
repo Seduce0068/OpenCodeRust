@@ -170,3 +170,84 @@ impl ProviderAuth {
         self.auth_manager.try_remove(provider_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ダミー文字列のみを使用する。実際のトークン値・認証情報は一切使わない。
+    const DUMMY_PROVIDER: &str = "dummy-provider";
+    const DUMMY_PERSIST_MESSAGE: &str = "dummy persistence failure";
+
+    #[test]
+    fn auth_error_from_conversion_creates_auth_variant() {
+        // Given: 源となる AuthError（source を持たない葉バリアント）
+        let auth_error = AuthError::OauthMissing(DUMMY_PROVIDER.to_string());
+
+        // When: From<AuthError> で ProviderAuthError に変換する
+        let err: ProviderAuthError = auth_error.into();
+
+        // Then: Auth バリアントになり、元の値が保持される
+        assert!(matches!(
+            &err,
+            ProviderAuthError::Auth(AuthError::OauthMissing(provider)) if provider == DUMMY_PROVIDER
+        ));
+    }
+
+    #[test]
+    fn auth_variant_display_forwards_inner_message() {
+        let err = ProviderAuthError::from(AuthError::OauthMissing(DUMMY_PROVIDER.to_string()));
+
+        assert_eq!(
+            err.to_string(),
+            format!("OAuth pending request not found for provider: {DUMMY_PROVIDER}")
+        );
+    }
+
+    #[test]
+    fn auth_variant_source_forwards_transparent_source() {
+        let err = ProviderAuthError::from(AuthError::OauthMissing(DUMMY_PROVIDER.to_string()));
+
+        // #[error(transparent)] は内側の source を委譲する。
+        // AuthError::OauthMissing は source を持たないため None になる。
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn persist_error_from_conversion_creates_persist_variant() {
+        let cause = anyhow::anyhow!(DUMMY_PERSIST_MESSAGE);
+
+        let err: ProviderAuthError = cause.into();
+
+        assert!(matches!(&err, ProviderAuthError::Persist(_)));
+    }
+
+    #[test]
+    fn persist_variant_display_prefixes_inner_message() {
+        let err = ProviderAuthError::from(anyhow::anyhow!(DUMMY_PERSIST_MESSAGE));
+
+        assert_eq!(
+            err.to_string(),
+            format!("failed to persist provider credentials: {DUMMY_PERSIST_MESSAGE}")
+        );
+    }
+
+    #[test]
+    fn persist_variant_source_chain_exposes_inner_error() {
+        let err = ProviderAuthError::from(anyhow::anyhow!(DUMMY_PERSIST_MESSAGE));
+
+        let source = std::error::Error::source(&err)
+            .expect("Persist バリアントは内側の anyhow::Error を source として保持する");
+        assert_eq!(source.to_string(), DUMMY_PERSIST_MESSAGE);
+    }
+
+    #[test]
+    fn auth_and_persist_variants_are_distinct() {
+        let auth_err = ProviderAuthError::from(AuthError::OauthCallbackFailed);
+        let persist_err = ProviderAuthError::from(anyhow::anyhow!(DUMMY_PERSIST_MESSAGE));
+
+        assert!(matches!(&auth_err, ProviderAuthError::Auth(_)));
+        assert!(matches!(&persist_err, ProviderAuthError::Persist(_)));
+        assert_ne!(auth_err.to_string(), persist_err.to_string());
+    }
+}
