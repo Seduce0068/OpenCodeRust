@@ -100,7 +100,14 @@ streamable HTTP で接続し、config の `headers` を送信する。401 は
 catalog 30s / execution 12h で、グローバル `mcp.timeout` を既定とし
 server の `timeout` がキー単位で上書きする。
 SSE transport、OAuth の token exchange、MCP オプションの `codemode` /
-`protocol` / `pool` は未実装。
+`pool` は未実装。`protocol` は parse され、`revision()` の返す値が
+`initialize` の `protocolVersion` として MCP クライアントへ渡る
+(`opencode-server/src/routes.rs` → `opencode-mcp` の `with_protocol_version`)。
+ただし `McpProtocol::Auto` の probe/fallback (2026-07-28 を試して
+legacy へ戻す挙動) は未実装で、`revision()` は `Legacy` と同じ
+`"2025-11-25"` を返す。新 revision を使うには `"2026-07-28"` を
+明示指定する必要がある。クライアントは `initialize` 応答の
+`protocolVersion` を参照せず、再 negotiation も行わない。
 `notifications/tools/list_changed` を受信すると tools を再ロードし
 `mcp.tools.changed` を発行する。`notifications/resources/list_changed` と
 `notifications/prompts/list_changed` は debug ログのみで、再ロード／

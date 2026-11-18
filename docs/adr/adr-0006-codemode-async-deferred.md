@@ -12,7 +12,7 @@ generated:
   at: "2026-11-16T22:55:25+09:00"
 reviewed:
   by: agent
-  at: "2026-11-16T22:55:25+09:00"
+  at: "2026-11-18T16:27:27+09:00"
 ---
 
 ## ADR-0006: CodeMode の非同期実行保留と段階的移植方針
@@ -32,12 +32,19 @@ Accepted (self-reviewed). 現行の同期設計を維持し、非同期対応は
 2026-11-16 時点で `execute_code` の呼び出し元は `opencode-codemode` クレート内の
 テストと parity corpus のみであり、他クレートへの API 波及はない。
 
-upstream `anomalyco/opencode` の `dev` は VM + job queue + park/resume 方式へ
-再構成されている。`async.ts` の `VmScheduler` は `parked` frame と `queue` を
-管理し、thenable adopt、reaction、unhandled rejection 診断を job として処理する。
-`vm.ts` は 103 KB で、frame / opcode / mode / signals を伴う。これは baseline
-`941e71d` を手本にした現行 Rust 実装 (再帰評価、`interpreter.rs` 13,827 行) と
-根本的に異なるアーキテクチャである。
+upstream `anomalyco/opencode` の codemode については、2026-11-16 時点の調査
+([investigation-final-report.md](../investigation-final-report.md)) で、
+`runtime.ts` が `interpreter/` 群へ再構成され、job queue + Promise reaction の
+基盤へ進展したと報告されている。報告は実体を
+`packages/codemode/src/interpreter/runner.ts:142` (job queue と `parked` frame)、
+`promises.ts:19` (thenable adopt / reaction)、`interpreter.ts:419` (`await`) とする。
+
+ただし本 checkout には上流ソースが無く (`references/` も存在しない)、
+`async.ts` / `scheduler.ts` / `vm.ts` は HEAD・全 ref に存在しない。
+したがって上記のファイル名・行番号はローカルで直接確認できず、調査報告の
+記載に依存する。ローカルで確認できるのは、現行 Rust 実装が同期再帰評価器
+(再帰評価、`interpreter.rs` 13,837 行) であり、手本とされた baseline `941e71d`
+を調査報告が挙げていることまでである。本 ADR の判断 (同期維持) は維持する。
 
 ### Decision
 
@@ -48,13 +55,14 @@ timeout は、現行の同期インタプリタでは実装しない。以下を
 - wall-clock timeout は文・block 境界で適用する (既存実装を維持)。
 - Promise 組み合わせと `await` は同期的に settle する既存セマンティクスを維持。
 
-非同期対応が必要になった場合は、VM + scheduler 方式への移行を新規 ADR/RFC で
-設計し、本 ADR を `Deprecated` にして後継へリンクする。
+非同期対応が必要になった場合は、upstream の job queue + Promise reaction 方式を
+手本にした移行を新規 ADR/RFC で設計し、本 ADR を `Deprecated` にして後継へ
+リンクする。
 
 ### Alternatives
 
 1. **`async-trait` による async 化**: `ToolHost::invoke` と `execute_code`、
-   評価器の全 `evaluate_*` を async 化する。呼び出し元は限定的だが、13,827 行の
+   評価器の全 `evaluate_*` を async 化する。呼び出し元は限定的だが、13,837 行の
    全面改修になり、upstream のマイクロタスク順序や unhandled rejection 診断を
    同期 Promise モデルでは再現できない。不採用。
 2. **host 呼び出しのスレッド化**: 同期 host を別スレッドで動かし channel で待つ。
@@ -70,12 +78,14 @@ timeout は、現行の同期インタプリタでは実装しない。以下を
   記載されたままになる (2026-11-16 時点で記載済み)。
 - 既存の parse / 構文検査 / data 境界 / limits / stdlib / 同期 tool 境界は変更しない。
 - `cargo check --all-targets` と `cargo test --workspace` の既存 green を維持する。
-- 将来 VM 方式へ移行する際は、本 ADR の判断を撤回する根拠 (性能要求、host tool の
-  実時間性、upstream parity の必須化など) を新 ADR に明記する。
+- 将来 job queue 方式へ移行する際は、本 ADR の判断を撤回する根拠 (性能要求、
+  host tool の実時間性、upstream parity の必須化など) を新 ADR に明記する。
 
 ### Links
 
 - [opencode-codemode モジュール設計](../opencode-codemode.md)
 - [公式 OpenCode とのマッピング](../../MAPPING.md)
-- [upstream async.ts (dev)](https://github.com/anomalyco/opencode/blob/dev/packages/codemode/src/async.ts)
-- [upstream scheduler.ts (dev)](https://github.com/anomalyco/opencode/blob/dev/packages/codemode/src/scheduler.ts)
+- [調査最終報告 (F-23b)](../investigation-final-report.md)
+- upstream の実体 (本 checkout には同梱されず、調査報告の記載に依存):
+  `packages/codemode/src/interpreter/runner.ts:142` / `promises.ts:19` /
+  `interpreter.ts:419`
