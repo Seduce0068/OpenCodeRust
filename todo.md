@@ -303,9 +303,15 @@ status: current
 - [x] **[M-11 一部]** provider/together.rs (6)・perplexity.rs (7)・cerebras.rs (6)（2026-11-18）
 - [x] **[M-11 一部]** provider/cohere.rs (8)・deepinfra.rs (8)・openrouter.rs (10)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI router(11)・branding(4)・state(3)・slash(13)・hooks(14)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
+- `Router::default()` の history 空問題（2026-11-18、swarm-coding R4 が発見、未修正）:
+  `#[derive(Default)]` のため history=[] だが `new()` は [Home]。本番は app_context.rs で
+  `new()` のみ使用のため即時影響なし。`impl Default for Router` を `Self::new()` を返す
+  実装へ変更すれば解消（別タスク）。
 - serde wire format 不整合（2026-11-18、types-data-test-worker が発見、未修正）:
   `PartType` は `rename_all="camelCase"` がタグ値のみに効き内部フィールド（tool_call_id /
   is_error 等）は snake_case のまま。`SessionStatus` は sqlx rename のみで serde は
