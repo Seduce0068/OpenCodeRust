@@ -133,66 +133,76 @@ impl Tool for GrepTool {
             .as_ref()
             .and_then(|g| glob::Pattern::new(g).ok());
 
-        let mut matches: Vec<GrepMatch> = Vec::new();
-        let mut has_errors = false;
         let limit = 100;
 
-        for entry in WalkDir::new(base_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|e| {
-                if include_hidden {
-                    true
-                } else {
-                    let name = e.file_name().to_string_lossy();
-                    !name.starts_with('.')
-                }
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
+        // 走査とファイル読み取りは同期 I/O なので、所有値を move したクロージャを
+        // spawn_blocking に逃がし、tokio ワーカーを占有しないようにする。
+        let base_dir_buf = base_dir.to_path_buf();
+        let (mut matches, has_errors) = tokio::task::spawn_blocking(move || {
+            let mut matches: Vec<GrepMatch> = Vec::new();
+            let mut has_errors = false;
 
-            if let Some(ref gp) = glob_pattern {
-                let rel_path = path.strip_prefix(base_dir).unwrap_or(path);
-                if !gp.matches(&rel_path.to_string_lossy()) {
+            for entry in WalkDir::new(&base_dir_buf)
+                .follow_links(true)
+                .into_iter()
+                .filter_entry(|e| {
+                    if include_hidden {
+                        true
+                    } else {
+                        let name = e.file_name().to_string_lossy();
+                        !name.starts_with('.')
+                    }
+                })
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if !path.is_file() {
                     continue;
                 }
-            }
 
-            let mtime = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-
-            if let Ok(file) = File::open(path) {
-                let reader = BufReader::new(file);
-                let path_str = path.to_string_lossy().to_string();
-
-                for (line_num, line_result) in reader.lines().enumerate() {
-                    if let Ok(line) = line_result {
-                        if regex.is_match(&line) {
-                            let truncated_line = if line.len() > MAX_LINE_LENGTH {
-                                format!("{}...", &line[..MAX_LINE_LENGTH])
-                            } else {
-                                line.clone()
-                            };
-
-                            matches.push(GrepMatch {
-                                path: path_str.clone(),
-                                mtime,
-                                line_num: line_num + 1,
-                                line_text: truncated_line,
-                            });
-                        }
+                if let Some(ref gp) = glob_pattern {
+                    let rel_path = path.strip_prefix(&base_dir_buf).unwrap_or(path);
+                    if !gp.matches(&rel_path.to_string_lossy()) {
+                        continue;
                     }
                 }
-            } else {
-                has_errors = true;
+
+                let mtime = path
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+
+                if let Ok(file) = File::open(path) {
+                    let reader = BufReader::new(file);
+                    let path_str = path.to_string_lossy().to_string();
+
+                    for (line_num, line_result) in reader.lines().enumerate() {
+                        if let Ok(line) = line_result {
+                            if regex.is_match(&line) {
+                                let truncated_line = if line.len() > MAX_LINE_LENGTH {
+                                    format!("{}...", &line[..MAX_LINE_LENGTH])
+                                } else {
+                                    line.clone()
+                                };
+
+                                matches.push(GrepMatch {
+                                    path: path_str.clone(),
+                                    mtime,
+                                    line_num: line_num + 1,
+                                    line_text: truncated_line,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    has_errors = true;
+                }
             }
-        }
+
+            (matches, has_errors)
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionError(format!("grep scan task failed: {}", e)))?;
 
         matches.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 
