@@ -61,7 +61,7 @@ pub use bootstrap::{
 pub use custom_fetch::*;
 pub use message::*;
 pub use provider::*;
-pub use retry::{with_retry, with_retry_and_hook, IsRetryable, RetryConfig};
+pub use retry::IsRetryable;
 pub use stream::*;
 pub use tools::*;
 pub use transform::{
