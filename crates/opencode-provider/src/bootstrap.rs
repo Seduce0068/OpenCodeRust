@@ -2986,4 +2986,401 @@ mod tests {
         assert_eq!(matches, vec!["gpt-5", "gpt-4"]);
         assert!(fuzzy_match("xyz", &options, 5).is_empty());
     }
+
+    fn bootstrap_state_with_dummy_models() -> ProviderBootstrapState {
+        let mut haiku = provider_model("claude-3-haiku");
+        haiku.provider_id = "myprovider".to_string();
+        let mut flash = provider_model("gemini-2.5-flash");
+        flash.provider_id = "myprovider".to_string();
+
+        let models = HashMap::from([
+            ("claude-3-haiku".to_string(), haiku),
+            ("gemini-2.5-flash".to_string(), flash),
+        ]);
+        let providers = HashMap::from([(
+            "myprovider".to_string(),
+            ProviderState {
+                id: "myprovider".to_string(),
+                name: "My Provider".to_string(),
+                source: "config".to_string(),
+                env: vec![],
+                key: None,
+                options: HashMap::new(),
+                models,
+            },
+        )]);
+        ProviderBootstrapState {
+            providers,
+            model_loaders: HashSet::new(),
+        }
+    }
+
+    fn status_model(model_id: &str, status: &str) -> ModelInfo {
+        let mut model = model_info(model_id);
+        model.status = Some(status.to_string());
+        model
+    }
+
+    #[test]
+    fn from_models_dev_model_maps_capabilities_cost_and_fallbacks() {
+        let mut model = model_info("dummy-model");
+        model.provider = None;
+        model.status = None;
+        model.release_date = None;
+        model.headers = None;
+        model.interleaved = Some(ModelInterleaved::Field {
+            field: "reasoning".to_string(),
+        });
+        model.modalities = Some(ModelModalities {
+            input: vec![
+                "text".to_string(),
+                "image".to_string(),
+                "audio".to_string(),
+                "video".to_string(),
+                "pdf".to_string(),
+            ],
+            output: vec!["text".to_string(), "image".to_string()],
+        });
+        model.cost = Some(crate::models::ModelCost {
+            input: 1.0,
+            output: 2.0,
+            cache_read: Some(0.1),
+            cache_write: Some(0.2),
+            context_over_200k: Some(Box::new(crate::models::ModelCost {
+                input: 3.0,
+                output: 4.0,
+                cache_read: Some(0.3),
+                cache_write: Some(0.4),
+                context_over_200k: None,
+            })),
+        });
+        model
+            .options
+            .insert("dummy".to_string(), serde_json::Value::Bool(true));
+
+        let provider = provider_info("myprovider", model.clone());
+        let runtime = from_models_dev_model(&provider, &model);
+
+        assert_eq!(runtime.id, "dummy-model");
+        assert_eq!(runtime.provider_id, "myprovider");
+        assert_eq!(runtime.status, "active");
+        assert_eq!(runtime.release_date, "");
+        assert!(runtime.headers.is_empty());
+        assert_eq!(runtime.api.url, "https://example.com");
+        assert_eq!(runtime.api.npm, "@ai-sdk/openai");
+        assert_eq!(
+            runtime.options.get("dummy"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(matches!(&runtime.capabilities.interleaved,
+                InterleavedConfig::Field { field } if field == "reasoning"));
+        assert!(runtime.capabilities.input.image);
+        assert!(runtime.capabilities.input.audio);
+        assert!(runtime.capabilities.input.video);
+        assert!(runtime.capabilities.input.pdf);
+        assert!(runtime.capabilities.output.image);
+        assert!(!runtime.capabilities.output.audio);
+        assert_eq!(runtime.cost.input, 1.0);
+        assert_eq!(runtime.cost.output, 2.0);
+        assert_eq!(runtime.cost.cache.read, 0.1);
+        assert_eq!(runtime.cost.cache.write, 0.2);
+        let over = runtime
+            .cost
+            .experimental_over_200k
+            .expect("over-200k cost should be preserved");
+        assert_eq!(over.input, 3.0);
+        assert_eq!(over.output, 4.0);
+        assert_eq!(over.cache.read, 0.3);
+        assert_eq!(over.cache.write, 0.4);
+        assert_eq!(runtime.limit.context, 128_000);
+        assert_eq!(runtime.limit.output, 8_192);
+    }
+
+    #[test]
+    fn from_models_dev_provider_preserves_models_and_metadata() {
+        let mut provider = provider_info("myprovider", model_info("model-a"));
+        provider
+            .models
+            .insert("model-b".to_string(), model_info("model-b"));
+        provider.env = vec!["DUMMY_PROVIDER_KEY".to_string()];
+
+        let state = from_models_dev_provider(&provider);
+
+        assert_eq!(state.id, "myprovider");
+        assert_eq!(state.name, "myprovider");
+        assert_eq!(state.source, "custom");
+        assert!(state.key.is_none());
+        assert!(state.options.is_empty());
+        assert_eq!(state.env, vec!["DUMMY_PROVIDER_KEY".to_string()]);
+        assert_eq!(state.models.len(), 2);
+        assert!(state.models.contains_key("model-a"));
+        assert!(state.models.contains_key("model-b"));
+    }
+
+    #[test]
+    fn filter_models_by_status_removes_deprecated_alpha_and_empty_providers() {
+        let mut keep = provider_info("keep", status_model("active-model", "active"));
+        keep.models.insert(
+            "alpha-model".to_string(),
+            status_model("alpha-model", "alpha"),
+        );
+        keep.models.insert(
+            "deprecated-model".to_string(),
+            status_model("deprecated-model", "deprecated"),
+        );
+        let only_alpha = provider_info("only-alpha", status_model("alpha-only", "alpha"));
+        let mut data = HashMap::new();
+        data.insert("keep".to_string(), keep);
+        data.insert("only-alpha".to_string(), only_alpha);
+
+        filter_models_by_status(&mut data, false);
+
+        let kept = data
+            .get("keep")
+            .expect("provider with active model remains");
+        assert_eq!(kept.models.len(), 1);
+        assert!(kept.models.contains_key("active-model"));
+        assert!(!data.contains_key("only-alpha"));
+
+        let mut keep = provider_info("keep", status_model("active-model", "active"));
+        keep.models.insert(
+            "alpha-model".to_string(),
+            status_model("alpha-model", "alpha"),
+        );
+        keep.models.insert(
+            "deprecated-model".to_string(),
+            status_model("deprecated-model", "deprecated"),
+        );
+        let only_alpha = provider_info("only-alpha", status_model("alpha-only", "alpha"));
+        let mut data = HashMap::new();
+        data.insert("keep".to_string(), keep);
+        data.insert("only-alpha".to_string(), only_alpha);
+
+        filter_models_by_status(&mut data, true);
+
+        let kept = data.get("keep").expect("provider should remain");
+        assert_eq!(kept.models.len(), 2);
+        assert!(kept.models.contains_key("active-model"));
+        assert!(kept.models.contains_key("alpha-model"));
+        assert!(!kept.models.contains_key("deprecated-model"));
+        assert!(data.contains_key("only-alpha"));
+    }
+
+    #[test]
+    fn amazon_bedrock_prefix_model_id_by_region() {
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("anthropic.claude-3", "us-east-1"),
+            "us.anthropic.claude-3"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("anthropic.claude-3", "us-gov-west-1"),
+            "anthropic.claude-3"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("anthropic.claude-sonnet-4-5", "ap-southeast-2"),
+            "au.anthropic.claude-sonnet-4-5"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("anthropic.claude-3", "ap-northeast-1"),
+            "jp.anthropic.claude-3"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("anthropic.claude-3", "ap-southeast-1"),
+            "apac.anthropic.claude-3"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("nova-lite", "eu-west-1"),
+            "eu.nova-lite"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("us.anthropic.claude-3", "eu-west-1"),
+            "us.anthropic.claude-3"
+        );
+        assert_eq!(
+            AmazonBedrockLoader::prefix_model_id("nova-lite", "cn-north-1"),
+            "nova-lite"
+        );
+    }
+
+    #[test]
+    fn bootstrap_config_from_raw_normalizes_provider_filters() {
+        let providers = HashMap::from([(
+            "myprovider".to_string(),
+            ConfigProvider {
+                name: Some("My Provider".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let config = bootstrap_config_from_raw(
+            providers,
+            vec!["disabled-one".to_string(), "disabled-one".to_string()],
+            vec![],
+            Some("myprovider/model-a".to_string()),
+            Some("myprovider/model-b".to_string()),
+        );
+
+        assert_eq!(config.disabled_providers.len(), 1);
+        assert!(config.disabled_providers.contains("disabled-one"));
+        assert!(config.enabled_providers.is_none());
+        assert!(!config.enable_experimental);
+        assert_eq!(config.model.as_deref(), Some("myprovider/model-a"));
+        assert_eq!(config.small_model.as_deref(), Some("myprovider/model-b"));
+        assert_eq!(
+            config
+                .providers
+                .get("myprovider")
+                .and_then(|p| p.name.as_deref()),
+            Some("My Provider")
+        );
+
+        let with_enabled =
+            bootstrap_config_from_raw(HashMap::new(), vec![], vec!["only".to_string()], None, None);
+        assert_eq!(
+            with_enabled.enabled_providers,
+            Some(HashSet::from(["only".to_string()]))
+        );
+    }
+
+    #[test]
+    fn bootstrap_state_get_model_reports_suggestions() {
+        let state = bootstrap_state_with_dummy_models();
+        assert!(state.get_model("myprovider", "claude-3-haiku").is_ok());
+
+        let missing = state
+            .get_model("myprovider", "claude-3-haiku-x")
+            .expect_err("unknown model should fail");
+        match &missing {
+            BootstrapError::ModelNotFound {
+                provider_id,
+                model_id,
+                suggestions,
+            } => {
+                assert_eq!(provider_id, "myprovider");
+                assert_eq!(model_id, "claude-3-haiku-x");
+                assert_eq!(
+                    suggestions.first().map(String::as_str),
+                    Some("claude-3-haiku")
+                );
+                assert!(suggestions.len() <= 3);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+        assert!(missing.to_string().contains("provider=myprovider"));
+
+        let missing_provider = state
+            .get_model("myprovidr", "x")
+            .expect_err("unknown provider should fail");
+        match &missing_provider {
+            BootstrapError::ModelNotFound {
+                provider_id,
+                suggestions,
+                ..
+            } => {
+                assert_eq!(provider_id, "myprovidr");
+                assert_eq!(suggestions, &vec!["myprovider".to_string()]);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bootstrap_state_query_helpers_use_dummy_models() {
+        let state = bootstrap_state_with_dummy_models();
+
+        assert_eq!(
+            state.closest("myprovider", &["flash", "haiku"]),
+            Some(("myprovider".to_string(), "gemini-2.5-flash".to_string()))
+        );
+        assert_eq!(state.closest("myprovider", &["absent"]), None);
+        assert_eq!(state.closest("absent-provider", &["haiku"]), None);
+
+        let small = state
+            .get_small_model("myprovider", None)
+            .expect("priority small model should be found");
+        assert_eq!(small.id, "gemini-2.5-flash");
+
+        let configured = state
+            .get_small_model("myprovider", Some("myprovider/claude-3-haiku"))
+            .expect("configured small model should be found");
+        assert_eq!(configured.id, "claude-3-haiku");
+        assert!(state.get_small_model("unknown-provider", None).is_none());
+
+        let from_config = state
+            .default_model(Some("myprovider/claude-3-haiku"), &[])
+            .expect("configured default model");
+        assert_eq!(from_config.provider_id, "myprovider");
+        assert_eq!(from_config.model_id, "claude-3-haiku");
+
+        let from_recent = state
+            .default_model(
+                None,
+                &[("myprovider".to_string(), "claude-3-haiku".to_string())],
+            )
+            .expect("recent default model");
+        assert_eq!(from_recent.model_id, "claude-3-haiku");
+
+        let fallback = state
+            .default_model(None, &[])
+            .expect("fallback default model");
+        assert_eq!(fallback.provider_id, "myprovider");
+    }
+
+    #[test]
+    fn merge_helpers_overlay_takes_precedence() {
+        let base = HashMap::from([
+            (
+                "shared".to_string(),
+                serde_json::Value::String("base".to_string()),
+            ),
+            ("keep".to_string(), serde_json::Value::Bool(true)),
+        ]);
+        let overlay = HashMap::from([(
+            "shared".to_string(),
+            serde_json::Value::String("overlay".to_string()),
+        )]);
+        let merged = merge_json_maps(&base, &overlay);
+        assert_eq!(
+            merged.get("shared"),
+            Some(&serde_json::Value::String("overlay".to_string()))
+        );
+        assert_eq!(merged.get("keep"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            base.get("shared"),
+            Some(&serde_json::Value::String("base".to_string()))
+        );
+
+        let base_strings = HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let overlay_strings = HashMap::from([("a".to_string(), "9".to_string())]);
+        let merged_strings = merge_string_maps(&base_strings, &overlay_strings);
+        assert_eq!(merged_strings.get("a").map(String::as_str), Some("9"));
+        assert_eq!(merged_strings.get("b").map(String::as_str), Some("2"));
+        assert_eq!(base_strings.get("a").map(String::as_str), Some("1"));
+
+        let mut state = provider_state("myprovider");
+        apply_patch(
+            &mut state,
+            ProviderPatch {
+                source: Some("config".to_string()),
+                name: Some("My Provider".to_string()),
+                env: Some(vec!["DUMMY_KEY".to_string()]),
+                key: Some("dummy-key".to_string()),
+                options: Some(HashMap::from([(
+                    "region".to_string(),
+                    serde_json::Value::String("dummy-region".to_string()),
+                )])),
+            },
+        );
+        apply_patch(&mut state, ProviderPatch::default());
+        assert_eq!(state.source, "config");
+        assert_eq!(state.name, "My Provider");
+        assert_eq!(state.env, vec!["DUMMY_KEY".to_string()]);
+        assert_eq!(state.key.as_deref(), Some("dummy-key"));
+        assert_eq!(
+            state.options.get("region"),
+            Some(&serde_json::Value::String("dummy-region".to_string()))
+        );
+    }
 }

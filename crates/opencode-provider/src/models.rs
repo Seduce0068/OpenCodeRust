@@ -339,4 +339,71 @@ mod tests {
         assert!(registry.get_provider("missing").await.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn model_info_deserialization_applies_defaults() {
+        let json = r#"{
+            "id": "dummy-model",
+            "name": "Dummy Model",
+            "limit": { "context": 1000, "output": 100 }
+        }"#;
+        let model: ModelInfo = serde_json::from_str(json).expect("dummy model should parse");
+
+        assert_eq!(model.id, "dummy-model");
+        assert_eq!(model.limit.context, 1000);
+        assert_eq!(model.limit.output, 100);
+        assert!(model.limit.input.is_none());
+        assert!(!model.attachment);
+        assert!(!model.reasoning);
+        assert!(!model.temperature);
+        assert!(!model.tool_call);
+        assert!(model.interleaved.is_none());
+        assert!(model.cost.is_none());
+        assert!(model.modalities.is_none());
+        assert!(model.experimental.is_none());
+        assert!(model.status.is_none());
+        assert!(model.options.is_empty());
+        assert!(model.headers.is_none());
+        assert!(model.provider.is_none());
+        assert!(model.variants.is_none());
+    }
+
+    #[test]
+    fn model_interleaved_accepts_bool_and_field() {
+        let flag: ModelInterleaved =
+            serde_json::from_str("true").expect("boolean interleaved should parse");
+        assert!(matches!(flag, ModelInterleaved::Bool(true)));
+
+        let field: ModelInterleaved = serde_json::from_str(r#"{"field":"reasoning"}"#)
+            .expect("field interleaved should parse");
+        match field {
+            ModelInterleaved::Field { field } => assert_eq!(field, "reasoning"),
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_cost_keeps_optional_cache_and_over_200k() {
+        let json = r#"{
+            "input": 1.0,
+            "output": 2.0,
+            "cache_read": 0.1,
+            "cache_write": 0.2,
+            "context_over_200k": { "input": 3.0, "output": 4.0 }
+        }"#;
+        let cost: ModelCost = serde_json::from_str(json).expect("dummy cost should parse");
+
+        assert_eq!(cost.input, 1.0);
+        assert_eq!(cost.output, 2.0);
+        assert_eq!(cost.cache_read, Some(0.1));
+        assert_eq!(cost.cache_write, Some(0.2));
+        let over = cost
+            .context_over_200k
+            .expect("over-200k cost should be preserved");
+        assert_eq!(over.input, 3.0);
+        assert_eq!(over.output, 4.0);
+        assert!(over.cache_read.is_none());
+        assert!(over.cache_write.is_none());
+        assert!(over.context_over_200k.is_none());
+    }
 }
