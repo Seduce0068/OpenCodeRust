@@ -309,9 +309,14 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI border(8)・markdown parser(9)・status(3)・help(8)・alert(12)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI confirm(13)・session_rename(20)・tag(28)・session_text(9)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
+- `session_text.rs:69-73` の到達不能コード（2026-11-18、swarm-coding R2-C が発見、未修正）:
+  `visible_count = if collapsible && collapsed { preview_lines } else { ... }` は同条件が
+  48-56 行目で早期 return するため到達不能。動作影響なし。単純化は別タスク。
 - `Router::default()` の history 空問題（2026-11-18、swarm-coding R4 発見 → R5 修正済み）:
   `#[derive(Default)]` を `impl Default for Router { Self::new() }` へ変更し、
   `default()` も `new()` と同じ history=[Home] を返すよう解消済み（回帰テスト 1 件追加）。
