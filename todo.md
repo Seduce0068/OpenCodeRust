@@ -78,10 +78,11 @@ status: current
     `preserve_order` feature の挙動影響を事前評価。厳密ピン拡充（8/61）は複数バージョン併存
     リスクの精査が必要（Cargo.lock コミット＋CI locked で再現性は担保済み）
   - version/edition/authors/license の workspace 継承は 7 クレートとも完了済み
-- [ ] **[M-16]** 依存方向の逆転と ADR／アーキテクチャ方針との矛盾
-  - charter の依存方向と逆に permission→plugin、tool→permission/plugin、session→
-    provider/tool/mcp/lsp、types が sqlx::Type を derive（循環なし、feature 分割は皆無）。ADR
-    改訂またはトレイト注入反転、sqlx derive の storage 側移管
+- [ ] **[M-16]** 依存方向の逆転（sqlx 未使用 derive は削除済み）
+  - 未使用の `SessionID` の sqlx::Type derive は削除済み。`SessionStatus` は storage が
+    実使用し orphan rule で storage への直接移管は不可（newtype＋From/Into 案は未検証）。
+    未対応は charter と逆の permission→plugin、tool→permission/plugin、session→
+    provider/tool/mcp/lsp の依存方向（ADR 改訂またはトレイト注入反転）
 - [ ] **[M-17]** 内部実装モジュールの過剰な pub 露出
   - provider/src/lib.rs が 32 個、tool/src/lib.rs が 24 個の実装モジュールを `pub mod`
     で露出しテストがフルパス参照。`pub(crate) mod` 化しファサード経由で公開
@@ -101,9 +102,10 @@ status: current
     std::fs 混在箇所（現行 L3433-3642 付近）。レイテンシ悪化は未計測、
     tokio::fs / spawn_blocking 移行は推奨対応（性能影響の事前計測が望ましい）
 - [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
-  - `tx.closed()` を select で監視する協調 break を実装済み（AbortHandle は循环的リーク
-    リスクで不採択）。未対応は spawn の JoinHandle 保持、初期 `chat_stream()` 呼び出し中の
-    切断検知、provider 実装側の上流生成キャンセル（routes.rs 外・未検証）
+  - `tx.closed()` の協調 break を実装済み。JoinHandle 保持は再調査（2026-11-18、
+    stream-handle-worker）で「tokio の破棄はデタッチ、協調 break で十分、AbortHandle は
+    部分永続化の回帰＋循环的参照リスク」のため見送り。残る実ギャップは初期
+    `chat_stream()` 確立中の切断検知と provider 側の上流キャンセル（routes.rs 外・未検証）
 
 ### 優先度: 低
 
@@ -114,9 +116,6 @@ status: current
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
-- [ ] **[L-09]** LiteRT プロバイダの未実装 FFI の設定面への露出
-  - `litert.rs:60-72` が TODO のままエラー、bootstrap が `LITERT_MODEL_PATH` で登録しモデルを広告、
-    MAPPING.md に記載なし。feature gate するか MAPPING.md へ追加
 - [ ] **[L-14]** 巨大 JSON 処理とメッセージ履歴の全件アロケーション
   - `routes.rs:1103-1118` が全件 collect、`:1316-1317` が全履歴 clone（O(n) は推測）。
     ページネーション／差分取得と Arc による copy-on-write
@@ -259,6 +258,8 @@ status: current
 - [x] **[M-11 一部]** provider models/bootstrap に 11 テスト（2026-11-18、provider-test-worker）
 - [x] **[M-04]** 公開 3 メソッドを Result<_, CommandError> 化（2026-11-18、command-api-worker）
 - [x] **[L-08 第3段]** missing_docs 276 件を 0 件へ（2026-11-18、apidoc3-worker）
+- [x] **[L-09]** 未実装 LiteRT を登録せず警告（2026-11-18、litert-worker）
+- [x] **[M-16 一部]** 未使用の SessionID の sqlx derive を削除（2026-11-18、sqlx-derive-worker）
 
 ## メモ
 

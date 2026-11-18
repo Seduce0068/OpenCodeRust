@@ -39,15 +39,18 @@ building, streaming response parsing, retries, and model capability queries.
 
 ## LiteRT-LM provider (local, incomplete)
 
-`bootstrap.rs` creates a `litert` provider from `modelPath` / `model_path`
-(or `LITERT_MODEL_PATH`) and `backend` (or `LITERT_BACKEND`, default `npu`).
-It advertises the `gemma-4-e2b` model with a 262,144-token context and
-4,096 max output tokens.
+The `litert` provider is **not implemented**: FFI to the LiteRT-LM C++
+library is not linked. `chat` and `chat_stream` return an explicit
+"not implemented" error, and `bootstrap.rs` does **not** register the
+provider, even when `modelPath` / `LITERT_MODEL_PATH` and `backend` /
+`LITERT_BACKEND` are configured. Those environment variables are ignored
+until the FFI is implemented. There is no feature gate; the `litert` module
+is always compiled as a placeholder.
 
-`chat` and `chat_stream` are not linked to the LiteRT-LM C++ library. They
-return `ProviderError::ApiError` placeholders, so the provider is unavailable
-for inference. In this environment the library is absent from `pkg-config`
-and `ldconfig`, so an FFI implementation needs the native dependency first.
+In this environment the library is absent from `pkg-config` and `ldconfig`,
+so an FFI implementation needs the native dependency first. After FFI is
+linked, the `litert` branch in `create_concrete_provider` must be
+re-enabled before the provider is advertised.
 
 ## Relations to other modules
 

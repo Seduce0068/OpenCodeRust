@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T12:02:24+09:00"
+  at: "2026-11-18T12:37:41+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1068 件
+  テスト総数 594 → 1069 件
 
 ### Changed
 
@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.63% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 37.60% を計測
+  （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -196,6 +197,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   の「anyhow は境界のみ」に準拠（破壊的変更、CLI の `?` は From で互換）(M-04)
 - docs: opencode-types/core の個別 pub 型へ `///` を 280 行追加し `missing_docs`
   残 276 件を 0 件へ解消 (L-08 第3段)
+- `opencode-provider`: 未実装の LiteRT を bootstrap で登録しないようにし、
+  `LITERT_MODEL_PATH` 等が無視されることを警告（回帰テスト追加）(L-09)
+- `opencode-types`: 未使用の `SessionID` の `sqlx::Type` derive を削除
+  （`SessionStatus` は storage が実使用のため維持）(M-16 一部)
+- MAPPING.md / docs/opencode-provider.md: LiteRT 未実装の現状を明記 (L-09)
 
 ## [0.1.0]
 
