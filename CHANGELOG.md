@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T09:28:21+09:00"
+  at: "2026-11-18T09:57:09+09:00"
 ---
 
 # Changelog
@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.93% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 36.91% を計測
+  （前回 36.93% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -168,6 +169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete+create を単一トランザクション化（server.rs へ配線）(H-10)
 - `opencode-server`: mcp_oauth.rs に 14 件のテストを追加
   （OAuth 判定／エラー経路／CSRF state、ダミー値のみ使用）(M-11)
+- `opencode-tool`: grep_tool の走査を所有値クロージャ＋`spawn_blocking` へ逃がし、
+  async 実行中の tokio ワーカー占有を回避（出力契約は不変）(M-37)
+- `opencode-core`: Event Bus のコールバックを Arc スナップショット化し、ロック
+  解放後に呼び出すよう変更（順序保証なしの性质は不変）(L-01)
+- `MAPPING.md`: MCP list_changed が tools のみ対応で resources/prompts は
+  debug ログのみであることを明記 (L-02)
 
 ## [0.1.0]
 

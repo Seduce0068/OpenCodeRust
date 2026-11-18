@@ -100,11 +100,10 @@ status: current
   - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
     `clippy_args` 追加、`unsafe_code = "deny"`、Renovate 設定
-- [ ] **[M-37]** async ハンドラ／ツール内の同期ファイル I/O（要確認）
-  - 事実確認済み（2026-11-18、grep-io-worker）: opencode-grep は同期ライブラリで tokio 非依存、
-    問題の実体は `opencode-tool/src/grep_tool.rs:140-195`（async 内で WalkDir/File::open）と
-    `server/routes.rs` の std::fs 混在箇所。レイテンシ悪化は未計測。
-    推奨: 走査部分を所有値クロージャへ切り出し `spawn_blocking(...).await` で逃がす
+- [ ] **[M-37]** async ハンドラ内の同期ファイル I/O（tool 側は対応済み）
+  - opencode-tool/grep_tool.rs は spawn_blocking 化済み。未対応は server/routes.rs の
+    std::fs 混在箇所（現行 L3433-3642 付近）。レイテンシ悪化は未計測、
+    tokio::fs / spawn_blocking 移行は推奨対応（性能影響の事前計測が望ましい）
 - [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
   - `tx.closed()` を select で監視する協調 break を実装済み（AbortHandle は循环的リーク
     リスクで不採択）。未対応は spawn の JoinHandle 保持、初期 `chat_stream()` 呼び出し中の
@@ -112,12 +111,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **[L-01]** Event Bus のロック保持中コールバックと publish 順序
-  - `bus.rs:57-62` が read guard 保持中にコールバック同期実行（write lock からの呼び出しでデッドロックしうる推測）、
-    status.rs は更新前に publish。ロック外実行と更新後 publish
-- [ ] **[L-02]** MCP list_changed 通知の非対称な処理
-  - `client.rs:622-642` が tools のみフラグを立て resources／prompts は debug ログのみ、
-    MAPPING.md に記載なし。フラグ追加または MAPPING.md へ明記
 - [ ] **[L-03]** 未配線コードの dead_code 抑制と CHANGELOG の矛盾
   - `prompt.rs:1961-1962` が定義のみ、`markdown/parser.rs` が 363 行全体を抑制、
     CHANGELOG.md:61-63 の「のみ」と矛盾。配線または削除し CHANGELOG を修正
@@ -260,6 +253,10 @@ status: current
 - [x] **[M-38]** SSE 切断を tx.closed() で検知し早期停止
   （2026-11-18、stream-cancel-worker）
 - [x] **[M-11 一部]** mcp_oauth.rs に 14 テスト追加（2026-11-18、oauth-test-worker）
+- [x] **[M-37]** grep_tool の走査を spawn_blocking へ（2026-11-18、grep-blocking-worker）
+- [x] **[L-01]** Event Bus のコールバックをロック解放後に実行（2026-11-18、eventbus-worker）
+- [x] **[L-02]** MCP list_changed の非対称を MAPPING.md へ明記
+  （2026-11-18、listchanged-worker + 親）
 
 ## メモ
 

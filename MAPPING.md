@@ -98,6 +98,10 @@ catalog 30s / execution 12h で、グローバル `mcp.timeout` を既定とし
 server の `timeout` がキー単位で上書きする。
 SSE transport、OAuth の token exchange、MCP オプションの `codemode` /
 `protocol` / `pool` は未実装。
+`notifications/tools/list_changed` を受信すると tools を再ロードし
+`mcp.tools.changed` を発行する。`notifications/resources/list_changed` と
+`notifications/prompts/list_changed` は debug ログのみで、再ロード／
+イベント発行は未実装（capability も `tools.listChanged` のみを宣言）。
 未マッピングのキーも parse を失敗させない。
 
 ## 命名差
