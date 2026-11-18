@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::{Tool, ToolContext, ToolError, ToolResult};
+use crate::{with_file_lock, PermissionRequest, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct MultiEditTool;
 
@@ -95,74 +95,133 @@ impl Tool for MultiEditTool {
         let mut total_files = 0;
 
         for file_edit in input.edits {
-            let file_path = base_path.join(&file_edit.file_path);
+            let file_label = file_edit.file_path.clone();
+
+            // edit/tool.rs と同様に絶対パスはそのまま使い、相対パスのみ
+            // ベースディレクトリへ結合する。
+            let file_path = if Path::new(&file_label).is_absolute() {
+                PathBuf::from(&file_label)
+            } else {
+                base_path.join(&file_label)
+            };
+            let path_str = file_path.to_string_lossy().to_string();
 
             if !file_path.exists() {
                 return Err(ToolError::FileNotFound(format!(
                     "File not found: {}",
-                    file_edit.file_path
+                    file_label
                 )));
             }
 
-            let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
-                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
-            })?;
+            // プロジェクト外のパスは external_directory 権限を確認する。
+            if ctx.is_external_path(&path_str) {
+                let parent = file_path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path_str.clone());
 
-            let mut new_content = content;
-            let mut file_edits = 0;
-
-            for edit in file_edit.edits {
-                let count = if edit.replace_all {
-                    let count = new_content.matches(&edit.old_string).count();
-                    new_content = new_content.replace(&edit.old_string, &edit.new_string);
-                    count
-                } else {
-                    if !new_content.contains(&edit.old_string) {
-                        return Err(ToolError::ExecutionError(format!(
-                            "Could not find '{}' in file {}",
-                            edit.old_string, file_edit.file_path
-                        )));
-                    }
-                    if let Some(pos) = new_content.find(&edit.old_string) {
-                        let before = &new_content[..pos];
-                        let after = &new_content[pos + edit.old_string.len()..];
-                        new_content = format!("{}{}{}", before, edit.new_string, after);
-                        1
-                    } else {
-                        0
-                    }
-                };
-                file_edits += count;
+                ctx.ask_permission(
+                    PermissionRequest::new("external_directory")
+                        .with_pattern(format!("{}/*", parent))
+                        .with_metadata("filepath", serde_json::json!(&path_str))
+                        .with_metadata("parentDir", serde_json::json!(parent)),
+                )
+                .await?;
             }
 
-            if file_edits > 0 {
-                tokio::fs::write(&file_path, &new_content)
-                    .await
-                    .map_err(|e| {
-                        ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
-                    })?;
+            let ctx_clone = ctx.clone();
+            let path_clone = file_path.clone();
+            let path_str_clone = path_str.clone();
+            let file_label_clone = file_label.clone();
+            let edits = file_edit.edits;
 
-                ctx.do_publish_bus(
-                    "file.edited",
-                    serde_json::json!({
-                        "file": file_edit.file_path
-                    }),
-                )
-                .await;
+            let file_edits = with_file_lock(&path_str, || async move {
+                let content = tokio::fs::read_to_string(&path_clone).await.map_err(|e| {
+                    ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+                })?;
 
-                ctx.do_publish_bus(
-                    "file_watcher.updated",
-                    serde_json::json!({
-                        "file": file_edit.file_path,
-                        "event": "change"
-                    }),
-                )
-                .await;
-
-                ctx.do_lsp_touch_file(file_edit.file_path.clone(), true)
+                // 読取り後に mtime を検証し、外部変更との競合を検出する。
+                ctx_clone
+                    .do_file_time_assert(path_str_clone.clone())
                     .await?;
 
-                results.push(format!("- {}: {} edit(s)", file_edit.file_path, file_edits));
+                let mut new_content = content.clone();
+                let mut count_total = 0;
+
+                for edit in edits {
+                    let count = if edit.replace_all {
+                        let count = new_content.matches(&edit.old_string).count();
+                        new_content = new_content.replace(&edit.old_string, &edit.new_string);
+                        count
+                    } else {
+                        if !new_content.contains(&edit.old_string) {
+                            return Err(ToolError::ExecutionError(format!(
+                                "Could not find '{}' in file {}",
+                                edit.old_string, file_label_clone
+                            )));
+                        }
+                        if let Some(pos) = new_content.find(&edit.old_string) {
+                            let before = &new_content[..pos];
+                            let after = &new_content[pos + edit.old_string.len()..];
+                            new_content = format!("{}{}{}", before, edit.new_string, after);
+                            1
+                        } else {
+                            0
+                        }
+                    };
+                    count_total += count;
+                }
+
+                if count_total > 0 {
+                    // edit/tool.rs と同じく書込み前に edit 権限を確認する。
+                    let diff = create_diff(&path_str_clone, &content, &new_content);
+                    ctx_clone
+                        .ask_permission(
+                            PermissionRequest::new("edit")
+                                .with_pattern(&path_str_clone)
+                                .with_metadata("diff", serde_json::json!(diff))
+                                .always_allow(),
+                        )
+                        .await?;
+
+                    tokio::fs::write(&path_clone, &new_content)
+                        .await
+                        .map_err(|e| {
+                            ToolError::execution_with_source(
+                                format!("Failed to write file: {}", e),
+                                e,
+                            )
+                        })?;
+
+                    ctx_clone
+                        .do_publish_bus(
+                            "file.edited",
+                            serde_json::json!({ "file": file_label_clone.clone() }),
+                        )
+                        .await;
+
+                    ctx_clone
+                        .do_publish_bus(
+                            "file_watcher.updated",
+                            serde_json::json!({
+                                "file": file_label_clone.clone(),
+                                "event": "change"
+                            }),
+                        )
+                        .await;
+
+                    ctx_clone
+                        .do_lsp_touch_file(file_label_clone.clone(), true)
+                        .await?;
+                    ctx_clone.do_file_time_read(path_str_clone.clone()).await?;
+                }
+
+                Ok::<usize, ToolError>(count_total)
+            })
+            .await?;
+
+            if file_edits > 0 {
+                results.push(format!("- {}: {} edit(s)", file_label, file_edits));
                 total_edits += file_edits;
                 total_files += 1;
             }
@@ -192,6 +251,36 @@ impl Default for MultiEditTool {
     fn default() -> Self {
         Self
     }
+}
+
+/// `edit` 権限のメタデータに渡す最小限の差分。`edit/tool.rs` の `create_diff` と同じ形式。
+fn create_diff(filepath: &str, old_content: &str, new_content: &str) -> String {
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+
+    let mut diff = format!("--- {}\n+++ {}\n", filepath, filepath);
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+
+    while old_idx < old_lines.len() || new_idx < new_lines.len() {
+        if old_idx >= old_lines.len() {
+            diff.push_str(&format!("+{}\n", new_lines[new_idx]));
+            new_idx += 1;
+        } else if new_idx >= new_lines.len() {
+            diff.push_str(&format!("-{}\n", old_lines[old_idx]));
+            old_idx += 1;
+        } else if old_lines[old_idx] == new_lines[new_idx] {
+            old_idx += 1;
+            new_idx += 1;
+        } else {
+            diff.push_str(&format!("-{}\n", old_lines[old_idx]));
+            diff.push_str(&format!("+{}\n", new_lines[new_idx]));
+            old_idx += 1;
+            new_idx += 1;
+        }
+    }
+
+    diff
 }
 
 #[cfg(test)]

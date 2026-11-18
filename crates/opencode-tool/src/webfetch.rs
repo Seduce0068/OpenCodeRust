@@ -1,5 +1,7 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
 use crate::{Tool, ToolContext, ToolError, ToolResult};
@@ -7,6 +9,8 @@ use crate::{Tool, ToolContext, ToolError, ToolResult};
 const MAX_RESPONSE_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
+/// 手動で追跡するリダイレクトの上限。reqwest の自動追跡は無効化する。
+const MAX_REDIRECTS: usize = 10;
 
 pub struct WebFetchTool {
     client: Client,
@@ -18,6 +22,8 @@ impl WebFetchTool {
             client: Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
                 .timeout(std::time::Duration::from_secs(MAX_TIMEOUT_SECS))
+                // リダイレクトは自動追跡せず、追跡先を毎回 SSRF 検証してから個別に送信する。
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
         }
@@ -35,6 +41,174 @@ struct WebFetchInput {
 
 fn default_format() -> String {
     "markdown".to_string()
+}
+
+/// IPv4 アドレスが SSRF 保護のために拒否すべき範囲かどうかを判定する（純粋関数）。
+fn ipv4_is_forbidden(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        // 169.254.169.254 は link-local に含まれるが、クラウドメタデータ
+        // エンドポイントとして明示的に拒否する意図を残す。
+        || *ip == Ipv4Addr::new(169, 254, 169, 254)
+        // CGNAT (100.64.0.0/10)、multicast (224.0.0.0/4)、
+        // reserved (240.0.0.0/4) も SSRF の宛先として拒否する。
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 0x40)
+        || (octets[0] & 0xf0) == 0xe0
+        || (octets[0] & 0xf0) == 0xf0
+}
+
+/// IPv6 アドレスが拒否すべき範囲かどうかを判定する（純粋関数）。
+fn ipv6_is_forbidden(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    // fc00::/7（unique local）、fe80::/10（link-local）、
+    // ff00::/8（multicast）をビット列で拒否する。
+    if (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xff00) == 0xff00
+    {
+        return true;
+    }
+    // IPv4-mapped（::ffff:a.b.c.d）と IPv4-compatible（::a.b.c.d）は
+    // IPv6 側の範囲検査をすり抜けてプライベート IPv4 を運べるため、
+    // 埋め込まれた IPv4 を取り出して IPv4 の規則で再検査する。
+    if segments[..5].iter().all(|&segment| segment == 0)
+        && (segments[5] == 0 || segments[5] == 0xffff)
+    {
+        let embedded = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return ipv4_is_forbidden(&embedded);
+    }
+    // 6to4（2002::/16）は bits 16-47 に IPv4 を埋め込む。
+    if segments[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        );
+        return ipv4_is_forbidden(&embedded);
+    }
+    // Teredo（2001::/32）は bits 32-63 にサーバ IPv4、
+    // bits 96-127 にクライアント IPv4 のビット反転値を埋め込む。
+    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+        let server = Ipv4Addr::new(
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+            (segments[3] >> 8) as u8,
+            segments[3] as u8,
+        );
+        if ipv4_is_forbidden(&server) {
+            return true;
+        }
+        let client = Ipv4Addr::new(
+            ((!segments[6]) >> 8) as u8,
+            (!segments[6]) as u8,
+            ((!segments[7]) >> 8) as u8,
+            (!segments[7]) as u8,
+        );
+        return ipv4_is_forbidden(&client);
+    }
+    false
+}
+
+/// IP アドレスが安全でない範囲（loopback / private / link-local / 未指定 /
+/// メタデータエンドポイント / CGNAT / multicast / reserved /
+/// トンネル埋め込み IPv4 等）にあるかどうかを判定する（純粋関数）。
+fn ip_is_forbidden(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_forbidden(v4),
+        IpAddr::V6(v6) => ipv6_is_forbidden(v6),
+    }
+}
+
+/// URL のホスト文字列から IP リテラルを取り出す。IPv6 の括弧を除去する。
+fn literal_ip_from_host(host: &str) -> Option<IpAddr> {
+    let candidate = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    candidate.parse::<IpAddr>().ok()
+}
+
+fn forbidden_target_error(url: &Url) -> ToolError {
+    ToolError::PermissionDenied(format!(
+        "Refusing to fetch '{}': host resolves to a loopback, private, link-local, or otherwise unsafe IP address",
+        url.host_str().unwrap_or("<no host>")
+    ))
+}
+
+/// URL のスキームと IP リテラルを検証する（DNS 問い合わせを行わない）。
+fn validate_url_literal(url: &Url) -> Result<(), ToolError> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(ToolError::InvalidArguments(format!(
+                "Unsupported URL scheme '{other}'; only http and https are allowed"
+            )))
+        }
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| ToolError::InvalidArguments("URL must contain a host".to_string()))?;
+
+    match literal_ip_from_host(host) {
+        Some(ip) if ip_is_forbidden(&ip) => return Err(forbidden_target_error(url)),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// ホスト名を解決し、解決された「すべての」IP を検査する。
+///
+/// 失敗時は fail-closed（解決不能・拒否どちらもエラー）とする。
+async fn validate_resolved_host(url: &Url) -> Result<(), ToolError> {
+    let host = match url.host_str() {
+        Some(host) => host,
+        None => {
+            return Err(ToolError::InvalidArguments(
+                "URL must contain a host".to_string(),
+            ))
+        }
+    };
+    if literal_ip_from_host(host).is_some() {
+        // IP リテラルは validate_url_literal で検査済み。
+        return Ok(());
+    }
+
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addresses: Vec<IpAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| ToolError::execution_with_source("Failed to resolve URL host", e))?
+        .map(|socket| socket.ip())
+        .collect();
+
+    if addresses.is_empty() {
+        return Err(ToolError::ExecutionError(
+            "URL host resolved to no IP addresses".to_string(),
+        ));
+    }
+    if addresses.iter().any(ip_is_forbidden) {
+        return Err(forbidden_target_error(url));
+    }
+    Ok(())
+}
+
+/// フェッチ対象（初期 URL と各リダイレクト先）の完全な検証。
+async fn validate_url_target(url: &Url) -> Result<(), ToolError> {
+    validate_url_literal(url)?;
+    validate_resolved_host(url).await
 }
 
 #[async_trait]
@@ -86,6 +260,11 @@ impl Tool for WebFetchTool {
             ));
         }
 
+        let parsed_url = Url::parse(&url)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid URL: {e}")))?;
+        // 権限確認の前に SSRF 検証を行い、危険な宛先はユーザー承認対象にすらしない。
+        validate_url_target(&parsed_url).await?;
+
         ctx.ask_permission(
             crate::PermissionRequest::new("webfetch")
                 .with_pattern(&url)
@@ -106,7 +285,7 @@ impl Tool for WebFetchTool {
         };
 
         let response = tokio::select! {
-            result = self.fetch_with_retry(&url, accept_header, timeout_secs) => result,
+            result = self.fetch_with_retry(&parsed_url, accept_header, timeout_secs) => result,
             _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
                 return Err(ToolError::Timeout(format!("Request timed out after {} seconds", timeout_secs)));
             }
@@ -230,45 +409,72 @@ impl Tool for WebFetchTool {
 impl WebFetchTool {
     async fn fetch_with_retry(
         &self,
-        url: &str,
+        url: &Url,
         accept_header: &str,
         _timeout_secs: u64,
     ) -> Result<reqwest::Response, ToolError> {
-        let response = self
-            .client
-            .get(url)
-            .header("Accept", accept_header)
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .send()
-            .await
-            .map_err(|e| ToolError::execution_with_source("Failed to fetch URL", e))?;
+        let mut current = url.clone();
 
-        if response.status() == 403 {
-            let cf_mitigated = response
-                .headers()
-                .get("cf-mitigated")
-                .and_then(|v| v.to_str().ok());
+        for _ in 0..=MAX_REDIRECTS {
+            // 初期 URL は execute() で検証済み。リダイレクト先は追跡のたびに再検証する。
+            let mut response = self
+                .client
+                .get(current.clone())
+                .header("Accept", accept_header)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .send()
+                .await
+                .map_err(|e| ToolError::execution_with_source("Failed to fetch URL", e))?;
 
-            if cf_mitigated == Some("challenge") {
-                return self
-                    .client
-                    .get(url)
-                    .header("Accept", accept_header)
-                    .header("User-Agent", "opencode")
-                    .send()
-                    .await
-                    .map_err(|e| ToolError::execution_with_source("Failed to fetch URL", e));
+            if response.status() == 403 {
+                let cf_mitigated = response
+                    .headers()
+                    .get("cf-mitigated")
+                    .and_then(|v| v.to_str().ok());
+
+                if cf_mitigated == Some("challenge") {
+                    response = self
+                        .client
+                        .get(current.clone())
+                        .header("Accept", accept_header)
+                        .header("User-Agent", "opencode")
+                        .send()
+                        .await
+                        .map_err(|e| ToolError::execution_with_source("Failed to fetch URL", e))?;
+                }
             }
+
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        ToolError::ExecutionError(format!(
+                            "Redirect from '{current}' has no valid Location header"
+                        ))
+                    })?;
+                let next = current.join(location).map_err(|e| {
+                    ToolError::ExecutionError(format!("Invalid redirect URL '{location}': {e}"))
+                })?;
+                validate_url_target(&next).await?;
+                current = next;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                return Err(ToolError::ExecutionError(format!(
+                    "Request failed with status code: {}",
+                    response.status()
+                )));
+            }
+
+            return Ok(response);
         }
 
-        if !response.status().is_success() {
-            return Err(ToolError::ExecutionError(format!(
-                "Request failed with status code: {}",
-                response.status()
-            )));
-        }
-
-        Ok(response)
+        Err(ToolError::ExecutionError(format!(
+            "Exceeded maximum of {MAX_REDIRECTS} redirects"
+        )))
     }
 }
 
@@ -425,5 +631,122 @@ mod tests {
     fn convert_html_to_markdown_delegates_to_strip_html() {
         let html = "<div>text</div>";
         assert_eq!(convert_html_to_markdown(html), strip_html(html));
+    }
+
+    #[test]
+    fn ipv4_forbidden_ranges_are_rejected() {
+        for literal in [
+            "127.0.0.1",
+            "127.255.255.254",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "169.254.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "100.64.0.1",
+            "100.127.255.254",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.254",
+        ] {
+            let ip: IpAddr = literal.parse().unwrap();
+            assert!(ip_is_forbidden(&ip), "{literal} must be rejected");
+        }
+    }
+
+    #[test]
+    fn ipv4_public_addresses_are_allowed() {
+        for literal in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            // CGNAT は 100.64.0.0/10 のみ。前後の /8 は許可する。
+            "100.0.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            // multicast (224/4) と reserved (240/4) の直前まで許可する。
+            "223.255.255.255",
+        ] {
+            let ip: IpAddr = literal.parse().unwrap();
+            assert!(!ip_is_forbidden(&ip), "{literal} must be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_forbidden_ranges_and_embedded_ipv4_are_rejected() {
+        for literal in [
+            "::1",
+            "fc00::1",
+            "fd00::1",
+            "fe80::1",
+            "::",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "ff02::1",
+            // 6to4（2002::/16）の bits 16-47 に loopback / private を埋め込む。
+            "2002:7f00:1::",
+            "2002:a00:1::",
+            // Teredo（2001::/32）の末尾 32bit はクライアント IPv4 の反転値。
+            // 0x80ff:fffe -> 127.0.0.1
+            "2001:0:4136:e378:8000:63bf:80ff:fffe",
+            // bits 32-63 の Teredo サーバ IPv4 が loopback の場合も拒否する。
+            "2001:0:7f00:1:8000:63bf:c000:22d",
+        ] {
+            let ip: IpAddr = literal.parse().unwrap();
+            assert!(ip_is_forbidden(&ip), "{literal} must be rejected");
+        }
+    }
+
+    #[test]
+    fn ipv6_public_addresses_are_allowed() {
+        for literal in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "::ffff:8.8.8.8",
+            // Teredo でも埋め込み IPv4 とサーバ IPv4 が public なら許可する。
+            "2001:0:4136:e378:8000:63bf:c000:22d",
+        ] {
+            let ip: IpAddr = literal.parse().unwrap();
+            assert!(!ip_is_forbidden(&ip), "{literal} must be allowed");
+        }
+    }
+
+    #[test]
+    fn literal_ip_from_host_strips_ipv6_brackets() {
+        assert_eq!(
+            literal_ip_from_host("127.0.0.1"),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(
+            literal_ip_from_host("[::1]"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(literal_ip_from_host("example.com"), None);
+    }
+
+    #[test]
+    fn validate_url_literal_rejects_unsafe_targets_without_network() {
+        let cases = [
+            ("http://127.0.0.1/", true),
+            ("http://[::1]/", true),
+            ("http://169.254.169.254/latest/meta-data/", true),
+            ("http://[::ffff:192.168.1.1]/", true),
+            ("http://[2002:7f00:1::]/", true),
+            ("file:///etc/passwd", true),
+            ("https://example.com/", false),
+        ];
+        for (raw, should_reject) in cases {
+            let parsed = Url::parse(raw).unwrap();
+            assert_eq!(
+                validate_url_literal(&parsed).is_err(),
+                should_reject,
+                "unexpected validation result for {raw}"
+            );
+        }
     }
 }

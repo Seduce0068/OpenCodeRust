@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Metadata, PermissionRequest, Tool, ToolContext, ToolError, ToolResult};
+use crate::{
+    with_file_lock, Metadata, PermissionRequest, Tool, ToolContext, ToolError, ToolResult,
+};
 
 pub struct ApplyPatchTool;
 #[cfg(feature = "lsp")]
@@ -103,9 +105,11 @@ impl Tool for ApplyPatchTool {
         let mut total_diff = String::new();
 
         for file_patch in &file_patches {
-            let file_path = base_path.join(&file_patch.path);
-
+            // edit/tool.rs と同じく絶対パスはそのまま使い、相対パスのみ base_path に
+            // 結合する（PathBuf::join は絶対パスを採用するため意図を明示する）。
+            let file_path = resolve_patch_path(&base_path, &file_patch.path);
             let file_path_str = file_path.to_string_lossy().to_string();
+
             if ctx.is_external_path(&file_path_str) {
                 ctx.ask_permission(
                     PermissionRequest::new("external_directory").with_pattern(&file_path_str),
@@ -113,7 +117,37 @@ impl Tool for ApplyPatchTool {
                 .await?;
             }
 
-            let change = process_file_patch(&base_path, file_patch).await?;
+            // M-54: Move の移送先 (move_path) も移送元と同じく検証する。
+            // 未検証のまま `*** Move To: /etc/passwd` のようなパスを通すと、
+            // 書込みフェーズで project_root 外へ任意の内容を書き込める。
+            if let PatchOperation::Move { move_path } = &file_patch.operation {
+                let move_full_path = resolve_patch_path(&base_path, move_path);
+                let move_path_str = move_full_path.to_string_lossy().to_string();
+
+                // 移送先はまだ存在しないことが多い。is_external_path を直接使うと
+                // canonicalize 失敗が「外部」とみなされ正当な Move が拒否されるため、
+                // is_move_target_external で祖先の containment まで遡って判定する。
+                if is_move_target_external(&ctx, &move_full_path) {
+                    let parent = move_full_path
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| move_path_str.clone());
+                    ctx.ask_permission(
+                        PermissionRequest::new("external_directory")
+                            .with_pattern(format!("{}/*", parent))
+                            .with_metadata("filepath", serde_json::json!(&move_path_str))
+                            .with_metadata("parentDir", serde_json::json!(parent)),
+                    )
+                    .await?;
+                }
+            }
+
+            // 読取り・差分計算の間はファイルロックを保持し、外部変更との競合を
+            // process_file_patch 内の do_file_time_assert で検出する。
+            let change = with_file_lock(&file_path_str, || {
+                process_file_patch(&base_path, file_patch, &ctx)
+            })
+            .await?;
             total_diff.push_str(&change.diff);
             total_diff.push('\n');
             file_changes.push(change);
@@ -163,7 +197,7 @@ impl Tool for ApplyPatchTool {
         let mut lsp_targets: Vec<String> = Vec::new();
 
         for change in &file_changes {
-            let file_path = base_path.join(&change.relative_path);
+            let file_path = resolve_patch_path(&base_path, &change.relative_path);
 
             match change.operation {
                 PatchOperation::Add => {
@@ -183,6 +217,9 @@ impl Tool for ApplyPatchTool {
                                 e,
                             )
                         })?;
+                    // 書込み後の mtime を記録し、後続編集で誤った競合が出ないようにする。
+                    ctx.do_file_time_read(file_path.to_string_lossy().to_string())
+                        .await?;
                     updates.push((change.relative_path.clone(), "add".to_string()));
                     summary_lines.push(format!("A {}", change.relative_path));
                     edited_files.push(change.relative_path.clone());
@@ -197,6 +234,8 @@ impl Tool for ApplyPatchTool {
                                 e,
                             )
                         })?;
+                    ctx.do_file_time_read(file_path.to_string_lossy().to_string())
+                        .await?;
                     updates.push((change.relative_path.clone(), "change".to_string()));
                     summary_lines.push(format!("M {}", change.relative_path));
                     edited_files.push(change.relative_path.clone());
@@ -210,7 +249,8 @@ impl Tool for ApplyPatchTool {
                     summary_lines.push(format!("D {}", change.relative_path));
                 }
                 PatchOperation::Move { ref move_path } => {
-                    let move_full_path = base_path.join(move_path);
+                    // 検証フェーズと同じ解決結果を使い、検査したパスへ必ず書込む。
+                    let move_full_path = resolve_patch_path(&base_path, move_path);
                     if let Some(parent) = move_full_path.parent() {
                         tokio::fs::create_dir_all(parent).await.map_err(|e| {
                             ToolError::execution_with_source(
@@ -233,6 +273,9 @@ impl Tool for ApplyPatchTool {
                             e,
                         )
                     })?;
+                    // 移送先の mtime を記録する（移送元は削除済みのため記録しない）。
+                    ctx.do_file_time_read(move_full_path.to_string_lossy().to_string())
+                        .await?;
                     updates.push((change.relative_path.clone(), "unlink".to_string()));
                     updates.push((move_path.clone(), "add".to_string()));
                     summary_lines.push(format!("M {}", move_path));
@@ -293,6 +336,51 @@ impl Tool for ApplyPatchTool {
             metadata,
             truncated: false,
         })
+    }
+}
+
+/// パッチ内のパスを絶対パスへ解決する。
+///
+/// `PathBuf::join` は第 2 引数が絶対パスの場合に第 1 引数を破棄して採用するため、
+/// 「絶対パスはそのまま、相対パスは base_path に結合」という意図を明示する。
+/// `edit/tool.rs` / `write.rs` と同じ分岐を使う。
+fn resolve_patch_path(base_path: &Path, path: &str) -> PathBuf {
+    if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        base_path.join(path)
+    }
+}
+
+/// Move の移送先が project_root 外かどうかを判定する。
+///
+/// `ToolContext::is_external_path` は対象の `canonicalize()` が失敗すると
+/// （＝まだ存在しないパス）安全側として「外部」を返す。しかし Move の移送先は
+/// 通常まだ存在しないため、そのまま使うと project_root 内の新規ファイルへの
+/// 正当な Move まで `external_directory` 権限を要求し、deny 既定の
+/// PermissionBroker では拒否されてしまう（機能リグレッション）。
+///
+/// 存在しない場合は「存在する最も近い祖先」を `canonicalize()` して
+/// containment を判定する。祖先が見つからない／project_root 外なら安全側として
+/// 外部扱いにする。絶対パス・`..` を含むパス・シンボリックリンク脱出は、
+/// `is_external_path` 側の正規化＋components 比較で従来どおり検出される。
+fn is_move_target_external(ctx: &ToolContext, target: &Path) -> bool {
+    if target.exists() {
+        return ctx.is_external_path(&target.to_string_lossy());
+    }
+
+    let mut ancestor = target;
+    loop {
+        let Some(parent) = ancestor.parent() else {
+            return true;
+        };
+        if parent.as_os_str().is_empty() || parent == ancestor {
+            return true;
+        }
+        ancestor = parent;
+        if ancestor.exists() {
+            return ctx.is_external_path(&ancestor.to_string_lossy());
+        }
     }
 }
 
@@ -572,8 +660,9 @@ fn parse_model_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError> {
 async fn process_file_patch(
     base_path: &Path,
     file_patch: &FilePatch,
+    ctx: &ToolContext,
 ) -> Result<FileChange, ToolError> {
-    let file_path = base_path.join(&file_patch.path);
+    let file_path = resolve_patch_path(base_path, &file_patch.path);
     let relative_path = file_patch.path.clone();
 
     match file_patch.operation {
@@ -617,6 +706,13 @@ async fn process_file_patch(
                 ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
             })?;
 
+            // 既存ファイルを更新する前に、直近の read 時に記録した mtime と突き合わせて
+            // 外部からの並行変更（競合編集）を検出する。edit/tool.rs と同じ順序。
+            if file_path.exists() {
+                ctx.do_file_time_assert(file_path.to_string_lossy().to_string())
+                    .await?;
+            }
+
             let new_content = apply_hunks(&old_content, &file_patch.hunks)?;
 
             let diff = generate_diff(&relative_path, &old_content, &new_content);
@@ -633,6 +729,11 @@ async fn process_file_patch(
             let old_content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
                 ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
             })?;
+
+            if file_path.exists() {
+                ctx.do_file_time_assert(file_path.to_string_lossy().to_string())
+                    .await?;
+            }
 
             let diff = format!(
                 "--- a/{}\n+++ /dev/null\n{}",
@@ -943,5 +1044,188 @@ mod tests {
             move_path: "x".to_owned()
         }
         .is_add());
+    }
+
+    #[test]
+    fn resolve_patch_path_keeps_absolute_and_joins_relative() {
+        let base = Path::new("/project");
+        assert_eq!(
+            resolve_patch_path(base, "/etc/passwd"),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(
+            resolve_patch_path(base, "src/main.rs"),
+            base.join("src/main.rs")
+        );
+    }
+
+    fn recording_context(
+        directory: &Path,
+    ) -> (
+        ToolContext,
+        std::sync::Arc<std::sync::Mutex<Vec<PermissionRequest>>>,
+    ) {
+        let asks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let asks_cb = asks.clone();
+        let ctx = ToolContext::new(
+            "s".to_owned(),
+            "m".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+        .with_ask(move |request| {
+            let asks = asks_cb.clone();
+            async move {
+                asks.lock().unwrap().push(request);
+                Ok(())
+            }
+        });
+        (ctx, asks)
+    }
+
+    fn rename_patch(move_to: &str) -> String {
+        format!(
+            concat!(
+                "diff --git a/src.txt b/src.txt\n",
+                "rename from src.txt\n",
+                "rename to {}\n",
+                "--- a/src.txt\n",
+                "+++ b/src.txt\n",
+                "@@ -1 +1 @@\n",
+                "-old\n",
+                "+new\n"
+            ),
+            move_to
+        )
+    }
+
+    #[tokio::test]
+    async fn move_to_external_absolute_path_requests_external_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.txt"), "old\n").unwrap();
+
+        // project_root の外側（tmp 直下）への絶対パス Move。
+        let external = tmp.path().join("outside.txt");
+        let external_str = external.to_string_lossy().to_string();
+        let (ctx, asks) = recording_context(&root);
+
+        // コールバックは拒否せず記録するだけなので実行自体は成功し得るが、
+        // 検証対象は external_directory 権限が要求されたことのみ。
+        let _ = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patchText": rename_patch(&external_str) }),
+                ctx,
+            )
+            .await;
+
+        let asks = asks.lock().unwrap();
+        let external_ask = asks
+            .iter()
+            .find(|r| r.permission == "external_directory")
+            .unwrap_or_else(|| {
+                panic!(
+                    "move_path outside project_root must request external_directory: {:?}",
+                    asks.iter()
+                        .map(|r| r.permission.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            external_ask
+                .metadata
+                .get("filepath")
+                .and_then(|v| v.as_str()),
+            Some(external_str.as_str())
+        );
+        assert!(!external_ask.patterns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_to_internal_absolute_path_does_not_request_external_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.txt"), "old\n").unwrap();
+        // 移送先は意図的に作成しない（本番の Move と同じ状態）。
+
+        let internal_str = root.join("dst.txt").to_string_lossy().to_string();
+        let (ctx, asks) = recording_context(&root);
+
+        ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patchText": rename_patch(&internal_str) }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        let asks = asks.lock().unwrap();
+        assert!(
+            !asks.iter().any(|r| r.permission == "external_directory"),
+            "a non-existent destination inside project_root must not request external_directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("dst.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_to_internal_path_with_missing_parent_does_not_request_external_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.txt"), "old\n").unwrap();
+
+        // 親ディレクトリも存在しない移送先。祖先を辿って project_root に
+        // 到達できれば external_directory は要求されないはず。
+        let internal_str = root.join("newdir/dst.txt").to_string_lossy().to_string();
+        let (ctx, asks) = recording_context(&root);
+
+        ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patchText": rename_patch(&internal_str) }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        let asks = asks.lock().unwrap();
+        assert!(
+            !asks.iter().any(|r| r.permission == "external_directory"),
+            "a missing parent directory inside project_root must not request external_directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("newdir/dst.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_to_external_path_with_missing_parent_still_requests_external_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.txt"), "old\n").unwrap();
+
+        // project_root 外の存在しない親ディレクトリ配下への Move は
+        // フォールバック後も外部と判定され、権限が要求され続けること。
+        let external = tmp.path().join("outside/nested/dst.txt");
+        let external_str = external.to_string_lossy().to_string();
+        let (ctx, asks) = recording_context(&root);
+
+        let _ = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patchText": rename_patch(&external_str) }),
+                ctx,
+            )
+            .await;
+
+        let asks = asks.lock().unwrap();
+        assert!(
+            asks.iter().any(|r| r.permission == "external_directory"),
+            "a non-existent destination outside project_root must still request external_directory"
+        );
     }
 }
