@@ -62,11 +62,13 @@ status: current
   - pty／util／watcher／local-llm／codemode の 5 クレートが無依存（codemode は ADR-0006
     で既知の先送り）、server が portable-pty を直接依存し同名 PtyManager を再実装。配線または member 外し、
     server を opencode-pty 利用へ
-- [ ] **[M-04]** エラー型の残課題（source 付きバリアント追加は完了）
+- [ ] **[M-04]** エラー型の残課題（source 付きバリアント＋ tool 側 33 箇所は置換済み）
   - command の 3 メソッドと、ToolError/ProviderError の source 付きバリアント追加済み。
-    未対応は約 30 ファイルの呼び出し元（`map_err(|e| X(e.to_string()))`）を新コンストラクタへ
-    置換する作業（優先: tool の read/write/apply_patch/edit/bash/webfetch、provider 各ファイルの
-    reqwest 近傍）。新バリアントは_enum 非 non_exhaustive_ のため下流列挙には破壊的変更になりうる
+    2026-11-19 に opencode-tool の 12 ファイル 33 箇所を `execution_with_source` へ置換
+    （メッセージ不変・非対象は据え置き）。残存 `ExecutionError` 17 箇所は下位エラーが無い
+    固定文字列／StatusCode／別バリアント（InvalidArguments 等）。provider 側の
+    `InvalidArguments(e.to_string())`（serde_json）は未対応。新バリアントは
+    _enum 非 non_exhaustive_ のため下流列挙には破壊的変更になりうる
 - [ ] **[M-05]** Todo 状態の未配線（要確認、配線には他クレート変更が必須）
   - 事実確認済み（2026-11-18、todo-wire-worker）: 本番 update 0 件、todo_update/todo_get
     None。配線には ①session/prompt.rs へコールバック注入 API、②server.rs へ TodoManager
@@ -330,6 +332,8 @@ status: current
 - [x] **[M-11 一部]** TUI api(13)・context/app_context(14)・clipboard(7)
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-02 一部]** list_messages の snake_case 契約を双方向で固定
+  （2026-11-19、swarm-coding R1-R6）
+- [x] **[M-04 一部]** tool 12 ファイル 33 箇所を execution_with_source へ置換
   （2026-11-19、swarm-coding R1-R6）
 
 ## メモ
