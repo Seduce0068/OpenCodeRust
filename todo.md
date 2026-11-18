@@ -200,12 +200,16 @@ status: current
 - [ ] **[M-46]** /session/{id}/stream がエージェント・ツールなしの生 chat_stream
   - `routes.rs:1344-1355,1983-2051`。/prompt と応答品質・課金が異なる（confirmed）
 - [ ] **[M-47]** PermissionNext::evaluate がパターンを常に "*" で評価
-  - `agent/agent.rs:764-800`。個別パス権限が効かない（likely / R1-SV05）
-- [ ] **[M-48]** ツール結果から tool_call_id/name/is_error が失われる
-  - `agent/message.rs:77-89,134-143`。tool-use 会話の対応が壊れる（confirmed）
-- [ ] **[M-49]** retry ヘルパーが未配線で Retry-After も効かない
-  - `provider/retry.rs:145-205`。with_retry は定義・re-export のみで呼び出し 0 件、
-    delay にヘッダを渡さず固定バックオフ（confirmed / R1-SV03）
+  - `agent/agent.rs:119`。調査済み（2026-11-19、swarm-coding R2）: pattern は permission
+    カテゴリ内の対象を指す。現状 evaluate は tool_name しか受け取らず対象値を運べない。
+    推奨方針は `evaluate(agent, tool_name, pattern)` へ拡張し executor 側から args 由来の
+    対象を渡す（Option A）。呼び出し側波及と wildcard ルールの回帰確認が必要。
+- [ ] **[M-49]** provider の retry ヘルパーが未配線（削除方針）
+  - 調査済み（2026-11-19、swarm-coding R2）: 実行経路は `session/llm.rs:349-389` の
+    ループで、ヘッダ反映・CancellationToken・300s timeout を備える上位互換。
+    provider の `with_retry` はキャンセル不能・ヘッダ None 固定・既定 5 試行（session は 3）
+    で配線すると回帰するため、公開 API の参照確認のうえ削除する方針。
+    「Retry-After が効かない」は未配線ヘルパーのみで実行経路では正しくない。
 - [ ] **[M-50 残り]** FreeUsageLimitError が retry 対象のまま
   - `session/retry.rs:109-115`。response_body の文字列一致で検出し Some を返すため
     無料枠超過で最大試行回数まで無駄な待機。専用エラー型導入が必要（未対応）。
@@ -213,6 +217,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-48]** tool_result の ID 保持と tool_use の会話伝播
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-45 フォロー]** 残り 5 ハンドラの 501 化と CLI/TUI の整理
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-44 一部]** 復元時 total_cost を 0.0 に修正（2026-11-19、swarm-coding R1-R6）
