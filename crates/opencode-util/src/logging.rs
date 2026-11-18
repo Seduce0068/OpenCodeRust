@@ -404,3 +404,51 @@ pub fn init_tracing(level: Option<&str>, log_dir: Option<PathBuf>, print: bool) 
 
     Some(log_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 環境変数を書き換えずに、フォールバック経路の期待値を組み立てる。
+    ///
+    /// `RUST_LOG` の変更は並列実行中の他テストと衝突しうるため、ここでは
+    /// 現在値を読み取るだけにとどめ、`build_filter` と同じ規則
+    /// （未設定・不正値なら `info`）で期待値を導出する。
+    fn fallback_directive() -> String {
+        match std::env::var("RUST_LOG") {
+            Ok(value) => EnvFilter::try_new(&value)
+                .map(|filter| filter.to_string())
+                .unwrap_or_else(|_| "info".to_string()),
+            Err(_) => "info".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_filter_prefers_explicit_level_over_rust_log() {
+        let fallback = fallback_directive();
+        // 環境値と必ず異なる比較対象を選び、優先順位を明示的に検証する。
+        let explicit = if fallback == "debug" {
+            "trace"
+        } else {
+            "debug"
+        };
+
+        assert_ne!(fallback, explicit);
+        assert_eq!(build_filter(Some(explicit)).to_string(), explicit);
+        assert_eq!(build_filter(None).to_string(), fallback);
+    }
+
+    #[test]
+    fn build_filter_accepts_uppercase_level() {
+        assert_eq!(build_filter(Some("ERROR")).to_string(), "error");
+    }
+
+    #[test]
+    fn build_filter_falls_back_when_level_is_empty() {
+        let expected = fallback_directive();
+
+        assert_eq!(build_filter(Some("")).to_string(), expected);
+        assert_eq!(build_filter(Some("   ")).to_string(), expected);
+        assert_eq!(build_filter(None).to_string(), expected);
+    }
+}
