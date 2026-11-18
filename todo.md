@@ -321,9 +321,16 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI dialog(6)・message(12)・home(9)・markdown renderer(12)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI api(13)・context/app_context(14)・clipboard(7)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
+- 単一メッセージ応答のキー不一致（2026-11-18、swarm-coding R2-A が発見、未検証）:
+  `opencode-server/src/routes.rs:2264-2269` は `"sessionID"` / `"createdAt"` を返すが、
+  `tui/api.rs` の `MessageInfo` は `session_id`（alias は `sessionId` のみ）と
+  `created_at`（alias なし・必須 i64）を要求。当該 endpoint は `{"info", "parts"}`
+  形状で別契約のため即バグとは断定不可。M-02 / P-01 の parity 調査課題。
 - `PermissionType::from_permission_str`（2026-11-18、swarm-coding R2-C が発見、未修正）:
   `ExecuteCommand` / `NetworkRequest` に対応する arm が無く、これら 2 バリアントは
   直接構築でしか到達できない。サーバが `"execute_command"` 等を送る想定なら
