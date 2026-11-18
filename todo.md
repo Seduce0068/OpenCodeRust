@@ -26,6 +26,10 @@ status: current
 - [ ] **[H-01]** 秘密情報の平文保存（GitHub PAT）
   - `.env:1` に GitHub PAT が平文、`.envrc:1` の dotenv で direnv 自動ロード、copilot-auth.ts
     が `GITHUB_TOKEN` 参照。取り消し再発行し、リポジトリ外の秘密管理先へ移して dotenv を無効化する
+  - 関連（2026-11-19、combo-sv01/sv06）: `routes.rs:2858-2882` の GET /config マスキングは
+    provider 直下の api_key のみで models.*.apiKey / oauth.client_secret が露出しうる
+    （likely）。`config/loader.rs:383-408` のレガシー移行は {env:...} 展開済み秘密を
+    umask 依存の権限で書き出す（confirmed）。あわせて対処すること
 - [ ] **[H-03]** プラグイン subprocess bridge のサプライチェーン／信頼境界
   - `loader.rs:334-349` が未指定 npm spec に `*`、`:268-313` で install 実行、
     plugin-host.ts:403 が検証なし import、`$` ヘルパ／認証ヘッダ渡し fetch／Deno `--allow-all`。
@@ -160,6 +164,43 @@ status: current
     契約（`packages/protocol/src/groups/generate.ts:25-73`）あり。M-06 の具体化。
     text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
 
+### 優先度: 高（swarm review+discovery 2026-11-19）
+
+- [ ] **[H-15]** multiedit が権限確認なしでファイルを直接書き込む（critical）
+  - `tool/multiedit.rs:97,98,139` は `is_external_path` / `ask_permission` /
+    `do_file_time_assert` を一切呼ばず `base_path.join` へ直接 `fs::write`。edit/tool.rs
+    にはある。絶対パスでプロジェクト外を承認なしに上書き可能（confirmed / R1-SV04）
+- [ ] **[H-16]** NetworkErrorWithSource が再試行判定から漏れる
+  - `provider.rs:109-113` は WithSource を retryable と判定するが
+    `parse_api_call_error`（`:248-255`）は `NetworkError(_)` のみ拾い
+    `_ => (None,false)` に落ちる。M-04 の置換で実害化（confirmed / R1-SV03）
+- [ ] **[H-17]** 設定ローダーが JSONC パース前に {env:VAR} を生文字列置換
+  - `config/loader.rs:61,440,442`。値に引用符・改行があるとパース失敗／設定キー注入。
+    パース後に serde_json::Value として代入する方式へ（confirmed / R1-SV06）
+- [ ] **[H-18]** MCP notifications/initialized を id 付きリクエストとして送信
+  - `mcp/client.rs:607,499`。JSON-RPC notification は id を持たず応答も来ないため
+    準拠サーバで 30 秒タイムアウト。JsonRpcNotification で送信し応答待ちを削除（confirmed）
+- [ ] **[H-19]** MCP OAuth が RFC 8707 resource インジケーターを送信しない
+  - `mcp/discovery.rs:38,68` / `oauth.rs:295`。resource をパースするだけで
+    認可リクエストへ渡さず confused deputy に無防備（confirmed）
+- [ ] **[H-20]** FileSystemImpl がルート外への相対パス走査を検証しない
+  - `core/filesystem.rs:46-49,52-55`。`root.join(path)` のみで `../../etc/passwd` が読める。
+    canonicalize して root 配下を検証（confirmed / R1-SV05）
+- [ ] **[H-21]** サブセッションが親の disabled_tools を継承しない
+  - `agent/executor.rs:439-477,498-500`。tool 引数の agent_name/model で別エージェントを
+    選べ、禁止ツールを迂回。深さ上限も無し（confirmed / R1-SV05）
+- [ ] **[H-22]** Anthropic SSE の content_block_stop でストリームを終了させる
+  - `provider/stream.rs:297-298`。複数ブロックの 2 個目以降が届かない。message_stop のみ
+    Done とし、ブロック終了は TextEnd 等へ（confirmed / R1-SV03）
+- [ ] **[H-23]** Anthropic ツール入力デルタが常に空 ID で発行される
+  - `provider/stream.rs:279-283`。index→id 状態マップを持ち tool_use を対応付ける（confirmed）
+- [ ] **[H-24]** WebFetch が URL の http/https プレフィックスしか検証しない
+  - `tool/webfetch.rs:83,237,242`。127.0.0.1 / 169.254.169.254 等への SSRF が可能。
+    URL 解析＋IP 範囲拒否＋リダイレクト再検証（confirmed / R1-SV04）
+- [ ] **[H-25]** LSP の JSON-RPC 読み取りが Content-Length を使わない
+  - `lsp/lib.rs:233-259`。lines() で 1 行ずつ読み整形済み JSON や複数メッセージで
+    フレーミングが壊れ 30 秒 Timeout。ヘッダー＋read_exact 方式へ（confirmed）
+
 ### 優先度: 中（残タスク調査で追加）
 
 - [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
@@ -188,6 +229,38 @@ status: current
     v2 core credential/integration/location (G-09)、native ACP (G-11)、JS SDK (G-12)。
     出典は `docs/investigation-final-report.md` と `.cache/investigation/round3-upstream.md`。
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
+
+### 優先度: 中（swarm review+discovery 2026-11-19）
+
+- [ ] **[M-43]** PTY セッションが Exited/Error に遷移せず child も回収されない
+  - `server/pty.rs:124-158,212-223`。EOF 後も status=Running のまま、child.wait() 不在で
+    ゾンビ蓄積（confirmed / R1-SV01）
+- [ ] **[M-44]** ストレージ復元で summary/metadata が失われ total_cost にトークン数が入る
+  - `server.rs:588-627`。`/session/{id}/diff` が空になりコスト表示が壊れる（confirmed）
+- [ ] **[M-45]** 未実装ハンドラが 501 ではなく成功レスポンスを返す
+  - `routes.rs:2329-2351,2468-2496,3719-3721` 等。execute_shell / lsp status /
+    vcs 情報
+    等が固定値で success。501 化または実装（confirmed / R1-SV01）
+- [ ] **[M-46]** /session/{id}/stream がエージェント・ツールなしの生 chat_stream
+  - `routes.rs:1344-1355,1983-2051`。/prompt と応答品質・課金が異なる（confirmed）
+- [ ] **[M-47]** PermissionNext::evaluate がパターンを常に "*" で評価
+  - `agent/agent.rs:764-800`。個別パス権限が効かない（likely / R1-SV05）
+- [ ] **[M-48]** ツール結果から tool_call_id/name/is_error が失われる
+  - `agent/message.rs:77-89,134-143`。tool-use 会話の対応が壊れる（confirmed）
+- [ ] **[M-49]** retry ヘルパーが未配線で Retry-After も効かない
+  - `provider/retry.rs:145-205`。with_retry は定義・re-export のみで呼び出し 0 件、
+    delay にヘッダを渡さず固定バックオフ（confirmed / R1-SV03）
+- [ ] **[M-50]** 再試行がクレジット枯渇を対象とし retry-after に上限がない
+  - `session/retry.rs:40-95`。FreeUsageLimitError が Some を返し無駄な再試行、
+    ヘッダ由来遅延がクランプされない（confirmed / R1-SV05）
+- [ ] **[M-51]** キーバインド display_thinking / tool_details が未登録
+  - `tui/context/keybind.rs:156,213`。参照名と登録名が不一致でトグル到達不能（confirmed）
+- [ ] **[M-52]** API bool 応答を unwrap_or(true) で読み失敗を成功と報告
+  - `tui/api.rs:404,575,589,600,671`。削除・切断・認証解除の失敗が隠れる（confirmed）
+- [ ] **[M-53]** UTF-8 境界を無視したバイトスライスが多バイト文字で panic
+  - `tool/read.rs:377-378` / `truncation.rs:50-53`。外部ファイル内容で再現可能な DoS（confirmed）
+- [ ] **[M-54]** multiedit / apply_patch Move で外部パス検証と file_time_assert が欠落
+  - `apply_patch.rs:106-109,212-222`。競合編集検出も不可（confirmed / R1-SV04）
 
 ## 完了
 
@@ -341,6 +414,15 @@ status: current
 
 ## メモ
 
+- swarm review+discovery（2026-11-19）で採用見送った指摘:
+  - `external_directory.rs:61-72` の prefix 比較は誤検知（絶対パスは H-02 で
+    `Path::starts_with` のコンポーネント比較へ修正済み）。ただし相対パス `../` の
+    無条件許可は残存しており、H-02 のフォローアップ候補。
+  - `AgentSelectDialog::set_agents` の選択未リセット、`ThemeListDialog::new()` の
+    Some(0) 初期化は現挙動をテストで固定済みで実害なし（各 R2 エージェントの記録）。
+  - core `Bus` の未配線・削除判断（方針 A/B）は設計判断待ちのまま M-20 に記録済み。
+  - `/api` prefix（P-01）、generate（P-02）、upstream parity（P-07）は既存 todo と重複。
+  - performance / scale 系の指摘は測定根拠が無いため todo 化せず保留。
 - 単一メッセージ応答のキー不一致（2026-11-18 発見 → 2026-11-19 親がコード追跡で解消）:
   `routes.rs:2264-2269` の `get_message` は `"sessionID"` / `"createdAt"` の手組み
   JSON を返すが、TUI が呼ぶのは `list_messages`（routes.rs:1094、server 側 MessageInfo
