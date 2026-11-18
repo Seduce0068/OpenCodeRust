@@ -169,12 +169,11 @@ status: current
   - doc と MAPPING.md を実挙動へ修正済み: Auto は Legacy と同じ `"2025-11-25"`
     を送り、probe/fallback は未実装、新 revision は明示指定が必要。回帰テスト追加済み。
     未対応は probe 実装（opencode-mcp の initialize に retry ロジック追加、外部通信を伴う）
-- [ ] **[P-06]** upstream 新規設定キー `timezone` / `policies` / `worktree` が未対応
-  - upstream `packages/schema/src/config.ts:55,61,109`
-    （追加 2026-09〜10、MAPPING baseline より後）。
-    Rust `Config` (`opencode-config/src/schema.rs:4-124`) に同名字段なし。
-    `update` / `commands` / `plugins` の複数形キー (`config.ts:39,94,106`) も単数形フィールドと
-    不一致で捨てられる可能性（要 Runtime Proof）
+- [ ] **[P-06]** upstream 新規設定キー（timezone 対応、他は明記済み）
+  - `timezone` は型が確定（`Option<String>`）し追加済み、回帰テストあり。
+    `policies` / `worktree` は構造判明だが runtime 配線が scope 外、`update` / `commands` /
+    `plugins` は Rust 側と型不一致（alias すると parse 失敗）のため未対応。
+    全キーの型・出典・理由は MAPPING.md に明記済み。未対応はこれら実際の配線
 - [ ] **[P-07]** upstream 2026-08〜10 追加グループの parity ギャップ
   - artifacts (G-05)、persistent-pty (G-06)、websearch/rpc/migration/form/media (G-08)、
     v2 core credential/integration/location (G-09)、native ACP (G-11)、JS SDK (G-12)。
@@ -289,6 +288,9 @@ status: current
 - [x] **[P-05]** protocol Auto の実挙動を明記＋回帰テスト（2026-11-18、p05-worker）
 - [x] **[P-08]** ADR-0006 の参照と事実関係を修正（2026-11-18、p08-worker）
 - [x] **[M-11 一部]** util/logging.rs に build_filter の 3 テスト（2026-11-18、logging-test-worker）
+- [x] **[P-06]** timezone 追加と他キーの未対応を明記（2026-11-18、p06-worker）
+- [x] **[L-01 一部]** core/bus.rs に 8 テスト（L-01 の中核も検証）（2026-11-18、bus-test-worker）
+- [x] **[M-11 一部]** plugin/subprocess/mod.rs に 2 テスト（2026-11-18、plugin-subproc-test-worker）
 
 ## メモ
 

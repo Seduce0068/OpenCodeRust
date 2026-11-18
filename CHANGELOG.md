@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-18T16:45:11+09:00"
+  at: "2026-11-18T17:11:42+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 1198 件
+  テスト総数 594 → 1209 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 38.84% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 38.92% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -238,6 +238,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   旨を明記（同期維持の判断は不変）(P-08)
 - `opencode-util`: build_filter の level 優先／RUST_LOG fallback を検証する
   3 テストを追加（環境変数を変更せずフレーキ回避）(M-11)
+- `opencode-config`: upstream の `timezone` キーを追加し、他 5 キーの未対応を
+  MAPPING.md に明記（型不一致のため alias 見送り、権威 checkout を特定）(P-06)
+- `opencode-core`: bus.rs に 8 テストを追加（L-01 の中核であるコールバック内
+  subscribe のデッドロック回避を timeout 付きで検証）(L-01 一部)
+- `opencode-plugin`: subprocess/mod.rs に 13 種フック名変換の 2 テストを追加 (M-11)
 
 ## [0.1.0]
 

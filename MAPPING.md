@@ -114,6 +114,59 @@ legacy へ戻す挙動) は未実装で、`revision()` は `Legacy` と同じ
 イベント発行は未実装（capability も `tools.listChanged` のみを宣言）。
 未マッピングのキーも parse を失敗させない。
 
+### upstream 新規キーとキー名ズレ (2026-11-18, P-06)
+
+調査元は `.cache/investigation/round5-audit.md` が特定した upstream checkout
+`/home/koppe/ドキュメント/作業用/opencode` (branch `permission-path-match`、
+HEAD `9c7bc2f42f`、2026-10-31) の `packages/schema/src/config.ts`。
+MAPPING baseline (`941e71d`) とは異なる checkout である点に注意。
+
+| upstream キー | upstream 型 | Rust 側の状況 |
+| --- | --- | --- |
+| `timezone` (`:55`) | `String?` | 追加済み (`Option<String>`) |
+| `policies` (`:61`) | `ConfigPolicy.Info[]` | 未対応 (破棄) |
+| `worktree` (`:109`) | `ConfigWorktree.Info` | 未対応 (破棄) |
+| `update` (`:39`) | 3 リテラル | 未対応 (`autoupdate` 不一致) |
+| `commands` (`:94`) | `Record<String, Cmd.Info>` | 未対応 (alias せず) |
+| `plugins` (`:106`) | string または object[] | 未対応 (`Vec<String>` 不一致) |
+
+`timezone` 以外はすべて未知キーとして warn のうえ破棄される。`plugins` の
+object 要素は `{package: String, options?: Record<String, unknown>}`、
+`update` の 3 リテラルは `disable` / `notify` / `auto` である。
+
+追加コミットは `timezone` が `4585c316c3` (2026-10-28)、`policies` が
+`f576da508d` (2026-10-13)、`worktree` が `c30285c148` (2026-09-04) で、
+いずれも MAPPING baseline より後 (git log で確認)。
+
+`timezone` は upstream の記述が "IANA time zone for schedules" で型・意味が
+自明なため、`Config.timezone: Option<String>` として追加し
+`known_config_keys()` にも登録した。runtime 消費箇所は現時点で 0 件。
+
+`policies` は同 checkout でトップレベルへ昇格しており、要素は
+`{action, resource, effect}` (`action` は `provider.use` / `tool.use` /
+`integration.connect` / `integration.use` / `mcp.use` / `skill.use` /
+`plugin.use`、`effect` は `allow` / `deny`) と、legacy resource 変換を伴う。
+Rust の `permissions` (tool permission rules) とは意味が異なるため流用しない。
+`worktree` は `{directory: String}` (非空・trim) のみ。両者は構造を確認済みだが
+runtime 配線は本タスクの scope 外のため、フィールド追加は行わず未対応とする。
+
+alias を見送った理由:
+
+- `update`: Rust の `autoupdate` は `bool` または `String` の untagged enum
+  (`AutoUpdateMode`)。upstream の 3 リテラルをそのまま受けると `disable` も
+  `notify` も `Notify(String)` として解釈され意味が変わる。
+- `plugins`: upstream は string または `{package, options}` オブジェクトの
+  配列。`plugin: Vec<String>` に alias すると object 要素で parse が失敗し、
+  「起動を止めない」互換方針に反する。
+- `commands`: 型は近いが upstream の `subagent` 等を落とすため、ここでは
+  alias を追加せず現状を明記するのみとする。
+
+Runtime Proof: `schema.rs` の
+`parses_timezone_and_discards_unmapped_upstream_keys` により、上記 6 キーを
+含む JSON が parse 成功し、`timezone` のみ保持されて他は破棄されることを
+確認済み。loader は未知キー名のみ warn し、値はログに出さない
+(`crates/opencode-config/src/loader.rs:538-548`)。
+
 ### 未配線の設定フィールド (2026-11-18)
 
 `Config` (`crates/opencode-config/src/schema.rs`) の下記フィールドは
