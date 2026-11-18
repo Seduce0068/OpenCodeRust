@@ -367,3 +367,618 @@ fn format_session_time(updated_at_ms: i64) -> (String, String) {
 
     (category, updated_local.format("%H:%M").to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        // ratatui-core の Buffer は Display を実装しないため cell() で走査する。
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// テスト用 SessionItem を構築するヘルパー。
+    fn session(
+        id: &str,
+        title: &str,
+        directory: &str,
+        parent_id: Option<&str>,
+        updated_at: i64,
+        is_busy: bool,
+    ) -> SessionItem {
+        SessionItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            directory: directory.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            updated_at,
+            is_busy,
+        }
+    }
+
+    /// 更新時刻降順に並ぶ 3 件のトップレベルセッションを返すヘルパー。
+    fn sample_sessions() -> Vec<SessionItem> {
+        vec![
+            session("s1", "Alpha", "/proj/alpha", None, 1_700_000_000_000, false),
+            session("s2", "Beta", "/proj/beta", None, 1_700_000_060_000, true),
+            session("s3", "Gamma", "/proj/gamma", None, 1_700_000_120_000, false),
+        ]
+    }
+
+    /// セッションを設定して開いたダイアログを返すヘルパー。
+    fn opened_dialog() -> SessionListDialog {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(None);
+        dialog
+    }
+
+    // --- SessionItem データ保持 ---
+
+    #[test]
+    fn session_stores_all_fields() {
+        let item = session(
+            "s1",
+            "Alpha",
+            "/proj/alpha",
+            Some("parent"),
+            1_700_000_000_000,
+            true,
+        );
+
+        assert_eq!(item.id, "s1");
+        assert_eq!(item.title, "Alpha");
+        assert_eq!(item.directory, "/proj/alpha");
+        assert_eq!(item.parent_id.as_deref(), Some("parent"));
+        assert_eq!(item.updated_at, 1_700_000_000_000);
+        assert!(item.is_busy);
+    }
+
+    #[test]
+    fn session_allows_missing_parent_and_idle_state() {
+        let item = session("s2", "Beta", "/proj/beta", None, 1_700_000_060_000, false);
+
+        assert_eq!(item.id, "s2");
+        assert!(item.parent_id.is_none());
+        assert!(!item.is_busy);
+    }
+
+    #[test]
+    fn session_clone_preserves_all_fields() {
+        let original = session(
+            "s3",
+            "Gamma",
+            "/proj/gamma",
+            Some("root"),
+            1_700_000_120_000,
+            true,
+        );
+
+        let cloned = original.clone();
+
+        assert_eq!(cloned.id, original.id);
+        assert_eq!(cloned.title, original.title);
+        assert_eq!(cloned.directory, original.directory);
+        assert_eq!(cloned.parent_id, original.parent_id);
+        assert_eq!(cloned.updated_at, original.updated_at);
+        assert_eq!(cloned.is_busy, original.is_busy);
+    }
+
+    // --- DeleteState ---
+
+    #[test]
+    fn delete_state_keeps_armed_and_confirmed_payload() {
+        let armed = DeleteState::Armed("s1".to_string());
+        let confirmed = DeleteState::Confirmed("s2".to_string());
+
+        assert!(matches!(armed, DeleteState::Armed(id) if id == "s1"));
+        assert!(matches!(confirmed, DeleteState::Confirmed(id) if id == "s2"));
+    }
+
+    #[test]
+    fn delete_state_clone_preserves_variant_and_id() {
+        let original = DeleteState::Armed("s3".to_string());
+
+        let cloned = original.clone();
+
+        assert!(matches!(cloned, DeleteState::Armed(id) if id == "s3"));
+        assert!(matches!(original, DeleteState::Armed(id) if id == "s3"));
+    }
+
+    // --- new / Default ---
+
+    #[test]
+    fn new_starts_empty_and_closed() {
+        let dialog = SessionListDialog::new();
+
+        assert!(!dialog.is_open());
+        assert!(dialog.query().is_empty());
+        assert!(!dialog.is_renaming());
+        // new() は選択を Some(0) にするが filtered は空なので実セッションは無い。
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    #[test]
+    fn default_matches_new() {
+        let dialog = SessionListDialog::default();
+
+        assert!(!dialog.is_open());
+        assert!(dialog.query().is_empty());
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    // --- set_sessions ---
+
+    #[test]
+    fn set_sessions_sorts_by_updated_at_descending() {
+        let mut dialog = SessionListDialog::new();
+
+        dialog.set_sessions(sample_sessions());
+
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn set_sessions_excludes_child_sessions() {
+        let mut dialog = SessionListDialog::new();
+        let mut sessions = sample_sessions();
+        sessions.push(session(
+            "s3-child",
+            "Child",
+            "/proj/child",
+            Some("s3"),
+            1_800_000_000_000,
+            false,
+        ));
+
+        dialog.set_sessions(sessions);
+
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+        dialog.move_down();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+        dialog.move_down();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+        dialog.move_down();
+        // 子セッションは filtered に含まれないため末尾でクランプされる。
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn set_sessions_replaces_existing_sessions() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+
+        dialog.set_sessions(vec![session("x1", "Only", "/only", None, 1, false)]);
+
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("x1"));
+        dialog.move_down();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("x1"));
+    }
+
+    #[test]
+    fn set_sessions_can_clear_sessions_and_selection() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        assert!(dialog.selected_session_id().is_some());
+
+        dialog.set_sessions(Vec::new());
+
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    // --- open / close / is_open ---
+
+    #[test]
+    fn open_sets_open_state_and_selects_first_session() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        assert!(!dialog.is_open());
+
+        dialog.open(None);
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn open_selects_current_session() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+
+        dialog.open(Some("s1"));
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.state.selected(), Some(2));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+        assert_eq!(dialog.active_session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn open_with_unknown_current_session_falls_back_to_first() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+
+        dialog.open(Some("missing"));
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+        assert_eq!(dialog.active_session_id.as_deref(), Some("missing"));
+    }
+
+    #[test]
+    fn open_without_sessions_selects_none() {
+        let mut dialog = SessionListDialog::new();
+
+        dialog.open(None);
+
+        assert!(dialog.is_open());
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    #[test]
+    fn open_clears_query_pending_delete_and_rename() {
+        let mut dialog = opened_dialog();
+        dialog.handle_input('b');
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s2"
+        ));
+        assert!(dialog.start_rename_selected());
+        assert!(dialog.is_renaming());
+
+        dialog.open(None);
+
+        assert!(dialog.is_open());
+        assert!(dialog.query().is_empty());
+        assert!(!dialog.is_renaming());
+        // pending delete がクリアされているので再び Armed から始まる。
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+    }
+
+    #[test]
+    fn close_clears_open_and_transient_state_but_keeps_data() {
+        let mut dialog = opened_dialog();
+        dialog.handle_input('g');
+        assert!(dialog.trigger_delete_selected().is_some());
+        assert!(dialog.start_rename_selected());
+        assert!(dialog.is_open());
+
+        dialog.close();
+
+        assert!(!dialog.is_open());
+        assert!(!dialog.is_renaming());
+        // close() は query を消さない。
+        assert_eq!(dialog.query(), "g");
+        assert!(dialog.selected_session_id().is_some());
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+    }
+
+    #[test]
+    fn open_close_cycles_toggle_state() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+
+        for _ in 0..3 {
+            dialog.open(None);
+            assert!(dialog.is_open());
+            dialog.close();
+            assert!(!dialog.is_open());
+        }
+    }
+
+    #[test]
+    fn close_is_idempotent_from_new() {
+        let mut dialog = SessionListDialog::new();
+
+        dialog.close();
+        dialog.close();
+
+        assert!(!dialog.is_open());
+        assert_eq!(dialog.state.selected(), Some(0));
+    }
+
+    // --- 選択状態遷移 ---
+
+    #[test]
+    fn move_down_advances_selection() {
+        let mut dialog = opened_dialog();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+
+        dialog.move_down();
+
+        assert_eq!(dialog.state.selected(), Some(1));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn move_down_clamps_at_last_item() {
+        let mut dialog = opened_dialog();
+
+        for _ in 0..10 {
+            dialog.move_down();
+        }
+
+        assert_eq!(dialog.state.selected(), Some(2));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn move_up_moves_back_and_clamps_at_zero() {
+        let mut dialog = opened_dialog();
+        dialog.move_down();
+        dialog.move_down();
+        assert_eq!(dialog.state.selected(), Some(2));
+
+        dialog.move_up();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+        dialog.move_up();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+        dialog.move_up();
+        assert_eq!(dialog.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn move_up_and_move_down_are_noop_without_selection() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(Vec::new());
+        assert_eq!(dialog.state.selected(), None);
+
+        dialog.move_up();
+        dialog.move_down();
+
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    #[test]
+    fn move_down_before_data_is_set_stays_clamped() {
+        let mut dialog = SessionListDialog::new();
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(dialog.selected_session_id().is_none());
+
+        dialog.move_down();
+        dialog.move_down();
+
+        // new() 直後は選択が Some(0) だが filtered が空のため移動しない（直近ラウンドで失敗したパターン）。
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    #[test]
+    fn move_down_with_empty_items_stays_none() {
+        let mut dialog = SessionListDialog::new();
+        dialog.open(None);
+        assert_eq!(dialog.state.selected(), None);
+
+        dialog.move_down();
+
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    // --- 削除状態遷移 ---
+
+    #[test]
+    fn trigger_delete_selected_returns_armed_first() {
+        let mut dialog = opened_dialog();
+
+        let state = dialog.trigger_delete_selected();
+
+        assert!(matches!(state, Some(DeleteState::Armed(id)) if id == "s3"));
+    }
+
+    #[test]
+    fn trigger_delete_selected_returns_confirmed_on_second_call() {
+        let mut dialog = opened_dialog();
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+
+        let state = dialog.trigger_delete_selected();
+        assert!(matches!(state, Some(DeleteState::Confirmed(id)) if id == "s3"));
+
+        // confirmed で pending が消えるため 3 回目は Armed に戻る。
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+    }
+
+    #[test]
+    fn trigger_delete_selected_uses_currently_selected_session() {
+        let mut dialog = opened_dialog();
+        dialog.move_down();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+
+        let state = dialog.trigger_delete_selected();
+
+        assert!(matches!(state, Some(DeleteState::Armed(id)) if id == "s2"));
+    }
+
+    #[test]
+    fn trigger_delete_selected_is_none_without_selection() {
+        let mut dialog = SessionListDialog::new();
+        assert!(dialog.trigger_delete_selected().is_none());
+
+        dialog.set_sessions(Vec::new());
+        assert!(dialog.trigger_delete_selected().is_none());
+    }
+
+    #[test]
+    fn selection_change_resets_pending_delete() {
+        let mut dialog = opened_dialog();
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+
+        dialog.move_down();
+
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s2"
+        ));
+    }
+
+    #[test]
+    fn pending_delete_survives_move_down_at_last_item() {
+        let mut dialog = opened_dialog();
+        dialog.move_down();
+        dialog.move_down();
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s1"
+        ));
+
+        // 末尾では選択が動かないため pending delete は維持される。
+        dialog.move_down();
+
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Confirmed(id)) if id == "s1"
+        ));
+    }
+
+    #[test]
+    fn query_input_resets_pending_delete() {
+        let mut dialog = opened_dialog();
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+
+        dialog.handle_input('b');
+        assert_eq!(dialog.query(), "b");
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s2"
+        ));
+    }
+
+    #[test]
+    fn backspace_resets_pending_delete_and_filter() {
+        let mut dialog = opened_dialog();
+        dialog.handle_input('b');
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s2"
+        ));
+
+        dialog.handle_backspace();
+
+        assert!(dialog.query().is_empty());
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+    }
+
+    // --- render ---
+
+    #[test]
+    fn render_when_closed_draws_nothing() {
+        let mut dialog = opened_dialog();
+        dialog.close();
+        let theme = Theme::default();
+        assert!(!dialog.is_open());
+
+        let text = render_to_string(100, 30, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 100, 30), &theme);
+        });
+
+        assert!(
+            text.trim().is_empty(),
+            "closed session dialog must not draw any content"
+        );
+    }
+
+    #[test]
+    fn render_when_open_shows_sessions_and_controls() {
+        let dialog = opened_dialog();
+        let theme = Theme::default();
+
+        let text = render_to_string(100, 30, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 100, 30), &theme);
+        });
+
+        assert!(text.contains("Sessions"), "dialog title");
+        assert!(text.contains("Alpha"), "first session title");
+        assert!(text.contains("Beta"), "second session title");
+        assert!(text.contains("Gamma"), "third session title");
+        assert!(text.contains("ctrl+d"), "delete hint");
+        assert!(text.contains("open session"), "open hint");
+    }
+
+    #[test]
+    fn render_shows_pending_delete_hint() {
+        let mut dialog = opened_dialog();
+        assert!(matches!(
+            dialog.trigger_delete_selected(),
+            Some(DeleteState::Armed(id)) if id == "s3"
+        ));
+        let theme = Theme::default();
+
+        let text = render_to_string(100, 30, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 100, 30), &theme);
+        });
+
+        assert!(text.contains("Press ctrl+d again to confirm delete"));
+        assert!(
+            !text.contains("Gamma"),
+            "pending row hides the original title"
+        );
+    }
+
+    #[test]
+    fn render_marks_current_session() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s2"));
+        let theme = Theme::default();
+
+        let text = render_to_string(100, 30, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 100, 30), &theme);
+        });
+
+        assert!(text.contains("●"), "current session marker");
+    }
+}
