@@ -28,3 +28,10 @@ jobs:
       #（共通ワークフローの locked 既定値も true のため挙動は不変）
       locked: true
       audit: true
+      # unsafe ブロックを lint で検出したらビルド失敗（workspace lint の
+      # unsafe_code = "deny" に加え、clippy 側でも二重に担保する）
+      clippy_args: -D clippy::undocumented_unsafe_blocks
+      # 既定ゲートはデフォルト feature のみ。all-features（例: opencode-lsp の
+      # feature 追加で 591→899 行の差分）も CI で検証する。
+      extra_gates: |
+        cargo check --workspace --all-features --all-targets --locked

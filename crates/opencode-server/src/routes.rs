@@ -3628,47 +3628,57 @@ async fn find_text(Query(query): Query<FindTextQuery>) -> Result<Json<Vec<Search
         .path
         .unwrap_or_else(|| root.to_string_lossy().to_string());
     let base_path = resolve_input_path(&base_input, &root)?;
-    let mut results = Vec::new();
+    let pattern = query.pattern;
 
-    fn search_in_file(path: &std::path::Path, pattern: &str, results: &mut Vec<SearchResult>) {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for (line_num, line) in content.lines().enumerate() {
-                if let Some(col) = line.find(pattern) {
-                    results.push(SearchResult {
-                        path: path.to_string_lossy().to_string(),
-                        line: line_num + 1,
-                        column: col + 1,
-                        match_text: line.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    fn search_recursive(
-        path: &FsPath,
-        root: &FsPath,
-        pattern: &str,
-        results: &mut Vec<SearchResult>,
-    ) {
-        if path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let path_buf = entry.path();
-                    if !is_within_root(&path_buf, root) {
-                        continue;
-                    }
-                    if path_buf.is_dir() {
-                        search_recursive(&path_buf, root, pattern, results);
-                    } else if path_buf.is_file() {
-                        search_in_file(&path_buf, pattern, results);
+    // 再帰走査とファイル読み取りは同期 I/O なので、所有値を move したクロージャを
+    // spawn_blocking に逃がし、tokio ワーカーを占有しないようにする
+    // （grep_tool.rs の採用前例に準拠）。ApiError / SearchResult は Send + 'static。
+    let results = tokio::task::spawn_blocking(move || {
+        fn search_in_file(path: &std::path::Path, pattern: &str, results: &mut Vec<SearchResult>) {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for (line_num, line) in content.lines().enumerate() {
+                    if let Some(col) = line.find(pattern) {
+                        results.push(SearchResult {
+                            path: path.to_string_lossy().to_string(),
+                            line: line_num + 1,
+                            column: col + 1,
+                            match_text: line.to_string(),
+                        });
                     }
                 }
             }
         }
-    }
 
-    search_recursive(&base_path, &root, &query.pattern, &mut results);
+        fn search_recursive(
+            path: &FsPath,
+            root: &FsPath,
+            pattern: &str,
+            results: &mut Vec<SearchResult>,
+        ) {
+            if path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let path_buf = entry.path();
+                        if !is_within_root(&path_buf, root) {
+                            continue;
+                        }
+                        if path_buf.is_dir() {
+                            search_recursive(&path_buf, root, pattern, results);
+                        } else if path_buf.is_file() {
+                            search_in_file(&path_buf, pattern, results);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        search_recursive(&base_path, &root, &pattern, &mut results);
+        results
+    })
+    .await
+    .map_err(|e| ApiError::InternalError(format!("find_text scan task failed: {}", e)))?;
+
     Ok(Json(results))
 }
 
@@ -3682,39 +3692,48 @@ pub struct FindFilesQuery {
 
 async fn find_files(Query(query): Query<FindFilesQuery>) -> Result<Json<Vec<String>>> {
     let base_path = project_root()?;
-    let mut results = Vec::new();
     let limit = query.limit.unwrap_or(100);
+    let name_query = query.query;
 
-    fn find_recursive(
-        path: &FsPath,
-        root: &FsPath,
-        query: &str,
-        results: &mut Vec<String>,
-        limit: usize,
-    ) {
-        if results.len() >= limit {
-            return;
-        }
-        if path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let path_buf = entry.path();
-                    if !is_within_root(&path_buf, root) {
-                        continue;
-                    }
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.contains(query) {
-                        results.push(path_buf.to_string_lossy().to_string());
-                    }
-                    if path_buf.is_dir() && results.len() < limit {
-                        find_recursive(&path_buf, root, query, results, limit);
+    // 再帰走査は同期 I/O なので spawn_blocking に逃がす。打ち切り条件
+    // （results.len() >= limit / results.len() < limit）と出力順はそのまま維持。
+    let results = tokio::task::spawn_blocking(move || {
+        fn find_recursive(
+            path: &FsPath,
+            root: &FsPath,
+            query: &str,
+            results: &mut Vec<String>,
+            limit: usize,
+        ) {
+            if results.len() >= limit {
+                return;
+            }
+            if path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let path_buf = entry.path();
+                        if !is_within_root(&path_buf, root) {
+                            continue;
+                        }
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.contains(query) {
+                            results.push(path_buf.to_string_lossy().to_string());
+                        }
+                        if path_buf.is_dir() && results.len() < limit {
+                            find_recursive(&path_buf, root, query, results, limit);
+                        }
                     }
                 }
             }
         }
-    }
 
-    find_recursive(&base_path, &base_path, &query.query, &mut results, limit);
+        let mut results = Vec::new();
+        find_recursive(&base_path, &base_path, &name_query, &mut results, limit);
+        results
+    })
+    .await
+    .map_err(|e| ApiError::InternalError(format!("find_files scan task failed: {}", e)))?;
+
     Ok(Json(results))
 }
 

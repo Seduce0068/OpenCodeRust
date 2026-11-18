@@ -15,11 +15,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::trace::TraceLayer;
-use tracing::Instrument;
+use tower_http::trace::{OnResponse, TraceLayer};
+use tracing::{Instrument, Span};
 use url::Url;
 use uuid::Uuid;
 
@@ -42,6 +43,9 @@ use crate::pty::PtyManager;
 use crate::routes;
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
+
+/// `x-request-id` ヘッダ値の最大長（文字数）。超過分は先頭のみ採用する。
+const MAX_REQUEST_ID_LEN: usize = 128;
 
 fn generate_auth_token() -> String {
     use base64::Engine;
@@ -961,11 +965,55 @@ fn is_extra_allowed_origin_exact(origin: &str) -> bool {
     }
 }
 
-/// `/session/{id}/...` パスから session id を取り出す。
+/// `/session/{id}/...` および `/api/session/{id}/...` パスから session id を取り出す。
+///
+/// P-01 の `/api` エイリアス経由リクエストでも session id がスパンへ記録されるよう
+/// `/api/session/` を優先して照合し、従来の `/session/` も維持する。
 fn session_id_from_path(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/session/")?;
+    let rest = path
+        .strip_prefix("/api/session/")
+        .or_else(|| path.strip_prefix("/session/"))?;
     let id = rest.split('/').next().unwrap_or_default();
     (!id.is_empty()).then_some(id)
+}
+
+/// `x-request-id` ヘッダ値をログ安全な形式へ正規化する。
+///
+/// 制御文字を除去し前後の空白を落としたうえで最大 `MAX_REQUEST_ID_LEN` 文字へ
+/// 切り詰める。空になった場合は `None` を返し、呼び出し側で UUID を生成する。
+fn sanitize_request_id(raw: &str) -> Option<String> {
+    let without_controls: String = raw.chars().filter(|ch| !ch.is_control()).collect();
+    let cleaned = without_controls.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.chars().take(MAX_REQUEST_ID_LEN).collect())
+}
+
+/// レスポンス完了時に status / latency / outcome をリクエストスパンへ記録する。
+#[derive(Clone, Debug)]
+struct RequestCompletionLog;
+
+impl<B> OnResponse<B> for RequestCompletionLog {
+    fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
+        let status = response.status();
+        let outcome = if status.is_server_error() {
+            "server_error"
+        } else if status.is_client_error() {
+            "client_error"
+        } else if status.is_redirection() {
+            "redirect"
+        } else {
+            "success"
+        };
+        tracing::info!(
+            parent: span,
+            status = status.as_u16(),
+            latency_ms = latency.as_millis() as u64,
+            outcome = outcome,
+            "http_request completed"
+        );
+    }
 }
 
 /// リクエストごとの構造化スパンを生成し、request id / session id をログ文脈に伝播させる。
@@ -976,8 +1024,7 @@ async fn request_span_middleware(request: Request<axum::body::Body>, next: Next)
         .headers()
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .and_then(sanitize_request_id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let session_id = session_id_from_path(request.uri().path()).map(str::to_owned);
     let method = request.method().clone();
@@ -1077,7 +1124,7 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
              next: Next| async move { auth_middleware(state, request, next).await },
         ))
         .layer(cors_layer())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().on_response(RequestCompletionLog))
         .layer(middleware::from_fn(request_span_middleware))
         .with_state(state);
 
@@ -1111,7 +1158,7 @@ pub async fn run_server_with_state(
              next: Next| async move { auth_middleware(state, request, next).await },
         ))
         .layer(cors_layer())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().on_response(RequestCompletionLog))
         .layer(middleware::from_fn(request_span_middleware))
         .with_state(state);
 
@@ -1139,6 +1186,45 @@ mod tests {
         assert_eq!(session_id_from_path("/session"), None);
         assert_eq!(session_id_from_path("/health"), None);
         assert_eq!(session_id_from_path("/session//message"), None);
+    }
+
+    #[test]
+    fn session_id_from_path_extracts_api_alias_session_routes() {
+        assert_eq!(
+            session_id_from_path("/api/session/abc-123/message"),
+            Some("abc-123")
+        );
+        assert_eq!(
+            session_id_from_path("/api/session/abc-123"),
+            Some("abc-123")
+        );
+        assert_eq!(session_id_from_path("/api/session"), None);
+        assert_eq!(session_id_from_path("/api/session//message"), None);
+        assert_eq!(session_id_from_path("/api/health"), None);
+    }
+
+    #[test]
+    fn sanitize_request_id_removes_controls_and_bounds_length() {
+        let long_id = format!("req-{}-id", "x".repeat(200));
+        let with_controls = format!("  {}\n\r\u{0000}  ", long_id);
+        let sanitized = sanitize_request_id(&with_controls).expect("non-empty request id");
+        assert_eq!(sanitized.chars().count(), MAX_REQUEST_ID_LEN);
+        assert!(sanitized.chars().all(|ch| !ch.is_control()));
+        assert_eq!(
+            sanitized,
+            long_id.chars().take(MAX_REQUEST_ID_LEN).collect::<String>()
+        );
+
+        assert_eq!(
+            sanitize_request_id("ab\ncd\tef"),
+            Some("abcdef".to_string())
+        );
+        assert_eq!(
+            sanitize_request_id("plain-id"),
+            Some("plain-id".to_string())
+        );
+        assert_eq!(sanitize_request_id("  "), None);
+        assert_eq!(sanitize_request_id("\n\r\u{0000}"), None);
     }
 
     fn state_with_repos(
