@@ -35,10 +35,6 @@ status: current
     `@modelcontextprotocol/server-devtools` と `server-playwright` が公式 npm で
     404（パッケージ不在）のため固定不能。代替（`@playwright/mcp` 等）の選定、
     lockfile 生成、CI npm スキャン対象化）
-- [ ] **[H-07]** マイグレーションの完全統一（schema/user_version は対応済み、残りに絞る）
-  - `Storage::migrate()` は schema.rs の ALL_MIGRATIONS 経路へ統一済み。未対応は
-    SCHEMA_VERSION / user_version の共有（database.rs に pub(crate) の migrate_pool を
-    切り出すリファクタ）と runbook 化
 - [ ] **[H-10]** セッション永続化の並行制御（トランザクション化は対応済み）
   - 移行と delete+create（`replace_for_session`）は原子化済み。未対応は単一ライタ
     persist キュー、session_repo.update/create とメッセージ置換の同一トランザクション化、
@@ -118,9 +114,9 @@ status: current
 - [ ] **[L-07]** 依存 feature の過剰指定
   - `Cargo.toml:49,83` が tokio／hyper に `full`、opencode-lsp が重複指定、plugin
     の使用は限定的（ビルド面増大は推測）。 使用中の feature のみに絞る
-- [ ] **[L-08]** 公開 API ドキュメント欠落（ADR-0007 既知の先送り）（要確認）
-  - 5,604 件を見送る ADR-0007 の一方、types／core が `//!` なし、19 クレートの lib.rs
-    先頭もなし（「矛盾」は解釈次第）。段階対象として types／core から `///`／`//!` を付与し ADR 進捗表を更新
+- [ ] **[L-08]** 公開 API ドキュメント欠落（types/core の第1段は対応済み）
+  - types/core の `//!` と主要 pub mod の `///` を追加、ADR-0007 に進捗表を記録済み。
+    未対応は個別 pub 型の `///`（2 クレート合計 `missing_docs` 残 276 件）と他 19 クレート
 - [ ] **[L-09]** LiteRT プロバイダの未実装 FFI の設定面への露出
   - `litert.rs:60-72` が TODO のままエラー、bootstrap が `LITERT_MODEL_PATH` で登録しモデルを広告、
     MAPPING.md に記載なし。feature gate するか MAPPING.md へ追加
@@ -257,6 +253,9 @@ status: current
 - [x] **[M-15]** 7 クレートの version 等を workspace 継承へ（2026-11-18、workspace-version-worker）
 - [x] **[L-04]** init_tracing を CLI へ配線し logLevel を実効化（2026-11-18、tracing-wire-worker）
 - [x] **[L-03]** 未配線 dead code 約 400 行と抑制属性を削除（2026-11-18、deadcode-worker）
+- [x] **[H-07]** migrate_pool 切り出しで 2 経路を完全統一（2026-11-18、migrate-unify-worker）
+- [x] **[M-11 一部]** server/oauth.rs に 7 テスト追加（2026-11-18、oauth2-test-worker）
+- [x] **[L-08]** types/core にクレートドキュメントと主要 pub mod の doc（2026-11-18、apidoc-worker）
 
 ## メモ
 

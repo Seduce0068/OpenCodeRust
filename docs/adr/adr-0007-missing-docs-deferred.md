@@ -66,6 +66,13 @@ AGENTS.md セクション8は「公開 API: すべてに `///` ドキュメン�
 - 既存の `cargo check` / `clippy` / `test` のゲートは影響を受けない。
 - rustdoc の HTML タグ解釈警告（`Vec<PartInput>`）は別途修正済みである。
 
+段階的対応の進捗（2026-11-18 時点）:
+
+- `opencode-cli` / `opencode-local-llm`: 個別 green（既存）。
+- `opencode-types` / `opencode-core`: クレートドキュメント (`//!`) と主要
+  `pub mod` の `///` を追加済み。個別 pub 型の `///` は段階対応中で、
+  `missing_docs` は 2 クレート合計 276 件残存。
+
 ### Links
 
 - [AGENTS.md](../../AGENTS.md)
