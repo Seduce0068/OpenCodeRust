@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T07:13:44+09:00"
+  at: "2026-11-19T07:33:31+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2107 件
+  テスト総数 594 → 2109 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 47.62% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.04% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -330,6 +330,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server`: list_messages に後方互換な limit/offset pagination を追加
   （Query デシリアライズ経路のテストを含む、swarm-coding R1-R6、R4 指摘を R5 で修正）
   (L-14)
+- `server` / `MAPPING.md` / `Cargo.toml`: /api エイリアス、/stream の位置づけ明記、
+  残り 20 件の workspace 依存集約（swarm-coding R1-R6、R4 の誤記/行番号/
+  false green 指摘を R5 で修正）(P-01/M-46/L-07)
 
 ## [0.1.0]
 
