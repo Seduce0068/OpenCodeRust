@@ -102,6 +102,15 @@ status: current
     残存 14 モジュールは外部参照ありで維持。さらに縮小するには dead_code 解消＋
     ファサード再エクスポート整理（他ファイル変更）が必要
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
+  - 調査済み（2026-11-19、swarm-coding R2）: 推奨方針は **Bus 削除（方針 B）**。
+    3 系統は core Bus（本番発行/購読 0 件のデッドコード）／
+    Server `broadcast<String>`（実効イベント源、{\"type\":...} フラット JSON）／
+    TUI `mpsc<Event>`（下流 UI キュー）。
+    Bus を配線すると SSE スキーマが {\"event_type\",\"properties\"} へ非互換変更となり
+    TUI パーサ（app.rs:3852-3935、4 種のみ処理）が全イベントをドロップするリスク。
+    削除対象は bus.rs（348 行）と session 側 5 ファイルの publish 配線。
+    server/routes/tui は変更不要で実行時回帰リスク低。公開 API 破壊とイベント名
+    カタログ喪失が副作用（ワークスペース内利用はテストのみ）。
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
   - 補足（2026-11-18、eventbus-tui-worker）: TUI の `EventBus::new()` は受信側を即破棄するが、
@@ -114,11 +123,15 @@ status: current
     PTY `broadcast<Vec<u8>>`。
     Server は発行 10 箇所・購読 2 箇所（SSE）、TUI の実配送は app.rs の別 mpsc。
     方針A（配線）は 5〜7 ファイル・120–300 行、方針B（Bus 削除）は 348 行削除。設計判断待ち。
-- [ ] **[M-21]** ServerState 外のグローバル static（ほぼ移行済み）
-  - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS、
-    PROJECT_METADATA、TODO_MANAGER、PTY_MANAGER。
-    残存: MODEL_VARIANT_LOOKUP / MCP_OAUTH_MANAGER / PLUGIN_LOADER /
-    EXTRA_CORS_WHITELIST（不変データまたは初期化一回の OnceCell／設定関数経由で実害限定的）
+- [x] **[M-21]** 残存 static は現状維持（2026-11-19、swarm-coding R2 調査）
+  - 移行済み 7 件に加え残存 4 件（MODEL_VARIANT_LOOKUP / MCP_OAUTH_MANAGER /
+    PLUGIN_LOADER / EXTRA_CORS_WHITELIST）を調査。結論は**すべて残す**。
+    いずれも set-once／遅延初期化のプロセス・ライフタイム資源で、本番は ServerState
+    が 1 インスタンス／プロセスのため instance 化の利益なし。MCP_OAUTH_MANAGER は
+    固定 callback ポート 19876＋保留フロー状態、PLUGIN_LOADER は依存先
+    GLOBAL_PLUGIN_SYSTEM が process-global、EXTRA_CORS_WHITELIST は CORS の
+    'static predicate から参照する起動時構成（セキュリティ関連）で移行リスク大。
+    再検討条件: 同一プロセスで複数 ServerState を運用する要件が発生した場合。
 - [ ] **[M-34 残り]** 依存更新検知の Renovate 委譲とスクリプトゲート
   - 2026-11-19 対応済み: ci.yml に all-features と unsafe lint ゲートを追加（`extra_gates`
     / `clippy_args`、ローカルで両方 green、共通ワークフロー README で入力仕様確認）。
@@ -126,10 +139,11 @@ status: current
     依存更新検知は Renovate（renovate.json 追加＋GitHub App 有効化が別判断）へ委譲。
     `scripts/opencode_llm_mcp.rs` は workspace member 外で `--locked` 再現性の観点から
     ゲート化を見送り（恒久対策は member 化）。脆弱性監査は `audit: true` で既にゲート済み。
-- [ ] **[M-37 残り]** 他の同期 I/O（find 系は 2026-11-19 に spawn_blocking 化済み）
-  - 残存: read_file の tokio::fs 化、list_files、git subprocess（get_file_status /
-    current_project_info）、共通 canonicalize ヘルパ async 化、tool 側 glob/read の
-    WalkDir。性能改善の実測は未実施で効果量は speculative。
+- [ ] **[M-37 残り]** 他の同期 I/O
+  - 2026-11-19 対応済み: find 系の spawn_blocking 化に続き、read_file の tokio::fs 化と
+    get_file_status の git subprocess を tokio::process 化。
+  - 残存: list_files、current_project_info の git subprocess、共通 canonicalize
+    ヘルパ async 化、tool 側 glob/read の WalkDir。性能改善の実測は未実施。
 - [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
   - `tx.closed()` の協調 break を実装済み。JoinHandle 保持は再調査（2026-11-18、
     stream-handle-worker）で「tokio の破棄はデタッチ、協調 break で十分、AbortHandle は
@@ -198,6 +212,7 @@ status: current
 
 ## 完了
 
+- [x] **[M-37 一部]** read_file/git status の非同期化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-34 一部]** CI に all-features / unsafe lint ゲートを追加
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-37 一部]** find 系走査の spawn_blocking 化（2026-11-19、swarm-coding R1-R6）
