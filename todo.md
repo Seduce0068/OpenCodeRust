@@ -319,6 +319,8 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI mcp(28)・provider(24)・permission(20)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-11 一部]** TUI dialog(6)・message(12)・home(9)・markdown renderer(12)
+  （2026-11-18、swarm-coding R1-R6）
 
 ## メモ
 
