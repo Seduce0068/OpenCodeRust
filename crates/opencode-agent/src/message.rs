@@ -6,6 +6,15 @@ pub struct AgentMessage {
     pub content: String,
     pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// `MessageRole::Tool` が参照する tool call の ID。
+    #[serde(default)]
+    pub tool_call_id: String,
+    /// `MessageRole::Tool` が対応するツール名。
+    #[serde(default)]
+    pub tool_name: String,
+    /// ツール実行がエラーだったかどうか。
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +47,9 @@ impl AgentMessage {
             content: content.into(),
             reasoning: None,
             tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            is_error: false,
         }
     }
 
@@ -47,6 +59,9 @@ impl AgentMessage {
             content: content.into(),
             reasoning: None,
             tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            is_error: false,
         }
     }
 
@@ -56,6 +71,9 @@ impl AgentMessage {
             content: content.into(),
             reasoning,
             tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            is_error: false,
         }
     }
 
@@ -69,22 +87,26 @@ impl AgentMessage {
             content: content.into(),
             reasoning,
             tool_calls,
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            is_error: false,
         }
     }
 
-    // ... (rest of methods)
-
     pub fn tool_result(
-        _tool_call_id: impl Into<String>,
-        _name: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
         content: impl Into<String>,
-        _is_error: bool,
+        is_error: bool,
     ) -> Self {
         Self {
             role: MessageRole::Tool,
             content: content.into(),
             reasoning: None,
             tool_calls: vec![],
+            tool_call_id: tool_call_id.into(),
+            tool_name: name.into(),
+            is_error,
         }
     }
 }
@@ -116,6 +138,18 @@ impl Conversation {
             .push(AgentMessage::assistant(content, reasoning));
     }
 
+    /// assistant の応答と、それに伴う tool_use 呼び出しを一緒に記録する。
+    pub fn add_assistant_message_with_tools(
+        &mut self,
+        content: impl Into<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    ) {
+        self.messages.push(AgentMessage::assistant_with_tools(
+            content, reasoning, tool_calls,
+        ));
+    }
+
     pub fn add_tool_result(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -137,8 +171,59 @@ impl Conversation {
             .map(|m| match m.role {
                 MessageRole::System => opencode_provider::Message::system(&m.content),
                 MessageRole::User => opencode_provider::Message::user(&m.content),
-                MessageRole::Assistant => opencode_provider::Message::assistant(&m.content),
-                MessageRole::Tool => opencode_provider::Message::assistant(&m.content),
+                MessageRole::Assistant if m.tool_calls.is_empty() => {
+                    opencode_provider::Message::assistant(&m.content)
+                }
+                MessageRole::Assistant => opencode_provider::Message {
+                    role: opencode_provider::Role::Assistant,
+                    content: opencode_provider::Content::Parts(
+                        std::iter::once(opencode_provider::ContentPart {
+                            content_type: "text".to_string(),
+                            text: Some(m.content.clone()),
+                            ..opencode_provider::ContentPart::default()
+                        })
+                        .chain(
+                            m.tool_calls
+                                .iter()
+                                .map(|call| opencode_provider::ContentPart {
+                                    content_type: "tool_use".to_string(),
+                                    tool_use: Some(opencode_provider::ToolUse {
+                                        id: call.id.clone(),
+                                        name: call.name.clone(),
+                                        input: call.arguments.clone(),
+                                    }),
+                                    ..opencode_provider::ContentPart::default()
+                                }),
+                        )
+                        .collect(),
+                    ),
+                    cache_control: None,
+                    provider_options: None,
+                },
+                // 旧永続化データの Tool メッセージは tool_call_id が空のため、
+                // tool_result ブロックを送らず content を text として残す。
+                MessageRole::Tool if m.tool_call_id.is_empty() => opencode_provider::Message {
+                    role: opencode_provider::Role::Tool,
+                    content: opencode_provider::Content::Text(m.content.clone()),
+                    cache_control: None,
+                    provider_options: None,
+                },
+                MessageRole::Tool => opencode_provider::Message {
+                    role: opencode_provider::Role::Tool,
+                    content: opencode_provider::Content::Parts(vec![
+                        opencode_provider::ContentPart {
+                            content_type: "tool_result".to_string(),
+                            tool_result: Some(opencode_provider::ToolResult {
+                                tool_use_id: m.tool_call_id.clone(),
+                                content: m.content.clone(),
+                                is_error: Some(m.is_error),
+                            }),
+                            ..opencode_provider::ContentPart::default()
+                        },
+                    ]),
+                    cache_control: None,
+                    provider_options: None,
+                },
             })
             .collect()
     }
@@ -216,6 +301,145 @@ mod tests {
         assert_eq!(message.content, "dummy-result");
         assert_eq!(message.reasoning, None);
         assert!(message.tool_calls.is_empty());
+        assert_eq!(message.tool_call_id, "call-1");
+        assert_eq!(message.tool_name, "read");
+        assert!(message.is_error);
+    }
+
+    #[test]
+    fn to_provider_messages_maps_tool_result_to_content_parts() {
+        let conversation = Conversation {
+            messages: vec![
+                AgentMessage::tool_result("call-42", "read", "dummy-failure", true),
+                AgentMessage::tool_result("call-43", "write", "dummy-success", false),
+            ],
+        };
+
+        let provider_messages = conversation.to_provider_messages();
+        assert_eq!(provider_messages.len(), 2);
+
+        let expectations = [("call-42", true), ("call-43", false)];
+        for (message, (expected_id, expected_is_error)) in
+            provider_messages.iter().zip(expectations)
+        {
+            assert!(matches!(&message.role, opencode_provider::Role::Tool));
+            let parts = match &message.content {
+                opencode_provider::Content::Parts(parts) => parts,
+                other => panic!("expected Content::Parts, got {other:?}"),
+            };
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].content_type, "tool_result");
+            let result = parts[0]
+                .tool_result
+                .as_ref()
+                .expect("tool_result should be set");
+            assert_eq!(result.tool_use_id, expected_id);
+            assert_eq!(result.is_error, Some(expected_is_error));
+            assert!(result.content.starts_with("dummy-"));
+        }
+    }
+
+    #[test]
+    fn legacy_agent_message_json_without_tool_fields_deserializes() {
+        let legacy = json!({
+            "role": "Tool",
+            "content": "dummy-result",
+            "reasoning": null,
+            "tool_calls": []
+        });
+        let message: AgentMessage =
+            serde_json::from_value(legacy).expect("legacy AgentMessage should deserialize");
+
+        assert!(matches!(&message.role, MessageRole::Tool));
+        assert_eq!(message.content, "dummy-result");
+        assert_eq!(message.tool_call_id, "");
+        assert_eq!(message.tool_name, "");
+        assert!(!message.is_error);
+    }
+
+    #[test]
+    fn to_provider_messages_maps_assistant_tool_calls_to_content_parts() {
+        let conversation = Conversation {
+            messages: vec![AgentMessage::assistant_with_tools(
+                "dummy-answer",
+                None,
+                vec![ToolCall {
+                    id: "call-9".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({"path": "dummy.txt"}),
+                }],
+            )],
+        };
+
+        let provider_messages = conversation.to_provider_messages();
+        assert_eq!(provider_messages.len(), 1);
+        let message = &provider_messages[0];
+        assert!(matches!(&message.role, opencode_provider::Role::Assistant));
+        let parts = match &message.content {
+            opencode_provider::Content::Parts(parts) => parts,
+            other => panic!("expected Content::Parts, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].content_type, "text");
+        assert_eq!(parts[0].text.as_deref(), Some("dummy-answer"));
+        assert_eq!(parts[1].content_type, "tool_use");
+        let tool_use = parts[1].tool_use.as_ref().expect("tool_use should be set");
+        assert_eq!(tool_use.id, "call-9");
+        assert_eq!(tool_use.name, "read");
+        assert_eq!(tool_use.input, json!({"path": "dummy.txt"}));
+    }
+
+    #[test]
+    fn add_assistant_message_with_tools_keeps_plain_assistant_as_text() {
+        let mut conversation = Conversation::new();
+        conversation.add_assistant_message("plain", None);
+        conversation.add_assistant_message_with_tools(
+            "with-tools",
+            Some("thought".to_string()),
+            vec![dummy_tool_call()],
+        );
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(conversation.messages[0].tool_calls.is_empty());
+        let message = &conversation.messages[1];
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].id, "call-1");
+
+        let provider_messages = conversation.to_provider_messages();
+        assert!(matches!(
+            &provider_messages[0].content,
+            opencode_provider::Content::Text(_)
+        ));
+        assert!(matches!(
+            &provider_messages[1].content,
+            opencode_provider::Content::Parts(_)
+        ));
+    }
+
+    #[test]
+    fn to_provider_messages_falls_back_to_text_for_legacy_tool_message() {
+        let legacy = json!({
+            "role": "Tool",
+            "content": "dummy-result",
+            "reasoning": null,
+            "tool_calls": []
+        });
+        let message: AgentMessage =
+            serde_json::from_value(legacy).expect("legacy AgentMessage should deserialize");
+        let conversation = Conversation {
+            messages: vec![message],
+        };
+
+        let provider_messages = conversation.to_provider_messages();
+        assert_eq!(provider_messages.len(), 1);
+        assert!(matches!(
+            &provider_messages[0].role,
+            opencode_provider::Role::Tool
+        ));
+        assert!(matches!(
+            &provider_messages[0].content,
+            opencode_provider::Content::Text(text) if text == "dummy-result"
+        ));
     }
 
     #[test]
