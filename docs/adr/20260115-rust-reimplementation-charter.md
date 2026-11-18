@@ -1,7 +1,7 @@
 ---
 type: ADR
 title: OpenCodeRust - Rust再実装プロジェクト憲章
-status: Approved
+status: approved
 date: "2026-01-15T00:00:00+09:00"
 deciders:
   - OpenCodeRust Team
@@ -9,6 +9,9 @@ tags:
   - architecture
   - strategy
   - rust
+generated:
+  by: OpenCodeRust Team
+  at: "2026-01-15T00:00:00+09:00"
 ---
 
 ## ADR-0000: OpenCodeをRustで再実装し、上流追随とRustの強みを活かした再構築を行う

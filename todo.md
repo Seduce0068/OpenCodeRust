@@ -35,16 +35,18 @@ status: current
     `@modelcontextprotocol/server-devtools` と `server-playwright` が公式 npm で
     404（パッケージ不在）のため固定不能。代替（`@playwright/mcp` 等）の選定、
     lockfile 生成、CI npm スキャン対象化）
-- [ ] **[H-07]** マイグレーションの経路統一（version/原子性は対応済み、残りに絞る）
-  - `database.rs` は user_version 記録・単一トランザクション・metadata PRAGMA 判定を実装済み。
-    未対応は `Storage::migrate()`（lib.rs）の別スキーマ経路統一と runbook 化
+- [ ] **[H-07]** マイグレーションの完全統一（schema/user_version は対応済み、残りに絞る）
+  - `Storage::migrate()` は schema.rs の ALL_MIGRATIONS 経路へ統一済み。未対応は
+    SCHEMA_VERSION / user_version の共有（database.rs に pub(crate) の migrate_pool を
+    切り出すリファクタ）と runbook 化
 - [ ] **[H-10]** セッション永続化のトランザクション境界と並行制御（移行は対応済み、残りに絞る）
   - `database.rs` の移行は単一トランザクション化済み。未対応は `server.rs:553-588` の
     非アトミック書き出し（delete＋1 件ずつ create）と単一ライタ persist キュー。
     古い snapshot の遅延 commit による更新喪失は推測のまま
-- [ ] **[H-11]** キュー再実行による assistant レスポンス重複と冪等性欠如
-  - promoted 更新失敗はログのみでキューが processing のまま残り起動時に再実行、assistant 側に冪等性なし（課金重複は推測）。
-    `queue_id` を assistant にも相関 ID 保持するか promoted 更新を同一トランザクション化
+- [ ] **[H-11]** キュー冪等性の完全化（終端化・相関 ID は対応済み）
+  - promote 失敗時 failed 化と assistant への queue_id 付与は完了。未対応は
+    セッション永続化と promoted 更新の同一トランザクション化（repository.rs 変更要）と、
+    下流での queue_id による重複レスポンス排除。完全な二重課金防止は未検証
 - [ ] **[H-13]** TUI イベントルートのブロッキング HTTP と全件再マッピング
   - 事実確認済み（2026-11-18、tui-http-worker）: 同期 HTTP は `ApiClient`（api.rs、
     書き込みスコープ外）にあり 30s timeout。Tick は 2 秒ごとで約 12 箇所の同期呼び出し。
@@ -94,10 +96,6 @@ status: current
   - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS。
     未対応: PROJECT_METADATA（cwd キーで実害限定的、ハンドラ 4 箇所のシグネチャ変更要）、
     TODO_MANAGER / PTY_MANAGER（M-05 / M-20 と連携した配線が必要）
-- [ ] **[M-33]** OKF フロントマターの残課題（date/verified は対応済み）
-  - ADR 4 件の date オフセット・TERMUX_BUILD の verified 構造化は完了。未対応は
-    `generated` mapping 欠如、status "Approved" の enum 不一致、TERMUX_BUILD の
-    title 欠如と本文 H1。index.md は docs/README.md が兼ねるため追加不要と判断
 - [ ] **[M-34]** CI ゲートの抜け（all-features・unsafe lint・依存監査・スクリプト）
   - `ci.yml:21-27` がデフォルト feature のみ、lsp feature の 591→899 差分未検証、unsafe
     lint／cargo outdated／Renovate／`scripts/*.rs` が対象外。`extra_gates` と
@@ -252,6 +250,9 @@ status: current
 - [x] **[M-34 一部]** workspace lints に unsafe_code = deny（2026-11-18、unsafe-lint-worker）
 - [x] **[M-21 一部]** SESSION_RUN_STATUS / PROMPT_LOCKS を state 化（2026-11-18、static-migrate-worker）
 - [x] **[M-11 一部]** database.rs に rollback/commit/分離テスト追加（2026-11-18、db-test-worker）
+- [x] **[H-07]** Storage::migrate を schema.rs の ALL_MIGRATIONS へ統一（2026-11-18、storage-path-worker）
+- [x] **[H-11]** promote 失敗時 failed 化と assistant へ queue_id 付与（2026-11-18、queue-idem-worker）
+- [x] **[M-33]** ADR の status/generated と TERMUX_BUILD title を OKF 準拠化（2026-11-18、okf2-worker）
 
 ## メモ
 

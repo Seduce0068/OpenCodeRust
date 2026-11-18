@@ -2,7 +2,7 @@
 type: ADR
 title: 質問フロー（question tool / question.prompt）の配線
 description: QuestionBroker、質問コールバック、TUI への question/permission イベント配送を定義する。
-status: Accepted
+status: approved
 tags:
   - session
   - server

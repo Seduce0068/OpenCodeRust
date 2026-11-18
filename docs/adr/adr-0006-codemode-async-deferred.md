@@ -2,7 +2,7 @@
 type: ADR
 title: CodeMode の非同期実行保留と段階的移植方針
 description: 同期インタプリタの現行設計を維持し、真の非同期実行と host 中断 timeout を別タスクとして扱う判断を記録する。
-status: Accepted
+status: approved
 tags:
   - codemode
   - async
