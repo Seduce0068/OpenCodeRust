@@ -72,8 +72,9 @@ status: current
 - [ ] **[M-11]** 重要パスのテストカバレッジ空白（多数対応済み）
   - 対応済み: storage/database.rs、server/mcp_oauth.rs・oauth.rs・pty.rs、mcp/oauth.rs・
     protocol.rs、plugin/subprocess/protocol.rs、provider/models.rs・bootstrap.rs、
-    watcher、codemode/tools.rs など。未対応は provider 統合テストの
-    HTTP／ストリーミング／認証フロー（モック OAuth／callback）
+    watcher、codemode/tools.rs、tui/context/keybind.rs・command.rs、agent/message.rs
+    など。未対応は provider 統合テストの HTTP／ストリーミング／認証フロー
+    （モック OAuth／callback）
   - 補足: provider/convert.rs は lib.rs から未配線のスタブで、テストを追加しても
     本クレートでは実行されない（2026-11-18 発見、追加は差し戻し済み）
 - [ ] **[M-15]** 依存ピン留めの残課題（CI locked と集約 6 件は対応済み）
@@ -273,6 +274,9 @@ status: current
   （2026-11-18、mcp-protocol-test-worker + 親）
 - [x] **[M-11 一部]** plugin/subprocess/protocol.rs に 8 テスト
   （2026-11-18、plugin-protocol-test-worker）
+- [x] **[M-11 一部]** tui/context/keybind.rs に 17 テスト（2026-11-18、keybind-test-worker）
+- [x] **[M-11 一部]** tui/command.rs に 10 テスト（2026-11-18、tui-command-test-worker）
+- [x] **[M-11 一部]** agent/message.rs に 7 テスト（2026-11-18、agent-message-test-worker）
 
 ## メモ
 
