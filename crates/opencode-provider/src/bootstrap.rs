@@ -10,7 +10,6 @@ use crate::github_copilot::GitHubCopilotProvider;
 use crate::gitlab::GitLabProvider;
 use crate::google::GoogleProvider;
 use crate::groq::GroqProvider;
-use crate::litert::{LiteRTConfig, LiteRTProvider};
 use crate::mistral::MistralProvider;
 use crate::models::{ModelInfo, ModelInterleaved, ModelsData, ProviderInfo as ModelsProviderInfo};
 use crate::openai::OpenAIProvider;
@@ -2198,19 +2197,15 @@ fn create_concrete_provider(
             Some(Arc::new(GoogleProvider::new(api_key)))
         }
         "litert" => {
-            let model_path = provider_option_string(provider, &["modelPath", "model_path"])
-                .or_else(|| env_any(&["LITERT_MODEL_PATH"]))
-                .unwrap_or_default();
-            let backend = provider_option_string(provider, &["backend"])
-                .or_else(|| env_any(&["LITERT_BACKEND"]))
-                .unwrap_or_else(|| "npu".to_string());
-
-            Some(Arc::new(LiteRTProvider::new(LiteRTConfig {
-                id: "litert".to_string(),
-                name: "LiteRT-LM".to_string(),
-                model_path,
-                backend,
-            })))
+            // The LiteRT-LM native FFI is not linked yet. Every chat call would
+            // fail, so registering this provider would advertise `gemma-4-e2b`
+            // as usable while no inference is possible. Refuse registration to
+            // keep the configuration surface honest until the FFI is implemented.
+            tracing::warn!(
+                provider = "litert",
+                "LiteRT provider is not implemented; LITERT_MODEL_PATH/LITERT_BACKEND are ignored"
+            );
+            None
         }
         "azure" => {
             let api_key = provider_secret(provider, &["AZURE_API_KEY", "AZURE_OPENAI_API_KEY"])?;
@@ -2811,6 +2806,19 @@ mod tests {
             options: HashMap::new(),
             models: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn litert_provider_is_not_registered_until_ffi_is_implemented() {
+        let mut state = provider_state("litert");
+        state.options.insert(
+            "modelPath".to_string(),
+            serde_json::Value::String("/tmp/model.litert".to_string()),
+        );
+
+        // The FFI is not linked: configuration must not produce a registered
+        // provider that advertises an unusable model.
+        assert!(create_concrete_provider("litert", &state).is_none());
     }
 
     #[test]
