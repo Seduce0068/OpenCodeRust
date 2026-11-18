@@ -149,7 +149,7 @@ impl Provider for GitLabProvider {
             .json(&gitlab_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -163,7 +163,7 @@ impl Provider for GitLabProvider {
         let gitlab_response: GitLabResponse = response
             .json()
             .await
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         Ok(convert_gitlab_response(gitlab_response))
     }
@@ -182,7 +182,7 @@ impl Provider for GitLabProvider {
             .json(&gitlab_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();

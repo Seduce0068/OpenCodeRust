@@ -229,7 +229,7 @@ impl Provider for GoogleVertexProvider {
             .json(&vertex_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -243,7 +243,7 @@ impl Provider for GoogleVertexProvider {
         let vertex_response: VertexResponse = response
             .json()
             .await
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         Ok(convert_vertex_response(vertex_response))
     }
@@ -264,7 +264,7 @@ impl Provider for GoogleVertexProvider {
             .json(&vertex_request)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();

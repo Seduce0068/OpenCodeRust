@@ -328,7 +328,7 @@ impl Provider for BedrockProvider {
 
         let bedrock_request = self.convert_request(request);
         let body = serde_json::to_vec(&bedrock_request)
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         let headers = self
             .sign_request(
@@ -347,7 +347,7 @@ impl Provider for BedrockProvider {
             .body(body)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -358,7 +358,7 @@ impl Provider for BedrockProvider {
         let bedrock_response: BedrockConverseResponse = response
             .json()
             .await
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         Ok(convert_bedrock_response(bedrock_response))
     }
@@ -373,7 +373,7 @@ impl Provider for BedrockProvider {
 
         let bedrock_request = self.convert_request(request);
         let body = serde_json::to_vec(&bedrock_request)
-            .map_err(|e| ProviderError::ApiError(e.to_string()))?;
+            .map_err(|e| ProviderError::api_error_with_source(e.to_string(), e))?;
 
         let headers = self
             .sign_request(
@@ -393,7 +393,7 @@ impl Provider for BedrockProvider {
             .body(body)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();

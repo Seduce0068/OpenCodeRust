@@ -737,7 +737,7 @@ impl OpenAIProvider {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -753,7 +753,7 @@ impl OpenAIProvider {
                 msg.push_str(&cause.to_string());
                 source = cause.source();
             }
-            ProviderError::ApiError(msg)
+            ProviderError::api_error_with_source(msg, e)
         })?;
 
         // Some OpenAI-compatible providers (e.g. ZhipuAI) return SSE-formatted
@@ -767,10 +767,10 @@ impl OpenAIProvider {
                 } else {
                     body.clone()
                 };
-                ProviderError::ApiError(format!(
-                    "failed to decode response: {}\nBody: {}",
-                    e, preview
-                ))
+                ProviderError::api_error_with_source(
+                    format!("failed to decode response: {}\nBody: {}", e, preview),
+                    e,
+                )
             })?
         };
         Ok(raw.into_chat_response())
@@ -920,7 +920,7 @@ impl OpenAIProvider {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
