@@ -66,9 +66,11 @@ status: current
   - command の 3 メソッドを `Result<_, CommandError>` 化済み（破壊的変更、CLI の `?` は
     anyhow の From で互換を実証）。未対応は ToolError／ApiError の String のみで
     `#[source]` なしの問題（他クレートの別タスク）
-- [ ] **[M-05]** Todo 状態の未配線（ServerState / ToolContext / TUI SSE）（要確認）
-  - 本番で `TodoManager::update` 呼び出し 0 件（テストからの呼び出しは存在）、`ToolContext::todo_update`
-    が None、`todo.updated` を TUI が非処理。`ServerState` 保持＋コールバック配線＋SSE publish
+- [ ] **[M-05]** Todo 状態の未配線（要確認、配線には他クレート変更が必須）
+  - 事実確認済み（2026-11-18、todo-wire-worker）: 本番 update 0 件、todo_update/todo_get
+    None。配線には ①session/prompt.rs へコールバック注入 API、②server.rs へ TodoManager
+    保持、③routes.rs で broadcast、④TUI の forward_server_event マッピングが必要。
+    tool.rs 単独の global static 案は M-21 方針に反するため却下済み
 - [ ] **[M-11]** 重要パスのテストカバレッジ空白（多数対応済み）
   - 対応済み: storage/database.rs、server/mcp_oauth.rs・oauth.rs・pty.rs、mcp/oauth.rs・
     protocol.rs、plugin/subprocess/protocol.rs、provider/models.rs・bootstrap.rs、
@@ -87,12 +89,16 @@ status: current
     実使用し orphan rule で storage への直接移管は不可（newtype＋From/Into 案は未検証）。
     未対応は charter と逆の permission→plugin、tool→permission/plugin、session→
     provider/tool/mcp/lsp の依存方向（ADR 改訂またはトレイト注入反転）
-- [ ] **[M-17]** 内部実装モジュールの過剰な pub 露出
-  - provider/src/lib.rs が 32 個、tool/src/lib.rs が 24 個の実装モジュールを `pub mod`
-    で露出しテストがフルパス参照。`pub(crate) mod` 化しファサード経由で公開
+- [ ] **[M-17]** 内部実装モジュールの pub 露出（7 モジュール縮小済み）
+  - 外部フルパス参照ゼロの 7 モジュールを pub(crate) 化済み（ファサード公開維持）。
+    残存 14 モジュールは外部参照ありで維持。さらに縮小するには dead_code 解消＋
+    ファサード再エクスポート整理（他ファイル変更）が必要
 - [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
   - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
     `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
+  - 補足（2026-11-18、event-test-worker）: TUI の `EventBus::new()` は `let (tx, _rx) =
+    channel()` で受信側を即破棄 → new()/default() 経由の send は常に Err（握り潰される）。
+    AppContext::new() がこれを使う。本来の配送経路が意図通りか確認が必要
 - [ ] **[M-21]** ServerState 外のグローバル static（CONFIG_STATE／TUI キュー／実行状態は対応済み）
   - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS。
     未対応: PROJECT_METADATA（cwd キーで実害限定的、ハンドラ 4 箇所のシグネチャ変更要）、
@@ -277,6 +283,8 @@ status: current
 - [x] **[M-11 一部]** tui/context/keybind.rs に 17 テスト（2026-11-18、keybind-test-worker）
 - [x] **[M-11 一部]** tui/command.rs に 10 テスト（2026-11-18、tui-command-test-worker）
 - [x] **[M-11 一部]** agent/message.rs に 7 テスト（2026-11-18、agent-message-test-worker）
+- [x] **[M-11 一部]** tui/event.rs に 12 テスト（2026-11-18、event-test-worker）
+- [x] **[M-17 一部]** 7 モジュールを pub(crate) 化（2026-11-18、pubmod-worker）
 
 ## メモ
 
