@@ -165,11 +165,10 @@ status: current
     未対応は `transform_messages` 経路自体が未呼び出しで、`InterleavedConfig` を渡す
     引数追加＋呼び出し側（bootstrap 等）の改修が必要。model.interleaved → runtime
     capabilities への変換自体は bootstrap.rs で別経路配線済み
-- [ ] **[P-05]** MCP protocol negotiation の `Auto` が probe せず常に legacy
-  - `McpProtocol::Auto` はコメントで probe + fallback を謳うが
-    `revision()` (`opencode-config/src/schema.rs:571-592`) は `Legacy` と同じ
-    `"2025-11-25"` を返す。MAPPING.md:96-97 の「protocol 未実装」は stale だが、
-    Auto の実挙動は未実装。probe 実装またはドキュメント修正
+- [ ] **[P-05]** MCP protocol Auto の probe（実挙動は明記済み）
+  - doc と MAPPING.md を実挙動へ修正済み: Auto は Legacy と同じ `"2025-11-25"`
+    を送り、probe/fallback は未実装、新 revision は明示指定が必要。回帰テスト追加済み。
+    未対応は probe 実装（opencode-mcp の initialize に retry ロジック追加、外部通信を伴う）
 - [ ] **[P-06]** upstream 新規設定キー `timezone` / `policies` / `worktree` が未対応
   - upstream `packages/schema/src/config.ts:55,61,109`
     （追加 2026-09〜10、MAPPING baseline より後）。
@@ -181,15 +180,6 @@ status: current
     v2 core credential/integration/location (G-09)、native ACP (G-11)、JS SDK (G-12)。
     出典は `docs/investigation-final-report.md` と `.cache/investigation/round3-upstream.md`。
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
-
-### 優先度: 低（残タスク調査で追加）
-
-- [ ] **[P-08]** ADR-0006 の前提ファイル名が実在しない
-  - `docs/adr/adr-0006-codemode-async-deferred.md:35` が参照する
-    `packages/codemode/src/async.ts` / `scheduler.ts` / `vm.ts` は本 checkout の HEAD・
-    `origin/dev`・全 ref に存在せず、実体は `interpreter/runner.ts:142` /
-    `promises.ts:19` / `interpreter.ts:419` の job queue + Promise reaction 基盤。
-    判断（同期維持）は upstream 進展で再検証対象。リンクと事実関係を修正
 
 ## 完了
 
@@ -296,6 +286,9 @@ status: current
 - [x] **[P-03]** 未配線設定フィールドを MAPPING.md へ明記（2026-11-18、p03-worker）
 - [x] **[P-04]** interleaved の no-op 関数と呼び出しを削除（2026-11-18、p04-worker）
 - [x] **[M-11 一部]** provider/tools.rs に 17 テスト（2026-11-18、provider-tools-test-worker）
+- [x] **[P-05]** protocol Auto の実挙動を明記＋回帰テスト（2026-11-18、p05-worker）
+- [x] **[P-08]** ADR-0006 の参照と事実関係を修正（2026-11-18、p08-worker）
+- [x] **[M-11 一部]** util/logging.rs に build_filter の 3 テスト（2026-11-18、logging-test-worker）
 
 ## メモ
 
