@@ -1348,4 +1348,344 @@ mod tests {
         std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
+
+    /// Local and non-OAuth remote servers must never be treated as OAuth-capable.
+    #[test]
+    fn oauth_required_only_for_enabled_remote_servers() {
+        let local = McpRuntimeConfig::Local(LocalMcpConfig {
+            command: "noop".to_string(),
+            args: Vec::new(),
+            env: None,
+            cwd: None,
+            timeouts: McpTimeouts {
+                startup_ms: 1,
+                catalog_ms: 1,
+                execution_ms: 1,
+            },
+            protocol: None,
+        });
+        assert!(!local.oauth_required());
+
+        let remote_without_oauth = McpRuntimeConfig::Remote(RemoteMcpConfig {
+            oauth_enabled: false,
+            ..Default::default()
+        });
+        assert!(!remote_without_oauth.oauth_required());
+
+        let remote_with_oauth = McpRuntimeConfig::Remote(RemoteMcpConfig {
+            oauth_enabled: true,
+            ..Default::default()
+        });
+        assert!(remote_with_oauth.oauth_required());
+    }
+
+    #[test]
+    fn oauth_status_uses_lowercase_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&McpOAuthStatus::Pending).expect("serialize pending"),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&McpOAuthStatus::Authorized).expect("serialize authorized"),
+            "\"authorized\""
+        );
+        assert_eq!(
+            serde_json::to_string(&McpOAuthStatus::Failed).expect("serialize failed"),
+            "\"failed\""
+        );
+        let decoded: McpOAuthStatus = serde_json::from_str("\"pending\"").expect("deserialize");
+        assert_eq!(decoded, McpOAuthStatus::Pending);
+    }
+
+    #[test]
+    fn oauth_state_serde_round_trip() {
+        let state = McpOAuthState {
+            server_name: "remote".to_string(),
+            authorization_url: "https://idp.example.com/authorize".to_string(),
+            client_id: None,
+            status: McpOAuthStatus::Pending,
+        };
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+        let decoded: McpOAuthState = serde_json::from_str(&encoded).expect("deserialize state");
+        assert_eq!(decoded.server_name, state.server_name);
+        assert_eq!(decoded.authorization_url, state.authorization_url);
+        assert_eq!(decoded.status, McpOAuthStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn start_oauth_rejects_unknown_server() {
+        let manager = McpOAuthManager::new();
+        let error = manager
+            .start_oauth("missing")
+            .await
+            .expect_err("unknown server must fail");
+        assert!(matches!(error, McpOAuthError::ServerNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn start_oauth_rejects_local_server() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "local".to_string(),
+                McpRuntimeConfig::Local(LocalMcpConfig {
+                    command: "noop".to_string(),
+                    args: Vec::new(),
+                    env: None,
+                    cwd: None,
+                    timeouts: McpTimeouts {
+                        startup_ms: 1,
+                        catalog_ms: 1,
+                        execution_ms: 1,
+                    },
+                    protocol: None,
+                }),
+                true,
+            )
+            .await;
+
+        let error = manager
+            .start_oauth("local")
+            .await
+            .expect_err("local servers have no oauth flow");
+        assert!(matches!(error, McpOAuthError::OAuthNotSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn start_oauth_rejects_remote_without_oauth_enabled() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: false,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let error = manager
+            .start_oauth("remote")
+            .await
+            .expect_err("oauth must be explicitly enabled");
+        assert!(matches!(error, McpOAuthError::OAuthNotSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_callback_rejects_unknown_server() {
+        let manager = McpOAuthManager::new();
+        let error = manager
+            .handle_callback("missing", "dummy-code", Some("dummy-state"))
+            .await
+            .expect_err("unknown server must fail");
+        assert!(matches!(error, McpOAuthError::ServerNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_callback_requires_pending_flow() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let error = manager
+            .handle_callback("remote", "dummy-code", Some("dummy-state"))
+            .await
+            .expect_err("callback without a started flow must fail");
+        assert!(
+            matches!(&error, McpOAuthError::OAuthFailed(message) if message == "No pending OAuth flow"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_non_oauth_server() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: false,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let error = manager
+            .authenticate("remote")
+            .await
+            .expect_err("non-oauth server cannot authenticate");
+        assert!(matches!(error, McpOAuthError::OAuthNotSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn disabled_server_reports_disabled_status() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                false,
+            )
+            .await;
+
+        let status = manager
+            .connect("remote")
+            .await
+            .expect("connect returns runtime status");
+        assert_eq!(status.status, "disabled");
+        assert!(status.oauth_required);
+        assert_eq!(status.oauth_status, None);
+    }
+
+    #[tokio::test]
+    async fn server_registration_records_logs_and_listing() {
+        let manager = McpOAuthManager::new();
+        assert!(!manager.has_server("remote").await);
+
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        assert!(manager.has_server("remote").await);
+        let listed = manager.list_servers().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "remote");
+        assert_eq!(listed[0].status, "needs_auth");
+        assert!(listed[0].oauth_required);
+
+        let logs = manager
+            .get_logs("remote")
+            .await
+            .expect("registered server has logs");
+        assert!(logs
+            .iter()
+            .any(|entry| entry.message == "Server registered"));
+
+        let error = manager
+            .get_logs("missing")
+            .await
+            .expect_err("unknown server has no logs");
+        assert!(matches!(error, McpOAuthError::ServerNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn disconnect_rejects_unknown_server() {
+        let manager = McpOAuthManager::new();
+        let error = manager
+            .disconnect("missing")
+            .await
+            .expect_err("unknown server cannot disconnect");
+        assert!(matches!(error, McpOAuthError::ServerNotFound(_)));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn start_oauth_rejects_second_concurrent_flow() {
+        let auth_file = temp_auth_file("in-progress");
+        let _guard = auth_store_lock();
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let (issuer, _) = spawn_mock_authorization_server().await;
+        let (mcp_url, _) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer.clone())).await;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: mcp_url,
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        manager
+            .start_oauth("remote")
+            .await
+            .expect("first flow starts");
+        let error = manager
+            .start_oauth("remote")
+            .await
+            .expect_err("second concurrent flow must be rejected");
+        assert!(matches!(error, McpOAuthError::OAuthInProgress));
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn each_start_oauth_generates_a_fresh_state() {
+        let auth_file = temp_auth_file("fresh-state");
+        let _guard = auth_store_lock();
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let (issuer, _) = spawn_mock_authorization_server().await;
+        let (mcp_url, _) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer.clone())).await;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: mcp_url,
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let first = manager.start_oauth("remote").await.expect("first flow");
+        let first_state = opencode_mcp::auth::get_oauth_state("remote")
+            .await
+            .expect("first csrf state");
+        assert!(
+            first.authorization_url.contains(&first_state),
+            "authorization URL must carry the generated state"
+        );
+
+        manager.remove_oauth("remote").await;
+        let second = manager.start_oauth("remote").await.expect("second flow");
+        let second_state = opencode_mcp::auth::get_oauth_state("remote")
+            .await
+            .expect("second csrf state");
+        assert_ne!(
+            first_state, second_state,
+            "a new flow must use a fresh csrf state"
+        );
+        assert!(second.authorization_url.contains(&second_state));
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
+    }
 }

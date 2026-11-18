@@ -659,12 +659,11 @@ impl ServerState {
                 session_repo.create(&stored_session).await?;
             }
 
+            // delete + create を単一トランザクションで実行し、途中失敗で
+            // メッセージが欠損しないようにする (H-10)。
             message_repo
-                .delete_for_session(&stored_session.id.0)
+                .replace_for_session(&stored_session.id.0, &messages)
                 .await?;
-            for message in messages {
-                message_repo.create(&message).await?;
-            }
         }
 
         Ok(())
