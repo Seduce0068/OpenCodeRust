@@ -101,6 +101,12 @@ status: current
     本番で `event_bus.send*` 呼び出しは 0 件。実際の配送は app.rs:102 の別 mpsc チャネルで
     動作しており実害なし。receiver 保持は読む event loop が無くキュー蓄積リスクがあるため
     見送り。真に統合するなら app.rs 改修（EventBus を app のチャネルへ統合、または削除）が必要
+  - 調査（2026-11-19、swarm-coding R2-C）: core `Bus` は同期 `Fn` コールバック＋
+    broadcast、`publish` は guard 解放後にコールバック実行。本番利用 0 件で実質デッドコード。
+    系統は 3 つ（core Bus / TUI `mpsc<Event>` / Server `broadcast<String>`）＋
+    PTY `broadcast<Vec<u8>>`。
+    Server は発行 10 箇所・購読 2 箇所（SSE）、TUI の実配送は app.rs の別 mpsc。
+    方針A（配線）は 5〜7 ファイル・120–300 行、方針B（Bus 削除）は 348 行削除。設計判断待ち。
 - [ ] **[M-21]** ServerState 外のグローバル static（ほぼ移行済み）
   - 移行済み: CONFIG_STATE、TUI キュー群、SESSION_RUN_STATUS、PROMPT_LOCKS、
     PROJECT_METADATA、TODO_MANAGER、PTY_MANAGER。
@@ -323,14 +329,16 @@ status: current
   （2026-11-18、swarm-coding R1-R6）
 - [x] **[M-11 一部]** TUI api(13)・context/app_context(14)・clipboard(7)
   （2026-11-18、swarm-coding R1-R6）
+- [x] **[M-02 一部]** list_messages の snake_case 契約を双方向で固定
+  （2026-11-19、swarm-coding R1-R6）
 
 ## メモ
 
-- 単一メッセージ応答のキー不一致（2026-11-18、swarm-coding R2-A が発見、未検証）:
-  `opencode-server/src/routes.rs:2264-2269` は `"sessionID"` / `"createdAt"` を返すが、
-  `tui/api.rs` の `MessageInfo` は `session_id`（alias は `sessionId` のみ）と
-  `created_at`（alias なし・必須 i64）を要求。当該 endpoint は `{"info", "parts"}`
-  形状で別契約のため即バグとは断定不可。M-02 / P-01 の parity 調査課題。
+- 単一メッセージ応答のキー不一致（2026-11-18 発見 → 2026-11-19 親がコード追跡で解消）:
+  `routes.rs:2264-2269` の `get_message` は `"sessionID"` / `"createdAt"` の手組み
+  JSON を返すが、TUI が呼ぶのは `list_messages`（routes.rs:1094、server 側 MessageInfo
+  の snake_case を Vec で返す）のみ。TUI の `get_messages` はこれを正しく受け取れる。
+  双方向の wire format をテストで固定済み（server 2 件 / TUI 1 件）。実害なし。
 - `PermissionType::from_permission_str`（2026-11-18、swarm-coding R2-C が発見、未修正）:
   `ExecuteCommand` / `NetworkRequest` に対応する arm が無く、これら 2 バリアントは
   直接構築でしか到達できない。サーバが `"execute_command"` 等を送る想定なら
