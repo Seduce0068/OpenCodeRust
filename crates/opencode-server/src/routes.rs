@@ -2021,6 +2021,55 @@ fn spawn_prompt_execution(
             },
         ));
 
+        // TODO 状態を ServerState の TodoManager へ直接配線する。
+        // ServerState は Arc で共有されているため、所有権を移さずにコールバックへ保持でき、
+        // `GET /session/{id}/todo` と同じインスタンスを参照できる。
+        let todo_update_state = task_state.clone();
+        let todo_update: opencode_tool::TodoUpdateCallback = Arc::new(move |session_id, todos| {
+            let state = todo_update_state.clone();
+            Box::pin(async move {
+                let items: Vec<opencode_session::TodoInfo> = todos
+                    .iter()
+                    .map(|todo| opencode_session::TodoInfo {
+                        content: todo.content.clone(),
+                        status: todo.status.clone(),
+                        priority: todo.priority.clone(),
+                    })
+                    .collect();
+                state.todo_manager.update(&session_id, items).await;
+                state.broadcast(
+                    &serde_json::json!({
+                        "type": "todo.updated",
+                        "sessionID": session_id,
+                        "todos": todos.iter().map(|todo| serde_json::json!({
+                            "content": todo.content,
+                            "status": todo.status,
+                            "priority": todo.priority,
+                        })).collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                );
+                Ok(())
+            })
+        });
+        let todo_get_state = task_state.clone();
+        let todo_get: opencode_tool::TodoGetCallback = Arc::new(move |session_id| {
+            let state = todo_get_state.clone();
+            Box::pin(async move {
+                Ok(state
+                    .todo_manager
+                    .get(&session_id)
+                    .await
+                    .into_iter()
+                    .map(|todo| opencode_tool::TodoItemData {
+                        content: todo.content,
+                        status: todo.status,
+                        priority: todo.priority,
+                    })
+                    .collect())
+            })
+        });
+
         // Build AgentRegistry from config
         let cwd = std::env::current_dir().unwrap_or_default();
         let config = load_config(&cwd).unwrap_or_default();
@@ -2073,7 +2122,8 @@ fn spawn_prompt_execution(
 
         let prompt_runner = opencode_session::SessionPrompt::new(Arc::new(RwLock::new(
             opencode_session::SessionStateManager::new(),
-        )));
+        )))
+        .with_todo_hooks(todo_update, todo_get);
         let input = opencode_session::PromptInput {
             session_id: session_id.clone(),
             message_id,

@@ -31,7 +31,7 @@ use crate::components::{
 use crate::context::keybind::LeaderKeyState;
 use crate::context::{
     AppContext, McpConnectionStatus, McpServerStatus, Message, MessagePart as ContextMessagePart,
-    MessageRole, RevertInfo, Session, SessionStatus, TokenUsage,
+    MessageRole, RevertInfo, Session, SessionStatus, TodoItem, TokenUsage,
 };
 use crate::event::{CustomEvent, Event, StateChange};
 use crate::router::Route;
@@ -116,7 +116,7 @@ impl App {
         let base_url = resolve_tui_base_url();
         let api_client = Arc::new(ApiClient::new(base_url.clone()));
         context.set_api_client(api_client);
-        spawn_server_event_listener(event_tx.clone(), base_url);
+        spawn_server_event_listener(event_tx.clone(), base_url, context.clone());
 
         if let Ok(agent) = std::env::var("OPENCODE_TUI_AGENT") {
             let agent = agent.trim();
@@ -3771,7 +3771,57 @@ fn resolve_tui_base_url() -> String {
     "http://localhost:3000".to_string()
 }
 
-fn spawn_server_event_listener(event_tx: Sender<Event>, base_url: String) {
+/// サーバの TODO 状態を取得して TUI の `SessionContext` へ反映する。
+///
+/// `/event` の `todo.updated` は fire-and-forget のため、再接続中に届いた更新を
+/// 取りこぼすことがある。接続確立時に GET で上書きして欠落を回復する。
+fn resync_todos_from_server(context: &Arc<AppContext>) {
+    let Some(client) = context.get_api_client() else {
+        return;
+    };
+    let session_ids: Vec<String> = {
+        let session_ctx = context.session.read();
+        let mut ids: Vec<String> = session_ctx.sessions.keys().cloned().collect();
+        if let Some(current) = session_ctx.current_session_id.as_ref() {
+            if !ids.contains(current) {
+                ids.push(current.clone());
+            }
+        }
+        ids
+    };
+    for session_id in session_ids {
+        match client.get_todos(&session_id) {
+            Ok(todos) => {
+                let items: Vec<TodoItem> = todos
+                    .into_iter()
+                    .map(|todo| {
+                        let status = todo.status;
+                        TodoItem::from_wire(todo.content, &status)
+                    })
+                    .collect();
+                let mut session_ctx = context.session.write();
+                if items.is_empty() {
+                    session_ctx.todos.remove(&session_id);
+                } else {
+                    session_ctx.todos.insert(session_id.clone(), items);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    %err,
+                    "failed to resync todos from server"
+                );
+            }
+        }
+    }
+}
+
+fn spawn_server_event_listener(
+    event_tx: Sender<Event>,
+    base_url: String,
+    context: Arc<AppContext>,
+) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(2))
@@ -3785,6 +3835,8 @@ fn spawn_server_event_listener(event_tx: Sender<Event>, base_url: String) {
         };
 
         let event_url = format!("{}/event", base_url.trim_end_matches('/'));
+        // 起動時にもサーバ側の状態で上書きし、過去の更新の取りこぼしを回復する。
+        resync_todos_from_server(&context);
         loop {
             match client
                 .get(&event_url)
@@ -3792,7 +3844,10 @@ fn spawn_server_event_listener(event_tx: Sender<Event>, base_url: String) {
                 .send()
             {
                 Ok(response) if response.status().is_success() => {
-                    consume_server_event_stream(response, &event_tx);
+                    // 再接続中に届いた todo.updated を取りこぼす場合があるため、
+                    // ストリームの消費前に GET で再同期する。
+                    resync_todos_from_server(&context);
+                    consume_server_event_stream(response, &event_tx, &context);
                 }
                 Ok(response) => {
                     tracing::debug!(
@@ -3815,7 +3870,11 @@ fn spawn_server_event_listener(event_tx: Sender<Event>, base_url: String) {
     });
 }
 
-fn consume_server_event_stream(response: reqwest::blocking::Response, event_tx: &Sender<Event>) {
+fn consume_server_event_stream(
+    response: reqwest::blocking::Response,
+    event_tx: &Sender<Event>,
+    context: &Arc<AppContext>,
+) {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut data_lines: Vec<String> = Vec::new();
@@ -3824,13 +3883,13 @@ fn consume_server_event_stream(response: reqwest::blocking::Response, event_tx: 
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
-                forward_server_event(&data_lines, event_tx);
+                forward_server_event(&data_lines, event_tx, context);
                 break;
             }
             Ok(_) => {
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if trimmed.is_empty() {
-                    forward_server_event(&data_lines, event_tx);
+                    forward_server_event(&data_lines, event_tx, context);
                     data_lines.clear();
                     continue;
                 }
@@ -3849,7 +3908,11 @@ fn consume_server_event_stream(response: reqwest::blocking::Response, event_tx: 
     }
 }
 
-fn forward_server_event(data_lines: &[String], event_tx: &Sender<Event>) {
+fn forward_server_event(
+    data_lines: &[String],
+    event_tx: &Sender<Event>,
+    context: &Arc<AppContext>,
+) {
     if data_lines.is_empty() {
         return;
     }
@@ -3863,6 +3926,29 @@ fn forward_server_event(data_lines: &[String], event_tx: &Sender<Event>) {
         .and_then(|item| item.as_str())
         .or_else(|| value.get("sessionId").and_then(|item| item.as_str()));
     match event_type {
+        Some("todo.updated") | Some("todo.changed") => {
+            let Some(session_id) = session_id else {
+                return;
+            };
+            if let Some(items) = value.get("todos").and_then(|todos| todos.as_array()) {
+                let todos: Vec<TodoItem> = items
+                    .iter()
+                    .filter_map(|item| {
+                        let content = item.get("content")?.as_str()?;
+                        let status = item
+                            .get("status")
+                            .and_then(|status| status.as_str())
+                            .unwrap_or("pending");
+                        Some(TodoItem::from_wire(content.to_string(), status))
+                    })
+                    .collect();
+                let mut session_ctx = context.session.write();
+                session_ctx.todos.insert(session_id.to_string(), todos);
+            }
+            let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+                StateChange::TodoUpdated,
+            )));
+        }
         Some("session.updated") => {
             let Some(session_id) = session_id else {
                 return;

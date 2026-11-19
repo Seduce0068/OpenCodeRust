@@ -121,12 +121,48 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+impl TodoItem {
+    /// サーバが送る TODO 項目（-state の文字列表現）から TUI 用の型へ変換する。
+    ///
+    /// TUI の [`TodoItem`] は content と status のみを持つため priority は保持しない。
+    pub fn from_wire(content: String, status: &str) -> Self {
+        Self {
+            content,
+            status: TodoStatus::parse(status),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
     Cancelled,
+}
+
+impl TodoStatus {
+    /// `opencode_session::parse_status` と同じ対応で文字列から状態を復元する。
+    /// 未知の値は `Pending` にフォールバックする。
+    pub fn parse(status: &str) -> Self {
+        match status.to_lowercase().as_str() {
+            "pending" => Self::Pending,
+            "in_progress" | "in progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Pending,
+        }
+    }
+
+    /// `opencode_session::TodoStatus::as_str` と同じ文字列表現を返す。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 impl SessionContext {
@@ -445,6 +481,30 @@ mod tests {
                 status,
             });
         }
+    }
+
+    #[test]
+    fn todo_status_conversion_matches_session_representation() {
+        let cases = [
+            (TodoStatus::Pending, "pending"),
+            (TodoStatus::InProgress, "in_progress"),
+            (TodoStatus::Completed, "completed"),
+            (TodoStatus::Cancelled, "cancelled"),
+        ];
+        for (status, text) in cases {
+            assert_eq!(status.as_str(), text);
+            let parsed = TodoStatus::parse(text);
+            assert_eq!(format!("{parsed:?}"), format!("{status:?}"));
+        }
+        assert!(matches!(
+            TodoStatus::parse("in progress"),
+            TodoStatus::InProgress
+        ));
+        assert!(matches!(TodoStatus::parse("unknown"), TodoStatus::Pending));
+
+        let item = TodoItem::from_wire("task".to_string(), "completed");
+        assert_eq!(item.content, "task");
+        assert!(matches!(item.status, TodoStatus::Completed));
     }
 
     // これらの型は内部状態用で wire format の rename 属性を持たない。
