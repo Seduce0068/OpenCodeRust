@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{ChatRequest, ChatResponse, StreamResult};
 
@@ -45,6 +46,20 @@ pub trait Provider: Send + Sync {
 pub enum ProviderError {
     #[error("API error (status {status_code}): {message}")]
     ApiErrorWithStatus { message: String, status_code: u16 },
+
+    /// HTTP ステータスに加えて、レスポンスヘッダと本文 preview を構造化保持する API エラー。
+    ///
+    /// `Retry-After` を `opencode-session::retry::delay` へ接続するため、
+    /// ヘッダが判明している呼び出し側は [`ProviderError::api_error_with_headers`]
+    /// で構築する。既存の `ApiErrorWithStatus` / `api_error_from_status` の形は
+    /// 変更しないため、従来の呼び出し側はそのままコンパイルできる。
+    #[error("API error (status {status_code}): {message}")]
+    ApiErrorWithHeaders {
+        message: String,
+        status_code: u16,
+        response_headers: Option<HashMap<String, String>>,
+        response_body: Option<String>,
+    },
 
     #[error("API error: {0}")]
     ApiError(String),
@@ -112,8 +127,13 @@ impl crate::retry::IsRetryable for ProviderError {
             ProviderError::ApiErrorWithStatus {
                 status_code,
                 message,
+            }
+            | ProviderError::ApiErrorWithHeaders {
+                status_code,
+                message,
+                ..
             } => {
-                if matches!(status_code, 429 | 500 | 502 | 503 | 504) {
+                if ProviderError::is_retryable_status_code(*status_code) {
                     Some(format!("API error {status_code}: {message}"))
                 } else {
                     None
@@ -176,10 +196,71 @@ impl ProviderError {
         }
     }
 
+    /// HTTP ステータスを構造化して保持する API エラーを構築する共通ヘルパ。
+    ///
+    /// ステータス付きレスポンスを `ApiError(String)` へ文字列化するとリトライ判定と
+    /// `ParsedAPICallError::status_code` が失われるため、ステータスが判明している
+    /// エラーは必ずこのヘルパを通す。
     pub fn api_error_with_status(message: impl Into<String>, status_code: u16) -> Self {
         ProviderError::ApiErrorWithStatus {
             message: message.into(),
             status_code,
+        }
+    }
+
+    /// `api_error_with_status` の引数順を HTTP ステータス優先にした別名。
+    pub fn api_error_from_status(status_code: u16, message: impl Into<String>) -> Self {
+        ProviderError::api_error_with_status(message, status_code)
+    }
+
+    /// レスポンスヘッダと本文を構造化保持する API エラーを構築する。
+    ///
+    /// `response_body` には完全な本文ではなく 500 バイトの preview を渡すこと。
+    /// [`parse_api_call_error_with_headers`] が最終的な 500 バイト制限を再適用するため、
+    /// 全文が session 側のエラー・ログへ流出することはない。
+    pub fn api_error_with_headers(
+        status_code: u16,
+        message: impl Into<String>,
+        response_headers: Option<HashMap<String, String>>,
+        response_body: Option<String>,
+    ) -> Self {
+        ProviderError::ApiErrorWithHeaders {
+            message: message.into(),
+            status_code,
+            response_headers,
+            response_body,
+        }
+    }
+
+    /// 構造化保持されたレスポンスヘッダを返す。平坦化されたエラーは `None`。
+    pub fn response_headers(&self) -> Option<&HashMap<String, String>> {
+        match self {
+            ProviderError::ApiErrorWithHeaders {
+                response_headers, ..
+            } => response_headers.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 構造化保持されたレスポンス本文 preview を返す。平坦化されたエラーは `None`。
+    pub fn response_body(&self) -> Option<&str> {
+        match self {
+            ProviderError::ApiErrorWithHeaders { response_body, .. } => response_body.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// リトライ対象の HTTP ステータス集合を単一の情報源として判定する。
+    pub fn is_retryable_status_code(status_code: u16) -> bool {
+        matches!(status_code, 429 | 500 | 502 | 503 | 504)
+    }
+
+    /// 構造化されたステータスコードを取り出す。平坦化された `ApiError` は `None`。
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            ProviderError::ApiErrorWithStatus { status_code, .. }
+            | ProviderError::ApiErrorWithHeaders { status_code, .. } => Some(*status_code),
+            _ => None,
         }
     }
 
@@ -231,6 +312,21 @@ pub enum ParsedStreamError {
 }
 
 pub fn parse_api_call_error(provider_id: &str, error: &ProviderError) -> ParsedAPICallError {
+    parse_api_call_error_with_headers(provider_id, error, None)
+}
+
+/// `response_headers` / `response_body` を保持した `ParsedAPICallError` を構築する。
+///
+/// 既往の `parse_api_call_error` は常に `None` を渡していたため、
+/// `opencode-session::retry::delay` が `Retry-After` を解釈できなかった。
+/// 呼び出し側が明示したヘッダを優先し、未指定なら
+/// [`ProviderError::ApiErrorWithHeaders`] の構造化値から取り出す。
+/// 本文は 500 バイトの preview に制限して引き継ぐ。
+pub fn parse_api_call_error_with_headers(
+    provider_id: &str,
+    error: &ProviderError,
+    response_headers: Option<HashMap<String, String>>,
+) -> ParsedAPICallError {
     let message = format_error_message(provider_id, error);
 
     if ProviderError::is_overflow(&message) {
@@ -241,11 +337,12 @@ pub fn parse_api_call_error(provider_id: &str, error: &ProviderError) -> ParsedA
     }
 
     let (status_code, is_retryable) = match error {
-        ProviderError::ApiErrorWithStatus { status_code, .. } => {
+        ProviderError::ApiErrorWithStatus { status_code, .. }
+        | ProviderError::ApiErrorWithHeaders { status_code, .. } => {
             let retryable = if provider_id.starts_with("openai") {
                 is_openai_error_retryable(*status_code)
             } else {
-                matches!(status_code, 429 | 500 | 502 | 503 | 504)
+                ProviderError::is_retryable_status_code(*status_code)
             };
             (Some(*status_code), retryable)
         }
@@ -256,32 +353,102 @@ pub fn parse_api_call_error(provider_id: &str, error: &ProviderError) -> ParsedA
         _ => (None, false),
     };
 
+    // 呼び出し側が明示したヘッダを優先し、無ければ構造化値から取り出す。
+    let response_headers = response_headers.or_else(|| error.response_headers().cloned());
+    // 本文全文をログ・エラーへ出さないよう 500 バイト preview に制限する。
+    let response_body = error
+        .response_body()
+        .map(|body| crate::openai::error_body_preview(body, 500));
+
     ParsedAPICallError::ApiError {
         message,
         status_code,
         is_retryable,
-        response_headers: None,
-        response_body: None,
+        response_headers,
+        response_body,
         metadata: None,
     }
 }
 
 fn format_error_message(provider_id: &str, error: &ProviderError) -> String {
     // GitHub Copilot 403 special case
-    if provider_id.contains("github-copilot") {
-        if let ProviderError::ApiErrorWithStatus {
-            status_code: 403, ..
-        } = error
-        {
-            return "Please reauthenticate with the copilot provider to ensure your credentials work properly with OpenCode.".to_string();
-        }
+    if provider_id.contains("github-copilot")
+        && matches!(
+            error,
+            ProviderError::ApiErrorWithStatus {
+                status_code: 403,
+                ..
+            } | ProviderError::ApiErrorWithHeaders {
+                status_code: 403,
+                ..
+            }
+        )
+    {
+        return "Please reauthenticate with the copilot provider to ensure your credentials work properly with OpenCode.".to_string();
     }
     error.to_string()
 }
 
 fn is_openai_error_retryable(status: u16) -> bool {
     // OpenAI sometimes returns 404 for models that are actually available
-    status == 404 || matches!(status, 429 | 500 | 502 | 503 | 504)
+    status == 404 || ProviderError::is_retryable_status_code(status)
+}
+
+/// `Retry-After` の秒指定値をパースする純粋ヘルパ。
+///
+/// ヘッダ名は大文字小文字を区別しない。HTTP-date 形式は
+/// `opencode-session::retry` 側で解釈されるため、ここでは扱わない。
+/// 正の有限数以外（0・負・NaN・無限大・不正文字列）は `None` を返す。
+pub fn parse_retry_after_seconds(headers: &HashMap<String, String>) -> Option<f64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+}
+
+/// `Retry-After` をバックオフ上限（ミリ秒）へ反映する純粋ヘルパ。
+///
+/// `opencode-session::retry::RETRY_MAX_DELAY` と同じ上限を既定値として使い、
+/// 上限を超える値はクランプする。ヘッダが無い・不正な場合は `None`。
+pub const DEFAULT_RETRY_AFTER_CAP_MS: u64 = 2_147_483_647;
+
+pub fn retry_after_backoff_cap_ms(
+    headers: Option<&HashMap<String, String>>,
+    default_cap_ms: u64,
+) -> Option<u64> {
+    let seconds = parse_retry_after_seconds(headers?)?;
+    let millis = seconds * 1000.0;
+    if !millis.is_finite() || millis <= 0.0 {
+        return None;
+    }
+    let cap = default_cap_ms.min(DEFAULT_RETRY_AFTER_CAP_MS);
+    Some((millis.ceil() as u64).min(cap))
+}
+
+/// 共通 HTTP クライアントの接続タイムアウト既定値。
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 共通 HTTP クライアントのリクエスト全体タイムアウト既定値。
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 接続・全体タイムアウトを明示設定した `reqwest::Client` を構築する。
+///
+/// 各アダプタの `Client::new()` は既定タイムアウトが設定されないため、
+/// 未設定のまま無期限に待つ可能性がある。アダプタはこの `pub(crate)` API
+/// を利用してクライアントを構築する（個別ファイルの変更は別スコープ）。
+pub(crate) fn build_http_client(
+    connect_timeout: Duration,
+    timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
+        .build()
+}
+
+/// 既定タイムアウトで共通 HTTP クライアントを構築する。
+pub(crate) fn default_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    build_http_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
 }
 
 pub fn parse_stream_error(data: &str) -> Option<ParsedStreamError> {
@@ -600,5 +767,190 @@ mod tests {
     fn test_parse_stream_error_non_error() {
         let data = r#"{"type":"message","content":"hello"}"#;
         assert!(parse_stream_error(data).is_none());
+    }
+
+    #[test]
+    fn test_retryable_status_codes_are_fixed() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(
+                ProviderError::is_retryable_status_code(status),
+                "status {status} must be retryable"
+            );
+        }
+        for status in [200, 400, 401, 403, 404, 408, 418, 422] {
+            assert!(
+                !ProviderError::is_retryable_status_code(status),
+                "status {status} must not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_error_from_status_keeps_structured_status() {
+        use crate::retry::IsRetryable;
+
+        let error = ProviderError::api_error_from_status(503, "Service Unavailable");
+        match &error {
+            ProviderError::ApiErrorWithStatus {
+                status_code,
+                message,
+            } => {
+                assert_eq!(*status_code, 503);
+                assert_eq!(message.as_str(), "Service Unavailable");
+            }
+            other => panic!("expected structured status error, got {other:?}"),
+        }
+        assert_eq!(error.status_code(), Some(503));
+        assert!(
+            error.is_retryable().is_some(),
+            "503 must stay retryable when status is structured"
+        );
+
+        // 平坦化された ApiError はステータス情報を失う（回帰防止）。
+        let flattened = ProviderError::ApiError("503: Service Unavailable".to_string());
+        assert_eq!(flattened.status_code(), None);
+        assert!(flattened.is_retryable().is_none());
+    }
+
+    #[test]
+    fn test_parse_api_call_error_keeps_retryable_status() {
+        for status in [429, 500, 502, 503, 504] {
+            let error = ProviderError::api_error_from_status(status, "boom");
+            let parsed = parse_api_call_error("anthropic", &error);
+            match parsed {
+                ParsedAPICallError::ApiError {
+                    status_code: Some(actual),
+                    is_retryable: true,
+                    ..
+                } => assert_eq!(actual, status),
+                other => panic!("status {status} should be retryable, got {other:?}"),
+            }
+        }
+
+        let error = ProviderError::api_error_from_status(400, "bad request");
+        let parsed = parse_api_call_error("anthropic", &error);
+        match parsed {
+            ParsedAPICallError::ApiError { is_retryable, .. } => assert!(!is_retryable),
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_api_call_error_with_headers_passes_headers_through() {
+        let error = ProviderError::api_error_from_status(429, "rate limited");
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "2".to_string());
+
+        let parsed = parse_api_call_error_with_headers("openai", &error, Some(headers.clone()));
+        match parsed {
+            ParsedAPICallError::ApiError {
+                response_headers, ..
+            } => assert_eq!(response_headers, Some(headers)),
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+
+        let without = parse_api_call_error("openai", &error);
+        match without {
+            ParsedAPICallError::ApiError {
+                response_headers, ..
+            } => {
+                assert!(response_headers.is_none())
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_api_error_with_headers_feeds_parsed_error() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "2".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+        let long_body = format!("{{\"error\":\"{}\"}}", "x".repeat(2_000));
+        let error = ProviderError::api_error_with_headers(
+            429,
+            "rate limited",
+            Some(headers.clone()),
+            Some(long_body.clone()),
+        );
+
+        // 構造化値が保持され、既存の status/retryable 判定も壊れていないこと。
+        assert_eq!(error.status_code(), Some(429));
+        assert_eq!(error.response_headers(), Some(&headers));
+        assert_eq!(error.response_body(), Some(long_body.as_str()));
+        use crate::retry::IsRetryable;
+        assert!(error.is_retryable().is_some());
+
+        // parse 経由で session 側へ届くこと。本文は 500 バイト preview に制限される。
+        let parsed = parse_api_call_error("openai", &error);
+        match parsed {
+            ParsedAPICallError::ApiError {
+                status_code,
+                is_retryable,
+                response_headers,
+                response_body,
+                ..
+            } => {
+                assert_eq!(status_code, Some(429));
+                assert!(is_retryable);
+                assert_eq!(response_headers, Some(headers));
+                let body = response_body.expect("body must be propagated");
+                assert!(
+                    body.len() <= 503,
+                    "full body leaked into preview: {} bytes",
+                    body.len()
+                );
+                assert!(body.ends_with("..."));
+                assert!(!body.contains(&long_body));
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_retry_after_seconds_seconds_only() {
+        let mut headers = HashMap::new();
+        headers.insert("Retry-After".to_string(), "2.5".to_string());
+        assert_eq!(parse_retry_after_seconds(&headers), Some(2.5));
+
+        // HTTP-date 形式は秒指定ではないためパースしない（session 側が担当）。
+        let mut date_headers = HashMap::new();
+        date_headers.insert(
+            "retry-after".to_string(),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+        );
+        assert_eq!(parse_retry_after_seconds(&date_headers), None);
+
+        for value in ["0", "-1", "NaN", "inf"] {
+            let mut invalid = HashMap::new();
+            invalid.insert("retry-after".to_string(), value.to_string());
+            assert_eq!(parse_retry_after_seconds(&invalid), None, "value={value}");
+        }
+    }
+
+    #[test]
+    fn test_retry_after_backoff_cap_ms_is_clamped() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "1e9".to_string());
+        assert_eq!(
+            retry_after_backoff_cap_ms(Some(&headers), 5_000),
+            Some(5_000)
+        );
+
+        headers.insert("retry-after".to_string(), "2".to_string());
+        assert_eq!(
+            retry_after_backoff_cap_ms(Some(&headers), DEFAULT_RETRY_AFTER_CAP_MS),
+            Some(2_000)
+        );
+
+        assert_eq!(retry_after_backoff_cap_ms(None, 5_000), None);
+    }
+
+    #[test]
+    fn test_default_http_client_builds_with_timeouts() {
+        let client = default_http_client().expect("client with timeouts must build");
+        // reqwest::Client はタイムアウト値を公開しないため、構築成功を固定する。
+        let _ = &client;
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(120));
     }
 }

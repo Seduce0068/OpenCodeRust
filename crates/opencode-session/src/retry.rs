@@ -77,7 +77,10 @@ pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
                 }
             }
 
-            return saturating_backoff(RETRY_INITIAL_DELAY, RETRY_BACKOFF_FACTOR, exponent);
+            // Finding 6: ヘッダはあるが Retry-After を解釈できなかった場合も、
+            // ヘッダ無しと同じ 30 秒上限を適用する（従来は u64::MAX まで伸びていた）。
+            return saturating_backoff(RETRY_INITIAL_DELAY, RETRY_BACKOFF_FACTOR, exponent)
+                .min(RETRY_MAX_DELAY_NO_HEADERS);
         }
     }
 
@@ -233,10 +236,16 @@ mod tests {
         // 2^70 would overflow u64; saturating arithmetic must not panic/wrap.
         assert_eq!(delay(u32::MAX, None), RETRY_MAX_DELAY_NO_HEADERS);
 
-        // Headers without a retry-after hint use the uncapped branch.
+        // Finding 6: a header-bearing error without a usable Retry-After must
+        // use the same 30s cap as the no-headers branch (previously u64::MAX).
+        // Saturating arithmetic is still exercised: 2^u32::MAX saturates before
+        // the cap is applied, so this must not panic or wrap.
         let mut headers = HashMap::new();
         headers.insert("x-request-id".to_owned(), "abc".to_owned());
-        assert_eq!(delay(u32::MAX, Some(&info(Some(headers)))), u64::MAX);
+        assert_eq!(
+            delay(u32::MAX, Some(&info(Some(headers)))),
+            RETRY_MAX_DELAY_NO_HEADERS
+        );
     }
 
     #[test]
@@ -258,6 +267,30 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("retry-after".to_owned(), "not-a-number".to_owned());
         assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000);
+    }
+
+    #[test]
+    fn delay_retry_after_with_unrelated_headers_is_honored() {
+        // (b) ヘッダが存在し、解釈可能な Retry-After があれば delay へ反映される。
+        let mut headers = HashMap::new();
+        headers.insert("x-request-id".to_owned(), "abc".to_owned());
+        headers.insert("retry-after".to_owned(), "2".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000);
+    }
+
+    #[test]
+    fn delay_unrelated_headers_only_never_exceeds_no_headers_cap() {
+        // (c) 無関係ヘッダだけでは 30 秒を超えないこと。
+        for attempt in [1, 5, 10, 20, u32::MAX] {
+            let mut headers = HashMap::new();
+            headers.insert("x-request-id".to_owned(), "abc".to_owned());
+            headers.insert("content-type".to_owned(), "application/json".to_owned());
+            let actual = delay(attempt, Some(&info(Some(headers))));
+            assert!(
+                actual <= RETRY_MAX_DELAY_NO_HEADERS,
+                "attempt={attempt}, delay={actual}"
+            );
+        }
     }
 
     #[test]

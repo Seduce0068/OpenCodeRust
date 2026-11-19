@@ -136,7 +136,7 @@ impl BedrockProvider {
         ];
 
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             config,
             models,
         }
@@ -354,7 +354,14 @@ impl Provider for BedrockProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         let bedrock_response: BedrockConverseResponse = response
@@ -400,7 +407,14 @@ impl Provider for BedrockProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         // 生バイトを保持し、完全な JSON オブジェクトが揃ってからデコードする。

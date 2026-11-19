@@ -82,7 +82,7 @@ impl AzureProvider {
         ];
 
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             config,
             models,
         }
@@ -155,7 +155,14 @@ impl Provider for AzureProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         response
@@ -185,7 +192,14 @@ impl Provider for AzureProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         // bytes_stream のチャンク境界をまたぐ SSE 行を SseLineBuffer で組み立てる。

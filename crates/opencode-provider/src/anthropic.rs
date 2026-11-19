@@ -92,7 +92,7 @@ impl AnthropicProvider {
         ];
 
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             config,
             models,
         }
@@ -178,7 +178,14 @@ impl Provider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         let anthropic_response: AnthropicResponse = response
@@ -211,7 +218,14 @@ impl Provider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         // ストリーム全体で 1 つのパーサを共有し、content_block_start で得た tool_use id を
@@ -585,5 +599,44 @@ mod tests {
             "分割されたマルチバイト文字は U+FFFD に置換されず復元される必要がある: {events:?}"
         );
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn rate_limited_status_response_is_retryable() {
+        use crate::retry::IsRetryable;
+
+        // アダプタと同一の構築経路。平坦化された ApiError ではリトライ判定を失う。
+        let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let body = "rate limited";
+        let error = ProviderError::api_error_from_status(
+            status.as_u16(),
+            format!(
+                "{}: {}",
+                status,
+                crate::openai::error_body_preview(body, 500)
+            ),
+        );
+        assert_eq!(error.status_code(), Some(429));
+        assert!(
+            error.is_retryable().is_some(),
+            "429 レスポンスはリトライ可能でなければならない: {error:?}"
+        );
+
+        // 本文全体をエラーへ埋め込まないことの回帰防止。
+        let long_body = "x".repeat(1000);
+        let long_error = ProviderError::api_error_from_status(
+            status.as_u16(),
+            format!(
+                "{}: {}",
+                status,
+                crate::openai::error_body_preview(&long_body, 500)
+            ),
+        );
+        let message = long_error.to_string();
+        assert!(message.contains("..."), "長い本文は省略されるべき");
+        assert!(
+            !message.contains(long_body.as_str()),
+            "本文全体をエラーへ露出してはならない"
+        );
     }
 }

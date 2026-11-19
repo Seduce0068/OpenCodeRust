@@ -70,7 +70,7 @@ impl GitLabProvider {
         ];
 
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             config,
             models,
         }

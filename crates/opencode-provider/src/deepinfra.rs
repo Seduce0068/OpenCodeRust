@@ -19,7 +19,7 @@ pub struct DeepInfraProvider {
 impl DeepInfraProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             api_key: api_key.into(),
             models: vec![
                 ModelInfo {
