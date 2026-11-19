@@ -3054,6 +3054,30 @@ pub fn should_compact(messages: &[SessionMessage], max_tokens: u64) -> bool {
     estimated_tokens > max_tokens as usize
 }
 
+/// Return the longest prefix of `text` that fits within `max_bytes` bytes and
+/// ends on a UTF-8 character boundary.
+///
+/// A plain `&text[..max_bytes]` slice panics when a multibyte character
+/// straddles the byte limit. This helper mirrors `str::floor_char_boundary`
+/// using `char_indices` (the same approach as `system::trim_for_prompt`), so it
+/// stays safe for Japanese and any other multibyte input while producing
+/// byte-identical results for ASCII.
+fn truncate_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
 pub fn trigger_compaction(session: &mut Session, messages: &[SessionMessage]) -> Option<String> {
     if !should_compact(messages, 100000) {
         return None;
@@ -3074,7 +3098,7 @@ pub fn trigger_compaction(session: &mut Session, messages: &[SessionMessage]) ->
 
     let summary = format!(
         "[Context Compaction Triggered]\nRecent messages summarized:\n{}",
-        &text_content[..text_content.len().min(500)]
+        truncate_bytes(&text_content, 500)
     );
 
     // Persist the compaction summary as a Compaction part on a new assistant message.
@@ -3295,7 +3319,7 @@ pub fn generate_session_title(first_user_message: &str) -> String {
     let first_line = first_user_message.lines().next().unwrap_or("").trim();
 
     if first_line.len() > 100 {
-        format!("{}...", &first_line[..97])
+        format!("{}...", truncate_bytes(first_line, 97))
     } else if first_line.is_empty() {
         "New Session".to_string()
     } else {
@@ -3364,7 +3388,7 @@ pub async fn generate_session_title_llm(
             if cleaned.is_empty() {
                 fallback
             } else if cleaned.len() > 100 {
-                format!("{}...", &cleaned[..97])
+                format!("{}...", truncate_bytes(&cleaned, 97))
             } else {
                 cleaned
             }
@@ -3596,7 +3620,8 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use opencode_provider::{
-        ChatRequest, ChatResponse, ModelInfo, ProviderError, StreamEvent, StreamResult, StreamUsage,
+        ChatRequest, ChatResponse, Choice, ModelInfo, ProviderError, StreamEvent, StreamResult,
+        StreamUsage,
     };
     use std::sync::Mutex as StdMutex;
 
@@ -4841,5 +4866,128 @@ mod tests {
 
         assert_eq!(tool_content, payload);
         assert_eq!(tool_content.matches("<system-reminder>").count(), 1);
+    }
+
+    #[test]
+    fn test_truncate_bytes_ascii_is_byte_identical() {
+        let text = "abcdefghij".repeat(60);
+        assert_eq!(truncate_bytes(&text, 97), &text[..97]);
+        assert_eq!(truncate_bytes(&text, 500), &text[..500]);
+        assert_eq!(truncate_bytes("short", 97), "short");
+    }
+
+    #[test]
+    fn test_truncate_bytes_multibyte_boundary() {
+        // 'あ' is 3 bytes: byte 97 lands inside the 33rd character, so a raw
+        // `&text[..97]` slice would panic. The result must stop at 96 bytes.
+        let text = "あ".repeat(40);
+        let truncated = truncate_bytes(&text, 97);
+        assert_eq!(truncated, "あ".repeat(32));
+        assert!(truncated.len() <= 97);
+        assert!(!truncated.contains('\u{fffd}'));
+
+        // 500-byte budget: 166 * 3 = 498 bytes; byte 500 splits a character.
+        let long = "あ".repeat(200);
+        assert_eq!(truncate_bytes(&long, 500), "あ".repeat(166));
+        assert!(!truncate_bytes(&long, 500).contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn test_generate_session_title_ascii_truncation_unchanged() {
+        let title = generate_session_title(&"a".repeat(150));
+        assert_eq!(title, format!("{}...", "a".repeat(97)));
+    }
+
+    #[test]
+    fn test_generate_session_title_multibyte_boundary() {
+        // 40 * 3 = 120 bytes > 100, and byte 97 splits a 3-byte character.
+        // The old `&first_line[..97]` slice panicked on this input.
+        let title = generate_session_title(&"あ".repeat(40));
+        assert_eq!(title, format!("{}...", "あ".repeat(32)));
+        assert!(!title.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn test_generate_session_title_llm_multibyte_boundary() {
+        struct LongTitleProvider {
+            model: ModelInfo,
+        }
+
+        #[async_trait]
+        impl Provider for LongTitleProvider {
+            fn id(&self) -> &str {
+                "mock"
+            }
+
+            fn name(&self) -> &str {
+                "Mock"
+            }
+
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![self.model.clone()]
+            }
+
+            fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+                if id == self.model.id {
+                    Some(&self.model)
+                } else {
+                    None
+                }
+            }
+
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+                Ok(ChatResponse {
+                    id: "chat_mock".to_string(),
+                    model: self.model.id.clone(),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: Message::assistant("あ".repeat(40)),
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+            }
+
+            async fn chat_stream(
+                &self,
+                _request: ChatRequest,
+            ) -> Result<StreamResult, ProviderError> {
+                Ok(Box::pin(stream::empty()))
+            }
+        }
+
+        let provider = LongTitleProvider {
+            model: ModelInfo {
+                id: "mock-model".to_string(),
+                name: "Mock".to_string(),
+                provider: "mock".to_string(),
+                context_window: 8192,
+                max_output_tokens: 1024,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            },
+        };
+
+        let title =
+            generate_session_title_llm("test input", Arc::new(provider), "mock-model").await;
+        assert_eq!(title, format!("{}...", "あ".repeat(32)));
+        assert!(!title.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn test_trigger_compaction_multibyte_boundary() {
+        // should_compact() needs > 100_000 estimated tokens (> 400_000 bytes).
+        // 200_000 'あ' = 600_000 bytes, and truncating to 500 bytes lands
+        // inside a 3-byte character in the original implementation.
+        let mut session = Session::new("proj", ".");
+        let messages = vec![SessionMessage::user("ses_test", "あ".repeat(200_000))];
+
+        let summary = trigger_compaction(&mut session, &messages)
+            .expect("compaction should trigger for a large multibyte message");
+        assert!(summary.starts_with("[Context Compaction Triggered]"));
+        assert!(summary.ends_with(&"あ".repeat(166)));
+        assert!(!summary.contains('\u{fffd}'));
     }
 }
