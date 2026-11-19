@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -85,6 +86,10 @@ pub struct App {
     state: AppState,
     terminal: terminal::Tui,
     event_rx: Receiver<Event>,
+    /// SSE リスナへ終了を通知するフラグ。Drop で set してから join する。
+    sse_shutdown: Arc<AtomicBool>,
+    /// SSE リスナの JoinHandle。App 終了後にポーリングが残らないようにする。
+    sse_listener: Option<thread::JoinHandle<()>>,
     prompt: Prompt,
     selection: Selection,
     session_view: Option<SessionView>,
@@ -149,7 +154,13 @@ impl App {
             auth_token.as_deref(),
         ));
         context.set_api_client(api_client);
-        spawn_server_event_listener(event_tx.clone(), base_url, context.clone());
+        let sse_shutdown = Arc::new(AtomicBool::new(false));
+        let sse_listener = spawn_server_event_listener(
+            event_tx.clone(),
+            base_url,
+            context.clone(),
+            sse_shutdown.clone(),
+        );
 
         if let Ok(agent) = std::env::var("OPENCODE_TUI_AGENT") {
             let agent = agent.trim();
@@ -231,6 +242,8 @@ impl App {
             state: AppState::default(),
             terminal,
             event_rx,
+            sse_shutdown,
+            sse_listener: Some(sse_listener),
             prompt,
             selection: Selection::new(),
             session_view: None,
@@ -3528,10 +3541,15 @@ impl App {
         let selection = &self.selection;
 
         let mut captured_lines: Vec<String> = Vec::new();
+        let mut snapshot_skipped = false;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
             if area.width < 10 || area.height < 10 {
+                // 描画もスナップショットもしない。古い screen_lines を残すと
+                // 選択コピーが現在の座標で古い行を参照してしまうため、
+                // 描画後にスナップショットと選択を破棄する。
+                snapshot_skipped = true;
                 return;
             }
 
@@ -3647,14 +3665,49 @@ impl App {
             }
         })?;
 
-        self.screen_lines = captured_lines;
+        if finish_screen_snapshot(
+            &mut self.screen_lines,
+            &mut self.selection,
+            snapshot_skipped,
+            captured_lines,
+        ) {
+            // 極小ターミナルではスナップショットを破棄したので、次のイベントで
+            // 再描画し、必ず新しいバッファから取り直す。
+            self.event_caused_change = true;
+        }
         Ok(())
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        // event_rx は Drop::drop の後にフィールドが破棄されるため、SSE 側の
+        // send 失敗だけでは停止を検知できない。明示的にフラグを立ててから join する。
+        self.sse_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.sse_listener.take() {
+            let _ = handle.join();
+        }
         let _ = terminal::restore();
+    }
+}
+
+/// 描画結果を選択用スナップショットへ反映する。
+///
+/// 極小ターミナルで描画をスキップした場合は、古い行を現在の座標で参照しないよう
+/// スナップショットと選択を破棄し、再スナップショットが必要であることを返す。
+fn finish_screen_snapshot(
+    screen_lines: &mut Vec<String>,
+    selection: &mut Selection,
+    snapshot_skipped: bool,
+    captured_lines: Vec<String>,
+) -> bool {
+    if snapshot_skipped {
+        screen_lines.clear();
+        selection.clear();
+        true
+    } else {
+        *screen_lines = captured_lines;
+        false
     }
 }
 
@@ -4054,11 +4107,31 @@ fn sse_delay_after_stream_end(
     }
 }
 
+/// 指数バックオフの待機時間を維持しつつ、終了通知だけは即座に反映する。
+/// 戻り値は待機を最後まで終えた場合 (再接続を続けてよい場合) に true。
+fn sse_sleep_until(delay: Duration, shutdown: &AtomicBool) -> bool {
+    const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+    let deadline = Instant::now() + delay;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(SHUTDOWN_POLL.min(remaining));
+    }
+}
+
+/// サーバイベントリスナを起動し、JoinHandle を呼び出し側へ返す。
+/// 終了は `shutdown` フラグで通知し、ハンドルを join してスレッドの残留を防ぐ。
 fn spawn_server_event_listener(
     event_tx: Sender<Event>,
     base_url: String,
     context: Arc<AppContext>,
-) {
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // attach 先サーバが認証を有効にしている場合は SSE にも Bearer を付与する。
         // トークン値はログへ出力しない。
@@ -4080,11 +4153,17 @@ fn spawn_server_event_listener(
             }
         };
 
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         let event_url = format!("{}/event", base_url.trim_end_matches('/'));
         // 起動時にもサーバ側の状態で上書きし、過去の更新の取りこぼしを回復する。
         resync_todos_from_server(&context);
         let mut retry_attempt: u32 = 0;
         loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             match client
                 .get(&event_url)
                 .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -4092,11 +4171,17 @@ fn spawn_server_event_listener(
                 .send()
             {
                 Ok(response) if response.status().is_success() => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     // 再接続中に届いた todo.updated を取りこぼす場合があるため、
                     // ストリームの消費前に GET で再同期する。
                     resync_todos_from_server(&context);
                     let stream_started = Instant::now();
-                    consume_server_event_stream(response, &event_tx, &context);
+                    // 受信側が消えた (send が Err) 場合は再接続せず終了する。
+                    if !consume_server_event_stream(response, &event_tx, &context, &shutdown) {
+                        break;
+                    }
                     // EOF / ストリーム終了も失敗として扱い、即再接続しない。
                     let (attempt, delay) = sse_delay_after_stream_end(
                         stream_started.elapsed(),
@@ -4110,7 +4195,9 @@ fn spawn_server_event_listener(
                         ?delay,
                         "server event stream ended; backing off"
                     );
-                    thread::sleep(delay);
+                    if !sse_sleep_until(delay, &shutdown) {
+                        break;
+                    }
                 }
                 Ok(response) => {
                     tracing::debug!(
@@ -4120,7 +4207,9 @@ fn spawn_server_event_listener(
                     );
                     let (attempt, delay) = sse_delay_after_failure(retry_attempt, sse_jitter_ms());
                     retry_attempt = attempt;
-                    thread::sleep(delay);
+                    if !sse_sleep_until(delay, &shutdown) {
+                        break;
+                    }
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -4130,35 +4219,46 @@ fn spawn_server_event_listener(
                     );
                     let (attempt, delay) = sse_delay_after_failure(retry_attempt, sse_jitter_ms());
                     retry_attempt = attempt;
-                    thread::sleep(delay);
+                    if !sse_sleep_until(delay, &shutdown) {
+                        break;
+                    }
                 }
             }
         }
-    });
+    })
 }
 
 /// SSE ストリームを消費する。この関数が戻ることはすなわち EOF / 読込エラー /
 /// タイムアウトによるストリーム終了を意味し、呼び出し側はバックオフ待機を行う。
+/// 受信側の消失 (send 失敗) または終了要求では false を返し、再接続しない。
 fn consume_server_event_stream(
     response: reqwest::blocking::Response,
     event_tx: &Sender<Event>,
     context: &Arc<AppContext>,
-) {
+    shutdown: &AtomicBool,
+) -> bool {
     let mut reader = BufReader::new(response);
     let mut line = String::new();
     let mut data_lines: Vec<String> = Vec::new();
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
-                forward_server_event(&data_lines, event_tx, context);
+                if !forward_server_event(&data_lines, event_tx, context, shutdown) {
+                    return false;
+                }
                 break;
             }
             Ok(_) => {
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if trimmed.is_empty() {
-                    forward_server_event(&data_lines, event_tx, context);
+                    if !forward_server_event(&data_lines, event_tx, context, shutdown) {
+                        return false;
+                    }
                     data_lines.clear();
                     continue;
                 }
@@ -4175,20 +4275,29 @@ fn consume_server_event_stream(
             }
         }
     }
+    true
 }
 
+/// サーバイベントを TUI のイベントチャネルへ転送する。
+/// 戻り値はリスナを継続してよい場合のみ true。受信側の消失・終了要求で false。
 fn forward_server_event(
     data_lines: &[String],
     event_tx: &Sender<Event>,
     context: &Arc<AppContext>,
-) {
+    shutdown: &AtomicBool,
+) -> bool {
+    if shutdown.load(Ordering::Relaxed) {
+        return false;
+    }
     if data_lines.is_empty() {
-        return;
+        return true;
     }
     let payload = data_lines.join("\n");
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
-        return;
+        return true;
     };
+    // send が Err になったら握り潰さず、呼び出し側へ停止を伝える。
+    let send = |event: Event| event_tx.send(event).is_ok();
     let event_type = value.get("type").and_then(|item| item.as_str());
     let session_id = value
         .get("sessionID")
@@ -4197,7 +4306,7 @@ fn forward_server_event(
     match event_type {
         Some("todo.updated") | Some("todo.changed") => {
             let Some(session_id) = session_id else {
-                return;
+                return true;
             };
             if let Some(items) = value.get("todos").and_then(|todos| todos.as_array()) {
                 let todos: Vec<TodoItem> = items
@@ -4214,21 +4323,25 @@ fn forward_server_event(
                 let mut session_ctx = context.session.write();
                 session_ctx.todos.insert(session_id.to_string(), todos);
             }
-            let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+            if !send(Event::Custom(CustomEvent::StateChanged(
                 StateChange::TodoUpdated,
-            )));
+            ))) {
+                return false;
+            }
         }
         Some("session.updated") => {
             let Some(session_id) = session_id else {
-                return;
+                return true;
             };
-            let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+            if !send(Event::Custom(CustomEvent::StateChanged(
                 StateChange::SessionUpdated(session_id.to_string()),
-            )));
+            ))) {
+                return false;
+            }
         }
         Some("session.status") => {
             let Some(session_id) = session_id else {
-                return;
+                return true;
             };
             let status_type = value
                 .get("status")
@@ -4237,14 +4350,18 @@ fn forward_server_event(
                 .or_else(|| value.get("status").and_then(|item| item.as_str()));
             match status_type {
                 Some("busy") => {
-                    let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+                    if !send(Event::Custom(CustomEvent::StateChanged(
                         StateChange::SessionStatusBusy(session_id.to_string()),
-                    )));
+                    ))) {
+                        return false;
+                    }
                 }
                 Some("idle") => {
-                    let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+                    if !send(Event::Custom(CustomEvent::StateChanged(
                         StateChange::SessionStatusIdle(session_id.to_string()),
-                    )));
+                    ))) {
+                        return false;
+                    }
                 }
                 Some("retry") => {
                     let attempt = value
@@ -4264,30 +4381,37 @@ fn forward_server_event(
                         .and_then(|status| status.get("next"))
                         .and_then(|item| item.as_i64())
                         .unwrap_or_default();
-                    let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+                    if !send(Event::Custom(CustomEvent::StateChanged(
                         StateChange::SessionStatusRetrying {
                             session_id: session_id.to_string(),
                             attempt,
                             message,
                             next,
                         },
-                    )));
+                    ))) {
+                        return false;
+                    }
                 }
                 _ => {}
             }
         }
         Some("question.asked") => {
             if let Some(event) = parse_question_asked(&value) {
-                let _ = event_tx.send(Event::Custom(event));
+                if !send(Event::Custom(event)) {
+                    return false;
+                }
             }
         }
         Some("permission.requested") => {
             if let Some(event) = parse_permission_requested(&value) {
-                let _ = event_tx.send(Event::Custom(event));
+                if !send(Event::Custom(event)) {
+                    return false;
+                }
             }
         }
         _ => {}
     }
+    true
 }
 
 /// Parse a `question.asked` server event into a TUI custom event.
@@ -4739,5 +4863,86 @@ mod tests {
             with_jitter <= Duration::from_millis(base + SSE_JITTER_MAX_MS),
             "jitter must stay within the bounded range"
         );
+    }
+
+    #[test]
+    fn sse_listener_stops_on_shutdown_and_can_be_joined() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_server_event_listener(
+            event_tx,
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(AppContext::new()),
+            shutdown.clone(),
+        );
+        // App の Drop と同じ手順で通知して join できれば、リスナが残留しない。
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn sse_backoff_sleep_is_interruptible() {
+        let shutdown = AtomicBool::new(true);
+        let started = Instant::now();
+        assert!(!sse_sleep_until(Duration::from_secs(60), &shutdown));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // 終了要求が無い場合は指定したバックオフ時間をそのまま待つ。
+        let shutdown = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(sse_sleep_until(Duration::from_millis(60), &shutdown));
+        assert!(started.elapsed() >= Duration::from_millis(55));
+    }
+
+    #[test]
+    fn sse_forwarding_stops_when_receiver_is_gone() {
+        let context = Arc::new(AppContext::new());
+        let shutdown = AtomicBool::new(false);
+        let payload =
+            vec![r#"{"type":"session.status","sessionID":"ses_1","status":"idle"}"#.to_string()];
+
+        let (tx, rx) = mpsc::channel();
+        assert!(forward_server_event(&payload, &tx, &context, &shutdown));
+        assert!(rx.try_recv().is_ok());
+
+        drop(rx);
+        assert!(!forward_server_event(&payload, &tx, &context, &shutdown));
+
+        // 終了要求時は send せず停止を返す。
+        let (tx, rx) = mpsc::channel();
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(!forward_server_event(&payload, &tx, &context, &shutdown));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tiny_terminal_discards_stale_screen_snapshot_and_selection() {
+        let mut screen_lines = vec!["stale".to_string()];
+        let mut selection = Selection::new();
+        selection.start(2, 3);
+        assert!(selection.is_active());
+
+        assert!(finish_screen_snapshot(
+            &mut screen_lines,
+            &mut selection,
+            true,
+            Vec::new()
+        ));
+        assert!(screen_lines.is_empty());
+        assert!(!selection.is_active());
+
+        // 通常フレームでは新しいスナップショットへ差し替え、選択は維持する。
+        let mut screen_lines = vec!["old".to_string()];
+        let mut selection = Selection::new();
+        selection.start(1, 1);
+        let captured = vec!["fresh".to_string()];
+        assert!(!finish_screen_snapshot(
+            &mut screen_lines,
+            &mut selection,
+            false,
+            captured.clone()
+        ));
+        assert_eq!(screen_lines, captured);
+        assert!(selection.is_active());
     }
 }

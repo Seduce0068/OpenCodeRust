@@ -5442,6 +5442,10 @@ struct PluginAuthAuthorizeResponse {
     url: Option<String>,
     instructions: Option<String>,
     method: Option<String>,
+    /// Opaque id from the plugin host; lets the client correlate a later
+    /// callback with this specific authorize flow.
+    #[serde(rename = "flowId", skip_serializing_if = "Option::is_none")]
+    flow_id: Option<String>,
 }
 
 async fn plugin_auth_authorize(
@@ -5460,12 +5464,22 @@ async fn plugin_auth_authorize(
         url: result.url,
         instructions: result.instructions,
         method: result.method,
+        flow_id: result.flow_id,
     }))
 }
 
 #[derive(Debug, Deserialize)]
 struct PluginAuthCallbackRequest {
     code: Option<String>,
+    /// Opaque id returned by `auth.authorize`. Absent for legacy clients.
+    #[serde(rename = "flowId", default)]
+    flow_id: Option<String>,
+}
+
+/// Extract the arguments forwarded to the bridge. Pure so the flowId wiring
+/// can be regression-tested without a running plugin subprocess.
+fn plugin_callback_args(req: &PluginAuthCallbackRequest) -> (Option<&str>, Option<&str>) {
+    (req.code.as_deref(), req.flow_id.as_deref())
 }
 
 async fn plugin_auth_callback(
@@ -5475,8 +5489,9 @@ async fn plugin_auth_callback(
 ) -> Result<Json<serde_json::Value>> {
     let bridge = get_auth_bridge(&name).await?;
 
+    let (code, flow_id) = plugin_callback_args(&req);
     let result = bridge
-        .callback(req.code.as_deref())
+        .callback_with_flow(code, flow_id)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -5559,6 +5574,69 @@ async fn get_auth_bridge(provider: &str) -> Result<Arc<PluginAuthBridge>> {
         .auth_bridge(provider)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("no auth plugin for provider: {}", provider)))
+}
+
+#[cfg(test)]
+mod plugin_auth_flow_id_tests {
+    use super::*;
+
+    #[test]
+    fn authorize_response_includes_flow_id() {
+        let response = PluginAuthAuthorizeResponse {
+            url: Some("https://example.invalid/authorize".to_string()),
+            instructions: None,
+            method: Some("oauth".to_string()),
+            flow_id: Some("flow-abc123".to_string()),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value.get("flowId").and_then(serde_json::Value::as_str),
+            Some("flow-abc123")
+        );
+
+        // Older clients see the same response shape when no flow id is present.
+        let legacy = PluginAuthAuthorizeResponse {
+            flow_id: None,
+            ..response
+        };
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_value.get("flowId").is_none());
+    }
+
+    #[test]
+    fn callback_request_deserializes_flow_id_and_defaults_when_absent() {
+        let parsed: PluginAuthCallbackRequest = serde_json::from_value(serde_json::json!({
+            "code": "dummy-code",
+            "flowId": "flow-abc123",
+        }))
+        .unwrap();
+        assert_eq!(parsed.code.as_deref(), Some("dummy-code"));
+        assert_eq!(parsed.flow_id.as_deref(), Some("flow-abc123"));
+
+        let legacy: PluginAuthCallbackRequest =
+            serde_json::from_value(serde_json::json!({ "code": "dummy-code" })).unwrap();
+        assert_eq!(legacy.code.as_deref(), Some("dummy-code"));
+        assert_eq!(legacy.flow_id, None);
+    }
+
+    #[test]
+    fn callback_forwards_code_and_flow_id_to_bridge() {
+        let req: PluginAuthCallbackRequest = serde_json::from_value(serde_json::json!({
+            "code": "dummy-code",
+            "flowId": "flow-abc123",
+        }))
+        .unwrap();
+        let (code, flow_id) = plugin_callback_args(&req);
+        assert_eq!(code, Some("dummy-code"));
+        assert_eq!(flow_id, Some("flow-abc123"));
+
+        // Legacy requests must forward None so the bridge keeps its legacy path.
+        let legacy: PluginAuthCallbackRequest =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let (code, flow_id) = plugin_callback_args(&legacy);
+        assert_eq!(code, None);
+        assert_eq!(flow_id, None);
+    }
 }
 
 #[cfg(test)]

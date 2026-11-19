@@ -117,6 +117,10 @@ pub struct AuthorizeResult {
     pub url: Option<String>,
     pub instructions: Option<String>,
     pub method: Option<String>,
+    /// Opaque id used to correlate a later `auth.callback` with this authorize
+    /// flow. Absent on older hosts, which then use the single-pending-flow path.
+    #[serde(rename = "flowId", default)]
+    pub flow_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,9 +285,34 @@ impl PluginSubprocess {
         self.call("auth.authorize", Some(params)).await
     }
 
-    /// Complete OAuth callback.
+    /// Build `auth.callback` params. `flowId` is emitted only when present: the
+    /// host distinguishes an absent field (legacy single-pending-flow path) via
+    /// `params.flowId === undefined`, so a present-but-null value would break it.
+    fn auth_callback_params(code: Option<&str>, flow_id: Option<&str>) -> Value {
+        let mut params = serde_json::json!({ "code": code });
+        if let Some(flow_id) = flow_id {
+            params["flowId"] = Value::String(flow_id.to_string());
+        }
+        params
+    }
+
+    /// Complete OAuth callback on the legacy single-pending-flow path.
+    ///
+    /// Existing callers keep this signature; it delegates with `flow_id = None`.
     pub async fn auth_callback(&self, code: Option<&str>) -> Result<Value, PluginSubprocessError> {
-        let params = serde_json::json!({ "code": code });
+        self.auth_callback_with_flow(code, None).await
+    }
+
+    /// Complete OAuth callback for a specific authorize flow.
+    ///
+    /// `flow_id` must be the value returned by `auth.authorize` as `flowId`.
+    /// When it is `None`, the host falls back to the legacy single-flow behavior.
+    pub async fn auth_callback_with_flow(
+        &self,
+        code: Option<&str>,
+        flow_id: Option<&str>,
+    ) -> Result<Value, PluginSubprocessError> {
+        let params = Self::auth_callback_params(code, flow_id);
         self.call("auth.callback", Some(params)).await
     }
 
@@ -997,5 +1026,42 @@ mod tests {
             .expect("JSON-RPC 2.0 response should be accepted");
         assert_eq!(response.jsonrpc, "2.0");
         assert_eq!(response.result, Some(serde_json::json!(1)));
+    }
+
+    // -- Auth flowId regression tests ---------------------------------------
+
+    #[test]
+    fn authorize_result_deserializes_flow_id() {
+        let result: AuthorizeResult = serde_json::from_value(serde_json::json!({
+            "url": "https://example.invalid/auth",
+            "method": "oauth2",
+            "flowId": "flow-abc123",
+        }))
+        .expect("authorize result with flowId should deserialize");
+        assert_eq!(result.flow_id.as_deref(), Some("flow-abc123"));
+
+        // Backward compatibility: an older host that omits flowId still parses.
+        let legacy: AuthorizeResult = serde_json::from_value(serde_json::json!({
+            "url": "https://example.invalid/auth",
+        }))
+        .expect("legacy authorize result without flowId should deserialize");
+        assert_eq!(legacy.flow_id, None);
+    }
+
+    #[test]
+    fn auth_callback_params_include_flow_id_only_when_present() {
+        let params =
+            PluginSubprocess::auth_callback_params(Some("dummy-code"), Some("flow-abc123"));
+        assert_eq!(
+            params.get("flowId").and_then(Value::as_str),
+            Some("flow-abc123")
+        );
+        assert!(params.get("code").is_some());
+
+        // The legacy wrapper must not emit a `flowId` key at all: the host treats
+        // only `undefined` as the single-pending-flow path (`=== undefined`).
+        let legacy = PluginSubprocess::auth_callback_params(Some("dummy-code"), None);
+        assert!(legacy.get("flowId").is_none());
+        assert!(legacy.get("code").is_some());
     }
 }

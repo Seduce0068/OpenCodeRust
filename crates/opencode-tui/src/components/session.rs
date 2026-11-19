@@ -230,7 +230,7 @@ impl SessionView {
         } else {
             // Follow content: prompt sits directly below rendered messages.
             let max_messages_height = available_after_header_footer.saturating_sub(prompt_height);
-            let desired_messages_height = (self.rendered_line_count as u16)
+            let desired_messages_height = scroll_offset_for_ratatui(self.rendered_line_count)
                 .max(1)
                 .min(max_messages_height);
 
@@ -881,7 +881,7 @@ impl SessionView {
                     .borders(Borders::LEFT)
                     .border_style(Style::default().fg(theme.border)),
             )
-            .scroll((self.scroll_offset as u16, 0));
+            .scroll((scroll_offset_for_ratatui(self.scroll_offset), 0));
 
         frame.render_widget(paragraph, messages_area);
         if let Some(scroll_area) = scrollbar_area {
@@ -910,7 +910,9 @@ impl SessionView {
             return false;
         }
 
-        let line_index = self.scroll_offset + usize::from(row.saturating_sub(area.y));
+        let line_index = self
+            .scroll_offset
+            .saturating_add(usize::from(row.saturating_sub(area.y)));
         if line_index >= self.rendered_line_count {
             return false;
         }
@@ -964,7 +966,7 @@ impl SessionView {
     pub fn scroll_down(&mut self) {
         let max_scroll = self.max_scroll_offset();
         if self.scroll_offset < max_scroll {
-            self.scroll_offset += 1;
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
         }
     }
 
@@ -995,7 +997,7 @@ impl SessionView {
     pub fn scroll_page_down(&mut self) {
         let step = self.messages_viewport_height.saturating_sub(1).max(1);
         let max_scroll = self.max_scroll_offset();
-        self.scroll_offset = (self.scroll_offset + step).min(max_scroll);
+        self.scroll_offset = self.scroll_offset.saturating_add(step).min(max_scroll);
     }
 
     pub fn scroll_to_message(&mut self, message_id: &str) {
@@ -1394,6 +1396,12 @@ fn titlecase(value: &str) -> String {
     }
 }
 
+/// ratatui の scroll 値は u16 のため、usize のオフセットを丸めずに上限へクランプする。
+/// 65,536 行を超えるセッションで 0 に戻る (wrap around) ことを防ぐ。
+fn scroll_offset_for_ratatui(offset: usize) -> u16 {
+    offset.min(u16::MAX as usize) as u16
+}
+
 fn format_number(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + (digits.len() / 3));
@@ -1483,5 +1491,35 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(texts, vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn scroll_offset_clamps_to_u16_without_wrapping() {
+        assert_eq!(scroll_offset_for_ratatui(0), 0);
+        assert_eq!(scroll_offset_for_ratatui(65_535), u16::MAX);
+        // u16::MAX を 1 でも超えたら 0 に戻らず上限に留まる。
+        assert_eq!(scroll_offset_for_ratatui(65_536), u16::MAX);
+        assert_eq!(scroll_offset_for_ratatui(usize::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn scroll_arithmetic_saturates_instead_of_overflowing() {
+        let mut view = SessionView::new(Arc::new(AppContext::new()), "ses_1".to_string());
+        view.rendered_line_count = usize::MAX;
+        view.messages_viewport_height = 8;
+        let max_scroll = usize::MAX - 8;
+
+        view.scroll_offset = usize::MAX - 2;
+        view.scroll_down_by(16);
+        assert_eq!(view.scroll_offset, max_scroll);
+
+        view.scroll_offset = usize::MAX - 2;
+        view.scroll_page_down();
+        assert_eq!(view.scroll_offset, max_scroll);
+
+        // 行座標を足す経路も oob ではなく saturate し、read 中に panic しない。
+        view.scroll_offset = usize::MAX;
+        view.last_messages_area = Some(Rect::new(0, 0, 40, 10));
+        assert!(!view.handle_click(0, 5));
     }
 }

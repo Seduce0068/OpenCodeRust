@@ -133,14 +133,22 @@ impl crate::retry::IsRetryable for ProviderError {
                 message,
                 ..
             } => {
-                if ProviderError::is_retryable_status_code(*status_code) {
+                if is_status_retryable("", *status_code) {
                     Some(format!("API error {status_code}: {message}"))
                 } else {
                     None
                 }
             }
+            // source が reqwest の一時エラー（connect / timeout / request）なら
+            // リトライ可。下位エラーの本文や URL はメッセージへ含めない。
+            ProviderError::ApiErrorWithSource { message, source } => {
+                if source_is_transient_reqwest_error(source.as_ref()) {
+                    Some(format!("API error: {message}"))
+                } else {
+                    None
+                }
+            }
             ProviderError::ApiError(_)
-            | ProviderError::ApiErrorWithSource { .. }
             | ProviderError::AuthError(_)
             | ProviderError::ModelNotFound(_)
             | ProviderError::InvalidRequest(_)
@@ -150,6 +158,30 @@ impl crate::retry::IsRetryable for ProviderError {
             | ProviderError::ContextOverflow(_) => None,
         }
     }
+}
+
+/// ステータスコードに基づくリトライ可否の単一情報源。
+///
+/// `IsRetryable::is_retryable` と `parse_api_call_error_with_headers` の双方が
+/// この関数を呼び、経路による判定の分岐を防ぐ。`provider_id` は呼び出し側の
+/// 文脈を保つため引数として残すが、判定は全プロバイダ共通である。
+/// 従前 OpenAI のみ 404 をリトライ可としていた特例は廃止して統一した。
+pub fn is_status_retryable(provider_id: &str, status_code: u16) -> bool {
+    let _ = provider_id; // 全プロバイダ共通のステータス集合へ統一（404 特例なし）。
+    matches!(status_code, 429 | 500 | 502 | 503 | 504)
+}
+
+/// `ApiErrorWithSource` の下位エラーが reqwest の一時エラーかを判定する。
+///
+/// `reqwest::Error` へ downcast し、`is_connect` / `is_timeout` / `is_request`
+/// のいずれかが真なら一時エラーとしてリトライ可とする。それ以外の
+/// （`std::io::Error` や HTTP ステータス由来の）エラーはリトライ可にしない。
+fn source_is_transient_reqwest_error(
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> bool {
+    source
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
 }
 
 static OVERFLOW_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
@@ -251,8 +283,11 @@ impl ProviderError {
     }
 
     /// リトライ対象の HTTP ステータス集合を単一の情報源として判定する。
+    ///
+    /// 実体はモジュール級の [`is_status_retryable`] に集約済み。既存の呼び出し
+    /// 互換のために残した薄いラッパーであり、判定ロジックは持たない。
     pub fn is_retryable_status_code(status_code: u16) -> bool {
-        matches!(status_code, 429 | 500 | 502 | 503 | 504)
+        is_status_retryable("", status_code)
     }
 
     /// 構造化されたステータスコードを取り出す。平坦化された `ApiError` は `None`。
@@ -339,17 +374,19 @@ pub fn parse_api_call_error_with_headers(
     let (status_code, is_retryable) = match error {
         ProviderError::ApiErrorWithStatus { status_code, .. }
         | ProviderError::ApiErrorWithHeaders { status_code, .. } => {
-            let retryable = if provider_id.starts_with("openai") {
-                is_openai_error_retryable(*status_code)
-            } else {
-                ProviderError::is_retryable_status_code(*status_code)
-            };
-            (Some(*status_code), retryable)
+            // IsRetryable と同じ単一関数を呼ぶ（OpenAI 404 特例は廃止して統一）。
+            (
+                Some(*status_code),
+                is_status_retryable(provider_id, *status_code),
+            )
         }
         ProviderError::RateLimit => (Some(429), true),
         ProviderError::Timeout => (None, true),
         ProviderError::NetworkError(_) => (None, true),
         ProviderError::NetworkErrorWithSource { .. } => (None, true),
+        ProviderError::ApiErrorWithSource { source, .. } => {
+            (None, source_is_transient_reqwest_error(source.as_ref()))
+        }
         _ => (None, false),
     };
 
@@ -387,11 +424,6 @@ fn format_error_message(provider_id: &str, error: &ProviderError) -> String {
         return "Please reauthenticate with the copilot provider to ensure your credentials work properly with OpenCode.".to_string();
     }
     error.to_string()
-}
-
-fn is_openai_error_retryable(status: u16) -> bool {
-    // OpenAI sometimes returns 404 for models that are actually available
-    status == 404 || ProviderError::is_retryable_status_code(status)
 }
 
 /// 構造化エラーへ渡すレスポンスヘッダをサニタイズする共通ヘルパ。
@@ -773,6 +805,9 @@ mod tests {
             Some("Network error: request failed")
         );
 
+        // 一時エラー判定は reqwest::Error の connect/timeout/request に限定した。
+        // 汎用 std::io::Error は一時エラーではないため、非リトライを維持する
+        // （期待値を変えず、理由をここに明記する）。
         let api = ProviderError::api_error_with_source("bad request", std::io::Error::other("bad"));
         assert!(api.is_retryable().is_none());
     }
@@ -799,7 +834,9 @@ mod tests {
             other => panic!("expected ApiError, got {other:?}"),
         }
 
-        // ApiErrorWithSource は is_retryable() と同様に非リトライのままであること。
+        // ApiErrorWithSource は source が一時 reqwest エラー（connect/timeout/request）
+        // でない限り非リトライ。ここでは std::io::Error なので
+        // is_retryable() と揃って非リトライのままであることを固定する。
         let api = ProviderError::api_error_with_source("bad request", std::io::Error::other("bad"));
         let parsed = parse_api_call_error("some-provider", &api);
         match parsed {
@@ -813,11 +850,94 @@ mod tests {
         }
     }
 
+    /// 従前は `parse_api_call_error` のみ OpenAI の 404 をリトライ可としていたが、
+    /// `IsRetryable` との乖離を解消するため特例を廃止し全プロバイダ共通の
+    /// ステータス集合へ統一した（期待値を更新した理由）。
     #[test]
-    fn test_openai_retryable_404() {
-        assert!(is_openai_error_retryable(404));
-        assert!(is_openai_error_retryable(429));
-        assert!(!is_openai_error_retryable(401));
+    fn test_openai_404_is_no_longer_special_cased() {
+        use crate::retry::IsRetryable;
+
+        assert!(!is_status_retryable("openai", 404));
+        assert!(is_status_retryable("openai", 429));
+        assert!(!is_status_retryable("openai", 401));
+
+        let error = ProviderError::api_error_from_status(404, "not found");
+        assert!(
+            error.is_retryable().is_none(),
+            "404 は IsRetryable 側で非リトライ"
+        );
+        match parse_api_call_error("openai", &error) {
+            ParsedAPICallError::ApiError { is_retryable, .. } => assert!(
+                !is_retryable,
+                "parse 側も 404 を非リトライとし、経路で一致するべき"
+            ),
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// `IsRetryable` と `parse_api_call_error` が全プロバイダ・全ステータスで
+    /// 同じリトライ判定を返すことを固定する回帰テスト。
+    #[test]
+    fn test_is_retryable_and_parse_agree_on_all_statuses() {
+        use crate::retry::IsRetryable;
+
+        for provider_id in ["openai", "anthropic", "github-copilot", "some-provider"] {
+            for status in [
+                200, 400, 401, 403, 404, 408, 418, 422, 429, 500, 502, 503, 504,
+            ] {
+                let error = ProviderError::api_error_from_status(status, "boom");
+                let via_trait = error.is_retryable().is_some();
+                let via_parse = match parse_api_call_error(provider_id, &error) {
+                    ParsedAPICallError::ApiError { is_retryable, .. } => is_retryable,
+                    other => {
+                        panic!("expected ApiError for {provider_id}/{status}, got {other:?}")
+                    }
+                };
+                assert_eq!(
+                    via_trait, via_parse,
+                    "判定が分岐した: provider={provider_id}, status={status}"
+                );
+            }
+        }
+    }
+
+    /// `ApiErrorWithSource` の source が reqwest の一時エラー
+    /// （loopback への connect 失敗）なら、`IsRetryable` / `parse` の双方が
+    /// リトライ可と判定することを固定する回帰テスト。
+    #[tokio::test]
+    async fn test_api_error_with_source_transient_reqwest_error_is_retryable() {
+        use crate::retry::IsRetryable;
+
+        // 一時的に listen して即座に閉じ、確実に connection refused を起こす。
+        // 外部ホストへは送信しない（loopback のみ）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let source = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("closed loopback port must fail to connect");
+        assert!(
+            source.is_connect() || source.is_request() || source.is_timeout(),
+            "unexpected reqwest error kind: {source:?}"
+        );
+
+        let error = ProviderError::api_error_with_source("request failed", source);
+        assert_eq!(
+            error.is_retryable().as_deref(),
+            Some("API error: request failed"),
+            "source 由来の一時エラーはリトライ可であるべき"
+        );
+        match parse_api_call_error("some-provider", &error) {
+            ParsedAPICallError::ApiError { is_retryable, .. } => {
+                assert!(is_retryable, "parse 経由でもリトライ可であるべき")
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
     }
 
     #[test]

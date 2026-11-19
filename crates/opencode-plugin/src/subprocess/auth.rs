@@ -106,12 +106,32 @@ impl PluginAuthBridge {
             url: result.url,
             instructions: result.instructions,
             method: result.method,
+            flow_id: result.flow_id,
         })
     }
 
-    /// Complete the OAuth callback with an optional authorization code.
+    /// Complete the OAuth callback on the legacy single-pending-flow path.
+    ///
+    /// Callers that do not correlate authorize flows (e.g. `ProviderAuth`) keep
+    /// this signature; it never emits a `flowId` to the plugin host.
     pub async fn callback(&self, code: Option<&str>) -> Result<Value, PluginAuthError> {
-        let result = self.client.auth_callback(code).await?;
+        self.callback_with_flow(code, None).await
+    }
+
+    /// Complete the OAuth callback for a specific authorize flow.
+    ///
+    /// `flow_id` must be the value returned by `auth.authorize` as `flowId`.
+    /// When it is `Some`, the id is forwarded to the host so parallel flows are
+    /// correlated correctly. `None` keeps the legacy `auth_callback` behavior.
+    pub async fn callback_with_flow(
+        &self,
+        code: Option<&str>,
+        flow_id: Option<&str>,
+    ) -> Result<Value, PluginAuthError> {
+        let result = match callback_path(flow_id) {
+            CallbackPath::FlowAware => self.client.auth_callback_with_flow(code, flow_id).await?,
+            CallbackPath::Legacy => self.client.auth_callback(code).await?,
+        };
         Ok(result)
     }
 
@@ -202,6 +222,29 @@ impl PluginAuthBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Callback routing
+// ---------------------------------------------------------------------------
+
+/// Which `auth.callback` RPC path a bridge callback should take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackPath {
+    /// No flow id: use the legacy single-pending-flow RPC.
+    Legacy,
+    /// Flow id present: use the flow-aware RPC so parallel flows do not collide.
+    FlowAware,
+}
+
+/// Pure routing decision, kept separate so the legacy/flow-aware branch can be
+/// regression-tested without spawning a plugin subprocess.
+fn callback_path(flow_id: Option<&str>) -> CallbackPath {
+    if flow_id.is_some() {
+        CallbackPath::FlowAware
+    } else {
+        CallbackPath::Legacy
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
@@ -210,6 +253,10 @@ pub struct PluginAuthorizeResult {
     pub url: Option<String>,
     pub instructions: Option<String>,
     pub method: Option<String>,
+    /// Opaque id correlating a later callback with this authorize flow.
+    /// Absent on older hosts; omitted on the wire when not provided.
+    #[serde(rename = "flowId", default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,12 +390,46 @@ mod tests {
             url: Some("https://example.invalid/authorize".to_string()),
             instructions: Some("dummy instructions".to_string()),
             method: Some("oauth".to_string()),
+            flow_id: Some("flow-abc123".to_string()),
         };
         let value = serde_json::to_value(&result).unwrap();
         let parsed: PluginAuthorizeResult = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.url, result.url);
         assert_eq!(parsed.instructions, result.instructions);
         assert_eq!(parsed.method, result.method);
+        assert_eq!(parsed.flow_id, result.flow_id);
+    }
+
+    #[test]
+    fn authorize_result_uses_camel_case_flow_id_and_defaults_when_absent() {
+        // The plugin host emits `flowId`; the Rust bridge must expose it on the
+        // authorization response so parallel flows can be correlated.
+        let result = PluginAuthorizeResult {
+            url: Some("https://example.invalid/authorize".to_string()),
+            instructions: None,
+            method: None,
+            flow_id: Some("flow-abc123".to_string()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            value.get("flowId").and_then(serde_json::Value::as_str),
+            Some("flow-abc123")
+        );
+
+        // Older hosts omit flowId entirely; deserialization must still succeed
+        // and leave it as None so the legacy callback path is preserved.
+        let legacy: PluginAuthorizeResult =
+            serde_json::from_value(serde_json::json!({ "url": "https://example.invalid/auth" }))
+                .unwrap();
+        assert_eq!(legacy.flow_id, None);
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_value.get("flowId").is_none());
+    }
+
+    #[test]
+    fn callback_path_selects_flow_aware_rpc_only_when_id_present() {
+        assert_eq!(callback_path(Some("flow-abc123")), CallbackPath::FlowAware);
+        assert_eq!(callback_path(None), CallbackPath::Legacy);
     }
 
     #[test]
