@@ -3503,23 +3503,47 @@ async fn list_files(Query(query): Query<ListFilesQuery>) -> Result<Json<Vec<File
     let mut files = Vec::new();
 
     if path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            for entry in entries.flatten() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&path).await {
+            // 旧実装の entries.flatten() と同じく、個別エントリの Err はスキップして継続する。
+            // ただし連続エラーが無限に続くとハングするため上限を設ける。
+            let mut consecutive_errors = 0usize;
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= 100 {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                consecutive_errors = 0;
                 let path_buf = entry.path();
                 if !is_within_root(&path_buf, &root) {
                     continue;
                 }
-                let file_type = if path_buf.is_dir() {
-                    "directory"
-                } else {
-                    "file"
+                let metadata = tokio::fs::metadata(&path_buf).await.ok();
+                let file_type = match entry.file_type().await {
+                    Ok(t) if t.is_dir() => "directory",
+                    Ok(t) if t.is_file() => "file",
+                    // シンボリックリンク等は元の Path::is_dir()/is_file() と同じく
+                    // metadata を辿って判定し、wire format を維持する
+                    _ => {
+                        if metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                            "directory"
+                        } else {
+                            "file"
+                        }
+                    }
                 };
-                let size = if path_buf.is_file() {
-                    std::fs::metadata(&path_buf).ok().map(|m| m.len())
+                let size = if metadata.as_ref().map(|m| m.is_file()).unwrap_or(false) {
+                    metadata.as_ref().map(|m| m.len())
                 } else {
                     None
                 };
-                let modified = std::fs::metadata(&path_buf).ok().and_then(|m| {
+                let modified = metadata.and_then(|m| {
                     m.modified().ok().map(|t| {
                         t.duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -3839,13 +3863,14 @@ pub(crate) struct ProjectMetadata {
     icon: Option<String>,
 }
 
-fn is_git_repository(path: &FsPath) -> bool {
-    let output = std::process::Command::new("git")
+async fn is_git_repository(path: &FsPath) -> bool {
+    let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
-        .output();
+        .output()
+        .await;
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == "true",
         _ => false,
@@ -3855,8 +3880,8 @@ fn is_git_repository(path: &FsPath) -> bool {
 async fn current_project_info(state: &Arc<ServerState>) -> Result<ProjectInfo> {
     let cwd = std::env::current_dir()
         .map_err(|e| ApiError::BadRequest(format!("Failed to resolve current directory: {}", e)))?;
-    let canonical = cwd
-        .canonicalize()
+    let canonical = tokio::fs::canonicalize(&cwd)
+        .await
         .map_err(|e| ApiError::BadRequest(format!("Failed to resolve project path: {}", e)))?;
     let project_id = canonical.to_string_lossy().to_string();
     let project_path = canonical.to_string_lossy().to_string();
@@ -3877,7 +3902,7 @@ async fn current_project_info(state: &Arc<ServerState>) -> Result<ProjectInfo> {
         id: project_id,
         name,
         path: project_path,
-        vcs: is_git_repository(&canonical),
+        vcs: is_git_repository(&canonical).await,
     })
 }
 

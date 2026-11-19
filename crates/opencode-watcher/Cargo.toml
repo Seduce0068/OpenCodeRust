@@ -17,7 +17,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
-dashmap = "6.1"
+dashmap = { workspace = true }
 glob = { workspace = true }
 
 [dev-dependencies]
