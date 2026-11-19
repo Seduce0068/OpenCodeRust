@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T21:24:52+09:00"
+  at: "2026-11-19T21:45:14+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2264 件
+  テスト総数 594 → 2278 件
 
 ### Changed
 
@@ -412,6 +412,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tool` / `server`: read/ls/skill の外部 symlink 権限すり抜け、edit の replace_all
   型丸め、read の metadata エラー丸め、PTY cursor 境界値を修正し引数パーサを共通化
   （swarm-coding R1-R6、R4 の DRY 指摘を R5 で修正）
+- `util` / `provider` / `server` / `session`: glob_up の symlink、SseLineBuffer の
+  上限、limit クエリのクランプと list_filtered への適用（swarm-coding R1-R6、
+  R4 の下流未適用指摘を R5 で修正）
 
 ## [0.1.0]
 
