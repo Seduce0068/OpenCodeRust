@@ -26,6 +26,13 @@ pub enum DatabaseError {
 
     #[error("Transaction error: {0}")]
     TransactionError(String),
+
+    /// 保存済みデータが壊れていて安全に読み取れない場合。
+    ///
+    /// 黙って行を捨てると、その結果を `replace_for_session` に渡した際に
+    /// 元行が物理削除されるため、読み取り側・書き込み側の両方で明示的に失敗させる。
+    #[error("Corrupt stored data: {0}")]
+    CorruptData(String),
 }
 
 pub struct Database {
@@ -114,6 +121,25 @@ pub(crate) async fn migrate_pool(pool: &SqlitePool) -> Result<(), DatabaseError>
     Ok(())
 }
 
+/// すべてのプール生成経路が共有する接続設定。
+///
+/// SQLite は `PRAGMA foreign_keys` が既定で OFF のため、`schema.rs` の
+/// `ON DELETE CASCADE`（6 件）が何も発動しない。`after_connect` はプールが
+/// 新規接続を確立するたびに呼ばれるので、ここで有効化すれば
+/// 通常クエリにも `begin()` 由来のトランザクションにも同じ設定が適用される。
+fn sqlite_pool_options(max_connections: u32) -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys = ON;")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+}
+
 impl Database {
     pub async fn new() -> Result<Self, DatabaseError> {
         let db_path = Self::get_database_path()?;
@@ -127,8 +153,7 @@ impl Database {
 
         info!("Connecting to database at {}", db_path.display());
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+        let pool = sqlite_pool_options(5)
             .connect(&db_url)
             .await
             .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
@@ -140,8 +165,7 @@ impl Database {
     }
 
     pub async fn in_memory() -> Result<Self, DatabaseError> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+        let pool = sqlite_pool_options(1)
             .connect("sqlite::memory:")
             .await
             .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
@@ -201,7 +225,7 @@ impl Database {
 
 #[cfg(test)]
 mod migration_tests {
-    use super::{Database, SCHEMA_VERSION};
+    use super::{sqlite_pool_options, Database, SCHEMA_VERSION};
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
 
@@ -387,6 +411,178 @@ mod migration_tests {
             count_sessions(second.pool(), "isolated").await,
             0,
             "each in_memory database must have its own storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_are_enabled_on_every_pool_creation_path() {
+        // in_memory() 経由（max_connections=1）。
+        let database = Database::in_memory().await.expect("database initializes");
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(database.pool())
+            .await
+            .expect("foreign_keys pragma readable");
+        assert_eq!(enabled, 1, "in_memory pool must have foreign_keys ON");
+
+        // Database::new() と同じ helper で作ったファイル DB 経由（max_connections=5 と同種）。
+        let path = std::env::temp_dir().join(format!("storage-fk-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = sqlite_pool_options(2)
+            .connect(&url)
+            .await
+            .expect("file-backed pool connects");
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("foreign_keys pragma readable");
+        assert_eq!(enabled, 1, "file-backed pool must have foreign_keys ON");
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn deleting_session_cascades_to_all_child_tables() {
+        // 実 DB（in_memory の SQLite）に対して 6 つの FK のうち session_id を
+        // 参照する 5 件がすべて発動することを確認する。
+        let database = Database::in_memory().await.expect("database initializes");
+        let pool = database.pool();
+
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) \
+             VALUES ('fk-session', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("session row exists");
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, created_at) \
+             VALUES ('fk-message', 'fk-session', 'user', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("message row exists");
+        sqlx::query(
+            "INSERT INTO parts (id, message_id, session_id, created_at, part_type) \
+             VALUES ('fk-part', 'fk-message', 'fk-session', 1, 'text')",
+        )
+        .execute(pool)
+        .await
+        .expect("part row exists");
+        sqlx::query(
+            "INSERT INTO todos (session_id, todo_id, content, position, created_at, updated_at) \
+             VALUES ('fk-session', 'fk-todo', 'todo', 0, 1, 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("todo row exists");
+        sqlx::query(
+            "INSERT INTO session_shares (session_id, id, secret, url, created_at) \
+             VALUES ('fk-session', 'fk-share', 'secret', 'https://example.com', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("share row exists");
+        sqlx::query(
+            "INSERT INTO session_input (id, session_id, prompt, status, created_at) \
+             VALUES ('fk-input', 'fk-session', 'prompt', 'pending', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("input row exists");
+
+        sqlx::query("DELETE FROM sessions WHERE id = 'fk-session'")
+            .execute(pool)
+            .await
+            .expect("delete session");
+
+        // Literal SQL per table: sqlx 0.9 rejects dynamic query strings.
+        let counts = [
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE session_id = ?")
+                .bind("fk-session")
+                .fetch_one(pool)
+                .await
+                .expect("count messages"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM parts WHERE session_id = ?")
+                .bind("fk-session")
+                .fetch_one(pool)
+                .await
+                .expect("count parts"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM todos WHERE session_id = ?")
+                .bind("fk-session")
+                .fetch_one(pool)
+                .await
+                .expect("count todos"),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM session_shares WHERE session_id = ?",
+            )
+            .bind("fk-session")
+            .fetch_one(pool)
+            .await
+            .expect("count session_shares"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM session_input WHERE session_id = ?")
+                .bind("fk-session")
+                .fetch_one(pool)
+                .await
+                .expect("count session_input"),
+        ];
+        for (table, count) in [
+            ("messages", counts[0]),
+            ("parts", counts[1]),
+            ("todos", counts[2]),
+            ("session_shares", counts[3]),
+            ("session_input", counts[4]),
+        ] {
+            assert_eq!(
+                count, 0,
+                "{table} rows must cascade-delete with the session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_message_cascades_to_its_parts() {
+        // 残る 1 件の FK（parts.message_id）も個別に検証する。
+        let database = Database::in_memory().await.expect("database initializes");
+        let pool = database.pool();
+
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) \
+             VALUES ('fk-parent', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("session row exists");
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, created_at) \
+             VALUES ('fk-msg-2', 'fk-parent', 'assistant', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("message row exists");
+        sqlx::query(
+            "INSERT INTO parts (id, message_id, session_id, created_at, part_type) \
+             VALUES ('fk-part-2', 'fk-msg-2', 'fk-parent', 1, 'text')",
+        )
+        .execute(pool)
+        .await
+        .expect("part row exists");
+
+        sqlx::query("DELETE FROM messages WHERE id = 'fk-msg-2'")
+            .execute(pool)
+            .await
+            .expect("delete message");
+
+        let parts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM parts WHERE message_id = ?")
+            .bind("fk-msg-2")
+            .fetch_one(pool)
+            .await
+            .expect("count parts");
+        assert_eq!(parts, 0, "parts must cascade-delete with their message");
+        assert_eq!(
+            count_sessions(pool, "fk-parent").await,
+            1,
+            "deleting a message must not delete its parent session"
         );
     }
 }
