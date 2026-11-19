@@ -43,8 +43,10 @@ impl JsRuntime {
     }
 
     /// Arguments for the install command.
+    ///
+    /// `--ignore-scripts` suppresses dependency lifecycle scripts during install.
     pub fn install_args(&self) -> Vec<String> {
-        vec!["install".into()]
+        vec!["install".into(), "--ignore-scripts".into()]
     }
 }
 
@@ -128,9 +130,12 @@ mod tests {
     }
 
     #[test]
-    fn install_args_is_always_a_single_install_token() {
+    fn install_args_disables_lifecycle_scripts_for_all_runtimes() {
         for rt in ALL_RUNTIMES {
-            assert_eq!(rt.install_args(), vec!["install".to_string()]);
+            assert_eq!(
+                rt.install_args(),
+                vec!["install".to_string(), "--ignore-scripts".to_string()]
+            );
         }
     }
 

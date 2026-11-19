@@ -392,6 +392,105 @@ function buildPluginInput(context: PluginContext, client: unknown): UnknownRecor
 }
 
 // ---------------------------------------------------------------------------
+// Plugin import-path validation (H-03 trust boundary)
+// ---------------------------------------------------------------------------
+
+// npm package name: lowercase alphanumerics plus `.`, `_`, `-`; must not start
+// with `.` or `_`. Scoped names (`@scope/pkg`) are supported as well.
+const NPM_NAME = "[a-z0-9][a-z0-9._-]*";
+const NPM_BARE_RE = new RegExp(`^(?:@${NPM_NAME}/)?${NPM_NAME}$`);
+// An optional version suffix is accepted for validation only; the version is
+// never used as an import specifier (`import("pkg@1.2.3")` is unresolvable).
+const NPM_VERSIONED_RE = new RegExp(
+  `^(?:@${NPM_NAME}/)?${NPM_NAME}@[0-9][0-9A-Za-z.+-]*$`,
+);
+
+type ValidatedPluginPath =
+  | { ok: true; importPath: string }
+  | { ok: false; reason: string };
+
+/**
+ * Validate the value `resolve_plugin()` handed to the host *before* it is used
+ * as an `import()` specifier, and derive the actual import target.
+ *
+ * Accepted forms:
+ *   - an explicit local `file://` URL (imported in normalized, encoded form);
+ *   - a bare npm package name, optionally scoped (e.g. `pkg`, `@scope/pkg`);
+ *   - a `pkg@version` / `@scope/pkg@version` spec — the version is validated
+ *     but stripped before import, because runtimes resolve bare specifiers
+ *     against the shared `node_modules/` (cwd is set by the loader).
+ *
+ * Everything else (absolute/relative filesystem paths, `..` traversal, other
+ * URL schemes such as `node:` / `data:`, empty or malformed values) is rejected
+ * so `import()` cannot be pointed at an arbitrary local path or module.
+ *
+ * Note: the exact version is pinned at install time in
+ * `install_npm_packages()` (package.json dependencies), not in this spec.
+ */
+function validatePluginImportPath(pluginPath: unknown): ValidatedPluginPath {
+  if (typeof pluginPath !== "string" || pluginPath.length === 0) {
+    return { ok: false, reason: "pluginPath must be a non-empty string" };
+  }
+
+  if (pluginPath.startsWith("file://")) {
+    let url: URL;
+    try {
+      url = new URL(pluginPath);
+    } catch {
+      return { ok: false, reason: "malformed file:// pluginPath" };
+    }
+    if (url.protocol !== "file:") {
+      return { ok: false, reason: "plugin file URL must use the file: protocol" };
+    }
+    // `file://host/...` is not a local file path (e.g. a UNC/SMB share).
+    if (url.host !== "" && url.host !== "localhost") {
+      return { ok: false, reason: "plugin file URL must be local" };
+    }
+    if (!url.pathname || url.pathname === "/") {
+      return { ok: false, reason: "plugin file URL must include a file path" };
+    }
+
+    // Percent-encoded dot segments (`%2e%2e`, `.%2e`, ...) must not be able to
+    // smuggle a `..` segment past the check below. A stray '%' that is not a
+    // valid escape is not a traversal vector, so fall back to the raw path.
+    let decodedPathname = url.pathname;
+    try {
+      decodedPathname = decodeURIComponent(url.pathname);
+    } catch {
+      // Keep the raw pathname for the segment check.
+    }
+    if (
+      url.pathname.split("/").includes("..") ||
+      decodedPathname.split("/").includes("..")
+    ) {
+      return { ok: false, reason: "plugin file URL must not contain '..' traversal" };
+    }
+
+    // Import the URL parser's normalized, still percent-encoded form. The
+    // loader emits `Url::from_file_path()`-style encoded URLs, so this is a
+    // no-op for legitimate paths while collapsing any dot segments the parser
+    // already resolved (the original untrusted string is never imported).
+    return { ok: true, importPath: url.href };
+  }
+
+  if (NPM_VERSIONED_RE.test(pluginPath)) {
+    // lastIndexOf('@') is the version separator here: scoped names have '@'
+    // only at index 0, and the version suffix is the final one.
+    return { ok: true, importPath: pluginPath.slice(0, pluginPath.lastIndexOf("@")) };
+  }
+
+  if (NPM_BARE_RE.test(pluginPath)) {
+    return { ok: true, importPath: pluginPath };
+  }
+
+  return {
+    ok: false,
+    reason:
+      "pluginPath must be a bare npm package name, a pkg@version spec, or an explicit file:// URL",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -399,8 +498,14 @@ async function handleInitialize(
   id: number,
   params: { pluginPath: string; context: PluginContext },
 ): Promise<void> {
+  const validated = validatePluginImportPath(params?.pluginPath);
+  if (!validated.ok) {
+    sendError(id, -32602, `Rejected plugin import: ${validated.reason}`);
+    return;
+  }
+
   try {
-    const mod = await import(params.pluginPath);
+    const mod = await import(validated.importPath);
     const pluginFn = mod.default ?? mod;
 
     if (typeof pluginFn !== "function") {
@@ -410,7 +515,7 @@ async function handleInitialize(
 
     // Build a PluginInput compatible with upstream @opencode-ai/plugin shape,
     // while keeping `context` for backward compatibility.
-    const client = await createPluginClient(params.context, params.pluginPath);
+    const client = await createPluginClient(params.context, validated.importPath);
     const pluginInput = buildPluginInput(params.context, client);
 
     const hooks: Hooks = await pluginFn(pluginInput);
@@ -439,7 +544,7 @@ async function handleInitialize(
     }
 
     sendResult(id, {
-      name: params.pluginPath.split("/").pop()?.replace(/\.[tj]s$/, "") ?? "unknown",
+      name: validated.importPath.split("/").pop()?.replace(/\.[tj]s$/, "") ?? "unknown",
       hooks: hookNames,
       auth: authMeta,
     });
