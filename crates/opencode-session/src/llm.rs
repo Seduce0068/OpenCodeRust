@@ -963,27 +963,8 @@ impl LlmProcessor {
 
         tokio::spawn(async move {
             match provider.chat_stream(request).await {
-                Ok(mut stream) => {
-                    while let Some(event_result) = stream.next().await {
-                        if abort.is_cancelled() {
-                            tracing::info!("LLM stream cancelled");
-                            break;
-                        }
-
-                        match event_result {
-                            Ok(event) => {
-                                if tx.send(event).await.is_err() {
-                                    tracing::warn!("Stream receiver dropped");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Stream error: {}", e);
-                                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                                break;
-                            }
-                        }
-                    }
+                Ok(stream) => {
+                    forward_stream_events(stream, tx, abort).await;
                 }
                 Err(e) => {
                     tracing::error!("Failed to start stream: {}", e);
@@ -1006,6 +987,51 @@ impl LlmProcessor {
             }
         }
         false
+    }
+}
+
+/// ストリームのイベントを `tx` へ転送し、キャンセル／受信側切断を即座に検知する。
+///
+/// `abort.cancelled()` と `tx.closed()` を `stream.next()` と競合させることで、
+/// 次のイベント待ち（アイドル中）でも上流ストリームの future をドロップして終了できる。
+/// `biased` によりキャンセル／切断分岐を優先しつつ、イベントの順序・Error イベント送信・
+/// ログは従来のループと同じに保つ。
+async fn forward_stream_events<S, E>(
+    mut stream: S,
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    abort: tokio_util::sync::CancellationToken,
+) where
+    S: futures::Stream<Item = Result<StreamEvent, E>> + Send + Unpin,
+    E: std::fmt::Display,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = abort.cancelled() => {
+                tracing::info!("LLM stream cancelled");
+                break;
+            }
+            _ = tx.closed() => {
+                tracing::warn!("Stream receiver dropped");
+                break;
+            }
+            event_result = stream.next() => {
+                match event_result {
+                    Some(Ok(event)) => {
+                        if tx.send(event).await.is_err() {
+                            tracing::warn!("Stream receiver dropped");
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("Stream error: {}", e);
+                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
     }
 }
 
@@ -1899,5 +1925,94 @@ mod tests {
             Some(StreamToolErrorKind::ExecutionError),
             "anything"
         ));
+    }
+
+    /// アイドル中（ストリームが何も発行しない状態）でも abort で即座に終了すること。
+    #[tokio::test]
+    async fn test_forward_stream_exits_on_abort_while_idle() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let abort = tokio_util::sync::CancellationToken::new();
+
+        let mut handle = tokio::spawn(forward_stream_events(
+            futures::stream::pending::<Result<StreamEvent, String>>(),
+            tx,
+            abort.clone(),
+        ));
+
+        // キャンセル前はアイドルのまま終了しない。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "task should stay alive while the stream is idle"
+        );
+
+        abort.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("task should exit promptly after abort")
+            .expect("task panicked");
+    }
+
+    /// 受信側がドロップされたらアイドル中でも即座に終了すること。
+    #[tokio::test]
+    async fn test_forward_stream_exits_on_receiver_drop_while_idle() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let abort = tokio_util::sync::CancellationToken::new();
+
+        let mut handle = tokio::spawn(forward_stream_events(
+            futures::stream::pending::<Result<StreamEvent, String>>(),
+            tx,
+            abort,
+        ));
+
+        // 受信側が生きている間はアイドルのまま終了しない。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "task should stay alive while the receiver is open"
+        );
+
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("task should exit promptly after receiver drop")
+            .expect("task panicked");
+    }
+
+    /// 従来どおりイベント順序と Error イベントの転送が維持されること。
+    #[tokio::test]
+    async fn test_forward_stream_preserves_event_order_and_error_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let abort = tokio_util::sync::CancellationToken::new();
+
+        let stream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::Start),
+            Ok(StreamEvent::TextDelta("hi".to_string())),
+            Err("boom".to_string()),
+            // Error 後に到達しても転送されない（従来どおり break するため）。
+            Ok(StreamEvent::Done),
+        ]));
+
+        tokio::spawn(forward_stream_events(stream, tx, abort))
+            .await
+            .expect("task panicked");
+
+        let mut received = Vec::new();
+        while let Some(event) = rx.recv().await {
+            received.push(event);
+        }
+
+        assert_eq!(received.len(), 3);
+        assert!(matches!(received[0], StreamEvent::Start));
+        match &received[1] {
+            StreamEvent::TextDelta(text) => assert_eq!(text, "hi"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        match &received[2] {
+            StreamEvent::Error(message) => assert_eq!(message, "boom"),
+            other => panic!("unexpected event: {:?}", other),
+        }
     }
 }
