@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T11:58:18+09:00"
+  at: "2026-11-19T12:31:13+09:00"
 ---
 
 # Changelog
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.03% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.02% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -357,6 +357,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `permission` / `tool`: BashArity を tool 内へ移動し tool→permission 依存を解消、
   2 トークン入力の範囲外スライス panic を修正（swarm-coding R1-R6、
   R4 の panic 指摘を R5 で修正）(M-16)
+- `cli` / `util`: TUI セッション中のみログをファイルへ出力し stdout 描画干渉を解消、
+  WorkerGuard を main ローカルで保持して終了時フラッシュを保証（swarm-coding
+  R1-R6、R4 の static 保持/コメント不一致指摘を R5 で修正）(L-04)
 
 ## [0.1.0]
 

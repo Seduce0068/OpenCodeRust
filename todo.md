@@ -137,16 +137,16 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **[L-04 残り]** tracing の残課題
-  - 2026-11-19 調査（swarm-coding R2）: 推奨は **TUI セッション中だけログを
-    ファイルシンクへ切り替える最小配線**（cli/main.rs と util/logging.rs の
-    2 ファイル・20〜30 行・見積りは speculative）。6 件中でユーザー可視の
-    実害があるのは TUI の stdout 描画干渉のみ。print=false 経路は現状未配線
-    のため WorkerGuard / rolling は dead path（有効化時に F3 のガード保持も
-    同時修正が必要）。F1（prompt/stream ログ）・F2（/log extra 平坦化）・
-    F5（load_config 二重化）は observability/効率の問題で後回し。
+- [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
+    TUI（Tui / Attach / サブコマンドなし）起動時のみログをファイルへ出力し
+    stdout 描画干渉を解消。WorkerGuard は main のローカル束縛で保持し終了時
+    フラッシュを保証（R4 の static 保持では終了時フラッシュされない指摘を修正）。
+  - 残存: prompt/stream ハンドラの開始・完了・切断ログ、/log の extra 平坦化、
+    load_config 二重化（いずれもユーザー可視の実害なし）。rolling 未使用は
+    ファイルログを本運用する段階で検討。二重初期化は .init() が panic する
+    ため呼び出しは 1 箇所に限定（doc 明記済み）。
 - [ ] **[L-14 残り]** スナップショット全件 clone の実害計測（現状維持）
   - list_messages の後方互換 pagination は対応済み。2026-11-19 調査で「Arc による
     メッセージ COW」という前提は誤りと判明: メッセージは所有 `Vec<SessionMessage>` で、
@@ -219,6 +219,7 @@ status: current
 
 ## 完了
 
+- [x] **[L-04 一部]** TUI ログをファイル出力へ切替（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-16 一部]** BashArity を tool 内へ移動し依存を解消
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** Anthropic SSE 行バッファと実 HTTP 回帰テスト
