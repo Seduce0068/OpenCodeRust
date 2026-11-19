@@ -262,31 +262,11 @@ status: current
     固定化される。eventstream は長さ付きフレームで 1 チャンク収まり保証が無い。
     空 TextDelta プレースホルダも残存（confirmed）。
   - 対応: フレーム長/CRC を読むバイト単位 stateful デコーダ、完全フレーム単位で JSON パース。
-    実行し同名ブランチで失敗。既存ブランチなら -b を外す分岐へ（confirmed）。
-- [ ] **[M-61]** TodoManager のメモリ index と DB todo_id が remove 後に不一致
-  - `session/todo.rs:49-56,198-219,133-161,168-191`。remove(0) 後も DB は
-    id_1/id_2 のまま、
-    set_status(0) は id_0 を B の内容で upsert し重複。安定 ID へ変更 or 再採番（confirmed、
-    本番 with_database 未配線のため配線時に顕在化）。
-- [ ] **[M-62]** TodoManager が RwLock write guard を DB I/O の .await をまたいで保持
-  - `session/todo.rs:134-155,169-190,199-214`。DB 遅延中に get() 含む全 readers がブロック。
-    update() は DB 後にロック取得で順序も不一致。DB 操作をロック外へ（confirmed）。
-- [ ] **[M-63]** FileWatcher が 2 回目以降に既存 watcher をドロップ
-  - `watcher/lib.rs:76-84,127-201`。単一 `RwLock<Option<Watcher>>` を上書きし 1 つ目の監視が
-    止まるが watched_paths に残る。2 回目以降 NonRecursive、unwatch も実解除しない。
-    crate 未配線（M-03）のため実害は限定的（confirmed）。
-- [ ] **[M-65]** SQLite の foreign_keys PRAGMA 未設定で ON DELETE CASCADE が無効
-  - `storage/schema.rs:72,112-113 等` の 6 FK に対し `storage/database.rs:130-147` に
-    after_connect / PRAGMA が無い。parts / session_shares / permissions は CRUD 皆無。
-    `PRAGMA foreign_keys = ON` ＋ cascade 統合テスト（medium-high、speculative 実害）。
-- [ ] **[M-66]** MessageRepository が不正 role/壊れた JSON を黙って捨てる
-  - `storage/repository.rs:408-436,419-422,470-473,516-542`。
-    filter_map で未知 role を消し、
-    parts パース失敗を空化。この結果を replace_for_session へ渡すと読み取り時に失われた
-    行が物理削除されうる（medium、speculative 壊れた行の生成経路）。
 
 ## 完了
 
+- [x] **[M-61/62/63/65/66]** TodoManager・SQLite・FileWatcher を修正
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-60/M-64/M-67]** worktree・cleanup・edit を修正
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-56〜M-59]** SSE/境界/存在判定/type フィルタを修正
@@ -490,6 +470,16 @@ status: current
 
 ## メモ
 
+- M-61〜66 R4 の残存（2026-11-19、記録のみ）:
+  - `Storage::new`（lib.rs:31）は `after_connect` を適用せず FK cascade が無効なまま
+    （Database::new/in_memory は有効）。セッション単位 writer 直列化は実装済み。
+  - FK 有効化により `InputRepository::enqueue` が未永続化セッションで失敗しうる
+    （routes.rs:2491-2522 はメモリ上の存在しか確認していない）。
+  - `remove()` は replace_for_session で全行再挿入するため生存行の created_at が更新される。
+  - `MessageRepository::replace_for_session` の破損行チェックはトランザクション外で TOCTOU。
+  - watcher は unwatch/stop が event_last_seen をクリアせず再 watch 直後イベントが抑制される。
+    debounce キーが PathBuf のみで種別を区別せず Remove→Add が失われうる。
+  - writer_locks レジストリはセッション終了後に削除せずセッション数分だけ増える。
 - M-60/M-64/M-67 R4 の残存（2026-11-19、記録のみ）:
   - 既存ブランチが元リポジトリ/別 worktree でチェックアウト済みの場合、
     `git worktree add <path> <branch>` は git 側で拒否される（修正前も別エラーで
