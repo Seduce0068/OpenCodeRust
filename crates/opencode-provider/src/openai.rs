@@ -762,11 +762,8 @@ impl OpenAIProvider {
             Self::reassemble_sse_chunks(&body)?
         } else {
             serde_json::from_str(&body).map_err(|e| {
-                let preview = if body.len() > 500 {
-                    format!("{}...", &body[..500])
-                } else {
-                    body.clone()
-                };
+                // 成功パスでは一切計算しないよう、プレビュー生成はエラー時のみ行う。
+                let preview = error_body_preview(&body, 500);
                 ProviderError::api_error_with_source(
                     format!("failed to decode response: {}\nBody: {}", e, preview),
                     e,
@@ -1103,6 +1100,21 @@ where
     }
 }
 
+/// エラーメッセージに埋め込むレスポンス本文のプレビューを作る。
+///
+/// 500 バイト目が UTF-8 マルチバイト文字の途中に一致しても文字境界まで
+/// 丸めて切り詰める。`&body[..500]` は境界でない場合に panic するため使わない。
+fn error_body_preview(body: &str, max_bytes: usize) -> String {
+    if body.len() <= max_bytes {
+        return body.to_string();
+    }
+    let mut end = max_bytes;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &body[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,6 +1284,43 @@ mod tests {
         let result: Result<u32, ProviderError> =
             resolve_with_fallback(async { Ok(1) }, |_| async { Ok(2) }).await;
         assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn error_body_preview_rounds_boundary_inside_multibyte_char() {
+        // 「界」(E7 95 8C) の 3 バイト目がちょうど 500 バイト目になるよう配置する。
+        let prefix = "a".repeat(498);
+        let body = format!("{}界の後半", prefix);
+        assert!(body.len() > 500);
+        assert!(!body.is_char_boundary(500));
+
+        let preview = error_body_preview(&body, 500);
+        assert!(preview.ends_with("..."));
+        let shown = preview.strip_suffix("...").expect("truncated preview");
+        assert_eq!(
+            shown,
+            prefix.as_str(),
+            "途中の文字は丸められて除外されること"
+        );
+        assert_eq!(
+            std::str::from_utf8(shown.as_bytes()).unwrap(),
+            prefix.as_str()
+        );
+    }
+
+    #[test]
+    fn error_body_preview_keeps_exact_limit_for_ascii() {
+        let body = "x".repeat(600);
+        assert_eq!(
+            error_body_preview(&body, 500),
+            format!("{}...", "x".repeat(500))
+        );
+    }
+
+    #[test]
+    fn error_body_preview_keeps_short_bodies_unchanged() {
+        let body = "日本語の短いエラーボディ".to_string();
+        assert_eq!(error_body_preview(&body, 500), body);
     }
 
     #[tokio::test]

@@ -98,8 +98,11 @@ impl Tool for WriteTool {
             .await?;
         }
 
+        // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
+        // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
+        // がスキップされ、並行編集による上書きを防げなくなる。
+        let exists = fs::try_exists(&path).await.unwrap_or(false);
         let old_content = fs::read_to_string(&path).await.unwrap_or_default();
-        let exists = !old_content.is_empty();
 
         if exists {
             ctx.do_file_time_assert(path_str.clone()).await?;
@@ -362,6 +365,8 @@ async fn get_lsp_diagnostics_impl(
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn temp_dir() -> PathBuf {
         let dir =
@@ -376,6 +381,36 @@ mod tests {
             "message".to_owned(),
             directory.to_string_lossy().to_string(),
         )
+    }
+
+    /// file_time_assert の呼び出し回数と publish_bus のイベントを記録するコンテキスト。
+    fn observing_context(
+        directory: &Path,
+        assert_calls: Arc<AtomicUsize>,
+        events: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> ToolContext {
+        context(directory)
+            .with_file_time_assert(move |_session_id, _file_path| {
+                let assert_calls = assert_calls.clone();
+                async move {
+                    assert_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), ToolError>(())
+                }
+            })
+            .with_publish_bus(move |event_type, properties| {
+                let events = events.clone();
+                async move {
+                    events.lock().unwrap().push((event_type, properties));
+                }
+            })
+    }
+
+    fn watcher_event(events: &[(String, serde_json::Value)]) -> &serde_json::Value {
+        &events
+            .iter()
+            .find(|(event_type, _)| event_type == "file_watcher.updated")
+            .expect("file_watcher.updated が発行されること")
+            .1
     }
 
     #[test]
@@ -459,6 +494,113 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // 既存判定を内容の空・非空ではなくパスの存在で行うことの回帰テスト。
+
+    #[tokio::test]
+    async fn execute_existing_empty_file_asserts_file_time_and_reports_change() {
+        let dir = temp_dir();
+        let file = dir.join("empty.txt");
+        // 既存だが内容が空のファイル（旧実装では新規作成と誤判定されていた）
+        std::fs::write(&file, "").unwrap();
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        let result = WriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "content": "new content"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            1,
+            "既存の空ファイルでも file_time_assert が呼ばれること"
+        );
+        assert_eq!(result.metadata["exists"], true);
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(watcher_event(&events)["event"], "change");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_new_file_skips_file_time_assert_and_reports_add() {
+        let dir = temp_dir();
+        let file = dir.join("new.txt"); // まだ存在しない
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        let result = WriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "content": "created"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            0,
+            "新規ファイルでは file_time_assert をスキップすること"
+        );
+        assert_eq!(result.metadata["exists"], false);
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(watcher_event(&events)["event"], "add");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_existing_nonempty_file_asserts_file_time_and_reports_change() {
+        let dir = temp_dir();
+        let file = dir.join("nonempty.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        let result = WriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "content": "new"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            1,
+            "既存の非空ファイルでは file_time_assert が呼ばれること"
+        );
+        assert_eq!(result.metadata["exists"], true);
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(watcher_event(&events)["event"], "change");
+        }
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -3781,46 +3781,110 @@ pub struct FindFilesQuery {
     pub limit: Option<usize>,
 }
 
-async fn find_files(Query(query): Query<FindFilesQuery>) -> Result<Json<Vec<String>>> {
-    let base_path = project_root()?;
-    let limit = query.limit.unwrap_or(100);
-    let name_query = query.query;
+/// `/find/file` の `type` クエリ値。
+/// 未指定・不正値は `None`（= ファイルとディレクトリの両方を返す）として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindFileTypeFilter {
+    File,
+    Directory,
+}
 
-    // 再帰走査は同期 I/O なので spawn_blocking に逃がす。打ち切り条件
-    // （results.len() >= limit / results.len() < limit）と出力順はそのまま維持。
-    let results = tokio::task::spawn_blocking(move || {
-        fn find_recursive(
-            path: &FsPath,
-            root: &FsPath,
-            query: &str,
-            results: &mut Vec<String>,
-            limit: usize,
-        ) {
-            if results.len() >= limit {
-                return;
-            }
-            if path.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(path) {
-                    for entry in entries.flatten() {
-                        let path_buf = entry.path();
-                        if !is_within_root(&path_buf, root) {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.contains(query) {
-                            results.push(path_buf.to_string_lossy().to_string());
-                        }
-                        if path_buf.is_dir() && results.len() < limit {
-                            find_recursive(&path_buf, root, query, results, limit);
-                        }
+fn parse_find_file_type(file_type: Option<&str>) -> Option<FindFileTypeFilter> {
+    match file_type {
+        Some("file") => Some(FindFileTypeFilter::File),
+        Some("directory") => Some(FindFileTypeFilter::Directory),
+        // 不正値はこのファイルの他クエリと同様にエラーにせず、未指定として扱う。
+        _ => None,
+    }
+}
+
+/// エントリが type フィルタに一致するか判定する。
+///
+/// `DirEntry::file_type()` はシンボリックリンクを辿らないため、リンク等は
+/// `Path::is_dir()` / `Path::is_file()`（metadata を辿る）で補完する。
+/// type 判定の方針は `list_files` と同じ。
+fn find_entry_matches_type(
+    entry: &std::fs::DirEntry,
+    path: &FsPath,
+    file_type: Option<FindFileTypeFilter>,
+) -> bool {
+    let file_type = match file_type {
+        Some(file_type) => file_type,
+        None => return true,
+    };
+    let (is_dir, is_file) = match entry.file_type() {
+        Ok(kind) if kind.is_dir() => (true, false),
+        Ok(kind) if kind.is_file() => (false, true),
+        _ => (path.is_dir(), path.is_file()),
+    };
+    match file_type {
+        FindFileTypeFilter::File => is_file,
+        FindFileTypeFilter::Directory => is_dir,
+    }
+}
+
+/// `find_files` の同期走査本体。
+/// spawn_blocking 内とテストから共通で呼べるようモジュールスコープに置く。
+/// 打ち切り条件・出力順は従来どおり維持する。
+fn collect_find_files(
+    base_path: PathBuf,
+    query: String,
+    file_type: Option<FindFileTypeFilter>,
+    limit: usize,
+) -> Vec<String> {
+    fn find_recursive(
+        path: &FsPath,
+        root: &FsPath,
+        query: &str,
+        file_type: Option<FindFileTypeFilter>,
+        results: &mut Vec<String>,
+        limit: usize,
+    ) {
+        if results.len() >= limit {
+            return;
+        }
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let path_buf = entry.path();
+                    if !is_within_root(&path_buf, root) {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.contains(query) && find_entry_matches_type(&entry, &path_buf, file_type)
+                    {
+                        results.push(path_buf.to_string_lossy().to_string());
+                    }
+                    if path_buf.is_dir() && results.len() < limit {
+                        find_recursive(&path_buf, root, query, file_type, results, limit);
                     }
                 }
             }
         }
+    }
 
-        let mut results = Vec::new();
-        find_recursive(&base_path, &base_path, &name_query, &mut results, limit);
-        results
+    let mut results = Vec::new();
+    find_recursive(
+        &base_path,
+        &base_path,
+        &query,
+        file_type,
+        &mut results,
+        limit,
+    );
+    results
+}
+
+async fn find_files(Query(query): Query<FindFilesQuery>) -> Result<Json<Vec<String>>> {
+    let base_path = project_root()?;
+    let limit = query.limit.unwrap_or(100);
+    let name_query = query.query;
+    let file_type = parse_find_file_type(query.file_type.as_deref());
+
+    // 再帰走査は同期 I/O なので spawn_blocking に逃がす。打ち切り条件
+    // （results.len() >= limit / results.len() < limit）と出力順はそのまま維持。
+    let results = tokio::task::spawn_blocking(move || {
+        collect_find_files(base_path, name_query, file_type, limit)
     })
     .await
     .map_err(|e| ApiError::InternalError(format!("find_files scan task failed: {}", e)))?;
@@ -6108,5 +6172,125 @@ mod api_alias_tests {
         }
 
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod find_files_type_tests {
+    use super::*;
+
+    /// テストごとに固有のルートを作る（並列実行時の衝突を避ける）。
+    fn temp_root(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "opencode-find-file-type-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `alpha_file.txt`（ファイル）と `alpha_dir`（ディレクトリ）を作る。
+    /// 両方ともクエリ `alpha` に一致し、内側の `inner.txt` は一致しない。
+    fn setup(root: &FsPath) {
+        std::fs::write(root.join("alpha_file.txt"), "content").unwrap();
+        std::fs::create_dir_all(root.join("alpha_dir")).unwrap();
+        std::fs::write(root.join("alpha_dir/inner.txt"), "content").unwrap();
+    }
+
+    fn names(results: &[String]) -> Vec<String> {
+        results
+            .iter()
+            .map(|p| {
+                FsPath::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_find_file_type_maps_known_and_invalid_values() {
+        assert_eq!(
+            parse_find_file_type(Some("file")),
+            Some(FindFileTypeFilter::File)
+        );
+        assert_eq!(
+            parse_find_file_type(Some("directory")),
+            Some(FindFileTypeFilter::Directory)
+        );
+        assert_eq!(parse_find_file_type(None), None);
+        // 不正値はエラーにせず未指定扱い（both）にする。
+        assert_eq!(parse_find_file_type(Some("bogus")), None);
+    }
+
+    #[test]
+    fn type_file_returns_only_files() {
+        let root = temp_root("file");
+        setup(&root);
+
+        let results = collect_find_files(
+            root.clone(),
+            "alpha".to_string(),
+            Some(FindFileTypeFilter::File),
+            100,
+        );
+        let names = names(&results);
+        assert!(names.iter().any(|n| n == "alpha_file.txt"));
+        assert!(!names.iter().any(|n| n == "alpha_dir"));
+        assert_eq!(names.len(), 1);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn type_directory_returns_only_directories() {
+        let root = temp_root("directory");
+        setup(&root);
+
+        let results = collect_find_files(
+            root.clone(),
+            "alpha".to_string(),
+            Some(FindFileTypeFilter::Directory),
+            100,
+        );
+        let names = names(&results);
+        assert!(names.iter().any(|n| n == "alpha_dir"));
+        assert!(!names.iter().any(|n| n == "alpha_file.txt"));
+        assert_eq!(names.len(), 1);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn type_unspecified_returns_both_files_and_directories() {
+        let root = temp_root("unspecified");
+        setup(&root);
+
+        let results = collect_find_files(root.clone(), "alpha".to_string(), None, 100);
+        let names = names(&results);
+        assert!(names.iter().any(|n| n == "alpha_file.txt"));
+        assert!(names.iter().any(|n| n == "alpha_dir"));
+        assert_eq!(names.len(), 2);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn type_invalid_value_is_treated_as_unspecified() {
+        let root = temp_root("invalid");
+        setup(&root);
+
+        let file_type = parse_find_file_type(Some("bogus"));
+        let results = collect_find_files(root.clone(), "alpha".to_string(), file_type, 100);
+        let names = names(&results);
+        assert!(names.iter().any(|n| n == "alpha_file.txt"));
+        assert!(names.iter().any(|n| n == "alpha_dir"));
+        assert_eq!(names.len(), 2);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

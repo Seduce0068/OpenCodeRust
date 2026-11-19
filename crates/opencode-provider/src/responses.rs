@@ -1437,11 +1437,18 @@ impl OpenAIResponsesLanguageModel {
                         status_code: status.as_u16(),
                     });
                 }
+                // 生バイトを SseLineBuffer に保持し、改行が確定した完全行だけを
+                // デコードして既存の SSE フレーム処理バッファへ流す。
+                // per-chunk の lossy デコードだと UTF-8 マルチバイト文字が
+                // チャンク境界で分断された瞬間に U+FFFD へ固定化されるため。
+                let mut line_buffer = crate::stream::SseLineBuffer::new();
                 Box::pin(
                     response
                         .bytes_stream()
-                        .map(|chunk_result| match chunk_result {
-                            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+                        .map(move |chunk_result| match chunk_result {
+                            Ok(bytes) => {
+                                Ok(sse_bytes_to_text_chunk(&mut line_buffer, bytes.as_ref()))
+                            }
                             Err(err) => Err(ProviderError::StreamError(err.to_string())),
                         }),
                 )
@@ -2349,6 +2356,22 @@ fn parse_json_or_string(raw: String) -> Value {
     serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw))
 }
 
+/// `bytes_stream()` の生バイトを `SseLineBuffer` に積み、改行が確定した行を
+/// `\n` 付きで 1 つの文字列へまとめる。
+///
+/// 返り値は呼び出し側の `String` バッファへそのまま `push_str` でき、
+/// `drain_next_sse_frame` / `extract_sse_data` によるフレーム抽出の契約を維持する。
+/// デコードは行が確定した後のみ行われるため、UTF-8 文字の途中で
+/// チャンクが切れても文字化けしない。
+fn sse_bytes_to_text_chunk(line_buffer: &mut crate::stream::SseLineBuffer, bytes: &[u8]) -> String {
+    let mut chunk = String::new();
+    for line in line_buffer.push(bytes) {
+        chunk.push_str(&line);
+        chunk.push('\n');
+    }
+    chunk
+}
+
 fn drain_next_sse_frame(buffer: &mut String) -> Option<String> {
     let lf = buffer.find("\n\n");
     let crlf = buffer.find("\r\n\r\n");
@@ -2453,6 +2476,56 @@ mod runtime_tests {
                 stream: Box::pin(stream::iter(frames.into_iter().map(Ok))),
             })
         }
+    }
+
+    /// 日本語マルチバイト文字の途中でバイト列が分割されても、
+    /// SseLineBuffer が完全行を待ってデコードするため文字化けしないこと。
+    #[test]
+    fn reqwest_sse_line_buffer_preserves_split_japanese_utf8() {
+        let wire = "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"item_1\",\"delta\":\"こんにちは世界\"}\n\n";
+        let bytes = wire.as_bytes();
+
+        // 「こ」(E3 81 93) の先頭バイト直後で分割する。
+        let split = bytes
+            .windows(3)
+            .position(|window| window[0] == 0xE3 && window[1] == 0x81 && window[2] == 0x93)
+            .expect("Japanese text should contain the UTF-8 sequence for こ")
+            + 1;
+
+        let mut line_buffer = crate::stream::SseLineBuffer::new();
+        let mut buffer = String::new();
+        for chunk in [&bytes[..split], &bytes[split..]] {
+            buffer.push_str(&sse_bytes_to_text_chunk(&mut line_buffer, chunk));
+        }
+        assert_eq!(
+            buffer, wire,
+            "wire format should be preserved across chunks"
+        );
+
+        let frame = drain_next_sse_frame(&mut buffer).expect("one complete frame");
+        let data = extract_sse_data(&frame).expect("data line");
+        let value: Value = serde_json::from_str(&data).expect("valid JSON after reassembly");
+        assert_eq!(value["type"], "response.output_text.delta");
+        assert_eq!(value["delta"], "こんにちは世界");
+    }
+
+    #[test]
+    fn reqwest_sse_line_buffer_preserves_single_chunk_wire_format() {
+        let wire = "data: {\"type\":\"response.created\"}\n\nevent: ping\ndata: {\"type\":\"response.completed\"}\n\n";
+        let mut line_buffer = crate::stream::SseLineBuffer::new();
+        let mut buffer = sse_bytes_to_text_chunk(&mut line_buffer, wire.as_bytes());
+        assert_eq!(buffer, wire);
+
+        let first = drain_next_sse_frame(&mut buffer).expect("first frame");
+        assert_eq!(
+            extract_sse_data(&first).as_deref(),
+            Some("{\"type\":\"response.created\"}")
+        );
+        let second = drain_next_sse_frame(&mut buffer).expect("second frame");
+        assert_eq!(
+            extract_sse_data(&second).as_deref(),
+            Some("{\"type\":\"response.completed\"}")
+        );
     }
 
     #[test]
