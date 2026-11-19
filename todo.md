@@ -217,19 +217,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
-- [ ] **[H-26]** Snapshot::revert が checkout 失敗を「ファイル不在」と誤判定して削除
-  - `session/snapshot.rs:39-63`。git checkout の失敗（権限・不正ハッシュ・一時障害）を
-    すべて「スナップショットに存在しない」とみなし、ls-tree 失敗まで `unwrap_or(false)`
-    で丸めて `fs::remove_file` を呼ぶ。rollback 対象の作業ツリーが不可逆に失われうる。
-    revert 経路のテストは 0 件（confirmed / 2026-11-19 swarm-todo-discovery）
-  - 対応: checkout エラーを種別判定し、ls-tree が成功して「確実に tree 内に無い」場合
-    のみ削除。ls-tree 失敗時は Err を返す。削除/非削除/失敗の 3 分岐テスト。
-- [ ] **[H-27]** unrevert が Snapshot::restore の失敗を無視して成功を返す
-  - `session/revert.rs:148-157`。`let _ = Snapshot::restore(...)` で失敗を捨てた後
-    `clear_revert()` と `Ok(Some(session))` を返すため、ファイルは元に戻っていないのに
-    スナップショット参照が失われ再試行手段もない。unrevert のテストは 0 件（confirmed）
-  - 対応: restore 結果を伝播、失敗時は clear_revert せずエラーを返す。成否双方のテスト。
-
 ### 優先度: 中（残タスク調査で追加）
 
 - [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
@@ -320,6 +307,7 @@ status: current
 
 ## 完了
 
+- [x] **[H-26/H-27]** revert 経路のデータ損失を修正（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** 全 16 アダプタの SSE 行バッファ化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-34 一部]** renovate.json を追加（2026-11-19、親が直接実施）
 - [x] **[L-04 一部]** TUI ログをファイル出力へ切替（2026-11-19、swarm-coding R1-R6）
@@ -518,6 +506,10 @@ status: current
 
 ## メモ
 
+- H-26 R4 の low 指摘（2026-11-19、記録のみ）: `checkout_failure_is_missing_path`
+  の分類関数単体テストのみで、`revert_with_ls_tree` を通した「他理由失敗時に
+  ls-tree/削除を行わない」フローは未固定。checkout 実行を注入する fixture で
+  ファイル残存を検証するテストが別タスク候補。
 - M-11 R4 の low 指摘（2026-11-19、記録のみ）: 既存 reassemble 系テストは
   SseLineBuffer と各 parse_* を直接呼ぶだけで try_unfold の pending/exhausted
   キューイングを通さない。vertex/together/vercel/xai には UTF-8 途中分割/CRLF の
