@@ -348,6 +348,8 @@ status: current
 
 ## 完了
 
+- [x] **[R4 残存 5 件]** ストリーミング上限・summary 永続化・URL redaction
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[review+discovery high 11 件]** no-op・fail-open・OOM・ログ基盤を修正
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[認証/設定 3 件]** attach パスワード・CLI fail-open・well-known 再注入
@@ -584,13 +586,11 @@ status: current
 
 ## メモ
 
-- 2026-11-20 R4 残存（high 11 件の修正時、記録のみ）:
-  - WebFetch の 5MB 上限がレスポンス全体バッファ後の検査で OOM 経路が残存
-  - MCP HTTP/SSE トランスポートにサイズ上限なし（stdio の 10 MiB 対策は迂回可）
-  - bash 出力の 50KB チェックが 1 行読了後で改行なし巨大出力で OOM
-  - CLI が cwd を log_dir として明示渡ししユーザー専用既定ログディレクトリが実効化されない
+- 2026-11-20 R4 残存（high 11 件の修正時）: うち 5 件は次イテレーションで対応済み
+  （WebFetch 5MB 逐次強制、MCP HTTP/SSE 上限＋bounded、bash 行長制限、
+  CLI log_dir None、server の summary 復元）。残存は以下のみ:
   - SessionRow の fail-loud が 1 行の破損でサーバ全体起動を停止（可用性との二層方針が必要）
-  - sessions.metadata 列なし、server.rs:684 の summary: None は別タスク提案
+  - sessions.metadata 列なし（スキーマ変更＋マイグレーションは別タスク）
 - 2026-11-19 R6 cross-skill 集約（swarm61、7 担当・68 件）: high 11 / medium 34 /
   low 9 を `## 未着手` へ追記。重複・却下は以下:
   - 却下: docs/README.md:49 の PTY リンク（R1-TS05-04）は前回意図的に
