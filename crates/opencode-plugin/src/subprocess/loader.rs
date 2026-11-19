@@ -1,11 +1,12 @@
 //! Plugin discovery, npm installation, and subprocess lifecycle management.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tokio::sync::RwLock;
+use url::Url;
 
 use super::auth::PluginAuthBridge;
 use super::client::{PluginContext, PluginSubprocess, PluginSubprocessError};
@@ -37,6 +38,12 @@ pub enum PluginLoaderError {
 
     #[error("npm install failed: {0}")]
     NpmInstall(String),
+
+    #[error("invalid npm plugin spec `{0}`: expected a lowercase npm name with an explicit fixed version (e.g. @scope/pkg@1.2.3)")]
+    InvalidNpmSpec(String),
+
+    #[error("plugin path is not absolute and cannot be converted to a file URL: {0:?}")]
+    InvalidPluginPath(PathBuf),
 }
 
 // ---------------------------------------------------------------------------
@@ -167,10 +174,7 @@ impl PluginLoader {
         let copilot_path = cache_dir.join("builtin-copilot-auth.ts");
         std::fs::write(&copilot_path, BUILTIN_COPILOT_AUTH)?;
 
-        let specs = vec![
-            format!("file://{}", codex_path.display()),
-            format!("file://{}", copilot_path.display()),
-        ];
+        let specs = vec![file_url(&codex_path)?, file_url(&copilot_path)?];
         self.load_all(&specs, context).await
     }
 
@@ -259,9 +263,11 @@ impl PluginLoader {
             return Ok(spec.to_string());
         }
 
-        // npm package — return bare package name for proper module resolution
-        let pkg_name = spec.split('@').next().unwrap_or(spec);
-        Ok(pkg_name.to_string())
+        // npm package — return bare package name for proper module resolution.
+        // Reuse parse_npm_spec so scoped names (e.g. @scope/pkg@1.0) keep their
+        // leading `@scope/` instead of being truncated at the first `@`.
+        let (name, _version) = parse_npm_spec(spec)?;
+        Ok(name.to_string())
     }
 
     /// Install npm packages into the shared cache directory.
@@ -286,7 +292,7 @@ impl PluginLoader {
 
         // Add new packages
         for spec in specs {
-            let (name, version) = parse_npm_spec(spec);
+            let (name, version) = parse_npm_spec(spec)?;
             deps.insert(
                 name.to_string(),
                 serde_json::Value::String(version.to_string()),
@@ -330,22 +336,97 @@ impl PluginLoader {
     }
 }
 
-/// Parse "pkg@version" into (name, version). Handles scoped packages like "@scope/pkg@1.0".
-fn parse_npm_spec(spec: &str) -> (&str, &str) {
+/// Build an encoded, local `file://` URL for a plugin path.
+///
+/// `Url::from_file_path` percent-encodes URL-significant characters (`#`, `?`,
+/// `%`, spaces) and yields a localhost/empty-host URL on every platform.
+/// `format!("file://{}", path.display())` instead breaks on Windows (`file://C:\...`,
+/// rejected by the host's local-host check) and for paths containing those
+/// characters.
+fn file_url(path: &Path) -> Result<String, PluginLoaderError> {
+    Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .map_err(|_| PluginLoaderError::InvalidPluginPath(path.to_path_buf()))
+}
+
+/// Validate an npm package name using the same lowercase-only grammar as the
+/// host (`[a-z0-9][a-z0-9._-]*`) plus npm's ban on leading/trailing/repeated
+/// dots. Scoped names (`@scope/pkg`) validate both the scope and the leaf.
+fn is_valid_npm_name(name: &str) -> bool {
+    let leaf = match name.strip_prefix('@') {
+        Some(rest) => match rest.split_once('/') {
+            Some((scope, leaf)) if is_valid_npm_name_part(scope) => leaf,
+            _ => return false,
+        },
+        None => name,
+    };
+    is_valid_npm_name_part(leaf)
+}
+
+/// One name component: `[a-z0-9][a-z0-9._-]*`, no leading/trailing or repeated
+/// dot, within npm's 214-character limit.
+fn is_valid_npm_name_part(part: &str) -> bool {
+    if part.is_empty() || part.len() > 214 {
+        return false;
+    }
+    let mut bytes = part.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    if part.starts_with('.') || part.ends_with('.') || part.contains("..") {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Accept only fixed versions (`1.2.3`, `1.2.3-beta.1+build.5`), never dist-tags
+/// (`latest`) or ranges (`^1.0.0`, `1.x`, `>=1.0.0`).
+fn is_fixed_version(version: &str) -> bool {
+    let mut bytes = version.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    if !bytes
+        .all(|b| b.is_ascii_digit() || b.is_ascii_alphabetic() || matches!(b, b'.' | b'+' | b'-'))
+    {
+        return false;
+    }
+    // `1.x` / `1.X` select a range, so they are not pinned versions.
+    !version.split('.').any(|part| part == "x" || part == "X")
+}
+
+/// Parse `"pkg@version"` into `(name, version)`. Handles scoped packages like
+/// `"@scope/pkg@1.0"`.
+///
+/// An explicit fixed version and a valid lowercase npm name are required;
+/// dist-tags, ranges, wildcards and malformed names are rejected so that
+/// repeated installs cannot silently resolve to a different release.
+fn parse_npm_spec(spec: &str) -> Result<(&str, &str), PluginLoaderError> {
     // Handle scoped packages: @scope/pkg@version
-    if let Some(stripped) = spec.strip_prefix('@') {
+    let (name, version) = if let Some(stripped) = spec.strip_prefix('@') {
         if let Some(idx) = stripped.find('@') {
             let split = idx + 1;
-            return (&spec[..split], &spec[split + 1..]);
+            (&spec[..split], &spec[split + 1..])
+        } else {
+            (spec, "")
         }
-        return (spec, "*");
+    } else if let Some(idx) = spec.find('@') {
+        (&spec[..idx], &spec[idx + 1..])
+    } else {
+        (spec, "")
+    };
+
+    if !is_valid_npm_name(name) || !is_fixed_version(version) {
+        return Err(PluginLoaderError::InvalidNpmSpec(spec.to_string()));
     }
 
-    if let Some(idx) = spec.find('@') {
-        return (&spec[..idx], &spec[idx + 1..]);
-    }
-
-    (spec, "*")
+    Ok((name, version))
 }
 
 fn hook_io_from_context(context: &HookContext) -> (Value, Value) {
@@ -633,10 +714,76 @@ mod tests {
 
     #[test]
     fn test_parse_npm_spec() {
-        assert_eq!(parse_npm_spec("foo@1.0.0"), ("foo", "1.0.0"));
-        assert_eq!(parse_npm_spec("foo"), ("foo", "*"));
-        assert_eq!(parse_npm_spec("@scope/foo@2.0"), ("@scope/foo", "2.0"));
-        assert_eq!(parse_npm_spec("@scope/foo"), ("@scope/foo", "*"));
+        assert_eq!(parse_npm_spec("foo@1.0.0").unwrap(), ("foo", "1.0.0"));
+        assert_eq!(
+            parse_npm_spec("@scope/foo@2.0").unwrap(),
+            ("@scope/foo", "2.0")
+        );
+        assert_eq!(
+            parse_npm_spec("foo-bar_baz.qux@1.2.3-beta.1+build.5").unwrap(),
+            ("foo-bar_baz.qux", "1.2.3-beta.1+build.5")
+        );
+        assert_eq!(
+            parse_npm_spec("@scope/pkg-name@0.0.13").unwrap(),
+            ("@scope/pkg-name", "0.0.13")
+        );
+
+        // 未指定・空・ワイルドカードの version はエラー（install 毎の最新解釈を防ぐ）
+        for spec in ["foo", "@scope/foo", "foo@", "foo@*", "@scope/foo@"] {
+            assert!(
+                parse_npm_spec(spec).is_err(),
+                "未指定 spec はエラーになるべき: {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_npm_spec_rejects_invalid_names_and_non_fixed_versions() {
+        for spec in [
+            "Foo@1.0.0",
+            "foo..bar@1.0.0",
+            ".foo@1.0.0",
+            "foo.@1.0.0",
+            "@Scope/pkg@1.0.0",
+            "@scope/pkg..x@1.0.0",
+            "@scope@1.0.0",
+            "foo@latest",
+            "foo@^1.0.0",
+            "foo@~1.2.3",
+            "foo@1.x",
+            "foo@>=1.0.0",
+        ] {
+            assert!(
+                parse_npm_spec(spec).is_err(),
+                "不正 spec は拒否されるべき: {spec}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_url_keeps_plain_absolute_path_shape() {
+        assert_eq!(
+            file_url(Path::new("/tmp/plugin.ts")).unwrap(),
+            "file:///tmp/plugin.ts"
+        );
+    }
+
+    #[test]
+    fn file_url_percent_encodes_url_significant_characters() {
+        let path = std::env::temp_dir().join("plugin #1?100%.ts");
+        let url = file_url(&path).expect("絶対パスは file URL へ変換できる");
+        assert!(url.starts_with("file:///"), "{url}");
+        assert!(url.contains("%20"), "スペース未エンコード: {url}");
+        assert!(url.contains("%23"), "# 未エンコード: {url}");
+        assert!(url.contains("%3F"), "? 未エンコード: {url}");
+        assert!(url.contains("%25"), "% 未エンコード: {url}");
+        assert!(url.ends_with(".ts"), "{url}");
+    }
+
+    #[test]
+    fn file_url_rejects_relative_paths() {
+        assert!(file_url(Path::new("relative/plugin.ts")).is_err());
     }
 
     #[test]
