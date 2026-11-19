@@ -245,7 +245,12 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lsp: Option<LspConfig>,
 
-    #[serde(default, skip_serializing_if = "ExplicitStringList::is_empty")]
+    // `instructions: []` も `plugin: []` と同じく明示的なクリア命令なので、
+    // 空配列であっても書き戻す（presence bit で判定する）。
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
     pub instructions: ExplicitStringList,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2699,6 +2704,29 @@ mod tests {
         assert!(
             json.get("plugin").is_none(),
             "an omitted plugin key must stay omitted"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_instructions_list_survives_serialization_round_trip() {
+        let explicit: Config = serde_json::from_str(r#"{"instructions":[]}"#).unwrap();
+        assert!(explicit.instructions.is_explicit());
+
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json.get("instructions"), Some(&serde_json::json!([])));
+
+        let reloaded: Config = serde_json::from_value(json).unwrap();
+        assert!(
+            reloaded.instructions.is_explicit() && reloaded.instructions.is_empty(),
+            "instructions: [] must persist as an explicit clear directive"
+        );
+
+        let absent = Config::default();
+        assert!(!absent.instructions.is_explicit());
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json.get("instructions").is_none(),
+            "an omitted instructions key must stay omitted"
         );
     }
 

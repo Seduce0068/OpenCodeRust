@@ -91,12 +91,12 @@ fn parse_no_auth(value: Option<&str>) -> bool {
     })
 }
 
-/// 認証が有効かどうかを返す。
+/// 起動時に `OPENCODE_NO_AUTH` から認証状態を読み取る。
 ///
 /// `OPENCODE_NO_AUTH` が明示的に無効化を要求する値の場合のみ `false`。
-/// 起動時の認証状態の警告・通知は CLI の `run_server_command` に一元化している
-/// （警告の二重出力を避けるため、ここではログを出さない）。
-fn is_auth_enabled() -> bool {
+/// 結果は `ServerState::auth_enabled` に一度だけ保持し、リクエスト処理中は
+/// 環境変数を再読しない（起動後の env 変更で認証判定が変わらないようにする）。
+fn auth_enabled_from_env() -> bool {
     !parse_no_auth(std::env::var("OPENCODE_NO_AUTH").ok().as_deref())
 }
 
@@ -486,6 +486,9 @@ pub struct ServerState {
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
     pub auth_token: Option<String>,
+    /// 起動時に確定した認証有効/無効。`auth_middleware` は毎回 env を読まずに
+    /// この値だけを参照する（起動後の `OPENCODE_NO_AUTH` 変更に影響されない）。
+    pub(crate) auth_enabled: bool,
     pub permission_broker: Arc<PermissionBroker>,
     pub question_broker: Arc<QuestionBroker>,
     /// Per-instance queue of pending TUI requests (was a process-global static).
@@ -523,6 +526,7 @@ impl ServerState {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
         let auth_token = generate_auth_token();
+        let auth_enabled = auth_enabled_from_env();
         let permission_broker = Arc::new(PermissionBroker::new(tx.clone()));
         let question_broker = Arc::new(QuestionBroker::new(tx.clone()));
         Self {
@@ -532,6 +536,7 @@ impl ServerState {
             auth_manager: Arc::new(AuthManager::new()),
             event_bus: tx,
             auth_token: Some(auth_token),
+            auth_enabled,
             permission_broker,
             question_broker,
             tui_request_queue: Mutex::new(VecDeque::new()),
@@ -1201,6 +1206,24 @@ fn cors_layer() -> CorsLayer {
         .allow_headers(cors_allow_headers())
 }
 
+/// 2 つの文字列を固定時間で比較する（新規依存なしの自前実装）。
+///
+/// `subtle` 等の定数時間比較クレートは workspace に存在しないため、ここでは
+/// 長さ不一致でも早期 return せず、両入力のうち長い方の長さまで常に同じ回数
+/// ループさせ、各バイトの XOR 差をアキュムレータへ畳み込む。長さの差自体も
+/// 累積値に XOR で含めるため、末尾が一致していても長さが違えば不一致になる。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut diff = a_bytes.len() ^ b_bytes.len();
+    for index in 0..a_bytes.len().max(b_bytes.len()) {
+        let left = a_bytes.get(index).copied().unwrap_or_default();
+        let right = b_bytes.get(index).copied().unwrap_or_default();
+        diff |= (left ^ right) as usize;
+    }
+    diff == 0
+}
+
 /// `auth_middleware` の判定を外部状態なしで検証するための純粋関数。
 ///
 /// `Misconfigured` は fail-open を防ぐための分岐（認証有効・トークン未設定）で、
@@ -1226,7 +1249,7 @@ fn auth_decision(
     };
 
     match supplied_bearer {
-        Some(token) if token == expected => AuthDecision::Pass,
+        Some(token) if constant_time_eq(token, expected) => AuthDecision::Pass,
         _ => AuthDecision::Unauthorized,
     }
 }
@@ -1242,7 +1265,7 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     let decision = auth_decision(
-        is_auth_enabled(),
+        state.auth_enabled,
         state.auth_token.as_deref(),
         supplied_bearer,
     );
@@ -1280,7 +1303,7 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
     let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
     routes::resume_queued_prompts(state.clone()).await?;
 
-    if is_auth_enabled() {
+    if state.auth_enabled {
         if let Some(token) = &state.auth_token {
             tracing::info!("Authentication enabled. Token: {}", redact_token(token));
             tracing::info!("Set Authorization: Bearer <token> header for all requests");
@@ -1314,7 +1337,7 @@ pub async fn run_server_with_state(
     state: Arc<ServerState>,
 ) -> anyhow::Result<()> {
     routes::resume_queued_prompts(state.clone()).await?;
-    if is_auth_enabled() {
+    if state.auth_enabled {
         if let Some(token) = &state.auth_token {
             tracing::info!("Authentication enabled. Token: {}", redact_token(token));
         }
@@ -1457,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn is_auth_enabled_matches_parsed_no_auth_value() {
+    fn auth_enabled_from_env_matches_parsed_no_auth_value() {
         let _guard = AUTH_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1466,7 +1489,7 @@ mod tests {
         // 未設定
         std::env::remove_var("OPENCODE_NO_AUTH");
         assert!(
-            is_auth_enabled(),
+            auth_enabled_from_env(),
             "unset OPENCODE_NO_AUTH must keep auth enabled"
         );
 
@@ -1484,9 +1507,9 @@ mod tests {
         for (value, expected_enabled) in cases {
             std::env::set_var("OPENCODE_NO_AUTH", value);
             assert_eq!(
-                is_auth_enabled(),
+                auth_enabled_from_env(),
                 expected_enabled,
-                "OPENCODE_NO_AUTH={value:?} should yield is_auth_enabled={expected_enabled}"
+                "OPENCODE_NO_AUTH={value:?} should yield auth_enabled_from_env={expected_enabled}"
             );
         }
     }
@@ -2312,6 +2335,137 @@ mod tests {
             auth_decision(true, Some("test-token-abc123"), Some("wrong-token")),
             AuthDecision::Unauthorized
         );
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_only_identical_bytes() {
+        assert!(constant_time_eq("", ""));
+        assert!(constant_time_eq("same-token", "same-token"));
+        // 途中の 1 バイト差と末尾の 1 バイト差はともに拒否する。
+        assert!(!constant_time_eq("abcdef", "abXdef"));
+        assert!(!constant_time_eq("abcdef", "abcdeg"));
+        // 長さ違い（共通接頭辞あり／なし、前後逆）も拒否する。
+        assert!(!constant_time_eq("abcdef", "abcde"));
+        assert!(!constant_time_eq("abcde", "abcdef"));
+        assert!(!constant_time_eq("", "x"));
+        assert!(!constant_time_eq("x", ""));
+        // auth_decision の分岐も同じ比較を使うことを固定する。
+        assert_eq!(
+            auth_decision(true, Some("abcdef"), Some("abcde")),
+            AuthDecision::Unauthorized
+        );
+        assert_eq!(
+            auth_decision(true, Some("abcdef"), Some("abcdef")),
+            AuthDecision::Pass
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_does_not_short_circuit() {
+        // 実時間の計測は環境依存で fragile なため、比較ヘルパが早期 return せず
+        // 入力の最大長まで全バイトを走査する構造をソースから検証する。
+        let source = include_str!("server.rs");
+        let start = source
+            .find("fn constant_time_eq(")
+            .expect("constant_time_eq helper must exist");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("helper closing brace");
+        let body = &rest[..end + 2];
+
+        assert!(
+            !body.contains("return"),
+            "comparison helper must not early-return on a mismatch"
+        );
+        assert!(
+            body.contains(".max("),
+            "comparison helper must scan up to the longer input"
+        );
+        assert!(
+            body.contains("diff |= "),
+            "every byte must be folded into the XOR accumulator"
+        );
+    }
+
+    #[test]
+    fn auth_enabled_is_frozen_at_server_state_construction() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+
+        std::env::set_var("OPENCODE_NO_AUTH", "1");
+        let disabled = ServerState::new();
+        assert!(!disabled.auth_enabled);
+
+        // 起動後の env 変更は既存 state の auth_enabled を書き換えない。
+        std::env::set_var("OPENCODE_NO_AUTH", "0");
+        assert!(!disabled.auth_enabled);
+        assert_eq!(
+            auth_decision(
+                disabled.auth_enabled,
+                disabled.auth_token.as_deref(),
+                Some("bogus")
+            ),
+            AuthDecision::Pass,
+            "an auth-disabled state must stay disabled after env changes"
+        );
+
+        std::env::set_var("OPENCODE_NO_AUTH", "0");
+        let enabled = ServerState::new();
+        assert!(enabled.auth_enabled);
+        std::env::set_var("OPENCODE_NO_AUTH", "1");
+        assert!(enabled.auth_enabled);
+        assert_eq!(
+            auth_decision(
+                enabled.auth_enabled,
+                enabled.auth_token.as_deref(),
+                Some("bogus")
+            ),
+            AuthDecision::Unauthorized,
+            "an auth-enabled state must stay enabled after env changes"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auth_middleware_uses_frozen_auth_enabled_not_live_env() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+        let request = "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+
+        // 起動時に無効 → 起動後に有効へ変更してもトークン無しで通る。
+        std::env::set_var("OPENCODE_NO_AUTH", "1");
+        let disabled_state = Arc::new(ServerState::new());
+        std::env::set_var("OPENCODE_NO_AUTH", "0");
+        let app = auth_test_app(disabled_state);
+        let Some((addr, server)) = start_test_server(app).await else {
+            return;
+        };
+        let (status, _, _) = http_exchange(addr, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "startup-disabled auth must not be re-enabled by a later env change"
+        );
+        server.abort();
+
+        // 起動時に有効 → 起動後に無効へ変更してもトークン無しは 401。
+        std::env::set_var("OPENCODE_NO_AUTH", "0");
+        let enabled_state = Arc::new(ServerState::new());
+        std::env::set_var("OPENCODE_NO_AUTH", "1");
+        let app = auth_test_app(enabled_state);
+        let Some((addr, server)) = start_test_server(app).await else {
+            return;
+        };
+        let (status, _, _) = http_exchange(addr, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "startup-enabled auth must not be disabled by a later env change"
+        );
+        server.abort();
     }
 
     // current_thread ランタイムで実行され、ガードは環境変数の復元のためだけに
