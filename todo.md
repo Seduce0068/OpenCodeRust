@@ -48,10 +48,16 @@ status: current
     セッション永続化と promoted 更新の同一トランザクション化（repository.rs 変更要）と、
     下流での queue_id による重複レスポンス排除。完全な二重課金防止は未検証
 - [ ] **[H-13]** TUI イベントルートのブロッキング HTTP と全件再マッピング
-  - 事実確認済み（2026-11-18、tui-http-worker）: 同期 HTTP は `ApiClient`（api.rs、
-    書き込みスコープ外）にあり 30s timeout。Tick は 2 秒ごとで約 12 箇所の同期呼び出し。
-    根本修正には api.rs の非同期化＋サーバの差分 API＋12 箇所の async 化が必要で
-    大幅変更。app.rs のみの workaround は UI  timing を変えるため見送り
+  - 2026-11-19 一部対応: 常時 501 の `refresh_skill_list_dialog` /
+    `refresh_lsp_status` を 5 秒 Tick から削除。LSP はステータス表示を開く時のみ、
+    スキルは既存のスキル一覧オープン時のみ同期するよう変更（表示内容は不変）。
+  - 2026-11-19 調査で訂正: 背景の「Tick 2 秒」は不正確。`TICK_RATE_MS=16` で
+    2 秒は session 同期ゲート、5 秒は aux 同期ゲート（app.rs:41,786,792）。
+    残存は `get_session` + `get_messages`（2 秒）と `list_sessions` 系 + status + MCP
+    （5 秒）の同期 HTTP、全件再取得・再マッピング、30s timeout テールリスク。
+  - 推奨は**イベント駆動・差分同期**（server に since/version ベースの増分
+    メッセージ API、SSE の message.updated をトリガに全件 get_messages を差分適用へ）。
+    spawn_blocking は TUI に Tokio runtime が無く直接用いられない。未計測で体感は speculative。
 
 ### 優先度: 中
 
@@ -136,14 +142,18 @@ status: current
     操作のためユーザー判断として未実施**（設定ファイルだけでは動作しない）。
     `scripts/opencode_llm_mcp.rs` は workspace member 外で `--locked` 再現性の観点から
     ゲート化を見送り（恒久対策は member 化）。脆弱性監査は `audit: true` で既にゲート済み。
-- [ ] **[M-37 残り]** 共通 canonicalize ヘルパの async 化
+- [ ] **[M-37 残り]** 共通 canonicalize ヘルパの async 化（現状維持・実測トリガ付き保留）
   - 2026-11-19 対応済み: find 系 spawn_blocking、read_file の tokio::fs 化、
     get_file_status / current_project_info の git subprocess を tokio::process 化、
     list_files の read_dir/next_entry/file_type/metadata を非同期化（R4 の
     next_entry Err 打ち切り指摘を R5 で修正）、tool 側 glob/read の WalkDir も
     spawn_blocking 化。
-  - 残存: is_within_root / canonicalize_within_root の async 化（呼び出し 5 箇所に波及）。
-    性能改善の実測は未実施。
+  - 2026-11-19 調査: 推奨は**現状維持**。直接呼び出し 5 + 間接 3 の 8 箇所に波及、
+    うち 2 箇所は spawn_blocking 内で `block_on` は採用不可。対象パスはローカル cwd 配下
+    で実害未計測。真のホットスポットは list_files がエントリ毎に root を再 canonicalize
+    する点（syscall 半減可能で async 化より先に最適化候補）。
+  - 再検討トリガ: NFS/FUSE マウント対応、または list_files のワーカー占有計測。
+    実装時は「純粋述語 + 同期 I/O 版 + 非同期 I/O 版」の 3 層構成を推奨。
 - [x] **[M-38 一部]** /stream の初期切断検知を追加（2026-11-19、swarm-coding R1-R6）
   - chat_stream().await を tx.closed() と biased select! で競合、切断時に future を
     ドロップし永続化してから早期リターン（R4 の永続化回帰指摘を R5 で修正）。
@@ -238,6 +248,7 @@ status: current
 
 ## 完了
 
+- [x] **[H-13 一部]** 501 終点のポーリング除去（2026-11-19、swarm-coding R2）
 - [x] **[M-55]** Bedrock ストリームの行バッファ化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** OAuth トークン注入と discovery HTTP テスト
   （2026-11-19、swarm-coding R1-R6）

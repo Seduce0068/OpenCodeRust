@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T18:57:30+09:00"
+  at: "2026-11-19T19:06:47+09:00"
 ---
 
 # Changelog
@@ -394,6 +394,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `provider`: Bedrock ストリームを生バイト保持＋JSON 値ベース解析へ変更し、
   UTF-8 境界分割・固定オフセット panic・空 TextDelta を解消（swarm-coding
   R1-R6）(M-55)
+- `tui`: 常時 501 を返す skill/lsp 終点の 5 秒ポーリングを廃止し、
+  ダイアログオープン時のみの同期へ変更 (H-13 一部)
 
 ## [0.1.0]
 
