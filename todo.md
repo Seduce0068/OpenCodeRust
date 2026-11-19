@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[モデルパッチ / OpenRouter]** Update/Move 解釈とヘッダ unwrap 排除
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery high 2 件]** UTF-8 境界 panic と apply_patch stale 破壊
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[L-04 一部]** load_config を cwd キャッシュへ集約（2026-11-19、swarm-coding R2）
@@ -496,13 +498,15 @@ status: current
     PermissionBroker/QuestionBroker の pending 残留と reply の false success。
   - **low**: PTY cursor -2 以下の全リプレイ、SseLineBuffer 無上限、
     edit の replace_all 型丸め、read の metadata エラー丸め、limit 上限なし。
-  - 2026-11-19 R4 で判明した**既存設計の high 2 件**（今回の差分とは無関係で要別タスク）:
-    `parse_model_patch` が `*** Update File:` を解釈せず LLM の一般的な更新パッチが
-    一切適用されない（`apply_patch.rs:565-648`）、`*** Move To:` が Add-only hunk を
-    Move に転用し「新内容 + 旧内容」に連結される（同 :600,625,704,825,857）。
-  - 同 R4 の残存: truncate_bytes が prompt.rs/summary.rs に重複（DRY）、
+  - 2026-11-19 対応済み: `*** Update File:` と `@@` hunk のパース、`*** Move To:` の
+    全文置換（Add-only hunk を Move に転用しない）を実装。宣言行数との突き合わせで
+    カウント検証を強化（R4 の指摘を R5 で修正）。
+  - 残存: truncate_bytes が prompt.rs/summary.rs に重複（DRY）、
     末尾改行が Update で失われる（既存仕様の可能性）、同一 path の複数 FilePatch
     が先の変更を上書き、new_start 整合性は debug! のみ。
+    hunk 本体の接頭辞なし行がノイズとして無視される（正当行の取りこぼし可能性）、
+    裸 `@@` 連続時に old_start を直前 hunk の末尾と仮定（隙間のある正しいパッチが
+    拒否されうる）、`@@ -1 +1 @@` の行数省略形は本文から算出する寛容性を採用。
 - M-55 R4 の残存（2026-11-19、記録のみ）: 完全な eventstream フレームデコーダ
   （preamble length / prelude CRC / message CRC）は未実装で、既知 7 キーの JSON テキスト
   検索ヒューリスティックを維持。未知イベント（modelStreamErrorException 等）が
