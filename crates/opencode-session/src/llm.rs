@@ -6,8 +6,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use opencode_plugin::{HookContext, HookEvent};
 use opencode_provider::{
-    get_model_context_limit, ChatRequest, Content, ImageUrl, Message, Provider, StreamEvent,
-    StreamUsage, ToolDefinition, ToolErrorKind as StreamToolErrorKind,
+    get_model_context_limit, ChatRequest, Content, ImageUrl, Message, Provider, ProviderError,
+    StreamEvent, StreamUsage, ToolDefinition, ToolErrorKind as StreamToolErrorKind,
 };
 
 use crate::compaction::{CompactionConfig, CompactionEngine, ModelLimits, TokenUsage};
@@ -95,6 +95,235 @@ pub enum ToolChoice {
 
 pub struct StreamOutput {
     pub events: tokio::sync::mpsc::Receiver<StreamEvent>,
+}
+
+// ============================================================================
+// 構造化ストリームエラーの受け渡し
+// ============================================================================
+//
+// `opencode_provider::StreamEvent::Error` のペイロードは `String` のみであり、
+// 本タスクの書き込みスコープは opencode-session に限定されているため enum 自体へ
+// バリアントを追加することはできない。そこで文字列へバージョン付き JSON
+// エンベロープとして `ProviderError` の構造化情報（status / headers / message）を
+// 埋め込み、processor 側で `ProviderError` へ復元する。
+//
+// これにより `error_from_anyhow` の `downcast_ref::<ProviderError>()` が成功し、
+// `Retry-After` が session retry の `delay` へ届くようになる。
+//
+// セキュリティ:
+// - 本文は 500 バイト preview のみ保持し、全文はエンベロープへ載せない。
+//   `retry::retryable` の free-usage-limit 検出が streaming 経路でも機能する。
+// - ヘッダは encode / decode 双方で allowlist を再適用し、カスタム provider が
+//   混入させた `authorization` / `set-cookie` 等は復元時に除去する。
+// - デコード失敗時の生ペイロードはログ・エラー文字列へ埋め込まない。
+
+const STRUCTURED_STREAM_ERROR_MARKER: &str = "__opencode_session_provider_error_v1__";
+const STRUCTURED_STREAM_ERROR_VERSION: u32 = 1;
+const ERROR_BODY_PREVIEW_MAX_BYTES: usize = 500;
+
+/// デコード失敗時にユーザー・ログへ渡す固定メッセージ。
+const STREAM_ERROR_DECODE_FAILED: &str =
+    "Stream error: upstream error payload could not be decoded";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StructuredStreamError {
+    ApiErrorWithHeaders {
+        status_code: u16,
+        message: String,
+        response_headers: Option<HashMap<String, String>>,
+        response_body: Option<String>,
+    },
+    ApiErrorWithStatus {
+        status_code: u16,
+        message: String,
+    },
+    RateLimit,
+    Timeout,
+    NetworkError {
+        message: String,
+    },
+    AuthError {
+        message: String,
+    },
+    ContextOverflow {
+        message: String,
+    },
+    Other {
+        message: String,
+    },
+}
+
+/// マーカー直後に続くバージョン付きラッパ。未知バージョンは復元を拒否する。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StructuredStreamEnvelope {
+    _version: u32,
+    error: StructuredStreamError,
+}
+
+/// provider 側の `error_body_preview` と同じ 500 バイト制限を、UTF-8 文字境界を
+/// またがないように適用する。provider 側の実装は `pub(crate)` のため再利用できない。
+fn error_body_preview(body: &str) -> String {
+    if body.len() <= ERROR_BODY_PREVIEW_MAX_BYTES {
+        return body.to_string();
+    }
+    let mut end = ERROR_BODY_PREVIEW_MAX_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &body[..end])
+}
+
+/// ストリーミング経路で復元するヘッダの allowlist。
+///
+/// provider.rs の `sanitize_response_headers` は `pub(crate)` かつ `HeaderMap`
+/// 主体のため、書き込みスコープ内では `HashMap` 向けの最小実装を置く。
+fn sanitize_stream_response_headers(
+    headers: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    const ALLOWED_HEADERS: &[&str] = &["retry-after", "retry-after-ms", "x-request-id"];
+    const ALLOWED_PREFIXES: &[&str] = &["x-ratelimit-"];
+
+    headers.map(|headers| {
+        headers
+            .into_iter()
+            .filter(|(name, _)| {
+                let lower = name.to_ascii_lowercase();
+                ALLOWED_HEADERS.iter().any(|allowed| lower == *allowed)
+                    || ALLOWED_PREFIXES
+                        .iter()
+                        .any(|prefix| lower.starts_with(prefix))
+            })
+            .collect()
+    })
+}
+
+/// `ProviderError` を `StreamEvent::Error(String)` へ載せられる構造化ペイロードへ変換する。
+///
+/// 本文は 500 バイト preview に制限して保持する（free-usage-limit 検出に必要）。
+/// 全文がログやユーザー向けエラーへ流出しないよう、ここで切り詰める。
+fn encode_stream_error(error: &ProviderError) -> String {
+    let structured = match error {
+        ProviderError::ApiErrorWithHeaders {
+            status_code,
+            message,
+            response_headers,
+            ..
+        } => StructuredStreamError::ApiErrorWithHeaders {
+            status_code: *status_code,
+            message: message.clone(),
+            response_headers: sanitize_stream_response_headers(response_headers.clone()),
+            response_body: error.response_body().map(error_body_preview),
+        },
+        ProviderError::ApiErrorWithStatus {
+            status_code,
+            message,
+        } => StructuredStreamError::ApiErrorWithStatus {
+            status_code: *status_code,
+            message: message.clone(),
+        },
+        ProviderError::RateLimit => StructuredStreamError::RateLimit,
+        ProviderError::Timeout => StructuredStreamError::Timeout,
+        ProviderError::NetworkError(message)
+        | ProviderError::NetworkErrorWithSource { message, .. } => {
+            StructuredStreamError::NetworkError {
+                message: message.clone(),
+            }
+        }
+        ProviderError::AuthError(message) => StructuredStreamError::AuthError {
+            message: message.clone(),
+        },
+        ProviderError::ContextOverflow(message) => StructuredStreamError::ContextOverflow {
+            message: message.clone(),
+        },
+        // source() チェーンは anyhow へ渡す時点で失われるため、利用者向け
+        // メッセージだけを保持して既存の文字列エラーと同じ扱いにする。
+        _ => StructuredStreamError::Other {
+            message: error.to_string(),
+        },
+    };
+
+    let envelope = StructuredStreamEnvelope {
+        _version: STRUCTURED_STREAM_ERROR_VERSION,
+        error: structured,
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(json) => format!("{STRUCTURED_STREAM_ERROR_MARKER}{json}"),
+        // エンコード失敗時は従来どおり文字列だけを渡し、工作流を止めない。
+        Err(_) => error.to_string(),
+    }
+}
+
+/// 既知 `kind` ごとに許されるキー集合。未知 kind / 余分フィールドの拒否に使う。
+fn allowed_error_keys(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "api_error_with_headers" => Some(&[
+            "kind",
+            "status_code",
+            "message",
+            "response_headers",
+            "response_body",
+        ]),
+        "api_error_with_status" => Some(&["kind", "status_code", "message"]),
+        "rate_limit" | "timeout" => Some(&["kind"]),
+        "network_error" | "auth_error" | "context_overflow" | "other" => Some(&["kind", "message"]),
+        _ => None,
+    }
+}
+
+/// エンベロープを `ProviderError` へ復元する。通常の文字列エラーは `None`。
+///
+/// マーカー付きでも `_version` 不一致・未知 kind・余分フィールド・不正 JSON は
+/// すべて `None` とし、生ペイロードをエラーやログへ渡さない。
+fn decode_stream_error(payload: &str) -> Option<ProviderError> {
+    let json = payload.strip_prefix(STRUCTURED_STREAM_ERROR_MARKER)?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let envelope = value.as_object()?;
+
+    // トップレベルは `_version` と `error` のみ。余分フィールドは拒否する。
+    if envelope.len() != 2 || !envelope.contains_key("_version") || !envelope.contains_key("error")
+    {
+        return None;
+    }
+    if envelope.get("_version")?.as_u64()? != STRUCTURED_STREAM_ERROR_VERSION as u64 {
+        return None;
+    }
+
+    let error_value = envelope.get("error")?;
+    let error_obj = error_value.as_object()?;
+    let kind = error_obj.get("kind")?.as_str()?;
+    let allowed = allowed_error_keys(kind)?;
+    if error_obj.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return None;
+    }
+
+    let structured: StructuredStreamError = serde_json::from_value(error_value.clone()).ok()?;
+    Some(match structured {
+        StructuredStreamError::ApiErrorWithHeaders {
+            status_code,
+            message,
+            response_headers,
+            response_body,
+        } => ProviderError::api_error_with_headers(
+            status_code,
+            message,
+            // カスタム provider が混入した機微ヘッダをここで確実に除去する。
+            sanitize_stream_response_headers(response_headers),
+            response_body.map(|body| error_body_preview(&body)),
+        ),
+        StructuredStreamError::ApiErrorWithStatus {
+            status_code,
+            message,
+        } => ProviderError::api_error_with_status(message, status_code),
+        StructuredStreamError::RateLimit => ProviderError::RateLimit,
+        StructuredStreamError::Timeout => ProviderError::Timeout,
+        StructuredStreamError::NetworkError { message } => ProviderError::NetworkError(message),
+        StructuredStreamError::AuthError { message } => ProviderError::AuthError(message),
+        StructuredStreamError::ContextOverflow { message } => {
+            ProviderError::context_overflow(message)
+        }
+        StructuredStreamError::Other { message } => ProviderError::ApiError(message),
+    })
 }
 
 // ============================================================================
@@ -765,8 +994,16 @@ impl StreamProcessor {
                     break;
                 }
 
-                StreamEvent::Error(e) => {
-                    return Err(anyhow::anyhow!("Stream error: {}", e));
+                StreamEvent::Error(message) => {
+                    // 構造化エンベロープなら ProviderError を anyhow::Error の
+                    // ルートとして保持し、error_from_anyhow の downcast が
+                    // 成功するようにする（Retry-After の伝播に必須）。
+                    if let Some(provider_error) = decode_stream_error(&message) {
+                        return Err(anyhow::Error::new(provider_error));
+                    }
+                    // 復元できなかった生ペイロードはレスポンス本文を含む可能性があるため、
+                    // エラー文字列へそのまま埋め込まず固定メッセージへ正規化する。
+                    return Err(anyhow::anyhow!(STREAM_ERROR_DECODE_FAILED));
                 }
 
                 StreamEvent::Usage { .. } => {}
@@ -968,7 +1205,8 @@ impl LlmProcessor {
                 }
                 Err(e) => {
                     tracing::error!("Failed to start stream: {}", e);
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                    // 文字列化せず構造化情報を保持したまま StreamEvent へ渡す。
+                    let _ = tx.send(StreamEvent::Error(encode_stream_error(&e))).await;
                 }
             }
         });
@@ -1002,7 +1240,7 @@ async fn forward_stream_events<S, E>(
     abort: tokio_util::sync::CancellationToken,
 ) where
     S: futures::Stream<Item = Result<StreamEvent, E>> + Send + Unpin,
-    E: std::fmt::Display,
+    E: std::fmt::Display + std::any::Any,
 {
     loop {
         tokio::select! {
@@ -1024,8 +1262,22 @@ async fn forward_stream_events<S, E>(
                         }
                     }
                     Some(Err(e)) => {
-                        tracing::error!("Stream error: {}", e);
-                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        let provider_error =
+                            (&e as &dyn std::any::Any).downcast_ref::<ProviderError>();
+                        let status_code = provider_error.and_then(ProviderError::status_code);
+                        // ストリーム途中の ProviderError も構造化情報を保持したまま
+                        // 転送し、開始時エラーと同じ retry 経路へ載せる。
+                        let payload = provider_error
+                            .map(encode_stream_error)
+                            .unwrap_or_else(|| e.to_string());
+                        // 生ペイロードをログへ出さず、status_code と構造化マーカーの
+                        // 有無だけを記録する（本文混入防止）。
+                        tracing::error!(
+                            status_code = ?status_code,
+                            has_structured_marker = payload.starts_with(STRUCTURED_STREAM_ERROR_MARKER),
+                            "Stream error"
+                        );
+                        let _ = tx.send(StreamEvent::Error(payload)).await;
                         break;
                     }
                     None => break,
@@ -1573,7 +1825,13 @@ pub async fn collect_stream(
                 break;
             }
             StreamEvent::Error(e) => {
-                tracing::error!("Stream error: {}", e);
+                // 生ペイロードをログへ出さず、status_code とマーカー有無だけを記録する。
+                let decoded = decode_stream_error(&e);
+                tracing::error!(
+                    status_code = ?decoded.as_ref().and_then(ProviderError::status_code),
+                    has_structured_marker = e.starts_with(STRUCTURED_STREAM_ERROR_MARKER),
+                    "Stream error"
+                );
                 break;
             }
             StreamEvent::Usage { .. } => {}
@@ -2014,5 +2272,458 @@ mod tests {
             StreamEvent::Error(message) => assert_eq!(message, "boom"),
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // R4 残存 high: ストリーミング経路の Retry-After 伝播回帰テスト
+    // -----------------------------------------------------------------------
+
+    struct RateLimitProvider {
+        error: std::sync::Mutex<Option<ProviderError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RateLimitProvider {
+        fn id(&self) -> &str {
+            "openai"
+        }
+
+        fn name(&self) -> &str {
+            "Mock"
+        }
+
+        fn models(&self) -> Vec<opencode_provider::ModelInfo> {
+            vec![]
+        }
+
+        fn get_model(&self, _id: &str) -> Option<&opencode_provider::ModelInfo> {
+            None
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<opencode_provider::ChatResponse, ProviderError> {
+            Err(self
+                .error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_else(|| ProviderError::ApiError("no error configured".to_string())))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<opencode_provider::StreamResult, ProviderError> {
+            Err(self
+                .error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_else(|| ProviderError::ApiError("no error configured".to_string())))
+        }
+    }
+
+    fn make_stream_input() -> StreamInput {
+        StreamInput {
+            user: MessageInfo::User {
+                id: "msg_user".to_string(),
+                session_id: "ses_test".to_string(),
+                time: crate::message_v2::UserTime { created: 0 },
+                agent: "test".to_string(),
+                model: crate::message_v2::ModelRef {
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt-test".to_string(),
+                },
+                format: None,
+                summary: None,
+                system: None,
+                tools: None,
+                variant: None,
+            },
+            session_id: "ses_test".to_string(),
+            model: LlmModelRef {
+                model_id: "gpt-test".to_string(),
+                provider_id: "openai".to_string(),
+            },
+            agent: LlmAgent {
+                name: "test".to_string(),
+                system_prompt: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+            },
+            system: vec![],
+            abort: tokio_util::sync::CancellationToken::new(),
+            messages: vec![Message::user("hello")],
+            small: false,
+            tools: HashMap::new(),
+            retries: Some(1),
+            tool_choice: None,
+            cost_rates: None,
+            work_dir: None,
+        }
+    }
+
+    /// chat_stream が返した 429 + Retry-After 付き ProviderError が
+    /// StreamEvent::Error を経て error_from_anyhow の response_headers に届き、
+    /// retry::delay が Retry-After を反映すること。本文は漏洩しないこと。
+    #[tokio::test]
+    async fn test_stream_start_error_propagates_retry_after_to_session_retry() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "2".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+        // 500 バイト preview を超える位置にのみ機微文字列を置く全文をわざと渡す。
+        let full_body = format!(
+            "{}{}",
+            "rate limited; retryable payload padding. ".repeat(20),
+            "SECRET-BODY-AFTER-PREVIEW"
+        );
+        let provider = Arc::new(RateLimitProvider {
+            error: std::sync::Mutex::new(Some(ProviderError::api_error_with_headers(
+                429,
+                "rate limited",
+                Some(headers.clone()),
+                Some(full_body.clone()),
+            ))),
+        });
+        let input = make_stream_input();
+
+        let mut output = LlmProcessor::stream_from_input(&input, provider)
+            .await
+            .expect("stream setup must succeed");
+        let payload = match output
+            .events
+            .recv()
+            .await
+            .expect("error event must be emitted")
+        {
+            StreamEvent::Error(payload) => payload,
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        // 500 バイトを超える本文（機微文字列）はストリームペイロードへ出ないこと。
+        assert!(
+            !payload.contains("SECRET-BODY-AFTER-PREVIEW"),
+            "full response body must not leak into StreamEvent payload"
+        );
+
+        let decoded = decode_stream_error(&payload).expect("structured envelope must decode");
+        let message_error =
+            crate::message_v2::error_from_anyhow(anyhow::Error::new(decoded), "openai");
+        match &message_error {
+            MessageError::ApiError {
+                status_code,
+                is_retryable,
+                response_headers,
+                response_body,
+                ..
+            } => {
+                assert_eq!(*status_code, Some(429));
+                assert!(*is_retryable);
+                assert_eq!(response_headers.as_ref(), Some(&headers));
+                let body = response_body
+                    .as_deref()
+                    .expect("bounded body preview must propagate for retry detection");
+                assert!(
+                    body.len() <= ERROR_BODY_PREVIEW_MAX_BYTES + 3,
+                    "only a bounded preview may propagate, got {} bytes",
+                    body.len()
+                );
+                assert!(
+                    !body.contains("SECRET-BODY-AFTER-PREVIEW"),
+                    "full body must not propagate through the streaming envelope"
+                );
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+
+        let api_info = crate::retry::ApiErrorInfo {
+            message: "rate limited".to_string(),
+            is_retryable: true,
+            response_headers: Some(headers),
+            response_body: None,
+        };
+        assert_eq!(crate::retry::delay(1, Some(&api_info)), 2_000);
+    }
+
+    /// process_stream が ProviderError を anyhow::Error として保持し、
+    /// error_from_anyhow の downcast が成功すること。
+    #[tokio::test]
+    async fn test_process_stream_keeps_provider_error_for_error_from_anyhow() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "3".to_string());
+        let provider = Arc::new(RateLimitProvider {
+            error: std::sync::Mutex::new(Some(ProviderError::api_error_with_headers(
+                429,
+                "rate limited",
+                Some(headers.clone()),
+                None,
+            ))),
+        });
+        let input = make_stream_input();
+        let mut processor =
+            StreamProcessor::new("ses_test".to_string(), "msg_assistant".to_string());
+
+        let error = processor
+            .process_stream(&input, provider)
+            .await
+            .expect_err("stream must fail");
+        assert!(
+            error.downcast_ref::<ProviderError>().is_some(),
+            "ProviderError must remain the root of the anyhow error"
+        );
+        assert_eq!(error.to_string(), "API error (status 429): rate limited");
+
+        let message_error = crate::message_v2::error_from_anyhow(error, "openai");
+        match message_error {
+            MessageError::ApiError {
+                response_headers, ..
+            } => assert_eq!(response_headers.as_ref(), Some(&headers)),
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// ストリーム途中の ProviderError も同じ経路で Retry-After を保持すること。
+    #[tokio::test]
+    async fn test_forward_stream_preserves_structured_provider_error() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "5".to_string());
+        let provider_error =
+            ProviderError::api_error_with_headers(429, "rate limited", Some(headers.clone()), None);
+        let stream = Box::pin(futures::stream::iter(vec![
+            Err::<StreamEvent, ProviderError>(provider_error),
+        ]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let abort = tokio_util::sync::CancellationToken::new();
+
+        tokio::spawn(forward_stream_events(stream, tx, abort))
+            .await
+            .expect("task panicked");
+        let payload = match rx.recv().await.expect("error event must be emitted") {
+            StreamEvent::Error(payload) => payload,
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        let decoded = decode_stream_error(&payload).expect("structured envelope must decode");
+        let message_error =
+            crate::message_v2::error_from_anyhow(anyhow::Error::new(decoded), "openai");
+        match message_error {
+            MessageError::ApiError {
+                response_headers, ..
+            } => assert_eq!(response_headers.as_ref(), Some(&headers)),
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// 通常の文字列エラーは従来どおりプレーンな文字列として届くこと。
+    #[test]
+    fn test_decode_stream_error_ignores_plain_strings() {
+        assert!(decode_stream_error("boom").is_none());
+        assert!(decode_stream_error("Stream error: rate limited").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // R4 指摘: エンベロープの厳密性 / 情報漏洩 / テスト不足
+    // -----------------------------------------------------------------------
+
+    /// マーカー付きでも不正 JSON・バージョン違い・未知 kind・余分フィールドは
+    /// すべて拒否されること。
+    #[test]
+    fn test_decode_stream_error_rejects_malformed_envelopes() {
+        let valid = serde_json::json!({
+            "_version": STRUCTURED_STREAM_ERROR_VERSION,
+            "error": { "kind": "rate_limit" }
+        });
+
+        // マーカー始まりの不正 JSON
+        let bad_json = format!("{STRUCTURED_STREAM_ERROR_MARKER}{{not json");
+        assert!(decode_stream_error(&bad_json).is_none());
+
+        // _version 違い
+        let mut wrong_version = valid.clone();
+        wrong_version["_version"] = serde_json::json!(STRUCTURED_STREAM_ERROR_VERSION + 1);
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{wrong_version}");
+        assert!(decode_stream_error(&payload).is_none());
+
+        // 未知 kind
+        let mut unknown_kind = valid.clone();
+        unknown_kind["error"] = serde_json::json!({ "kind": "totally_unknown" });
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{unknown_kind}");
+        assert!(decode_stream_error(&payload).is_none());
+
+        // 余分フィールド（トップレベル）
+        let mut extra_top = valid.clone();
+        extra_top["extra"] = serde_json::json!("x");
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{extra_top}");
+        assert!(decode_stream_error(&payload).is_none());
+
+        // 余分フィールド（error 内）
+        let mut extra_inner = valid.clone();
+        extra_inner["error"] = serde_json::json!({ "kind": "rate_limit", "extra": "x" });
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{extra_inner}");
+        assert!(decode_stream_error(&payload).is_none());
+
+        // 対照: 正しいエンベロープは復元できること
+        let valid_payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{valid}");
+        assert!(matches!(
+            decode_stream_error(&valid_payload),
+            Some(ProviderError::RateLimit)
+        ));
+    }
+
+    /// カスタム provider が混入した機微ヘッダが allowlist で除去されること。
+    #[test]
+    fn test_decode_stream_error_reapplies_header_allowlist() {
+        let payload = format!(
+            "{STRUCTURED_STREAM_ERROR_MARKER}{}",
+            serde_json::json!({
+                "_version": STRUCTURED_STREAM_ERROR_VERSION,
+                "error": {
+                    "kind": "api_error_with_headers",
+                    "status_code": 429,
+                    "message": "rate limited",
+                    "response_headers": {
+                        "authorization": "Bearer should-be-dropped",
+                        "set-cookie": "session=secret",
+                        "retry-after": "2",
+                        "retry-after-ms": "1500",
+                        "x-request-id": "req-1",
+                        "x-ratelimit-remaining": "0",
+                        "x-custom-secret": "drop-me"
+                    },
+                    "response_body": ""
+                }
+            })
+        );
+        let decoded = decode_stream_error(&payload).expect("envelope must decode");
+        let headers = decoded.response_headers().expect("headers must survive");
+        assert_eq!(headers.len(), 4);
+        assert_eq!(headers.get("retry-after").map(String::as_str), Some("2"));
+        assert_eq!(
+            headers.get("retry-after-ms").map(String::as_str),
+            Some("1500")
+        );
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("req-1")
+        );
+        assert_eq!(
+            headers.get("x-ratelimit-remaining").map(String::as_str),
+            Some("0")
+        );
+        for dropped in ["authorization", "set-cookie", "x-custom-secret"] {
+            assert!(
+                !headers.contains_key(dropped),
+                "sensitive header must be dropped: {dropped}"
+            );
+        }
+    }
+
+    /// 本文 preview が streaming 経路でも free-usage-limit 検出に使われ、
+    /// 500 バイトを超える本文は漏洩しないこと。
+    #[test]
+    fn test_streaming_body_preview_enables_free_usage_limit_detection() {
+        let full_body = format!(
+            "{}{}{}{}",
+            "p".repeat(430),
+            "FreeUsageLimitError",
+            "q".repeat(200),
+            "LONGTAILSECRET".repeat(50)
+        );
+        let provider_error = ProviderError::api_error_with_headers(
+            429,
+            "rate limited",
+            None,
+            Some(full_body.clone()),
+        );
+        let payload = encode_stream_error(&provider_error);
+        assert!(
+            !payload.contains("LONGTAILSECRET"),
+            "full body must not enter the envelope"
+        );
+
+        let decoded = decode_stream_error(&payload).expect("envelope must decode");
+        let message_error =
+            crate::message_v2::error_from_anyhow(anyhow::Error::new(decoded), "openai");
+        assert!(
+            crate::retry::retryable(&message_error).is_none(),
+            "free-usage-limit marker in the preview must stop retries on the streaming path"
+        );
+
+        match &message_error {
+            MessageError::ApiError { response_body, .. } => {
+                let body = response_body.as_deref().expect("preview must propagate");
+                assert!(body.contains("FreeUsageLimitError"));
+                assert!(!body.contains("LONGTAILSECRET"));
+                assert!(body.len() <= ERROR_BODY_PREVIEW_MAX_BYTES + 3);
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// デコードできない生ペイロードはエラー文字列へ埋め込まれないこと。
+    struct PayloadErrorProvider {
+        payload: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PayloadErrorProvider {
+        fn id(&self) -> &str {
+            "openai"
+        }
+
+        fn name(&self) -> &str {
+            "Mock"
+        }
+
+        fn models(&self) -> Vec<opencode_provider::ModelInfo> {
+            vec![]
+        }
+
+        fn get_model(&self, _id: &str) -> Option<&opencode_provider::ModelInfo> {
+            None
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<opencode_provider::ChatResponse, ProviderError> {
+            Err(ProviderError::ApiError("unused".to_string()))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<opencode_provider::StreamResult, ProviderError> {
+            let payload = self.payload.clone();
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::Error(payload)),
+                Ok(StreamEvent::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_stream_normalizes_undecodable_payload() {
+        let secret = "RAW-RESPONSE-BODY-SECRET";
+        let provider = Arc::new(PayloadErrorProvider {
+            payload: format!("Stream error: {secret}"),
+        });
+        let input = make_stream_input();
+        let mut processor =
+            StreamProcessor::new("ses_test".to_string(), "msg_assistant".to_string());
+
+        let error = processor
+            .process_stream(&input, provider)
+            .await
+            .expect_err("stream must fail");
+        let rendered = error.to_string();
+        assert_eq!(rendered, STREAM_ERROR_DECODE_FAILED);
+        assert!(
+            !rendered.contains(secret),
+            "raw payload must not leak into the normalized error"
+        );
     }
 }

@@ -591,6 +591,42 @@ pub async fn filter_compacted(messages: Vec<MessageWithParts>) -> Vec<MessageWit
 pub fn error_from_anyhow(e: anyhow::Error, provider_id: &str) -> MessageError {
     let err_str = e.to_string();
 
+    // 0. ProviderError の構造化情報を文字列ヒューリスティックより先に確認する。
+    //    429 の本文 preview に "unauthorized" / "AbortError" 等の語が含まれていても
+    //    AuthError / AbortedError へ誤分類されず、response_headers と response_body が
+    //    そのまま保持される。文字列ヒューリスティックは構造化情報が無い場合の
+    //    フォールバックとして扱う。
+    if let Some(provider_err) = e.downcast_ref::<ProviderError>() {
+        // 構造化保持されたレスポンスヘッダを取り出し、session 側の retry へ流す。
+        // 本文は parse 側で 500 バイト preview に制限される。
+        let response_headers = provider_err.response_headers().cloned();
+        let parsed = parse_api_call_error_with_headers(provider_id, provider_err, response_headers);
+        return match parsed {
+            ParsedAPICallError::ContextOverflow {
+                message,
+                response_body,
+            } => MessageError::ContextOverflowError {
+                message,
+                response_body,
+            },
+            ParsedAPICallError::ApiError {
+                message,
+                status_code,
+                is_retryable,
+                response_headers,
+                response_body,
+                metadata,
+            } => MessageError::ApiError {
+                message,
+                status_code: status_code.map(|s| s as i32),
+                is_retryable,
+                response_headers,
+                response_body,
+                metadata,
+            },
+        };
+    }
+
     // 1. AbortError – the operation was cancelled / aborted.
     if err_str.contains("abort") || err_str.contains("cancelled") || err_str.contains("AbortError")
     {
@@ -638,37 +674,7 @@ pub fn error_from_anyhow(e: anyhow::Error, provider_id: &str) -> MessageError {
         };
     }
 
-    // 5. Try to downcast to ProviderError for structured handling.
-    if let Some(provider_err) = e.downcast_ref::<ProviderError>() {
-        // 構造化保持されたレスポンスヘッダを取り出し、session 側の retry へ流す。
-        // 本文は parse 側で 500 バイト preview に制限される。
-        let response_headers = provider_err.response_headers().cloned();
-        let parsed = parse_api_call_error_with_headers(provider_id, provider_err, response_headers);
-        return match parsed {
-            ParsedAPICallError::ContextOverflow {
-                message,
-                response_body,
-            } => MessageError::ContextOverflowError {
-                message,
-                response_body,
-            },
-            ParsedAPICallError::ApiError {
-                message,
-                status_code,
-                is_retryable,
-                response_headers,
-                response_body,
-                metadata,
-            } => MessageError::ApiError {
-                message,
-                status_code: status_code.map(|s| s as i32),
-                is_retryable,
-                response_headers,
-                response_body,
-                metadata,
-            },
-        };
-    }
+    // 5. (ProviderError downcast is handled first, see step 0 above.)
 
     // 6. Context overflow heuristic on the raw string.
     if ProviderError::is_overflow(&err_str) {
@@ -1224,6 +1230,49 @@ mod tests {
         assert_eq!(
             crate::retry::delay(u32::MAX, Some(&api_info)),
             crate::retry::RETRY_MAX_DELAY_NO_HEADERS
+        );
+    }
+
+    /// 429 本文 preview に "unauthorized" が含まれても、構造化された
+    /// ProviderError が先に処理され AuthError へ誤分類されないこと。
+    #[test]
+    fn error_from_anyhow_prefers_structured_error_over_unauthorized_body_pattern() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "2".to_string());
+        headers.insert("x-request-id".to_string(), "req-42".to_string());
+        let body = "rate limited: unauthorized token seen in body preview".to_string();
+        let provider_error = ProviderError::api_error_with_headers(
+            429,
+            "rate limited",
+            Some(headers.clone()),
+            Some(body.clone()),
+        );
+
+        let error = error_from_anyhow(anyhow::Error::new(provider_error), "openai");
+        match &error {
+            MessageError::ApiError {
+                status_code,
+                is_retryable,
+                response_headers,
+                response_body,
+                ..
+            } => {
+                assert_eq!(*status_code, Some(429));
+                assert!(*is_retryable);
+                assert_eq!(response_headers.as_ref(), Some(&headers));
+                assert_eq!(response_body.as_deref(), Some(body.as_str()));
+            }
+            other => panic!("expected structured ApiError (not AuthError), got {other:?}"),
+        }
+    }
+
+    /// 構造化情報が無い素の文字列は従来どおり AuthError に分類されること。
+    #[test]
+    fn error_from_anyhow_still_classifies_plain_unauthorized_string_as_auth_error() {
+        let error = error_from_anyhow(anyhow::anyhow!("unauthorized: bad credentials"), "openai");
+        assert!(
+            matches!(error, MessageError::AuthError { .. }),
+            "plain string heuristic must remain as fallback"
         );
     }
 
