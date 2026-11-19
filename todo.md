@@ -101,37 +101,6 @@ status: current
   - 外部フルパス参照ゼロの 7 モジュールを pub(crate) 化済み（ファサード公開維持）。
     残存 14 モジュールは外部参照ありで維持。さらに縮小するには dead_code 解消＋
     ファサード再エクスポート整理（他ファイル変更）が必要
-- [ ] **[M-20]** 型付き Event Bus の未配線とイベント系統の分散
-  - 調査済み（2026-11-19、swarm-coding R2）: 推奨方針は **Bus 削除（方針 B）**。
-    3 系統は core Bus（本番発行/購読 0 件のデッドコード）／
-    Server `broadcast<String>`（実効イベント源、{\"type\":...} フラット JSON）／
-    TUI `mpsc<Event>`（下流 UI キュー）。
-    Bus を配線すると SSE スキーマが {\"event_type\",\"properties\"} へ非互換変更となり
-    TUI パーサ（app.rs:3852-3935、4 種のみ処理）が全イベントをドロップするリスク。
-    削除対象は bus.rs（348 行）と session 側 5 ファイルの publish 配線。
-    server/routes/tui は変更不要で実行時回帰リスク低。公開 API 破壊とイベント名
-    カタログ喪失が副作用（ワークスペース内利用はテストのみ）。
-  - `Bus::new` はテスト内のみで本番構築 0 件、ServerState は `broadcast<String>`、TUI は
-    `mpsc<Event>`、session 側 publish は bus=None で実行されない。単一イベント源として配線するか Bus を削除
-  - 補足（2026-11-18、eventbus-tui-worker）: TUI の `EventBus::new()` は受信側を即破棄するが、
-    本番で `event_bus.send*` 呼び出しは 0 件。実際の配送は app.rs:102 の別 mpsc チャネルで
-    動作しており実害なし。receiver 保持は読む event loop が無くキュー蓄積リスクがあるため
-    見送り。真に統合するなら app.rs 改修（EventBus を app のチャネルへ統合、または削除）が必要
-  - 調査（2026-11-19、swarm-coding R2-C）: core `Bus` は同期 `Fn` コールバック＋
-    broadcast、`publish` は guard 解放後にコールバック実行。本番利用 0 件で実質デッドコード。
-    系統は 3 つ（core Bus / TUI `mpsc<Event>` / Server `broadcast<String>`）＋
-    PTY `broadcast<Vec<u8>>`。
-    Server は発行 10 箇所・購読 2 箇所（SSE）、TUI の実配送は app.rs の別 mpsc。
-    方針A（配線）は 5〜7 ファイル・120–300 行、方針B（Bus 削除）は 348 行削除。設計判断待ち。
-- [x] **[M-21]** 残存 static は現状維持（2026-11-19、swarm-coding R2 調査）
-  - 移行済み 7 件に加え残存 4 件（MODEL_VARIANT_LOOKUP / MCP_OAUTH_MANAGER /
-    PLUGIN_LOADER / EXTRA_CORS_WHITELIST）を調査。結論は**すべて残す**。
-    いずれも set-once／遅延初期化のプロセス・ライフタイム資源で、本番は ServerState
-    が 1 インスタンス／プロセスのため instance 化の利益なし。MCP_OAUTH_MANAGER は
-    固定 callback ポート 19876＋保留フロー状態、PLUGIN_LOADER は依存先
-    GLOBAL_PLUGIN_SYSTEM が process-global、EXTRA_CORS_WHITELIST は CORS の
-    'static predicate から参照する起動時構成（セキュリティ関連）で移行リスク大。
-    再検討条件: 同一プロセスで複数 ServerState を運用する要件が発生した場合。
 - [ ] **[M-34 残り]** 依存更新検知の Renovate 委譲とスクリプトゲート
   - 2026-11-19 対応済み: ci.yml に all-features と unsafe lint ゲートを追加（`extra_gates`
     / `clippy_args`、ローカルで両方 green、共通ワークフロー README で入力仕様確認）。
@@ -212,6 +181,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-20]** core Bus と全 publish 配線を削除（2026-11-19、swarm-coding R1-R6）
+- [x] **[M-21]** 残存 static 4 件は現状維持（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-37 一部]** read_file/git status の非同期化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-34 一部]** CI に all-features / unsafe lint ゲートを追加
   （2026-11-19、swarm-coding R1-R6）
@@ -399,6 +370,18 @@ status: current
 
 ## メモ
 
+- M-17 調査結果（2026-11-19、swarm-coding R2）: 推奨は「ファサード先行・段階的
+  pub(crate) 化」。transform（session/prompt.rs の import 1 行）と registry
+  （cli/main.rs の import 1 行）は即時縮小可能。bootstrap / skill は
+  ファサードへ未再エクスポートの型があるため追加が必要。provider 実装 12 モジュール
+  は意図的な公開 API として pub 維持（意図は speculative）。他ファイル変更を伴うため
+  実装は別タスク。
+- M-38 調査結果（2026-11-19、swarm-coding R2）: 推奨は「/stream の chat_stream().await
+  を tx.closed() と tokio::select! で競わせる」（routes.rs 1 ファイル・5〜10 行・低
+  リスク、既存 biased select と同パターン）。provider 側に上流キャンセルの既存 API は
+  無く、CancellationToken 追加は 25 実装以上波及で高リスクのため非推奨。/prompt は
+  fire-and-forget 契約上クライアント切断検知手段が無く対象外（明示 abort は既存）。
+  reqwest future drop による上流停止効果は speculative。
 - 子エージェントの誤記（2026-11-19、swarm-coding R4 が発見、親が grep で confirmed）:
   M-46 調査担当は「/prompt は StreamProcessor を駆動する」と報告したが、
   `StreamProcessor::new()` の参照は llm.rs:1873 のテストモジュールのみで本番配線 0 件。
