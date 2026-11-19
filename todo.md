@@ -348,6 +348,7 @@ status: current
 
 ## 完了
 
+- [x] **[SessionRow 可用性]** 起動時一覧のみ破損行スキップ（2026-11-20、swarm-coding R1-R6）
 - [x] **[認証・設定の残存 2 件]** 定数時間比較・起動時固定・instructions presence
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[中優先 6 件]** CORS/401/auth・worktree 非同期・config 読み取り専用化
@@ -599,8 +600,10 @@ status: current
 - 2026-11-20 R4 残存（high 11 件の修正時）: うち 5 件は次イテレーションで対応済み
   （WebFetch 5MB 逐次強制、MCP HTTP/SSE 上限＋bounded、bash 行長制限、
   CLI log_dir None、server の summary 復元）。残存は以下のみ:
-  - SessionRow の fail-loud が 1 行の破損でサーバ全体起動を停止（可用性との二層方針が必要）
   - sessions.metadata 列なし（スキーマ変更＋マイグレーションは別タスク）
+  - SessionRow の二層方針は対応済み（起動時一覧のみ tolerant、個別 get は fail-loud）。
+    R4 残存: message_repo.list_for_session は依然 fail-loud（既存設計意図で scope 外）、
+    LIMIT 適用後に破損行をスキップするため極端な件数では正常行が欠落しうる（実用上は limit=100_000 で影響小）。
 - 2026-11-19 R6 cross-skill 集約（swarm61、7 担当・68 件）: high 11 / medium 34 /
   low 9 を `## 未着手` へ追記。重複・却下は以下:
   - 却下: docs/README.md:49 の PTY リンク（R1-TS05-04）は前回意図的に
