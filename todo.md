@@ -236,28 +236,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
-- [ ] **CLI /model がモデルを切り替えていない（no-op）** — `main.rs:1750-1764` / R1-ST01 / 高
-- [ ] **run の --continue/--session/--fork/--share がローカル実行で無視される**
-  — — `main.rs:1484-1488` / R1-ST03 / 高
-- [ ] **Bash 動的実行ガードが python/node/perl 等とラッパーコマンドを網羅せず权限昇格**
-  — — `bash.rs:538-629` / R1-IV01 / 高
-- [ ] **WebFetch の SSRF 検証と接続が別 DNS 解決で TOCTOU（DNS rebinding）**
-  — — `webfetch.rs:176-206,416-427` / R1-IV02 / 高
-- [ ] **MCP/plugin subprocess の Content-Length に上限がなく OOM**
-  — — `transport.rs:143-180`, `client.rs:501-528` / R1-IV03 / 高
-- [ ] **init_tracing がログファイル開放失敗時にサブスクライバを初期化せず全ログ無音化**
-  — — `logging.rs:399-416` / R1-OB01 / 高
-- [ ] **ログファイルが umask 依存 0644 で作られトークン prefix が永続化**
-  — — `logging.rs:332-404`, `server.rs:1194-1207` / R1-OB02 / 高
-- [ ] **カスタム Logger が tag/extra/message をエスケープせずログインジェクション**
-  — — `logging.rs:109-121,263-275` / R1-OB03 / 高
-- [ ] **SessionRow::into_session が revert/permission の JSON 破損を黙って捨て fail-open**
-  — — `repository.rs:63-64` / R1-E01 / 高
-- [ ] **SessionRepository が summary/metadata を SELECT するが復元せず常に破棄**
-  — — `repository.rs:26,58-59` / R1-E02 / 高
-- [ ] **AgentRegistry::from_project_dir が設定ロード失敗を握り潰しデフォルト権限で起動**
-  — — `agent.rs:511-515` / R1-E03 / 高
-
 ### 優先度: 中（残タスク調査で追加）
 
 - [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
@@ -370,6 +348,8 @@ status: current
 
 ## 完了
 
+- [x] **[review+discovery high 11 件]** no-op・fail-open・OOM・ログ基盤を修正
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[認証/設定 3 件]** attach パスワード・CLI fail-open・well-known 再注入
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[設定/CI/ドキュメント 3 件]** PTY 追随・NO_AUTH fail-open・all-features
@@ -604,6 +584,13 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（high 11 件の修正時、記録のみ）:
+  - WebFetch の 5MB 上限がレスポンス全体バッファ後の検査で OOM 経路が残存
+  - MCP HTTP/SSE トランスポートにサイズ上限なし（stdio の 10 MiB 対策は迂回可）
+  - bash 出力の 50KB チェックが 1 行読了後で改行なし巨大出力で OOM
+  - CLI が cwd を log_dir として明示渡ししユーザー専用既定ログディレクトリが実効化されない
+  - SessionRow の fail-loud が 1 行の破損でサーバ全体起動を停止（可用性との二層方針が必要）
+  - sessions.metadata 列なし、server.rs:684 の summary: None は別タスク提案
 - 2026-11-19 R6 cross-skill 集約（swarm61、7 担当・68 件）: high 11 / medium 34 /
   low 9 を `## 未着手` へ追記。重複・却下は以下:
   - 却下: docs/README.md:49 の PTY リンク（R1-TS05-04）は前回意図的に
