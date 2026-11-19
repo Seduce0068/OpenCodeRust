@@ -20,7 +20,6 @@ members = [
     "crates/opencode-command",
     "crates/opencode-plugin",
     "crates/opencode-tui",
-    "crates/opencode-pty",
     "crates/opencode-local-llm",
     "crates/opencode-codemode",
 ]
