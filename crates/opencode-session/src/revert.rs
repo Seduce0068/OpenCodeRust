@@ -146,7 +146,9 @@ impl RevertManager {
         };
 
         if let Some(ref snapshot) = revert.snapshot {
-            let _ = Snapshot::restore(&self.worktree, snapshot);
+            // Propagate restore failures so the revert state is preserved and
+            // the caller can retry. `?` returns before clear_revert() on error.
+            Snapshot::restore(&self.worktree, snapshot)?;
         }
 
         if let Some(session) = manager.get_mut(session_id) {
@@ -410,5 +412,92 @@ mod tests {
     fn lcs_length_empty_input() {
         assert_eq!(lcs_length(&[], &["a"]), 0);
         assert_eq!(lcs_length(&["a"], &[]), 0);
+    }
+
+    /// Successful restore: revert state is cleared and the session is returned.
+    #[test]
+    fn unrevert_clears_revert_on_successful_restore() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("unrevert_restore.txt");
+
+        std::fs::write(&file, "original\n").expect("write initial file");
+        let snapshot = Snapshot::track(root).expect("track snapshot");
+        std::fs::write(&file, "modified\n").expect("modify file");
+
+        let mut manager = SessionManager::new();
+        let session = manager.create("project", root.to_string_lossy().to_string());
+        let session_id = session.id.clone();
+        manager.set_revert(
+            &session_id,
+            crate::session::SessionRevert {
+                message_id: "msg-1".into(),
+                part_id: None,
+                snapshot: Some(snapshot),
+                diff: None,
+            },
+        );
+
+        let revert_manager = RevertManager::new(root.to_path_buf());
+        let result = revert_manager.unrevert(&session_id, &mut manager);
+
+        assert!(result.is_ok(), "unrevert should succeed on valid snapshot");
+        assert!(
+            result.unwrap().is_some(),
+            "existing session should be returned"
+        );
+
+        let updated = manager.get(&session_id).expect("session exists");
+        assert!(
+            updated.revert.is_none(),
+            "revert state should be cleared after a successful restore"
+        );
+
+        let restored = std::fs::read_to_string(&file).expect("read restored file");
+        assert_eq!(
+            restored, "original\n",
+            "file should be restored from snapshot"
+        );
+    }
+
+    /// Failed restore: error is propagated and the revert state is preserved
+    /// so the caller can retry instead of losing the only snapshot reference.
+    #[test]
+    fn unrevert_keeps_revert_on_failed_restore() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        let bad_snapshot = "ffffffffffffffffffffffffffffffffffffffff".to_string();
+
+        let mut manager = SessionManager::new();
+        let session = manager.create("project", root.to_string_lossy().to_string());
+        let session_id = session.id.clone();
+        manager.set_revert(
+            &session_id,
+            crate::session::SessionRevert {
+                message_id: "msg-1".into(),
+                part_id: None,
+                snapshot: Some(bad_snapshot.clone()),
+                diff: None,
+            },
+        );
+
+        let revert_manager = RevertManager::new(root.to_path_buf());
+        let result = revert_manager.unrevert(&session_id, &mut manager);
+
+        assert!(
+            result.is_err(),
+            "unrevert should propagate a restore failure"
+        );
+
+        let updated = manager.get(&session_id).expect("session exists");
+        let revert = updated
+            .revert
+            .as_ref()
+            .expect("revert state must be preserved when restore fails");
+        assert_eq!(
+            revert.snapshot.as_deref(),
+            Some(bad_snapshot.as_str()),
+            "the snapshot reference must remain available for retry"
+        );
     }
 }
