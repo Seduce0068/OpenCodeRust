@@ -201,6 +201,19 @@ status: current
     O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
+- [ ] **worktree 一覧だけがエラーを握り潰しエラー契約が不整合** — `routes.rs:5023` / R1-AR07
+- [ ] **CHANGELOG のカバレッジ増減が逆記述（49.19% を微減と記載）** — `CHANGELOG.md:45-46` / R1-TS01
+- [ ] **README のクレート数が 22 で現行 21 と不一致** — `README.md:142` / R1-TS02
+- [ ] **opencode-config.md の cwd 未対応記述が実装と矛盾**
+  — — `docs/opencode-config.md:71` / R1-TS05
+- [ ] **Session::touch テストが恒真アサーションで何も検証していない**
+  — — `session_integration.rs:72-80` / R1-TS08
+- [ ] **差分コーパスが RegExp/URL/normalize を完全に除外** — `parity_corpus.rs:1-7` / R1-TS10
+- [ ] **README にログレベル/出力先/ヘルスチェック/認証運用情報が無い** — `README.md:125-138` / R1-OB10
+- [ ] **docs/architecture.md の検証コマンドが CI ゲートより弱い**
+  — — `docs/architecture.md:114-119` / R1-DP07
+- [ ] **once_cell / lazy_static が std::sync::OnceLock / LazyLock で置換可能**
+  — — `Cargo.toml:70-71` / R1-DP09
 
 ### 優先度: 高（残タスク調査で追加）
 
@@ -222,6 +235,28 @@ status: current
     text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
+
+- [ ] **CLI /model がモデルを切り替えていない（no-op）** — `main.rs:1750-1764` / R1-ST01 / 高
+- [ ] **run の --continue/--session/--fork/--share がローカル実行で無視される**
+  — — `main.rs:1484-1488` / R1-ST03 / 高
+- [ ] **Bash 動的実行ガードが python/node/perl 等とラッパーコマンドを網羅せず权限昇格**
+  — — `bash.rs:538-629` / R1-IV01 / 高
+- [ ] **WebFetch の SSRF 検証と接続が別 DNS 解決で TOCTOU（DNS rebinding）**
+  — — `webfetch.rs:176-206,416-427` / R1-IV02 / 高
+- [ ] **MCP/plugin subprocess の Content-Length に上限がなく OOM**
+  — — `transport.rs:143-180`, `client.rs:501-528` / R1-IV03 / 高
+- [ ] **init_tracing がログファイル開放失敗時にサブスクライバを初期化せず全ログ無音化**
+  — — `logging.rs:399-416` / R1-OB01 / 高
+- [ ] **ログファイルが umask 依存 0644 で作られトークン prefix が永続化**
+  — — `logging.rs:332-404`, `server.rs:1194-1207` / R1-OB02 / 高
+- [ ] **カスタム Logger が tag/extra/message をエスケープせずログインジェクション**
+  — — `logging.rs:109-121,263-275` / R1-OB03 / 高
+- [ ] **SessionRow::into_session が revert/permission の JSON 破損を黙って捨て fail-open**
+  — — `repository.rs:63-64` / R1-E01 / 高
+- [ ] **SessionRepository が summary/metadata を SELECT するが復元せず常に破棄**
+  — — `repository.rs:26,58-59` / R1-E02 / 高
+- [ ] **AgentRegistry::from_project_dir が設定ロード失敗を握り潰しデフォルト権限で起動**
+  — — `agent.rs:511-515` / R1-E03 / 高
 
 ### 優先度: 中（残タスク調査で追加）
 
@@ -265,6 +300,73 @@ status: current
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
+
+- [ ] **CORS allow_headers に x-opencode-directory / x-request-id が欠落**
+  — — `server.rs:1155` / R1-AR01 / 中
+- [ ] **401 レスポンスだけが共通エラースキーマと不一致** — `server.rs:1182-1189` / R1-AR02 / 中
+- [ ] **per-instance ServerState と process-global な CORS/plugin/fetch-proxy 状態が矛盾**
+  — — `server.rs:491-516,996` / R1-AR03 / 中
+- [ ] **設定読み込み API（load_config）がユーザー設定ファイルを破壊的に書き換え**
+  — — `loader.rs:76-99,371-427` / R1-AR04 / 中
+- [ ] **worktree API が非同期ハンドラ内で同期 git サブプロセスを実行**
+  — — `routes.rs:5021-5060`, `worktree.rs:25-38` / R1-AR06 / 中
+- [ ] **auth_token が None の ServerState で認証が fail-open**
+  — — `server.rs:99-101,1167-1170` / R1-AR09 / 中
+- [ ] **update_config が plugin/instructions を追記のみで空配列削除不可**
+  — — `loader.rs:1571-1589`, `schema.rs:1855` / R1-AR10 / 中
+- [ ] **CLI clear が履歴を消去せずメッセージのみ出力** — `main.rs:1649-1652` / R1-ST02 / 中
+- [ ] **run --format json のローカル実行で JSON 以外が標準出力に混在**
+  — — `main.rs:1515-1524` / R1-ST05 / 中
+- [ ] **stats の Total Cost が常に Cost unavailable（コスト永続化未配線）**
+  — — `main.rs:2512-2517` / R1-ST06 / 中
+- [ ] **tui --fork --session が実際にはフォークせずベースセッションへ接続**
+  — — `main.rs:999-1003` / R1-ST07 / 中
+- [ ] **Bash が ctx.extra[\"env\"] と shell.env フックの環境変数名を無検証で注入**
+  — — `bash.rs:122-159` / R1-IV04 / 中
+- [ ] **WebFetch がレスポンス全体をバッファした後にサイズ上限を判定**
+  — — `webfetch.rs:306-329` / R1-IV05 / 中
+- [ ] **WebSearch の numResults/contextMaxCharacters に上限なし**
+  — — `websearch.rs:28-35,183-185` / R1-IV06 / 中
+- [ ] **プラグイン host/builtin スクリプトが予測可能な共有キャッシュへ symlink 追従で書き込まれる**
+  — — `loader.rs:68-74,164-178` / R1-IV08 / 中
+- [ ] **bash タイムアウト/abort 時の kill_process_tree が直系子のみ kill**
+  — — `bash.rs:26-43,231-292` / R1-IV09 / 中
+- [ ] **HTTP 5xx を含む全完了リクエストが INFO で記録されアラートが機能しない**
+  — — `server.rs:1091-1110` / R1-OB04 / 中
+- [ ] **生成 request_id がレスポンスへ返されず相関ログ照合が不能**
+  — — `server.rs:1116-1138` / R1-OB05 / 中
+- [ ] **ログタイムスタンプにタイムゾーン/ミリ秒が欠け共有 LAST_TIMESTAMP で誤読**
+  — — `logging.rs:39,100-107` / R1-OB06 / 中
+- [ ] **認証失敗ログに送信元 IP が含まれず発生元を特定できない**
+  — `server.rs:1116-1192` / R1-OB07 / 中
+- [ ] **all-features の clippy に undocumented_unsafe_blocks が付与されない**
+  — `ci.yml:31-42` / R1-OB09 / 中
+- [ ] **LLM 再試行時に StreamProcessor の蓄積状態がリセットされない**
+  — `llm.rs:324-407` / R1-E04 / 中
+- [ ] **subsessions メタデータのデシリアライズ失敗が次の保存で削除される**
+  — `prompt.rs:1777-1796` / R1-E05 / 中
+- [ ] **revert が Snapshot::track 失敗を空文字として保存**
+  — `revert.rs:101-116` / R1-E06 / 中
+- [ ] **ツール引数 JSON のパース失敗が Value::Null にされて実行される**
+  — `executor.rs:351-357` / R1-E07 / 中
+- [ ] **compaction の is_overflow が usable=0 のとき常に true**
+  — `compaction.rs:224-235` / R1-E08 / 中
+- [ ] **Snapshot::revert が checkout 失敗を無視して成功を返す**
+  — `snapshot.rs:57-71` / R1-E09 / 中
+- [ ] **compaction が要約メッセージを先に永続化し LLM 失敗時に残す**
+  — `compaction.rs:466-471,659-666` / R1-E10 / 中
+- [ ] **cargo audit がイベント駆動のみでスケジュール実行されない**
+  — `ci.yml:7-12` / R1-DP01 / 中
+- [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
+  — `renovate.json:3-5` / R1-DP02 / 中
+- [ ] **MSRV / Rust ツールチェーンが宣言・固定されていない**
+  — `Cargo.toml:36-40` / R1-DP03 / 中
+- [ ] **reqwest 既定 feature で rustls と native-tls が二重搭載**
+  — `Cargo.toml:85`, `Cargo.lock:3493-3538` / R1-DP04 / 中
+- [ ] **リリースビルドが CI ゲートに含まれていない**
+  — `ci.yml:39-42` / R1-DP05 / 中
+- [ ] **SQLite DB のバックアップ・復旧 Runbook が存在しない**
+  — `docs/opencode-storage.md:9-41` / R1-DP06 / 中
 
 ## 完了
 
@@ -502,6 +604,21 @@ status: current
 
 ## メモ
 
+- 2026-11-19 R6 cross-skill 集約（swarm61、7 担当・68 件）: high 11 / medium 34 /
+  low 9 を `## 未着手` へ追記。重複・却下は以下:
+  - 却下: docs/README.md:49 の PTY リンク（R1-TS05-04）は前回意図的に
+    opencode-server.md へ変更済みで opencode-pty.md は stub 化している。
+  - 既知: ADR-0008 の opencode-pty カバレッジ行（履歴スナップショット）、
+    {file:...} 重複時のコメント判定（R1-AR01-05、メモ済み）、worktree list の
+    unwrap_or_default（R1-AR07 は低として重複登録）、Litert スタブ（既知 L-09）、
+    Bedrock 完全 eventstream デコーダ（既知 M-55 残存）、TUI /lsp /formatter の
+    501 到達不能分岐（既知 501 終点）、@v1 タグピン（AGENTS.md 方針）、
+    MCP discovery の URL 未検証（swarm57 で既知）、20ms flaky テストと
+    SSE bind 失敗 pass（既知）。
+  - 事実確認: 親が `/model` no-op、logging init 無音化、SessionRow fail-open、
+    AgentRegistry 握り潰し、transport Content-Length、DNS rebinding、ログエスケープ、
+    README:142 の 22-crate を read で確認済み。
+  - プロファイル: 無制限（hy4-flash-free）、並列度 7、深度 1、全 7 件が正常完了。
 - 2026-11-19 R4 残存（認証/設定 3 件、記録のみ）: `parse_no_auth` が CLI と server に
   複製（共有化は公開 API 追加の判断が必要）、wellknown の `is_safe_env_key` が
   BASH_ENV / NODE_OPTIONS / HTTP_PROXY 等を許容（許可リスト方式の検討課題）、
