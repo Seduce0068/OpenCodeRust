@@ -50,6 +50,15 @@ pub struct SessionStatusInfo {
     pub next: Option<i64>,
 }
 
+/// `GET /session/{id}/todo` が返す TODO 項目。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoInfo {
+    pub id: String,
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionOptionInfo {
     pub label: String,
@@ -665,6 +674,21 @@ impl ApiClient {
 
         let messages: Vec<MessageInfo> = response.json()?;
         Ok(messages)
+    }
+
+    /// セッションに紐付いた TODO 一覧を `GET /session/{id}/todo` で取得する。
+    ///
+    /// `/event` の `todo.updated` は fire-and-forget のため再接続中の更新を
+    /// 取りこぼす可能性がある。接続確立時にこのメソッドで再同期する。
+    pub fn get_todos(&self, session_id: &str) -> anyhow::Result<Vec<TodoInfo>> {
+        let url = format!("{}/session/{}/todo", self.base_url, session_id);
+        let response = self.client.get(&url).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!("Failed to get todos: {} - {}", status, text);
+        }
+        Ok(response.json::<Vec<TodoInfo>>()?)
     }
 
     /// `/lsp` はサーバ側で未実装（常に 501）のため、型付きレスポンスへの変換は行わない。

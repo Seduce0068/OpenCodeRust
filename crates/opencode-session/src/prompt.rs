@@ -26,7 +26,7 @@ use crate::message_v2::{
 };
 use crate::summary::{summarize_into_session, SummarizeInput};
 use crate::system::SystemPrompt;
-use crate::{MessageRole, PartType, Session, SessionMessage, SessionStateManager};
+use crate::{MessageRole, PartType, Session, SessionMessage, SessionStateManager, TodoInfo};
 
 // Permission callback type for tool execution
 pub type PermissionCallback = Option<
@@ -240,6 +240,10 @@ pub struct SessionPrompt {
     session_state: Arc<RwLock<SessionStateManager>>,
     mcp_clients: Option<Arc<opencode_mcp::McpClientRegistry>>,
     lsp_registry: Option<Arc<opencode_lsp::LspClientRegistry>>,
+    /// `todowrite` / `todoread` が参照する TODO 更新コールバック。
+    todo_update: Option<opencode_tool::TodoUpdateCallback>,
+    /// `todoread` が参照する TODO 取得コールバック。
+    todo_get: Option<opencode_tool::TodoGetCallback>,
 }
 
 impl SessionPrompt {
@@ -249,6 +253,8 @@ impl SessionPrompt {
             session_state,
             mcp_clients: None,
             lsp_registry: None,
+            todo_update: None,
+            todo_get: None,
         }
     }
 
@@ -259,6 +265,60 @@ impl SessionPrompt {
 
     pub fn with_lsp_registry(mut self, registry: Arc<opencode_lsp::LspClientRegistry>) -> Self {
         self.lsp_registry = Some(registry);
+        self
+    }
+
+    /// [`crate::TodoManager`] を `Arc` で受け取り、ツール実行時の TODO 状態として配線する。
+    ///
+    /// `TodoManager` の内部状態は `Arc<RwLock<_>>` で共有されているため、同じ
+    /// インスタンスを指す `Arc` を他スレッドから参照しても更新結果は共通する。
+    pub fn with_todo_manager(self, manager: Arc<crate::TodoManager>) -> Self {
+        let update_manager = manager.clone();
+        let get_manager = manager;
+        let update: opencode_tool::TodoUpdateCallback = Arc::new(move |session_id, todos| {
+            let manager = update_manager.clone();
+            Box::pin(async move {
+                let items = todos
+                    .into_iter()
+                    .map(|todo| TodoInfo {
+                        content: todo.content,
+                        status: todo.status,
+                        priority: todo.priority,
+                    })
+                    .collect();
+                manager.update(&session_id, items).await;
+                Ok(())
+            })
+        });
+        let get: opencode_tool::TodoGetCallback = Arc::new(move |session_id| {
+            let manager = get_manager.clone();
+            Box::pin(async move {
+                Ok(manager
+                    .get(&session_id)
+                    .await
+                    .into_iter()
+                    .map(|todo| opencode_tool::TodoItemData {
+                        content: todo.content,
+                        status: todo.status,
+                        priority: todo.priority,
+                    })
+                    .collect())
+            })
+        });
+        self.with_todo_hooks(update, get)
+    }
+
+    /// TODO の更新・取得を任意のコールバックへ委譲する。
+    ///
+    /// サーバ側の `ServerState::todo_manager` のように既存インスタンスを
+    /// 所有権ごと渡せない場合に、その状態へ直接配線するために使う。
+    pub fn with_todo_hooks(
+        mut self,
+        update: opencode_tool::TodoUpdateCallback,
+        get: opencode_tool::TodoGetCallback,
+    ) -> Self {
+        self.todo_update = Some(update);
+        self.todo_get = Some(get);
         self
     }
 
@@ -948,6 +1008,8 @@ impl SessionPrompt {
             update_hook,
             permission_callback,
             question_callback,
+            self.todo_update.clone(),
+            self.todo_get.clone(),
         )
         .await;
 
@@ -1030,6 +1092,8 @@ impl SessionPrompt {
             None,
             None,
             None,
+            self.todo_update.clone(),
+            self.todo_get.clone(),
         )
         .await;
 
@@ -1057,6 +1121,8 @@ impl SessionPrompt {
         update_hook: Option<SessionUpdateHook>,
         permission_callback: PermissionCallback,
         question_callback: QuestionCallback,
+        todo_update: Option<opencode_tool::TodoUpdateCallback>,
+        todo_get: Option<opencode_tool::TodoGetCallback>,
     ) -> anyhow::Result<()> {
         let mut step = 0u32;
         let provider_type = ProviderType::from_provider_id(&provider_id);
@@ -1444,6 +1510,17 @@ impl SessionPrompt {
                     tool_context = tool_context.with_ask_question(
                         move |questions: Vec<opencode_tool::QuestionDef>| callback(questions),
                     );
+                }
+
+                // `todowrite` / `todoread` をセッション単位の状態へ配線する。
+                // ループは複数周するため Option は clone して毎回注入する。
+                if let Some(callback) = todo_update.clone() {
+                    tool_context = tool_context
+                        .with_todo_update(move |session_id, todos| callback(session_id, todos));
+                }
+                if let Some(callback) = todo_get.clone() {
+                    tool_context =
+                        tool_context.with_todo_get(move |session_id| callback(session_id));
                 }
 
                 let registry = Arc::new(opencode_tool::create_default_registry().await);
