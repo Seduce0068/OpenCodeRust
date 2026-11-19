@@ -117,6 +117,9 @@ pub struct AppContext {
     pub semantic_highlight: RwLock<bool>,
     pub has_connected_provider: RwLock<bool>,
     ui_kv: RwLock<UiKv>,
+    // attach -p/--password で渡された認証トークン。secret として扱い、
+    // Debug/ログ/エラーへ出力しないため private フィールドに保持する。
+    auth_token: RwLock<Option<String>>,
     pub api_client: RwLock<Option<Arc<ApiClient>>>,
 }
 
@@ -156,6 +159,7 @@ impl AppContext {
             semantic_highlight: RwLock::new(ui_kv.get_bool("semantic_highlight", true)),
             has_connected_provider: RwLock::new(false),
             ui_kv: RwLock::new(ui_kv),
+            auth_token: RwLock::new(None),
             api_client: RwLock::new(None),
         }
     }
@@ -291,6 +295,16 @@ impl AppContext {
             .collect::<Vec<_>>();
         names.sort_by_key(|a| a.to_lowercase());
         names
+    }
+
+    /// attach で指定された認証トークンを保持する。値はログへ出力しない。
+    pub(crate) fn set_auth_token(&self, token: Option<String>) {
+        *self.auth_token.write() = token;
+    }
+
+    /// 保持している認証トークンを取得する（呼び出し側が secret として扱う）。
+    pub(crate) fn auth_token(&self) -> Option<String> {
+        self.auth_token.read().clone()
     }
 
     pub fn set_api_client(&self, client: Arc<ApiClient>) {
@@ -669,5 +683,17 @@ mod tests {
             let parsed = MessageDensity::from_str_lossy(serialized);
             assert_eq!(parsed, density, "serialized={serialized}");
         }
+    }
+
+    #[test]
+    fn auth_token_is_held_and_can_be_cleared() {
+        let context = AppContext::new();
+        assert!(context.auth_token().is_none(), "token must start unset");
+
+        context.set_auth_token(Some("dummy-token".to_string()));
+        assert_eq!(context.auth_token().as_deref(), Some("dummy-token"));
+
+        context.set_auth_token(None);
+        assert!(context.auth_token().is_none(), "token must be clearable");
     }
 }

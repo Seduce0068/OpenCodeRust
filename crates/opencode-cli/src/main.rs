@@ -842,6 +842,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+const TUI_AUTH_TOKEN_ENV: &str = "OPENCODE_TUI_AUTH_TOKEN";
+
+/// attach のパスワードを TUI が読む env へ設定する（未指定時は何もしない）。
+fn set_tui_auth_token_env(password: &Option<String>) {
+    if let Some(password) = password {
+        std::env::set_var(TUI_AUTH_TOKEN_ENV, password);
+    }
+}
+
+fn clear_tui_auth_token_env() {
+    std::env::remove_var(TUI_AUTH_TOKEN_ENV);
+}
+
 async fn run_tui(
     project: Option<PathBuf>,
     model: Option<String>,
@@ -856,7 +869,7 @@ async fn run_tui(
     mdns_domain: String,
     cors: Vec<String>,
     attach_url: Option<String>,
-    _password: Option<String>,
+    password: Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(project) = project {
         std::env::set_current_dir(&project).map_err(|e| {
@@ -886,6 +899,10 @@ async fn run_tui(
         let bind_port = if port == 0 { 3000 } else { port };
         let addr: SocketAddr = format!("{}:{}", bind_host, bind_port).parse()?;
         let server_url = format!("http://{}:{}", client_host, bind_port);
+        // TUI のローカルサーバは run_server_command を通らず run_server を直接 spawn
+        // するため、CLI と同じ fail-closed 判定の認証状態通知をここで 1 回出す。
+        // attach（外部サーバへ接続する経路）ではローカルサーバを起動しないので出さない。
+        emit_auth_status_notice();
         eprintln!("Starting local server for TUI at {}", server_url);
         opencode_server::set_cors_whitelist(cors.clone());
         let mut handle = tokio::spawn(async move { opencode_server::run_server(addr).await });
@@ -897,6 +914,8 @@ async fn run_tui(
 
     let selected_session = resolve_requested_session(continue_last, session, fork).await?;
     std::env::set_var("OPENCODE_TUI_BASE_URL", &base_url);
+    // attach -p/--password を TUI 側へ secret として渡す。値はログ・エラーへ出さない。
+    set_tui_auth_token_env(&password);
     if let Some(model) = model {
         std::env::set_var("OPENCODE_TUI_MODEL", model);
     }
@@ -917,6 +936,7 @@ async fn run_tui(
     std::env::remove_var("OPENCODE_TUI_PROMPT");
     std::env::remove_var("OPENCODE_TUI_AGENT");
     std::env::remove_var("OPENCODE_TUI_SESSION");
+    clear_tui_auth_token_env();
 
     drop(mdns_publisher);
     if let Some(handle) = server_handle {
@@ -924,6 +944,36 @@ async fn run_tui(
     }
 
     run_result
+}
+
+#[cfg(test)]
+mod password_env_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // env を触るテストを直列化する（並列実行による他テストとの競合を避ける）。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn attach_password_is_forwarded_to_tui_env() {
+        let _guard = ENV_LOCK.lock().expect("env test lock");
+        let password = Some("dummy-password".to_string());
+        set_tui_auth_token_env(&password);
+        assert_eq!(
+            std::env::var(TUI_AUTH_TOKEN_ENV).ok(),
+            Some("dummy-password".to_string())
+        );
+        clear_tui_auth_token_env();
+    }
+
+    #[test]
+    fn absent_password_leaves_tui_env_unset() {
+        let _guard = ENV_LOCK.lock().expect("env test lock");
+        clear_tui_auth_token_env();
+        set_tui_auth_token_env(&None);
+        assert!(std::env::var(TUI_AUTH_TOKEN_ENV).is_err());
+        clear_tui_auth_token_env();
+    }
 }
 
 async fn resolve_requested_session(
@@ -1928,6 +1978,55 @@ fn show_help() {
     println!();
 }
 
+/// `OPENCODE_NO_AUTH` の値をパースし、認証を無効化すべきかどうかを返す純粋関数。
+///
+/// 判定ロジックは `opencode-server` の `parse_no_auth` と同一:
+/// `true` / `1` / `yes`（大小文字無視・前後空白除去）のみ無効化し、
+/// 未設定・空文字・`0` / `false`・不正値はすべて fail-closed（認証有効）。
+///
+/// NOTE: 本来は共有ヘルパへ切り出したいが、サーバ側の `parse_no_auth` / `is_auth_enabled`
+/// は私的関数（`pub` ではない）で `pub use server::*` でも公開されていない。共有化には
+/// サーバ側の公開 API 変更が必要なため、ここに同一ロジックを複製する。
+/// 実際の認証強制は server 側が行うため、この判定は起動時表示の正確性のみに使われ、
+/// 値を誤判定しても認証バイパスは発生しない。
+fn parse_no_auth(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        let normalized = raw.trim();
+        normalized == "1"
+            || normalized.eq_ignore_ascii_case("true")
+            || normalized.eq_ignore_ascii_case("yes")
+    })
+}
+
+/// 認証状態の通知文言（値非依存。トークン値も `OPENCODE_NO_AUTH` の値も混入させない）。
+const AUTH_DISABLED_NOTICE: &str =
+    "Authentication DISABLED via OPENCODE_NO_AUTH. Not safe for production.";
+const AUTH_ENABLED_NOTICE: &str =
+    "Authentication enabled with a random Bearer token (see server log).";
+
+/// 現在の `OPENCODE_NO_AUTH` を fail-closed で判定し、表示する通知文言を返す。
+fn auth_status_notice() -> &'static str {
+    if parse_no_auth(std::env::var("OPENCODE_NO_AUTH").ok().as_deref()) {
+        AUTH_DISABLED_NOTICE
+    } else {
+        AUTH_ENABLED_NOTICE
+    }
+}
+
+/// 認証状態通知を `writer` へ 1 行書き出す（値非依存の既存文言のみ）。
+fn write_auth_status_notice<W: Write>(writer: &mut W) -> io::Result<()> {
+    writeln!(writer, "{}", auth_status_notice())
+}
+
+/// 認証状態通知を stderr へ 1 回出す。
+///
+/// `run_server_command`（serve / web / acp）と `run_tui` のローカルサーバ起動前の
+/// 両方から呼ぶ。TUI は `run_server_command` を通らず `run_server` を直接 spawn
+/// するため、ここを共有しないと `OPENCODE_NO_AUTH` の警告が出ない。
+fn emit_auth_status_notice() {
+    let _ = write_auth_status_notice(&mut io::stderr());
+}
+
 async fn run_server_command(
     mode: &str,
     port: u16,
@@ -1936,11 +2035,9 @@ async fn run_server_command(
     mdns_domain: String,
     cors: Vec<String>,
 ) -> anyhow::Result<()> {
-    if std::env::var("OPENCODE_NO_AUTH").is_ok() {
-        eprintln!("Warning: OPENCODE_NO_AUTH is set; server is unsecured.");
-    } else {
-        eprintln!("Authentication enabled with a random Bearer token (see server log).");
-    }
+    // 認証状態の通知は CLI 側で 1 回だけ出す（server 側は警告を出さない）。
+    // 判定は server の parse_no_auth と同一（fail-closed）。
+    emit_auth_status_notice();
 
     let bind_host = if mdns && hostname == "127.0.0.1" {
         "0.0.0.0".to_string()
@@ -5722,5 +5819,131 @@ mod tests {
             format_stats_total_cost(Some(f64::INFINITY)),
             "Cost unavailable"
         );
+    }
+
+    #[test]
+    fn parse_no_auth_disables_auth_only_for_explicit_true_values() {
+        // 明示的な無効化値（大小文字無視・前後空白許容）のみ true。
+        // server の parse_no_auth と同一ロジックであることを保証する。
+        let disabling: [Option<&str>; 8] = [
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("TRUE"),
+            Some("YES"),
+            Some("True"),
+            Some(" true "),
+            Some("\tyes\n"),
+        ];
+        for value in disabling {
+            assert!(
+                parse_no_auth(value),
+                "explicit NO_AUTH value must disable auth: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_no_auth_keeps_auth_enabled_for_all_other_values() {
+        // 未設定・空・0/false・不正値は fail-closed（認証有効）。
+        let not_disabling: [Option<&str>; 9] = [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+            Some("no"),
+            Some("garbage"),
+            Some("2"),
+        ];
+        for value in not_disabling {
+            assert!(
+                !parse_no_auth(value),
+                "non-explicit NO_AUTH value must keep auth enabled: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_no_auth_acceptance_values_match_server() {
+        // 受け入れ条件の各値（未設定/1/true/yes/0/false/空/garbage）を明示的に検証する。
+        // 順序: 未設定, 1, true, yes, 0, false, 空文字, garbage。
+        // true 側は認証無効化、false 側は認証有効（fail-closed）を期待する。
+        let cases: [(Option<&str>, bool); 8] = [
+            (None, false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("yes"), true),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some(""), false),
+            (Some("garbage"), false),
+        ];
+        for (value, expected_disabled) in cases {
+            assert_eq!(
+                parse_no_auth(value),
+                expected_disabled,
+                "OPENCODE_NO_AUTH={value:?} should yield disabled={expected_disabled}"
+            );
+        }
+    }
+
+    /// env を書き換える通知テストを直列化する。
+    static NO_AUTH_NOTICE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// テスト後に `OPENCODE_NO_AUTH` を元へ戻すガード。
+    struct RestoreNoAuth(Option<String>);
+
+    impl Drop for RestoreNoAuth {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("OPENCODE_NO_AUTH", value),
+                None => std::env::remove_var("OPENCODE_NO_AUTH"),
+            }
+        }
+    }
+
+    #[test]
+    fn tui_local_server_auth_notice_warns_when_no_auth_disables_auth() {
+        // run_tui のローカルサーバ起動前に emit_auth_status_notice() が出す文言の回帰テスト。
+        // run_server_command と同じ判定・同じ値非依存文言であることを固定する。
+        let _guard = NO_AUTH_NOTICE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+
+        for value in ["1", "true", "yes", "TRUE", " true "] {
+            std::env::set_var("OPENCODE_NO_AUTH", value);
+            let mut output = Vec::new();
+            write_auth_status_notice(&mut output).expect("write auth notice");
+            assert_eq!(
+                String::from_utf8(output).expect("utf8 auth notice"),
+                format!("{}\n", AUTH_DISABLED_NOTICE),
+                "OPENCODE_NO_AUTH={value:?} must emit the disabled warning once"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_local_server_auth_notice_uses_enabled_text_for_fail_closed_values() {
+        let _guard = NO_AUTH_NOTICE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+
+        for value in [None, Some("0"), Some("false"), Some(""), Some("garbage")] {
+            match value {
+                Some(value) => std::env::set_var("OPENCODE_NO_AUTH", value),
+                None => std::env::remove_var("OPENCODE_NO_AUTH"),
+            }
+            let mut output = Vec::new();
+            write_auth_status_notice(&mut output).expect("write auth notice");
+            assert_eq!(
+                String::from_utf8(output).expect("utf8 auth notice"),
+                format!("{}\n", AUTH_ENABLED_NOTICE),
+                "OPENCODE_NO_AUTH={value:?} must keep the enabled notice (fail-closed)"
+            );
+        }
     }
 }

@@ -97,6 +97,23 @@ fn is_safe_env_key(key: &str) -> bool {
     valid && !BLOCKED.contains(&key)
 }
 
+/// Injects an auth token into the process environment when its key is safe.
+///
+/// Shared by both the fetch and the cache-hit paths so a rotated token is
+/// always re-injected, even while the config cache is still valid. Only the
+/// key and URL are ever logged — the token value is never written to logs.
+///
+/// Returns `true` when the token was injected, `false` when the key was
+/// rejected as unsafe.
+fn inject_auth_token(url: &str, auth: &WellKnownAuth) -> bool {
+    if !is_safe_env_key(&auth.key) {
+        tracing::warn!(url = %url, key = %auth.key, "refusing unsafe env key from auth.json");
+        return false;
+    }
+    std::env::set_var(&auth.key, &auth.token);
+    true
+}
+
 /// Fetches remote config from all wellknown auth entries and returns a merged
 /// `Config` representing the combined remote configuration.
 ///
@@ -109,29 +126,34 @@ pub async fn load_wellknown() -> Config {
     if entries.is_empty() {
         return Config::default();
     }
+    load_wellknown_from_entries(&entries).await
+}
 
+/// Core implementation of [`load_wellknown`], split out so tests can supply
+/// entries directly without depending on an on-disk `auth.json`.
+async fn load_wellknown_from_entries(entries: &HashMap<String, WellKnownAuth>) -> Config {
     let mut merged = Config::default();
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .build()
         .unwrap_or_default();
 
-    for (url, auth) in &entries {
-        // Check cache first
+    for (url, auth) in entries {
+        // Always (re)inject the token, including on cache hits. Tokens can be
+        // rotated while the cached config is still inside its TTL; skipping
+        // injection on a hit leaves the stale value in the environment and
+        // downstream provider auth keeps using the old token.
+        if !inject_auth_token(url, auth) {
+            continue;
+        }
+
+        // A cache hit still merges the cached config, but only after the
+        // token has been refreshed above.
         if let Some(cached) = get_cached(url) {
             tracing::debug!(url = %url, "using cached wellknown config");
             merged.merge(cached);
             continue;
         }
-
-        // Set the env var so downstream code (e.g. provider auth) can use it,
-        // matching the TS behaviour: `process.env[value.key] = value.token`.
-        // Refuse keys that would hijack process loading or lookup behaviour.
-        if !is_safe_env_key(&auth.key) {
-            tracing::warn!(url = %url, key = %auth.key, "refusing unsafe env key from auth.json");
-            continue;
-        }
-        std::env::set_var(&auth.key, &auth.token);
 
         let endpoint = format!("{}/.well-known/opencode", url.trim_end_matches('/'));
         tracing::debug!(url = %endpoint, "fetching remote wellknown config");
@@ -202,6 +224,25 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Env vars and the wellknown cache are process-global: serialize every
+    /// test that touches either so they cannot interfere with one another.
+    static TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Restores an environment variable to its original value on drop.
+    struct EnvRestoreGuard {
+        key: String,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(&self.key, value),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
 
     #[test]
     fn parses_wellknown_auth_entries_from_json() {
@@ -291,5 +332,85 @@ mod tests {
         assert!(!is_safe_env_key("lowerCase"));
         assert!(!is_safe_env_key("1BAD"));
         assert!(!is_safe_env_key("BAD-KEY"));
+    }
+
+    // std Mutex はプロセスグローバルな env の直列化にのみ使用し、await 中は
+    // 他スレッドが env を触らないため保持しても安全（テスト専用）。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cache_hit_reinjects_rotated_token_into_env() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+
+        let key = "OPENCODE_WK_ROTATION_TEST";
+        let url = "https://cache-hit.example.com";
+        let _env_guard = EnvRestoreGuard {
+            key: key.to_string(),
+            original: std::env::var_os(key),
+        };
+
+        // Simulate a still-valid cache entry (inside the TTL) and a stale
+        // token left in the process environment from an earlier load.
+        set_cached(
+            url.to_string(),
+            Config {
+                model: Some("cached-model".to_string()),
+                ..Default::default()
+            },
+        );
+        std::env::set_var(key, "stale-token");
+        assert_eq!(std::env::var(key).unwrap(), "stale-token");
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            url.to_string(),
+            WellKnownAuth {
+                key: key.to_string(),
+                token: "rotated-token".to_string(),
+            },
+        );
+
+        // Cache hit: the cached config must be merged AND the token refreshed.
+        let config = load_wellknown_from_entries(&entries).await;
+        assert_eq!(config.model.as_deref(), Some("cached-model"));
+
+        assert_eq!(
+            std::env::var(key).unwrap(),
+            "rotated-token",
+            "cache hit must re-inject the current auth token"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cache_hit_rejects_unsafe_env_key() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+
+        // "IFS" is on the blocklist but harmless to touch inside a Rust test
+        // process; the guard restores its original value on drop.
+        let key = "IFS";
+        let url = "https://unsafe-key.example.com";
+        let _env_guard = EnvRestoreGuard {
+            key: key.to_string(),
+            original: std::env::var_os(key),
+        };
+        std::env::remove_var(key);
+
+        set_cached(url.to_string(), Config::default());
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            url.to_string(),
+            WellKnownAuth {
+                key: key.to_string(),
+                token: "must-not-be-injected".to_string(),
+            },
+        );
+
+        let _config = load_wellknown_from_entries(&entries).await;
+
+        assert!(
+            std::env::var_os(key).is_none(),
+            "unsafe env key must be rejected even on a cache hit"
+        );
     }
 }

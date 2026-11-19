@@ -94,8 +94,8 @@ fn parse_no_auth(value: Option<&str>) -> bool {
 /// 認証が有効かどうかを返す。
 ///
 /// `OPENCODE_NO_AUTH` が明示的に無効化を要求する値の場合のみ `false`。
-/// 起動時の warning は `run_server` / `run_server_with_state` 側で 1 回だけ出力する
-/// （M-14 の既存警告と二重に出さないため、ここではログを出さない）。
+/// 起動時の認証状態の警告・通知は CLI の `run_server_command` に一元化している
+/// （警告の二重出力を避けるため、ここではログを出さない）。
 fn is_auth_enabled() -> bool {
     !parse_no_auth(std::env::var("OPENCODE_NO_AUTH").ok().as_deref())
 }
@@ -1206,9 +1206,8 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
             tracing::info!("Authentication enabled. Token: {}", redact_token(token));
             tracing::info!("Set Authorization: Bearer <token> header for all requests");
         }
-    } else {
-        tracing::warn!("Authentication DISABLED (OPENCODE_NO_AUTH=1). Not safe for production.");
     }
+    // 認証無効化の警告は CLI 側（run_server_command）に一本化している。
 
     let app = routes::router()
         .layer(middleware::from_fn_with_state(
@@ -1240,9 +1239,8 @@ pub async fn run_server_with_state(
         if let Some(token) = &state.auth_token {
             tracing::info!("Authentication enabled. Token: {}", redact_token(token));
         }
-    } else {
-        tracing::warn!("Authentication DISABLED (OPENCODE_NO_AUTH=1). Not safe for production.");
     }
+    // 認証無効化の警告は CLI 側（run_server_command）に一本化している。
 
     let app = routes::router()
         .layer(middleware::from_fn_with_state(
