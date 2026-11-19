@@ -178,6 +178,24 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **ADR-0005 の stale pending entry 既知制約は解消済みで記述が古い**
+  — `adr-0005:93-95`, `server.rs:62-70` / ADR5-STALE
+- [ ] **ADR-0001 の許可ヘッダーが 3 種記載で実装は 5 種**
+  — `adr-0001:48-51`, `server.rs:1175-1192` / ADR1-CORS-HEADERS
+- [ ] **ADR-0002 の permission reply ルートが stale（実際は /permission/{id}/reply）**
+  — `adr-0002:41-42` / ADR2-REPLY-PATH
+- [ ] **ADR-0001 の実装参照（関数名・行番号）が stale** — `adr-0001:55-59,70` / ADR1-REFS
+- [ ] **ADR-0004 の単一 writer 制約が process 単位で実装は ServerState 単位**
+  — `adr-0004:79-100` / ADR4-SCOPE
+- [ ] **SSE リスナースレッドが App 終了を検知せずデタッチ残存** — `app.rs:3850,3945-4056` / TUI-08
+- [ ] **長いセッションで scroll_offset が u16 に丸められる** — `session.rs:884` / TUI-09
+- [ ] **極小ターミナル時に screen_lines スナップショットが古いまま残る** — `app.rs:3377-3379` / TUI-10
+- [ ] **plugin auth callback が単一スロットで並行 OAuth フローが上書きされる**
+  — `plugin-host.ts:168,597-638` / PLUG-AUTH-SLOT
+- [ ] **plugin host が stdin EOF を検知せず自終了できない**
+  — `plugin-host.ts:87-104,120-128` / PLUG-HOST-EOF
+- [ ] **local-llm の model 引数が未検証で CLI オプションとして解釈されうる**
+  — `local-llm/main.rs:343-359` / LLM-ARG-INJECTION
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -234,6 +252,27 @@ status: current
     区別を追記。実 handler 実装は upstream checkout 取得後の別タスク。
     text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
 
+### 優先度: 高（swarm review+discovery 2026-11-20）
+
+- [ ] **HTTP エラーが ApiError(String) に平坦化され 429/5xx リトライ判定が働かない**
+  — `openai.rs:742-746` ほか全アダプタ / P-01 / 高（ApiErrorWithStatus は一部のみ）
+- [ ] **Retry-After / X-RateLimit ヘッダが未解釈で固定バックオフ**
+  — `provider.rs:78-79,259-266` / P-02 / 高
+- [ ] **全 provider の reqwest Client にタイムアウト未設定（無期限ハング）**
+  — `openai.rs:292` ほか 20 箇所 / P-03 / 高
+- [ ] **OAuth トークンの expires / refresh が無視され期限切れを使い回す**
+  — `auth.rs:13-22,187-193`, `bootstrap.rs:1323-1327` / P-04 / 高
+- [ ] **プロンプト入力中でも無修飾 'q' が即時終了し未送信入力を失う**
+  — `app.rs:458-461` / TUI-01 / 高（confirmed）
+- [ ] **Tab / Shift+Tab の agent 切替がプロンプト補完を遮蔽**
+  — `app.rs:538-545`, `prompt.rs:451-460` / TUI-02 / 高（confirmed）
+- [ ] **CodeMode の RegExp に backtrack_limit が無く ReDoS で CPU 占有**
+  — `interpreter.rs:6340-6348` / CM-REGEX-REDoS / 高
+- [ ] **plugin auth.fetch.stream が rpc_lock を保持したまま無期限待ちで後続 RPC デッドロック**
+  — `subprocess/client.rs:295-311` / PLUG-STREAM-LOCK-WEDGE / 高
+- [ ] **ADR-0001 が約束したトークン配布経路が実在せず、/health が 401 で起動待ち失敗**
+  — `adr-0001:31,63`, `server.rs:1296-1302` / ADR1-TOKEN / 高（設計判断）
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -276,6 +315,40 @@ status: current
     v2 core credential/integration/location (G-09)、native ACP (G-11)、JS SDK (G-12)。
     出典は `docs/investigation-final-report.md` と `.cache/investigation/round3-upstream.md`。
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
+
+### 優先度: 中（swarm review+discovery 2026-11-20）
+
+- [ ] **リトライ判定が IsRetryable と parse_api_call_error で乖離（OpenAI 404）**
+  — `provider.rs:103-133,282-285` / P-05
+- [ ] **source 付きエラーが常に非リトライで下位ネットワークエラーが無視される** — `provider.rs:122-123` / P-06
+- [ ] **認証キーのローテーションが無く 1 プロバイダ 1 キー固定** — `auth.rs:57-64,179-193` / P-07
+- [ ] **Bedrock の autoload 判定と Provider 生成で認証方式が不一致**
+  — `bootstrap.rs:553-581,2217-2241` / P-08
+- [ ] **ModelsRegistry が失敗をキャッシュせず 10 秒タイムアウトを毎回繰り返す**
+  — `models.rs:114-164` / P-09
+- [ ] **モデル ID 解決が HashMap 順依存で非決定的**
+  — `bootstrap.rs:1714-1726`, `provider.rs:390-397` / P-10
+- [ ] **ダイアログ上の左クリックが項目選択でなく「閉じる」として処理される** — `app.rs:1035-1072` / TUI-03
+- [ ] **Paste イベントがモーダル状態を無視してプロンプトへ挿入** — `app.rs:709-711` / TUI-04
+- [ ] **SSE 再接続にバックオフが無く成功直後 EOF で hot loop** — `app.rs:3874-3922` / TUI-05
+- [ ] **プロンプト編集が UTF-8 の書記素境界をまたぐ（grapheme 未対応）**
+  — `prompt.rs:1263-1282` / TUI-06
+- [ ] **モーダルのキー判定が修飾キーを無視し Ctrl ショートカットを横取り**
+  — `app.rs:352-371,1498-1525` / TUI-07
+- [ ] **local-llm のread_pipe が上限なしで OOM / コンテキスト汎miss**
+  — `local-llm/main.rs:31-39,316` / LLM-UNBOUNDED
+- [ ] **CodeMode の timeoutMs がホストツール呼び出しを拘束できない**
+  — `tools.rs:78-82` / CM-HOST-TIMEOUT
+- [ ] **plugin RPC に jsonrpc 2.0 検証と protocolVersion 交換が無い**
+  — `protocol.rs:33-55`, `plugin-host.ts:120-138` / PLUG-RPC-VERSION
+- [ ] **plugin ストリームの背圧で rpc_lock を保持したままデッドロック**
+  — `client.rs:302,374-380` / PLUG-STREAM-BACKPRESSURE
+- [ ] **local-llm がリクエストを直列処理し 300 秒間キャンセル不能**
+  — `local-llm/main.rs:168-198` / LLM-SERIAL
+- [ ] **ADR-0002 の always が永続化されず毎回プロンプトが出る**
+  — `adr-0002:66`, `routes.rs:2012-2020` / ADR2-ALWAYS
+- [ ] **ADR-0001 の CORS ポート完全一致決定が実装と不一致（任意ポート許可）**
+  — `adr-0001:37-46`, `server.rs:1065-1071` / ADR1-CORS-PORT
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
@@ -593,6 +666,15 @@ status: current
 
 ## メモ
 
+- 2026-11-20 cross-skill 集約（swarm68、4 担当・38 件、観点: TUI 内部 /
+  provider 共通基盤 / codemode・local-llm・plugin host / ADR 整合）:
+  high 9 / medium 18 / low 11 を `## 未着手` へ追記。親が high 8 件の根拠を
+  read で確認済み。P-01 は「リトライが一切働かない」は誇張で、
+  ApiErrorWithStatus バリアントは 429/5xx を既にリトライ可と判定しているが、
+  OpenAI 等が ApiError(String) へ平坦化している点は事実。
+  ADR1-TOKEN は設計判断（トークン配布経路の再定義）を含むため要検討。
+  重複: 旧 discovery の TUI HTTP/cost 系・plugin 信頼境界・SSE バッファ・
+  SSE テスト・Litert/M-55 は既往項目として統合した。
 - 2026-11-20 R4 残存（中優先 6 件の修正時、記録のみ）: 401 の error フィールドが
   文字列→オブジェクトへ型変更（旧クライアントが error を文字列比較していた場合は
   error.type への移行が必要）、CORS 許可ヘッダの明示列挙（リスト外カスタムヘッダは
