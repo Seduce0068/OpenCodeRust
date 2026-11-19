@@ -254,25 +254,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **HTTP エラーが ApiError(String) に平坦化され 429/5xx リトライ判定が働かない**
-  — `openai.rs:742-746` ほか全アダプタ / P-01 / 高（ApiErrorWithStatus は一部のみ）
-- [ ] **Retry-After / X-RateLimit ヘッダが未解釈で固定バックオフ**
-  — `provider.rs:78-79,259-266` / P-02 / 高
-- [ ] **全 provider の reqwest Client にタイムアウト未設定（無期限ハング）**
-  — `openai.rs:292` ほか 20 箇所 / P-03 / 高
-- [ ] **OAuth トークンの expires / refresh が無視され期限切れを使い回す**
-  — `auth.rs:13-22,187-193`, `bootstrap.rs:1323-1327` / P-04 / 高
-- [ ] **プロンプト入力中でも無修飾 'q' が即時終了し未送信入力を失う**
-  — `app.rs:458-461` / TUI-01 / 高（confirmed）
-- [ ] **Tab / Shift+Tab の agent 切替がプロンプト補完を遮蔽**
-  — `app.rs:538-545`, `prompt.rs:451-460` / TUI-02 / 高（confirmed）
-- [ ] **CodeMode の RegExp に backtrack_limit が無く ReDoS で CPU 占有**
-  — `interpreter.rs:6340-6348` / CM-REGEX-REDoS / 高
-- [ ] **plugin auth.fetch.stream が rpc_lock を保持したまま無期限待ちで後続 RPC デッドロック**
-  — `subprocess/client.rs:295-311` / PLUG-STREAM-LOCK-WEDGE / 高
-- [ ] **ADR-0001 が約束したトークン配布経路が実在せず、/health が 401 で起動待ち失敗**
-  — `adr-0001:31,63`, `server.rs:1296-1302` / ADR1-TOKEN / 高（設計判断）
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -421,6 +402,8 @@ status: current
 
 ## 完了
 
+- [x] **[新観点 high 8 件]** 構造化エラー・TUI 入力・ReDoS・Retry-After
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[sessions.metadata 列]** スキーマ・ALTER マイグレーション・往復を追加
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[SessionRow 可用性]** 起動時一覧のみ破損行スキップ（2026-11-20、swarm-coding R1-R6）
@@ -666,6 +649,13 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（新観点 high 8 件の修正時、記録のみ）: ADR1-TOKEN は
+  トークン配布経路の再定義が必要で仕様変更のため未実施。OAuth 期限検知ヘルパが
+  本番リクエストパスへ未配線（expires 単位は epoch ms と仮定で未確認、
+  refresh 自動更新も未配線）。本番 HTTP ヘッダを api_error_with_headers 経由で
+  渡すアダプタ置換は未実施（受け口と session 側配線のみ完成）。
+  models.rs のフォールバック取得だけ共通 Client に未接続。
+  TUI の q/Tab/Paste は純粋関数テストのみで handle_event 統合テストが無い。
 - 2026-11-20 cross-skill 集約（swarm68、4 担当・38 件、観点: TUI 内部 /
   provider 共通基盤 / codemode・local-llm・plugin host / ADR 整合）:
   high 9 / medium 18 / low 11 を `## 未着手` へ追記。親が high 8 件の根拠を
