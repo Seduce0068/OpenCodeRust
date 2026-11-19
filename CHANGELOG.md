@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T18:38:26+09:00"
+  at: "2026-11-19T18:57:30+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2207 件
+  テスト総数 594 → 2210 件
 
 ### Changed
 
@@ -391,6 +391,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp` / `server`: 保存済み Bearer トークンを per-server OAuth manager から
   HTTP/SSE 接続へ注入（トークン誤送信防止）、ログアウト時の manager 削除、
   discovery の実 HTTP テスト 7 件（swarm-coding R1-R6）(M-11 残り)
+- `provider`: Bedrock ストリームを生バイト保持＋JSON 値ベース解析へ変更し、
+  UTF-8 境界分割・固定オフセット panic・空 TextDelta を解消（swarm-coding
+  R1-R6）(M-55)
 
 ## [0.1.0]
 

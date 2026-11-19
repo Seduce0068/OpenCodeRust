@@ -236,15 +236,9 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
-- [ ] **[M-55]** Bedrock ストリームが AWS eventstream バイナリを per-chunk lossy デコード
-  - `provider/bedrock.rs:404-412,513-533`。各 chunk を個別に from_utf8_lossy してから
-    parse_bedrock_stream へ渡すため、UTF-8/JSON トークンが境界で切れると U+FFFD に
-    固定化される。eventstream は長さ付きフレームで 1 チャンク収まり保証が無い。
-    空 TextDelta プレースホルダも残存（confirmed）。
-  - 対応: フレーム長/CRC を読むバイト単位 stateful デコーダ、完全フレーム単位で JSON パース。
-
 ## 完了
 
+- [x] **[M-55]** Bedrock ストリームの行バッファ化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** OAuth トークン注入と discovery HTTP テスト
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[FK 統一 / M-11 一部]** Storage::new の FK cascade と OAuth CSRF 修正
@@ -458,6 +452,22 @@ status: current
 
 ## メモ
 
+- M-55 R4 の残存（2026-11-19、記録のみ）: 完全な eventstream フレームデコーダ
+  （preamble length / prelude CRC / message CRC）は未実装で、既知 7 キーの JSON テキスト
+  検索ヒューリスティックを維持。未知イベント（modelStreamErrorException 等）が
+  サイレント破棄されエラー伝播しない、キー直前の `{` 起点がテキスト内 JSON で
+  境界ずれしうる、既知キー無しストリームでバッファが無上限に伸びる可能性。
+  try_unfold 状態遷移の直接テストも未追加。実フレーム検証は external 送信不可のため未実施。
+- H-13 調査（2026-11-19、swarm-coding R2）: 推奨は**イベント駆動・差分同期**
+  （server に since/version ベースの増分メッセージ API、SSE の message.updated を
+  トリガに 2 秒の全件 get_messages を差分適用へ）。背景の「Tick 2 秒」は不正確で
+  TICK_RATE_MS=16、2 秒は session 同期ゲート、5 秒は aux 同期ゲート。常時 501 の
+  list_skills/lsp/formatter を 5 秒ごとにポーリングする無駄は副作用なしで除去可能。
+  spawn_blocking は TUI に Tokio runtime が無く直接用いられない。未計測で体感は speculative。
+- M-04 調査（2026-11-19、swarm-coding R2）: 推奨は**現状維持**。StreamError(e.to_string())
+  20 箇所は reqwest::Error の source を失うが、既存バリアント流用は retry/表示意味論が
+  変わり回帰。新規 StreamErrorWithSource を追加すると non_exhaustive でない enum の
+  下流網羅 match を破壊しうる。InvalidArguments(serde_json) 14 箇所は source 利得が低い。
 - M-11 R4 の残存（2026-11-19、記録のみ）: `add_sse` の OAuth 注入は実装済みだが
   `RemoteMcpConfig` に transport 選択肢が無く server `connect()` は `add_http` のみ。
   SSE リモートをサポートするなら transport 指定を追加して `add_sse` を選択する。
