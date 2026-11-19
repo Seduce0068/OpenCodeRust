@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T19:06:47+09:00"
+  at: "2026-11-19T19:31:10+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2210 件
+  テスト総数 594 → 2214 件
 
 ### Changed
 
@@ -396,6 +396,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   R1-R6）(M-55)
 - `tui`: 常時 501 を返す skill/lsp 終点の 5 秒ポーリングを廃止し、
   ダイアログオープン時のみの同期へ変更 (H-13 一部)
+- `plugin`: npm spec の厳密化（未指定/dist-tag/range 拒否、scoped 名保持）、
+  `--ignore-scripts`、import 先の検証と file:// URL 正規化（swarm-coding
+  R1-R6、R4 の Windows/エンコード/名検証指摘を R5 で修正）(H-03 一部)
 
 ## [0.1.0]
 

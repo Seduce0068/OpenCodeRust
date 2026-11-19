@@ -31,14 +31,24 @@ status: current
     （likely）。`config/loader.rs:383-408` のレガシー移行は {env:...} 展開済み秘密を
     umask 依存の権限で書き出す（confirmed）。あわせて対処すること
 - [ ] **[H-03]** プラグイン subprocess bridge のサプライチェーン／信頼境界
-  - `loader.rs:334-349` が未指定 npm spec に `*`、`:268-313` で install 実行、
-    plugin-host.ts:403 が検証なし import、`$` ヘルパ／認証ヘッダ渡し fetch／Deno `--allow-all`。
-    厳密バージョン＋lockfile＋`--ignore-scripts`、許可リスト化と信頼モデル ADR 化
+  - 2026-11-19 一部対応: parse_npm_spec を Result 化し未指定/`*`/dist-tag/range を
+    install 前に拒否、npm 名ルール検証、scoped 名保持、`--ignore-scripts` 付与。
+    plugin-host.ts に validatePluginImportPath を追加（bare/scoped/pkg@version/file://
+    のみ許可、`..` とパーセントエンコード traversal を拒否、import は正規化済み URL）。
+    file:// 生成は `Url::from_file_path` へ（Windows/特殊文字対応）。
+  - 残存: lockfile/integrity 完全固定、完全な許可リスト、auth.fetch の URL/ヘッダ検証、
+    `$` ヘルパ、Deno `--allow-all`、信頼モデル ADR（4 主体の定義と例外手続き）。
+    Deno の `deno install --ignore-scripts` 対応は未確認（外部仕様）。
 - [ ] **[H-04]** MCP 実行時依存の完全性検証（2 件は固定済み、残りに絞る）
   - `chrome-devtools-mcp` / `tavily-mcp` は Exact 固定済み。未対応は
     `@modelcontextprotocol/server-devtools` と `server-playwright` が公式 npm で
     404（パッケージ不在）のため固定不能。代替（`@playwright/mcp` 等）の選定、
     lockfile 生成、CI npm スキャン対象化）
+  - 2026-11-19 調査: 推奨は**外部確認が必要**。代替候補 `@playwright/mcp` は名前のみ
+    todo.md に存在し、実在性・バージョン・保守状況の裏付けがローカルに皆無。
+    npm lockfile / package.json は存在せず新規設営から。CI は cargo audit のみで
+    npm スキャン対象なし（共通ワークフロー委譲のため改修先の調整も必要）。
+    chrome-devtools サーバが既存するため devtools は統合/削除の可能性もある（speculative）。
 - [ ] **[H-10]** セッション永続化の並行制御（トランザクション化は対応済み）
   - 移行と delete+create（`replace_for_session`）は原子化済み。未対応は単一ライタ
     persist キュー、session_repo.update/create とメッセージ置換の同一トランザクション化、
@@ -69,9 +79,13 @@ status: current
     `pub use` 化 → server.rs を明示 From へ（H-10 の非アトミック書き出しと
     同一箇所、同時対応が効率的）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
-  - pty／util／watcher／local-llm／codemode の 5 クレートが無依存（codemode は ADR-0006
-    で既知の先送り）、server が portable-pty を直接依存し同名 PtyManager を再実装。配線または member 外し、
-    server を opencode-pty 利用へ
+  - 2026-11-19 調査: 推奨は **opencode-pty を member 外し＋削除、server 版 PtyManager は
+    現状維持**。2 つの PtyManager は API 非互換（sync spawn + `mpsc<String>` vs async
+    CRUD + `broadcast<Vec<u8>>` + replay）で直接置換不可。配線は約 500 行の実移管で
+    wire 契約・M-43 回収の回帰リスクあり。opencode-pty は外部参照 0 の orphan。
+  - 前提を訂正: util は CLI が実使用（L-04 で配線済み）で「無依存」は stale。
+    watcher は core の GitWatcher と config.watcher に機能分散（別 ADR 判断）。
+    local-llm は外部 MCP 起動想定（登録有無は未確認）、codemode は ADR-0006 維持。
 - [ ] **[M-04]** エラー型の残課題（source 付きバリアント＋ tool/provider 置換済み）
   - command の 3 メソッドと、ToolError/ProviderError の source 付きバリアント追加済み。
     2026-11-19 に opencode-tool の 12 ファイル 33 箇所を `execution_with_source` へ、
@@ -248,6 +262,7 @@ status: current
 
 ## 完了
 
+- [x] **[H-03 一部]** npm spec 厳密化と import 検証（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-13 一部]** 501 終点のポーリング除去（2026-11-19、swarm-coding R2）
 - [x] **[M-55]** Bedrock ストリームの行バッファ化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** OAuth トークン注入と discovery HTTP テスト
