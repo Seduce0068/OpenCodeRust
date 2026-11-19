@@ -75,8 +75,26 @@ fn auth_file_path() -> PathBuf {
 async fn read_all() -> HashMap<String, AuthEntry> {
     let path = auth_file_path();
     match fs::read_to_string(&path).await {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Ok(contents) => {
+            // On Unix, tighten a pre-existing over-permissive store on access.
+            // This is best-effort and never changes the read result.
+            #[cfg(unix)]
+            tighten_permissions(&path).await;
+            serde_json::from_str(&contents).unwrap_or_default()
+        }
         Err(_) => HashMap::new(),
+    }
+}
+
+/// Bring an existing credential file back to owner-only permissions (Unix).
+#[cfg(unix)]
+async fn tighten_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Ok(meta) = fs::metadata(path).await {
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+        }
     }
 }
 
@@ -87,7 +105,79 @@ async fn write_all(data: &HashMap<String, AuthEntry>) -> Result<(), std::io::Err
         fs::create_dir_all(parent).await?;
     }
     let json = serde_json::to_string_pretty(data).map_err(std::io::Error::other)?;
-    fs::write(&path, json).await
+    write_credential_file(&path, json.as_bytes()).await
+}
+
+/// Platform-specific credential write.
+///
+/// On Unix the file is created with 0600 and swapped into place via an atomic
+/// rename: readers never observe a partially written store, and the final
+/// file is never group/world readable even if a 0644 file existed before.
+#[cfg(unix)]
+async fn write_credential_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
+    let tmp_path = temp_sibling_path(path);
+
+    // create_new avoids clobbering an unrelated file; mode(0o600) is the first
+    // line of defence (umask can only ever make it stricter).
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut file = opts.open(&tmp_path).await?;
+
+    // Pin the exact 0600 regardless of an unusual umask.
+    fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await?;
+
+    let written = async {
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+
+    drop(file);
+
+    if let Err(err) = written {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+/// Windows keeps the previous behaviour: a direct overwrite write.
+#[cfg(not(unix))]
+async fn write_credential_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    fs::write(path, bytes).await
+}
+
+/// Unique sibling path for the atomic-write temporary file.
+#[cfg(unix)]
+fn temp_sibling_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mcp-auth");
+
+    path.with_file_name(format!(
+        ".{stem}.{pid:x}.{nanos:x}.{seq:x}.tmp",
+        pid = std::process::id()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +315,9 @@ pub fn is_token_expired(entry: &AuthEntry) -> Option<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     fn entry(tokens: Option<OAuthTokens>) -> AuthEntry {
         AuthEntry {
             tokens,
@@ -273,5 +366,187 @@ mod tests {
             scope: None,
         };
         assert_eq!(is_token_expired(&entry(Some(tokens))), Some(false));
+    }
+
+    // --- Secure auth-store regression tests --------------------------------
+
+    /// Test-only credential file. Redirects the store via the env var.
+    struct TempAuthFile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempAuthFile {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "opencode-mcp-auth-{pid}-{label}",
+                pid = std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("mcp-auth.json");
+            Self { dir, path }
+        }
+
+        fn activate(&self) {
+            std::env::set_var("OPENCODE_MCP_AUTH_FILE", &self.path);
+        }
+    }
+
+    impl Drop for TempAuthFile {
+        fn drop(&mut self) {
+            std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn permission_mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("stat auth file")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    async fn scenario_new_file_is_owner_only() {
+        let tmp = TempAuthFile::new("mode-0600");
+        tmp.activate();
+
+        let mut data = HashMap::new();
+        data.insert(
+            "server".to_owned(),
+            entry(Some(OAuthTokens {
+                access_token: "dummy-access".to_owned(),
+                refresh_token: Some("dummy-refresh".to_owned()),
+                expires_at: None,
+                scope: None,
+            })),
+        );
+        write_all(&data).await.expect("write auth store");
+
+        assert_eq!(
+            permission_mode(&tmp.path),
+            0o600,
+            "auth file must be readable/writable by its owner only"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn scenario_existing_0644_tightened_on_read() {
+        let tmp = TempAuthFile::new("tighten-read");
+        tmp.activate();
+
+        std::fs::write(&tmp.path, "{}").expect("seed auth file");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o644))
+            .expect("set 0644");
+
+        let _ = read_all().await;
+
+        assert_eq!(
+            permission_mode(&tmp.path),
+            0o600,
+            "pre-existing 0644 auth file must be tightened on read"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn scenario_existing_0644_tightened_on_write() {
+        let tmp = TempAuthFile::new("tighten-write");
+        tmp.activate();
+
+        std::fs::write(&tmp.path, "{}").expect("seed auth file");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o644))
+            .expect("set 0644");
+
+        write_all(&HashMap::new())
+            .await
+            .expect("rewrite auth store");
+
+        assert_eq!(
+            permission_mode(&tmp.path),
+            0o600,
+            "rewriting a 0644 auth file must yield 0600"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn scenario_concurrent_writes_never_expose_partial_json() {
+        let tmp = TempAuthFile::new("concurrent");
+        tmp.activate();
+
+        write_all(&HashMap::new()).await.expect("init auth store");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader_path = tmp.path.clone();
+        let reader_stop = stop.clone();
+        let reader = tokio::spawn(async move {
+            let mut bad_reads = 0usize;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(contents) = fs::read_to_string(&reader_path).await {
+                    if serde_json::from_str::<HashMap<String, AuthEntry>>(&contents).is_err() {
+                        bad_reads += 1;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            bad_reads
+        });
+
+        let writers: Vec<_> = (0..4)
+            .map(|worker| {
+                let worker_stop = stop.clone();
+                tokio::spawn(async move {
+                    while !worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut data = HashMap::new();
+                        data.insert(
+                            format!("server-{worker}"),
+                            entry(Some(OAuthTokens {
+                                access_token: "a".repeat(4096),
+                                refresh_token: Some("b".repeat(4096)),
+                                expires_at: None,
+                                scope: Some("scope".to_owned()),
+                            })),
+                        );
+                        write_all(&data).await.expect("write auth store");
+                    }
+                })
+            })
+            .collect();
+
+        // Let the writers race for a bounded number of iterations, then stop.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for writer in writers {
+            writer.await.expect("writer task");
+        }
+        let bad_reads = reader.await.expect("reader task");
+        assert_eq!(
+            bad_reads, 0,
+            "atomic rename must keep readers from ever seeing a partial store"
+        );
+    }
+
+    async fn scenario_missing_file_reads_empty() {
+        let tmp = TempAuthFile::new("missing");
+        tmp.activate();
+        assert!(read_all().await.is_empty());
+    }
+
+    /// Env-var based scenarios run serially because the variable is global.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secure_auth_store_behaviour() {
+        #[cfg(unix)]
+        scenario_new_file_is_owner_only().await;
+        #[cfg(unix)]
+        scenario_existing_0644_tightened_on_read().await;
+        #[cfg(unix)]
+        scenario_existing_0644_tightened_on_write().await;
+        #[cfg(unix)]
+        scenario_concurrent_writes_never_expose_partial_json().await;
+        scenario_missing_file_reads_empty().await;
     }
 }
