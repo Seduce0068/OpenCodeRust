@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T10:52:12+09:00"
+  at: "2026-11-19T11:29:31+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2104 件
+  テスト総数 594 → 2105 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.13% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.02% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -351,6 +351,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `provider` / `tool`: Anthropic SSE の行バッファと UTF-8 分割対応（実 HTTP モック
   テスト付き）、tool 側 WalkDir の spawn_blocking 化（swarm-coding R1-R6、
   R4 の UTF-8 境界/NO_PROXY 指摘を R5 で修正）(M-11/M-37)
+- `session` / `server` / `tui`: Todo 状態を最小配線（todowrite/todoread の false
+  success を解消、todo.updated broadcast と TUI 再同期、swarm-coding R1-R6、
+  R4 の session_id 誤検知は却下、再同期指摘を R5 で修正）(M-05)
 
 ## [0.1.0]
 
