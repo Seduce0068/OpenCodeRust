@@ -309,21 +309,10 @@ status: current
   — `models.rs:114-164` / P-09
 - [ ] **モデル ID 解決が HashMap 順依存で非決定的**
   — `bootstrap.rs:1714-1726`, `provider.rs:390-397` / P-10
-- [ ] **ダイアログ上の左クリックが項目選択でなく「閉じる」として処理される** — `app.rs:1035-1072` / TUI-03
 - [ ] **Paste イベントがモーダル状態を無視してプロンプトへ挿入** — `app.rs:709-711` / TUI-04
 - [ ] **SSE 再接続にバックオフが無く成功直後 EOF で hot loop** — `app.rs:3874-3922` / TUI-05
-- [ ] **プロンプト編集が UTF-8 の書記素境界をまたぐ（grapheme 未対応）**
-  — `prompt.rs:1263-1282` / TUI-06
-- [ ] **モーダルのキー判定が修飾キーを無視し Ctrl ショートカットを横取り**
-  — `app.rs:352-371,1498-1525` / TUI-07
-- [ ] **local-llm のread_pipe が上限なしで OOM / コンテキスト汎miss**
-  — `local-llm/main.rs:31-39,316` / LLM-UNBOUNDED
 - [ ] **CodeMode の timeoutMs がホストツール呼び出しを拘束できない**
   — `tools.rs:78-82` / CM-HOST-TIMEOUT
-- [ ] **plugin RPC に jsonrpc 2.0 検証と protocolVersion 交換が無い**
-  — `protocol.rs:33-55`, `plugin-host.ts:120-138` / PLUG-RPC-VERSION
-- [ ] **plugin ストリームの背圧で rpc_lock を保持したままデッドロック**
-  — `client.rs:302,374-380` / PLUG-STREAM-BACKPRESSURE
 - [ ] **local-llm がリクエストを直列処理し 300 秒間キャンセル不能**
   — `local-llm/main.rs:168-198` / LLM-SERIAL
 - [ ] **ADR-0002 の always が永続化されず毎回プロンプトが出る**
@@ -402,6 +391,8 @@ status: current
 
 ## 完了
 
+- [x] **[中優先 6 件]** TUI 操作・RPC バージョン・local-llm 上限
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[ストリーム構造化エラー]** Retry-After 到達とエンベロープ堅牢化
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[provider 残存 3 件]** OAuth 期限配線・ヘッダ保持・共通サニタイズ
@@ -653,6 +644,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（中優先 6 件の修正時、記録のみ）: SlashCommandPopup は
+  click_map 未対応で左クリックが close 動作のまま（components/ 直下で scope 外）。
+  書記素境界は std のみの実用近似で UAX #29 の完全規則（GB9c 等）に非対応。
+  plugin protocolVersion は欠落時既定値 1 を許容（互換維持）。local-llm の
+  ollama CLI が cobra の `--` を解釈する前提は外部確認していない。
+  local-llm の直列リクエスト処理・CM-HOST-TIMEOUT は未対応。
 - 2026-11-20 R4 残存（ストリーム構造化エラーの修正時、記録のみ）:
   encode_stream_error の Other バリアントが ApiError(String) へ平坦化され、
   status_code とバリアント種別が失われる（現状は非リトライで結果一致だが、
