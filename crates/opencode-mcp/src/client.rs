@@ -326,8 +326,12 @@ impl McpClient {
         let base_headers = headers.unwrap_or_default();
 
         // First attempt: inject the current token (refreshing it if expired).
+        // Clone first so the read guard is dropped before `get_token().await`
+        // (which may perform a refresh HTTP round-trip) and cannot block a
+        // concurrent `set_oauth_manager` write.
+        let mgr = self.oauth_manager.read().await.clone();
         let mut merged_headers = base_headers.clone();
-        if let Some(mgr) = self.oauth_manager.read().await.as_ref() {
+        if let Some(mgr) = mgr {
             match mgr.get_token().await {
                 Ok(Some(token)) => {
                     merged_headers.insert("Authorization".to_string(), format!("Bearer {token}"));
@@ -409,8 +413,9 @@ impl McpClient {
     ) -> Result<(), McpClientError> {
         let base_headers = headers.unwrap_or_default();
 
+        let mgr = self.oauth_manager.read().await.clone();
         let mut merged_headers = base_headers.clone();
-        if let Some(mgr) = self.oauth_manager.read().await.as_ref() {
+        if let Some(mgr) = mgr {
             match mgr.get_token().await {
                 Ok(Some(token)) => {
                     merged_headers.insert("Authorization".to_string(), format!("Bearer {token}"));
@@ -800,9 +805,10 @@ pub struct McpClientRegistry {
     statuses: RwLock<HashMap<String, McpStatus>>,
     connection_configs: RwLock<HashMap<String, RegistryConnectionConfig>>,
     logs: RwLock<HashMap<String, Vec<String>>>,
-    /// OAuth manager attached to HTTP/SSE clients so requests carry a bearer
-    /// token obtained through the authorization-code flow.
-    oauth_manager: RwLock<Option<Arc<McpOAuthManager>>>,
+    /// OAuth managers keyed by server name. A client must only ever receive
+    /// its own server's manager, otherwise a bearer token could be sent to a
+    /// different OAuth-protected server.
+    oauth_managers: RwLock<HashMap<String, Arc<McpOAuthManager>>>,
 }
 impl McpClientRegistry {
     pub fn new() -> Self {
@@ -812,7 +818,7 @@ impl McpClientRegistry {
             statuses: RwLock::new(HashMap::new()),
             connection_configs: RwLock::new(HashMap::new()),
             logs: RwLock::new(HashMap::new()),
-            oauth_manager: RwLock::new(None),
+            oauth_managers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -886,11 +892,36 @@ impl McpClientRegistry {
             }
         }
     }
-    /// Attaches an OAuth manager so HTTP/SSE connections can send a bearer
-    /// token obtained through the authorization-code flow.
-    pub async fn set_oauth_manager(&self, manager: Arc<McpOAuthManager>) {
-        let mut guard = self.oauth_manager.write().await;
-        *guard = Some(manager);
+    /// Attaches an OAuth manager for a single server so its HTTP/SSE
+    /// connections can send a bearer token obtained through the
+    /// authorization-code flow.
+    ///
+    /// Managers are keyed by server name: a token obtained for server A must
+    /// never be injected into a client for server B.
+    pub async fn set_oauth_manager(
+        &self,
+        server_name: impl Into<String>,
+        manager: Arc<McpOAuthManager>,
+    ) {
+        self.oauth_managers
+            .write()
+            .await
+            .insert(server_name.into(), manager);
+    }
+
+    /// Removes the OAuth manager registered for a server (e.g. on logout).
+    /// Returns `true` when a manager was present.
+    pub async fn remove_oauth_manager(&self, server_name: &str) -> bool {
+        self.oauth_managers
+            .write()
+            .await
+            .remove(server_name)
+            .is_some()
+    }
+
+    /// Whether an OAuth manager is currently registered for a server.
+    pub async fn has_oauth_manager(&self, server_name: &str) -> bool {
+        self.oauth_managers.read().await.contains_key(server_name)
     }
 
     pub async fn add_http(
@@ -916,8 +947,9 @@ impl McpClientRegistry {
         if let Some(protocol) = protocol {
             client_impl = client_impl.with_protocol_version(protocol);
         }
-        if let Some(manager) = self.oauth_manager.read().await.as_ref() {
-            client_impl = client_impl.with_oauth_manager(manager.clone()).await;
+        let oauth_manager = self.oauth_managers.read().await.get(&name).cloned();
+        if let Some(manager) = oauth_manager {
+            client_impl = client_impl.with_oauth_manager(manager).await;
         }
         let client = Arc::new(client_impl);
 
@@ -961,8 +993,9 @@ impl McpClientRegistry {
         if let Some(protocol) = protocol {
             client_impl = client_impl.with_protocol_version(protocol);
         }
-        if let Some(manager) = self.oauth_manager.read().await.as_ref() {
-            client_impl = client_impl.with_oauth_manager(manager.clone()).await;
+        let oauth_manager = self.oauth_managers.read().await.get(&name).cloned();
+        if let Some(manager) = oauth_manager {
+            client_impl = client_impl.with_oauth_manager(manager).await;
         }
         let client = Arc::new(client_impl);
 
@@ -1276,5 +1309,82 @@ mod tests {
             .await
             .expect_err("read_resource must time out");
         assert!(matches!(error, McpClientError::Timeout));
+    }
+
+    /// The registry keeps one OAuth manager per server name; registering a
+    /// second server must not overwrite the first one's manager (otherwise
+    /// its bearer token would be sent to the wrong server).
+    #[tokio::test]
+    async fn registry_keeps_oauth_managers_keyed_by_server_name() {
+        use crate::oauth::McpOAuthConfig;
+
+        let registry = McpClientRegistry::new();
+        let alpha = Arc::new(McpOAuthManager::new(
+            "alpha".to_string(),
+            "https://alpha.invalid".to_string(),
+            McpOAuthConfig::default(),
+        ));
+        let beta = Arc::new(McpOAuthManager::new(
+            "beta".to_string(),
+            "https://beta.invalid".to_string(),
+            McpOAuthConfig::default(),
+        ));
+
+        registry.set_oauth_manager("alpha", alpha.clone()).await;
+        registry.set_oauth_manager("beta", beta.clone()).await;
+
+        let managers = registry.oauth_managers.read().await;
+        assert_eq!(managers.len(), 2);
+        assert!(Arc::ptr_eq(
+            managers.get("alpha").expect("alpha manager"),
+            &alpha
+        ));
+        assert!(Arc::ptr_eq(
+            managers.get("beta").expect("beta manager"),
+            &beta
+        ));
+        assert!(managers.get("gamma").is_none());
+    }
+
+    /// Logout must drop only the named server's manager; otherwise
+    /// `add_http`/`add_sse` and `registry.restart` keep injecting stale
+    /// credentials even after the stored tokens were deleted.
+    #[tokio::test]
+    async fn remove_oauth_manager_drops_only_the_named_server() {
+        use crate::oauth::McpOAuthConfig;
+
+        let registry = McpClientRegistry::new();
+        let alpha = Arc::new(McpOAuthManager::new(
+            "alpha".to_string(),
+            "https://alpha.invalid".to_string(),
+            McpOAuthConfig::default(),
+        ));
+        let beta = Arc::new(McpOAuthManager::new(
+            "beta".to_string(),
+            "https://beta.invalid".to_string(),
+            McpOAuthConfig::default(),
+        ));
+
+        registry.set_oauth_manager("alpha", alpha).await;
+        registry.set_oauth_manager("beta", beta.clone()).await;
+        assert!(registry.has_oauth_manager("alpha").await);
+        assert!(registry.has_oauth_manager("beta").await);
+
+        assert!(registry.remove_oauth_manager("alpha").await);
+        assert!(!registry.has_oauth_manager("alpha").await);
+        assert!(
+            registry.oauth_managers.read().await.get("alpha").is_none(),
+            "removed manager must no longer be retrievable"
+        );
+        assert!(Arc::ptr_eq(
+            registry
+                .oauth_managers
+                .read()
+                .await
+                .get("beta")
+                .expect("beta must survive removal of alpha"),
+            &beta
+        ));
+        assert!(!registry.remove_oauth_manager("alpha").await);
     }
 }

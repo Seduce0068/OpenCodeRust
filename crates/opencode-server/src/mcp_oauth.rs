@@ -343,6 +343,31 @@ impl McpOAuthManager {
                         oauth_status,
                     }
                 } else {
+                    // Only an authorized OAuth server has usable tokens. Registering
+                    // its real client under this server name makes `add_http` inject
+                    // it into the MCP client, so the stored Bearer token actually
+                    // reaches the protected server. Without this, the callback
+                    // succeeds but the next connect still returns 401/needs_auth.
+                    // Static-header and non-OAuth remotes must not enter this path.
+                    if oauth_required && oauth_status == Some(McpOAuthStatus::Authorized) {
+                        match self.oauth_client_for(server_name).await {
+                            Ok(oauth_client) => {
+                                self.clients
+                                    .set_oauth_manager(server_name, oauth_client)
+                                    .await;
+                            }
+                            Err(error) => {
+                                // No usable manager: let add_http fail with
+                                // Unauthorized so the existing needs_auth path runs.
+                                self.log_event(
+                                    server_name,
+                                    "warn",
+                                    format!("OAuth client unavailable: {}", error),
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     if let Err(error) = self.clients.remove(server_name).await {
                         tracing::warn!(server = server_name, %error, "failed to remove existing MCP client");
                     }
@@ -651,6 +676,11 @@ impl McpOAuthManager {
             tracing::warn!(server = server_name, %error, "failed to delete stored MCP OAuth credentials");
         }
 
+        // The client registry keeps its own Arc for add_http/add_sse and
+        // registry.restart. Drop it too, so a logout cannot leave a stale
+        // manager that keeps being injected into a fresh client.
+        self.clients.remove_oauth_manager(server_name).await;
+
         self.log_event(server_name, "info", "OAuth state removed")
             .await;
 
@@ -833,6 +863,64 @@ mod tests {
             .expect("remote server should exist");
         assert_eq!(status.status, "needs_auth");
         assert_eq!(status.oauth_status, None);
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
+    /// Logout must also evict the manager cached by the client registry, which
+    /// `add_http`/`add_sse` and `registry.restart` would otherwise keep using.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_oauth_drops_cached_registry_manager() {
+        let _guard = auth_store_lock();
+        let auth_file = temp_auth_file("logout-registry");
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+        {
+            let mut states = manager.oauth_states.write().await;
+            states.insert(
+                "remote".to_string(),
+                McpOAuthState {
+                    server_name: "remote".to_string(),
+                    authorization_url: "https://idp.example.com/authorize".to_string(),
+                    client_id: None,
+                    status: McpOAuthStatus::Authorized,
+                },
+            );
+        }
+
+        // Seed the registry entry the Authorized connect path would install.
+        manager
+            .clients
+            .set_oauth_manager(
+                "remote",
+                Arc::new(RealOAuthManager::new(
+                    "remote".to_string(),
+                    "https://example.com/mcp".to_string(),
+                    RealOAuthConfig::default(),
+                )),
+            )
+            .await;
+        assert!(manager.clients.has_oauth_manager("remote").await);
+
+        assert!(manager.remove_oauth("remote").await);
+        assert!(
+            !manager.clients.has_oauth_manager("remote").await,
+            "logout must drop the manager registry entry"
+        );
 
         std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
@@ -1125,15 +1213,25 @@ mod tests {
     /// 8414 authorization-server metadata, and exchanges an authorization code
     /// for a token.
     async fn spawn_mock_authorization_server() -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        spawn_mock_authorization_server_with_token("access-token-123").await
+    }
+
+    /// Same mock authorization server, but issues a caller-chosen access token
+    /// so tests can tell two independent OAuth servers apart.
+    async fn spawn_mock_authorization_server_with_token(
+        access_token: &str,
+    ) -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
         use axum::response::IntoResponse;
 
         let seen_requests: Arc<tokio::sync::Mutex<Vec<String>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let access_token = access_token.to_string();
 
         #[derive(Clone)]
         struct AuthState {
             pub issuer: String,
             pub seen: Arc<tokio::sync::Mutex<Vec<String>>>,
+            pub access_token: String,
         }
 
         async fn resource_metadata(
@@ -1197,7 +1295,7 @@ mod tests {
                     .into_response();
             }
             axum::Json(serde_json::json!({
-                "access_token": "access-token-123",
+                "access_token": state.access_token.clone(),
                 "token_type": "Bearer",
                 "expires_in": 3600,
                 "refresh_token": "refresh-token-123",
@@ -1214,6 +1312,7 @@ mod tests {
         let state = AuthState {
             issuer: issuer.clone(),
             seen: seen_requests.clone(),
+            access_token,
         };
         let app = axum::Router::new()
             .route(
@@ -1301,6 +1400,93 @@ mod tests {
             "tokens must be stored after the exchange"
         );
         assert!(seen.lock().await.iter().any(|request| request == "token"));
+
+        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
+    /// Regression: a Bearer token obtained for one OAuth server must never be
+    /// injected into a different server's client. Two independent authorization
+    /// servers issue distinct tokens; after both callbacks, each MCP endpoint
+    /// must see only the token belonging to its own server.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn oauth_bearer_tokens_are_scoped_per_server() {
+        let auth_file = temp_auth_file("per-server-bearer");
+        let _guard = auth_store_lock();
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let (issuer_a, _) = spawn_mock_authorization_server_with_token("token-for-alpha").await;
+        let (issuer_b, _) = spawn_mock_authorization_server_with_token("token-for-beta").await;
+        let (mcp_url_a, seen_a) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer_a)).await;
+        let (mcp_url_b, seen_b) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer_b)).await;
+
+        let manager = McpOAuthManager::new();
+        for (name, url) in [("alpha", mcp_url_a), ("beta", mcp_url_b)] {
+            manager
+                .add_server(
+                    name.to_string(),
+                    McpRuntimeConfig::Remote(RemoteMcpConfig {
+                        url,
+                        oauth_enabled: true,
+                        ..Default::default()
+                    }),
+                    true,
+                )
+                .await;
+        }
+
+        // Each callback stores that server's tokens and connects immediately.
+        for name in ["alpha", "beta"] {
+            manager.start_oauth(name).await.expect("start oauth");
+            let state = opencode_mcp::auth::get_oauth_state(name)
+                .await
+                .expect("csrf state");
+            let info = manager
+                .handle_callback(name, "oauth-code", Some(&state))
+                .await
+                .expect("callback exchanges code and connects");
+            assert_eq!(
+                info.status, "connected",
+                "server {} must connect with its own bearer token",
+                name
+            );
+        }
+
+        let seen_a = seen_a.lock().await;
+        assert!(
+            seen_a
+                .iter()
+                .flatten()
+                .any(|header| header == "Bearer token-for-alpha"),
+            "alpha MCP server must receive its own token: {seen_a:?}"
+        );
+        assert!(
+            seen_a
+                .iter()
+                .flatten()
+                .all(|header| header != "Bearer token-for-beta"),
+            "alpha MCP server must not receive beta's token: {seen_a:?}"
+        );
+        drop(seen_a);
+
+        let seen_b = seen_b.lock().await;
+        assert!(
+            seen_b
+                .iter()
+                .flatten()
+                .any(|header| header == "Bearer token-for-beta"),
+            "beta MCP server must receive its own token: {seen_b:?}"
+        );
+        assert!(
+            seen_b
+                .iter()
+                .flatten()
+                .all(|header| header != "Bearer token-for-alpha"),
+            "beta MCP server must not receive alpha's token: {seen_b:?}"
+        );
 
         std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
