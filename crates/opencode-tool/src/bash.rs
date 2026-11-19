@@ -23,21 +23,133 @@ fn parse_u64_arg(args: &serde_json::Value, key: &str, default: u64) -> Result<u6
     })
 }
 
+/// Returns true when `key` may be injected into the child environment.
+///
+/// Only ASCII uppercase letters, underscores and non-leading digits are
+/// accepted. The blocklist covers variables read at shell / loader /
+/// interpreter startup: injecting them from tool context or a plugin would let
+/// the caller hijack every later subprocess (e.g. `BASH_ENV` sourcing a script,
+/// `LD_PRELOAD` loading a shared object, `PATH` redirecting lookup).
+fn is_safe_injected_env_key(key: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        // Shell startup / control.
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "GLOBIGNORE",
+        "CDPATH",
+        "IFS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "HISTFILE",
+        "SHELL",
+        "HOME",
+        "PWD",
+        "OLDPWD",
+        "PATH",
+        // Dynamic loader / library paths.
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_ORIGIN_PATH",
+        "LD_PROFILE",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FORCE_FLAT_NAMESPACE",
+        // Interpreter startup injection.
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PERL5LIB",
+        "PERL5OPT",
+        "RUBYOPT",
+        "RUBYLIB",
+        "PHPRC",
+        "PHP_INI_SCAN_DIR",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "_JAVA_OPTIONS",
+        "CLASSPATH",
+        "GEM_HOME",
+        "GEM_PATH",
+        "BUNDLE_GEMFILE",
+        "GOFLAGS",
+        "RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTDOCFLAGS",
+    ];
+    let well_formed = !key.is_empty()
+        && key
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_uppercase() || (i > 0 && c.is_ascii_digit()));
+    if !well_formed {
+        return false;
+    }
+    // Prefix families: interpreter startup, dynamic loader, git config/exec
+    // (core.sshCommand / core.hooksPath injection), and bash exported functions.
+    if key.starts_with("PYTHON")
+        || key.starts_with("BASH_FUNC_")
+        || key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || key.starts_with("GIT_")
+        || key.ends_with("_OPTIONS")
+        || key.ends_with("_FLAGS")
+    {
+        return false;
+    }
+    !BLOCKED.contains(&key)
+}
+
+/// Insert one injected variable after validating its name.
+///
+/// `source` identifies the injection path in logs. Only the variable name is
+/// ever logged — values (which may be tokens) are never included in logs or
+/// errors.
+fn insert_injected_env(
+    env_vars: &mut HashMap<String, String>,
+    key: &str,
+    value: &str,
+    source: &str,
+) {
+    if !is_safe_injected_env_key(key) {
+        tracing::warn!(
+            key = %key,
+            source = %source,
+            "blocked unsafe injected environment variable name"
+        );
+        return;
+    }
+    env_vars.insert(key.to_string(), value.to_string());
+}
+
+/// Terminate the whole process group rooted at `pid`, not just its direct
+/// children.
+///
+/// The bash child is spawned with `process_group(0)`, so its PGID equals its
+/// PID and every descendant that does not deliberately create a new group
+/// (e.g. the `sleep` in `bash -c 'sleep 300 &'`) stays in that group. The old
+/// `pkill -P <pid>` only reached direct children and left grandchildren alive
+/// after a timeout / abort. A negative pid addresses a process group; `--`
+/// stops the `kill` utility from parsing it as an option.
 #[cfg(unix)]
 async fn kill_process_tree(pid: u32) {
-    let _ = tokio::process::Command::new("pkill")
+    let pgid = format!("-{}", pid);
+    let _ = tokio::process::Command::new("kill")
         .arg("-TERM")
-        .arg("-P")
-        .arg(pid.to_string())
+        .arg("--")
+        .arg(&pgid)
         .status()
         .await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _ = tokio::process::Command::new("pkill")
+    let _ = tokio::process::Command::new("kill")
         .arg("-KILL")
-        .arg("-P")
-        .arg(pid.to_string())
+        .arg("--")
+        .arg(&pgid)
         .status()
         .await;
 }
@@ -186,7 +298,7 @@ impl Tool for BashTool {
             if let Some(env_obj) = extra_env.as_object() {
                 for (key, value) in env_obj {
                     if let Some(val_str) = value.as_str() {
-                        env_vars.insert(key.clone(), val_str.to_string());
+                        insert_injected_env(&mut env_vars, key, val_str, "ctx.extra[env]");
                     }
                 }
             }
@@ -216,7 +328,7 @@ impl Tool for BashTool {
             };
             for (key, value) in env {
                 if let Some(value_str) = value.as_str() {
-                    env_vars.insert(key.clone(), value_str.to_string());
+                    insert_injected_env(&mut env_vars, key, value_str, "shell.env hook");
                 }
             }
         }
@@ -268,6 +380,12 @@ impl Tool for BashTool {
         let mut cmd = tokio::process::Command::new(shell);
         cmd.arg(flag).arg(&command);
         cmd.current_dir(&workdir);
+        // Unix: make the shell a process-group leader so a timeout/abort can
+        // terminate its whole descendant tree with one group-wide signal.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
         for (key, value) in &env_vars {
             cmd.env(key, value);
         }
@@ -942,6 +1060,162 @@ mod tests {
             "message".to_owned(),
             directory.to_owned(),
         )
+    }
+
+    // --- R2: 環境変数名の検証（2 つの注入経路で共有するヘルパ） ---
+
+    #[test]
+    fn unsafe_injected_env_names_are_rejected() {
+        for key in [
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "GLOBIGNORE",
+            "CDPATH",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONWARNINGS",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_EXEC_PATH",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_SSH_COMMAND",
+            "LD_TRACE_LOADED_OBJECTS",
+            "LD_DEBUG_OUTPUT",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "PATH",
+            "IFS",
+            "HOME",
+            "SHELL",
+            "lower_case",
+            "1BAD",
+            "BAD-KEY",
+            "WITH SPACE",
+            "",
+        ] {
+            assert!(!is_safe_injected_env_key(key), "must reject: {key}");
+        }
+    }
+
+    #[test]
+    fn safe_injected_env_names_are_accepted() {
+        for key in [
+            "OPENAI_API_KEY",
+            "GH_TOKEN",
+            "MY_TOKEN_1",
+            "NODE_ENV",
+            "RUST_LOG",
+            "FOO_BAR",
+            "_PRIVATE_TOKEN",
+        ] {
+            assert!(is_safe_injected_env_key(key), "must accept: {key}");
+        }
+    }
+
+    #[test]
+    fn insert_injected_env_skips_only_unsafe_names() {
+        let mut env = HashMap::new();
+        insert_injected_env(&mut env, "SAFE_TOKEN", "value", "test");
+        insert_injected_env(&mut env, "BASH_ENV", "/tmp/evil.sh", "test");
+        insert_injected_env(&mut env, "NODE_OPTIONS", "--require evil", "test");
+        insert_injected_env(&mut env, "PATH", "/tmp/evil", "test");
+
+        assert_eq!(env.get("SAFE_TOKEN").map(String::as_str), Some("value"));
+        assert!(!env.contains_key("BASH_ENV"));
+        assert!(!env.contains_key("NODE_OPTIONS"));
+        assert!(!env.contains_key("PATH"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_filters_unsafe_env_from_context_extra() {
+        let mut ctx = context("/tmp");
+        ctx.extra.insert(
+            "env".to_owned(),
+            serde_json::json!({
+                "SAFE_ENV_PROBE": "safe-value",
+                "BASH_ENV": "/tmp/sentinel-bash-env",
+                "NODE_OPTIONS": "--require /tmp/sentinel-node-options",
+            }),
+        );
+        let result = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "printf '%s|%s' \"${SAFE_ENV_PROBE-}\" \"${BASH_ENV-}\"",
+                    "description": "probe injected environment"
+                }),
+                ctx,
+            )
+            .await
+            .expect("execute must succeed");
+
+        assert!(
+            result.output.starts_with("safe-value|"),
+            "safe env var must be injected: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("sentinel"),
+            "unsafe env values must never reach the child: {}",
+            result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_tree_terminates_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let heartbeat = dir.path().join("heartbeat");
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!(
+                "( while :; do echo tick >> '{}'; sleep 0.05; done ) & wait",
+                heartbeat.display()
+            ))
+            // Match the production spawn: the shell is a group leader so the
+            // background loop stays in the group that kill_process_tree signals.
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn bash");
+        let pid = child.id().expect("child pid");
+
+        // 子孫が実際に動作していることを心拍ファイルで確認する（zombie の
+        // 有無に依存しない判定にするため）。
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ticks = tokio::fs::read_to_string(&heartbeat)
+                    .await
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                if ticks >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("descendant heartbeat must start");
+
+        kill_process_tree(pid).await;
+        let bytes_before = tokio::fs::read_to_string(&heartbeat)
+            .await
+            .unwrap_or_default()
+            .len();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let bytes_after = tokio::fs::read_to_string(&heartbeat)
+            .await
+            .unwrap_or_default()
+            .len();
+
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        assert_eq!(
+            bytes_after, bytes_before,
+            "descendant survived the process-group kill and kept writing"
+        );
     }
 
     #[test]

@@ -36,6 +36,11 @@ for_kv_map = "allow"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# MSRV: 依存セットが 2025 年世代で高い要求値を持つ。
+# oxc_parser 0.154 = 1.97 / sqlx 0.9 = 1.94 / tree-sitter 0.27 = 1.90 /
+# edition 2024 依存 (rand 0.10 / toml 1.2 / notify 8.2 等) = 1.85。
+# 現行ツールチェーンは 1.100.0 で検証済み、宣言値は 1.97 とする。
+rust-version = "1.97"
 authors = ["OpenCode Team"]
 license = "MIT"
 
