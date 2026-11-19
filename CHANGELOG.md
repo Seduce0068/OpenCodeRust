@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T19:57:03+09:00"
+  at: "2026-11-19T20:14:54+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2213 件
+  テスト総数 594 → 2229 件
 
 ### Changed
 
@@ -402,6 +402,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `workspace`: 参照 0 の orphan クレート `opencode-pty` を member 外し・削除
   （server の PtyManager は現状維持）(M-03 一部)
 - `cli`: load_config の 11 回の再パースを cwd キーのキャッシュへ集約（L-04 一部）
+- `session` / `tool`: タイトル/要約の UTF-8 境界 panic と apply_patch の
+  stale patch 破壊を修正（swarm-coding R1-R6）(discovery high 2 件)
 
 ## [0.1.0]
 

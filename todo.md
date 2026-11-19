@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[discovery high 2 件]** UTF-8 境界 panic と apply_patch stale 破壊
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[L-04 一部]** load_config を cwd キャッシュへ集約（2026-11-19、swarm-coding R2）
 - [x] **[M-03 一部]** orphan クレート opencode-pty を削除（2026-11-19、親が直接実施）
 - [x] **[H-03 一部]** npm spec 厳密化と import 検証（2026-11-19、swarm-coding R1-R6）
@@ -486,18 +488,21 @@ status: current
 
 ## メモ
 
-- 2026-11-19 discovery 新規候補（swarm51、未着手。要 triage）:
-  - **high**: `session/prompt.rs:3077,3298,3367` と `summary.rs:343,496` の
-    タイトル/要約バイトスライス `&s[..97]` / `&s[..500]` が UTF-8 境界を検証せず
-    panic（system.rs:144-155 の `char_indices` 方式へ統一すべき）。
-  - **high**: `tool/apply_patch.rs:759-847` が Context/Remove 行のテキストを検証せず
-    位置指定で適用。stale patch が黙ってファイルを破壊（M-28/29/54 は別箇所）。
+- 2026-11-19 discovery 新規候補（swarm51）: high 2 件（session の UTF-8 境界 panic、
+  apply_patch の stale 破壊）は対応済み。残存（要 triage）:
   - **medium**: openrouter.rs:136-155 の HeaderValue::from_str().unwrap()、
     multiedit の逐次書き込み部分適用、glob/grep の follow_links(true) が
     external_directory 権限をすり抜ける、worktree.rs:56-93 の detached HEAD 除外、
     PermissionBroker/QuestionBroker の pending 残留と reply の false success。
   - **low**: PTY cursor -2 以下の全リプレイ、SseLineBuffer 無上限、
     edit の replace_all 型丸め、read の metadata エラー丸め、limit 上限なし。
+  - 2026-11-19 R4 で判明した**既存設計の high 2 件**（今回の差分とは無関係で要別タスク）:
+    `parse_model_patch` が `*** Update File:` を解釈せず LLM の一般的な更新パッチが
+    一切適用されない（`apply_patch.rs:565-648`）、`*** Move To:` が Add-only hunk を
+    Move に転用し「新内容 + 旧内容」に連結される（同 :600,625,704,825,857）。
+  - 同 R4 の残存: truncate_bytes が prompt.rs/summary.rs に重複（DRY）、
+    末尾改行が Update で失われる（既存仕様の可能性）、同一 path の複数 FilePatch
+    が先の変更を上書き、new_start 整合性は debug! のみ。
 - M-55 R4 の残存（2026-11-19、記録のみ）: 完全な eventstream フレームデコーダ
   （preamble length / prelude CRC / message CRC）は未実装で、既知 7 キーの JSON テキスト
   検索ヒューリスティックを維持。未知イベント（modelStreamErrorException 等）が
