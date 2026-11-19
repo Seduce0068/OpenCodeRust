@@ -394,6 +394,79 @@ fn is_openai_error_retryable(status: u16) -> bool {
     status == 404 || ProviderError::is_retryable_status_code(status)
 }
 
+/// 構造化エラーへ渡すレスポンスヘッダをサニタイズする共通ヘルパ。
+///
+/// 全 13 アダプタの `response_error_headers` / `response_header_map` はこの
+/// 1 関数へ委譲する。2 段構えで機微情報を構造化エラーへ渡さない:
+///
+/// 1. **allowlist（主防御）**: リトライ判定・レート制限・リクエスト識別に
+///    必要な既知のヘッダのみ保持する。将来ベンダが未知の認証ヘッダを
+///    追加しても、allowlist に無い限り構造的に漏れない。
+/// 2. **denylist（多層防御）**: 群 A / 群 B の除外リストの和集合を明示的に
+///    弾く。allowlist を誤って拡張した場合の保険として機能する。
+///
+/// 値は `to_str()` で UTF-8 変換し、obs-text 等非 UTF-8 はスキップする。
+/// ヘッダ名の比較は大小文字を区別しない。
+pub(crate) fn sanitize_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> HashMap<String, String> {
+    /// 保持を許可するヘッダ名（完全一致）。
+    const ALLOWED_HEADERS: &[&str] = &[
+        "retry-after",    // opencode-session::retry が秒指定 / HTTP-date を解釈
+        "retry-after-ms", // 同上（ミリ秒指定）
+        "x-request-id",   // 障害追跡用の識別子（値自体は機微情報ではない）
+    ];
+    /// 保持を許可するヘッダ名の前方一致（レート制限情報は全般を保持）。
+    const ALLOWED_PREFIXES: &[&str] = &["x-ratelimit-"];
+
+    /// 群 A / 群 B の機微ヘッダ除外リストの和集合（大小文字無視）。
+    const SENSITIVE_HEADERS: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "authentication",
+        "cookie",
+        "set-cookie",
+        "set-cookie2",
+        "api-key",
+        "x-api-key",
+        "x-auth",
+        "x-auth-token",
+        "x-access-token",
+        "x-api-token",
+        "x-amz-security-token",
+        "x-amz-credential",
+        "x-goog-api-key",
+        "x-goog-iam-authorization-token",
+        "x-session-token",
+        "x-csrf-token",
+        "x-xsrf-token",
+    ];
+
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            let lower = name.to_ascii_lowercase();
+            let allowed = ALLOWED_HEADERS
+                .iter()
+                .any(|header| lower.eq_ignore_ascii_case(header))
+                || ALLOWED_PREFIXES
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix));
+            let denied = SENSITIVE_HEADERS
+                .iter()
+                .any(|header| lower.eq_ignore_ascii_case(header));
+            allowed && !denied
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|text| (name.as_str().to_string(), text.to_string()))
+        })
+        .collect()
+}
+
 /// `Retry-After` の秒指定値をパースする純粋ヘルパ。
 ///
 /// ヘッダ名は大文字小文字を区別しない。HTTP-date 形式は
@@ -952,5 +1025,139 @@ mod tests {
         let _ = &client;
         assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(120));
+    }
+
+    /// 群 A / 群 B の除外リスト和集合の全項目がサニタイズで落ちる回帰テスト。
+    #[test]
+    fn test_sanitize_response_headers_drops_every_sensitive_header() {
+        const SENSITIVE_HEADERS: &[&str] = &[
+            "authorization",
+            "proxy-authorization",
+            "authentication",
+            "cookie",
+            "set-cookie",
+            "set-cookie2",
+            "api-key",
+            "x-api-key",
+            "x-auth",
+            "x-auth-token",
+            "x-access-token",
+            "x-api-token",
+            "x-amz-security-token",
+            "x-amz-credential",
+            "x-goog-api-key",
+            "x-goog-iam-authorization-token",
+            "x-session-token",
+            "x-csrf-token",
+            "x-xsrf-token",
+        ];
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        for name in SENSITIVE_HEADERS {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .expect("sensitive header name must be valid"),
+                reqwest::header::HeaderValue::from_static("secret-token-value"),
+            );
+        }
+
+        let sanitized = sanitize_response_headers(&headers);
+        assert!(
+            sanitized.is_empty(),
+            "機微ヘッダが 1 つも構造化エラーへ残ってはならない: {sanitized:?}"
+        );
+        assert!(!sanitized.values().any(|value| value.contains("secret")));
+    }
+
+    /// allowlist（retry-after / retry-after-ms / x-ratelimit-* / x-request-id）
+    /// は保持され、それ以外の未知ヘッダは構造的に除外される回帰テスト。
+    #[test]
+    fn test_sanitize_response_headers_keeps_only_allowlisted_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("retry-after", "2"),
+            ("retry-after-ms", "1500"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset-requests", "1s"),
+            ("x-request-id", "req-1"),
+        ] {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_static(value),
+            );
+        }
+        // 未知のヘッダ（認証ヘッダかどうかに関わらず）は allowlist に無いため落ちる。
+        for name in ["x-vendor-secret", "x-new-auth-token", "x-binary"] {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_static("must-not-leak"),
+            );
+        }
+        // obs-text は HeaderValue として有効だが to_str() は拒否するためスキップ。
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(b"x-ratelimit-weird").unwrap(),
+            reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+
+        let sanitized = sanitize_response_headers(&headers);
+        assert_eq!(sanitized.get("retry-after").map(String::as_str), Some("2"));
+        assert_eq!(
+            sanitized.get("retry-after-ms").map(String::as_str),
+            Some("1500")
+        );
+        assert_eq!(
+            sanitized.get("x-ratelimit-remaining").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            sanitized
+                .get("x-ratelimit-reset-requests")
+                .map(String::as_str),
+            Some("1s")
+        );
+        assert_eq!(
+            sanitized.get("x-request-id").map(String::as_str),
+            Some("req-1")
+        );
+        assert!(!sanitized.contains_key("x-vendor-secret"));
+        assert!(!sanitized.contains_key("x-new-auth-token"));
+        assert!(!sanitized.contains_key("x-binary"));
+        assert!(!sanitized.contains_key("x-ratelimit-weird"));
+        assert!(!sanitized
+            .values()
+            .any(|value| value.contains("must-not-leak")));
+    }
+
+    /// 機微ヘッダの値が構造化エラーの `response_headers` / `to_string()` の
+    /// いずれにも現れないことを end-to-end で確認する回帰テスト。
+    #[test]
+    fn test_sensitive_headers_do_not_reach_structured_error() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("authorization"),
+            reqwest::header::HeaderValue::from_static("Bearer secret-token-value"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-api-key"),
+            reqwest::header::HeaderValue::from_static("secret-token-value"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("retry-after"),
+            reqwest::header::HeaderValue::from_static("3"),
+        );
+
+        let map = sanitize_response_headers(&headers);
+        let error = ProviderError::api_error_with_headers(
+            429,
+            "rate limited",
+            Some(map.clone()),
+            Some("body-preview".to_string()),
+        );
+
+        let carried = error.response_headers().expect("headers must be carried");
+        assert_eq!(carried, &map);
+        assert_eq!(carried.get("retry-after").map(String::as_str), Some("3"));
+        assert!(!carried.values().any(|value| value.contains("secret")));
+        assert!(!error.to_string().contains("secret"));
     }
 }

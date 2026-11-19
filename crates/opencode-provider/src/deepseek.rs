@@ -1,13 +1,21 @@
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
 use reqwest::Client;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::{
     ChatRequest, ChatResponse, ModelInfo, Provider, ProviderError, StreamEvent, StreamResult,
 };
 
 const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
+
+/// 構造化エラーへ渡すレスポンスヘッダから機微情報を除外する。
+///
+/// 実装は [`crate::provider::sanitize_response_headers`] へ一本化した薄いラッパ。
+/// allowlist + 機微ヘッダ除外リスト和集合による 2 段防御はそちらを参照。
+fn response_error_headers(response: &reqwest::Response) -> HashMap<String, String> {
+    crate::provider::sanitize_response_headers(response.headers())
+}
 
 #[derive(Debug)]
 pub struct DeepSeekProvider {
@@ -77,14 +85,15 @@ impl Provider for DeepSeekProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let response_headers = response_error_headers(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let body_preview = crate::openai::error_body_preview(&body, 500);
+            let message = format!("{}: {}", status, body_preview);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                message,
+                Some(response_headers),
+                Some(body_preview),
             ));
         }
 
@@ -111,14 +120,15 @@ impl Provider for DeepSeekProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let response_headers = response_error_headers(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let body_preview = crate::openai::error_body_preview(&body, 500);
+            let message = format!("{}: {}", status, body_preview);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                message,
+                Some(response_headers),
+                Some(body_preview),
             ));
         }
 

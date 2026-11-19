@@ -211,14 +211,14 @@ impl Provider for OpenRouterProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let headers = crate::openai::response_header_map(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let preview = crate::openai::error_body_preview(&body, 500);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                format!("{status}: {preview}"),
+                Some(headers),
+                Some(preview),
             ));
         }
 
@@ -250,14 +250,14 @@ impl Provider for OpenRouterProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let headers = crate::openai::response_header_map(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let preview = crate::openai::error_body_preview(&body, 500);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                format!("{status}: {preview}"),
+                Some(headers),
+                Some(preview),
             ));
         }
 

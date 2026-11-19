@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::{
     ChatRequest, ChatResponse, Choice, Message, ModelInfo, Provider, ProviderError, StreamEvent,
@@ -10,6 +10,14 @@ use crate::{
 };
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// 構造化エラーへ渡すレスポンスヘッダから機微情報を除外する。
+///
+/// 実装は [`crate::provider::sanitize_response_headers`] へ一本化した薄いラッパ。
+/// allowlist + 機微ヘッダ除外リスト和集合による 2 段防御はそちらを参照。
+fn response_error_headers(response: &reqwest::Response) -> HashMap<String, String> {
+    crate::provider::sanitize_response_headers(response.headers())
+}
 
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -177,14 +185,15 @@ impl Provider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let response_headers = response_error_headers(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let body_preview = crate::openai::error_body_preview(&body, 500);
+            let message = format!("{}: {}", status, body_preview);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                message,
+                Some(response_headers),
+                Some(body_preview),
             ));
         }
 
@@ -217,14 +226,15 @@ impl Provider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let response_headers = response_error_headers(&response);
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let body_preview = crate::openai::error_body_preview(&body, 500);
+            let message = format!("{}: {}", status, body_preview);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                message,
+                Some(response_headers),
+                Some(body_preview),
             ));
         }
 
@@ -637,6 +647,72 @@ mod tests {
         assert!(
             !message.contains(long_body.as_str()),
             "本文全体をエラーへ露出してはならない"
+        );
+    }
+
+    /// 429 レスポンスのヘッダが構造化エラーへ保持され、機微ヘッダが除外される回帰テスト。
+    #[tokio::test]
+    async fn rate_limited_response_keeps_sanitized_headers_in_structured_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = "{\"error\":\"rate limited\"}";
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request_bytes = [0u8; 4096];
+            let read = socket.read(&mut request_bytes).await.unwrap();
+            assert!(read > 0, "リクエストが読み取れない");
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\n\
+                 Retry-After: 7\r\n\
+                 X-RateLimit-Remaining: 0\r\n\
+                 Set-Cookie: session=secret-token-value\r\n\
+                 Authorization: Bearer secret-token-value\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let provider = AnthropicProvider::with_config(AnthropicConfig {
+            api_key: "test-api-key".to_string(),
+            base_url: Some(format!("http://{}", addr)),
+        });
+        let error = provider
+            .chat(ChatRequest::new("claude-3", vec![Message::user("hi")]))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(error.status_code(), Some(429));
+        let headers = error
+            .response_headers()
+            .expect("429 レスポンスのヘッダは構造化エラーへ保持されるべき");
+        assert_eq!(headers.get("retry-after").map(String::as_str), Some("7"));
+        assert_eq!(
+            headers.get("x-ratelimit-remaining").map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            !headers.contains_key("set-cookie"),
+            "Set-Cookie は構造化エラーへ渡さない"
+        );
+        assert!(
+            !headers.contains_key("authorization"),
+            "Authorization は構造化エラーへ渡さない"
+        );
+        assert_eq!(error.response_body(), Some(body));
+        let message = error.to_string();
+        assert!(
+            !message.contains("secret-token-value"),
+            "トークン値をエラーへ露出してはならない"
         );
     }
 }

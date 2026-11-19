@@ -184,12 +184,27 @@ impl AuthManager {
         }
     }
 
+    /// OAuth アクセストークンを返す。期限切れ（skew ウィンドウ内を含む）の場合は
+    /// トークンを返さず、理由（provider_id のみ）を warn ログに出す。
+    ///
+    /// 呼び出し側は既存の `Option<String>` シグネチャをそのまま使える。
     pub async fn get_oauth_token(&self, provider_id: &str) -> Option<String> {
         let creds = self.credentials.read().await;
-        match creds.get(provider_id) {
-            Some(AuthInfo::OAuth { access, .. }) => Some(access.clone()),
-            _ => None,
+        let auth = creds.get(provider_id)?;
+        let AuthInfo::OAuth { access, .. } = auth else {
+            return None;
+        };
+        if let Err(error) = ensure_oauth_not_expired(
+            provider_id,
+            auth,
+            now_unix_ms(),
+            DEFAULT_OAUTH_EXPIRY_SKEW_MS,
+        ) {
+            // エラーには provider_id のみが含まれ、トークン値は含まれない。
+            tracing::warn!(%error, provider_id, "OAuth token rejected by expiry check");
+            return None;
         }
+        Some(access.clone())
     }
 
     pub async fn list(&self) -> HashMap<String, AuthInfo> {
@@ -267,10 +282,30 @@ pub enum AuthError {
 /// OAuth トークンの期限に対して余裕を持たせる既定値（60 秒）。
 pub const DEFAULT_OAUTH_EXPIRY_SKEW_MS: i64 = 60_000;
 
+/// 現在時刻を epoch milliseconds で返す（`is_oauth_expired` と単位を揃える）。
+/// システム時計が UNIX_EPOCH より前の場合は 0 として扱う。
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 /// OAuth 資格情報の期限（epoch milliseconds）を取り出す。
+///
+/// `expires` の単位は epoch milliseconds である。根拠: bundled plugin
+/// `crates/opencode-plugin/builtin/codex-auth.ts` が `Date.now() + 3600 * 1000`
+/// （JS の `Date.now()` は epoch ms）で生成し、`server/oauth.rs` がその値を
+/// `as_i64()` で保存するため。
+/// なお bundled `copilot-auth.ts` は期限不明のセンチネルとして `expires: 0`
+/// を書き込むため、0 以下は「期限情報なし」として扱う（期限切れにしない）。
 pub fn oauth_expires_at_ms(auth: &AuthInfo) -> Option<i64> {
     match auth {
-        AuthInfo::OAuth { expires, .. } => *expires,
+        AuthInfo::OAuth {
+            expires: Some(expires),
+            ..
+        } if *expires > 0 => Some(*expires),
         _ => None,
     }
 }
@@ -515,5 +550,70 @@ mod tests {
             DEFAULT_OAUTH_EXPIRY_SKEW_MS
         ));
         assert!(ensure_oauth_not_expired("openai", &auth, i64::MAX, 0).is_ok());
+    }
+
+    fn oauth_auth(access: &str, expires: Option<i64>) -> AuthInfo {
+        AuthInfo::OAuth {
+            access: access.to_string(),
+            refresh: "dummy-refresh".to_string(),
+            expires,
+            account_id: None,
+            enterprise_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_oauth_token_returns_none_for_expired_token() {
+        let manager = AuthManager::new();
+        manager
+            .set(
+                "openai",
+                oauth_auth("EXPIRED_DUMMY_TOKEN", Some(now_unix_ms() - 60_000)),
+            )
+            .await;
+
+        assert_eq!(manager.get_oauth_token("openai").await, None);
+    }
+
+    #[tokio::test]
+    async fn get_oauth_token_returns_none_inside_skew_window() {
+        let manager = AuthManager::new();
+        manager
+            .set(
+                "openai",
+                oauth_auth("SKEW_DUMMY_TOKEN", Some(now_unix_ms() + 30_000)),
+            )
+            .await;
+
+        assert_eq!(manager.get_oauth_token("openai").await, None);
+    }
+
+    #[tokio::test]
+    async fn get_oauth_token_returns_unexpired_token() {
+        let manager = AuthManager::new();
+        manager
+            .set(
+                "openai",
+                oauth_auth("FRESH_DUMMY_TOKEN", Some(now_unix_ms() + 3_600_000)),
+            )
+            .await;
+
+        assert_eq!(
+            manager.get_oauth_token("openai").await.as_deref(),
+            Some("FRESH_DUMMY_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_oauth_token_treats_zero_expires_as_no_expiry() {
+        let manager = AuthManager::new();
+        manager
+            .set("github-copilot", oauth_auth("PASTE_DUMMY_TOKEN", Some(0)))
+            .await;
+
+        assert_eq!(
+            manager.get_oauth_token("github-copilot").await.as_deref(),
+            Some("PASTE_DUMMY_TOKEN")
+        );
     }
 }

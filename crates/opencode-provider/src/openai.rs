@@ -741,14 +741,14 @@ impl OpenAIProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let headers = response_header_map(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let preview = error_body_preview(&body, 500);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                format!("{status}: {preview}"),
+                Some(headers),
+                Some(preview),
             ));
         }
 
@@ -928,14 +928,14 @@ impl OpenAIProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let headers = response_header_map(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::api_error_from_status(
+            let preview = error_body_preview(&body, 500);
+            return Err(ProviderError::api_error_with_headers(
                 status.as_u16(),
-                format!(
-                    "{}: {}",
-                    status,
-                    crate::openai::error_body_preview(&body, 500)
-                ),
+                format!("{status}: {preview}"),
+                Some(headers),
+                Some(preview),
             ));
         }
 
@@ -1127,6 +1127,14 @@ pub(crate) fn error_body_preview(body: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}...", &body[..end])
+}
+
+/// レスポンスヘッダを [`crate::ProviderError::api_error_with_headers`] へ渡せる形に変換する。
+///
+/// 実装は [`crate::provider::sanitize_response_headers`] へ一本化した薄いラッパ。
+/// allowlist + 機微ヘッダ除外リスト和集合による 2 段防御はそちらを参照。
+pub(crate) fn response_header_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    crate::provider::sanitize_response_headers(headers)
 }
 
 #[cfg(test)]
@@ -1335,6 +1343,81 @@ mod tests {
     fn error_body_preview_keeps_short_bodies_unchanged() {
         let body = "日本語の短いエラーボディ".to_string();
         assert_eq!(error_body_preview(&body, 500), body);
+    }
+
+    /// 群B アダプタが 503 レスポンスで組み立てる構造化エラーの回帰テスト。
+    /// ヘッダ（特に Retry-After）が保持され、機微ヘッダ・本文全文が漏れないこと。
+    #[test]
+    fn response_503_headers_are_preserved_in_structured_error() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("retry-after"),
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-request-id"),
+            reqwest::header::HeaderValue::from_static("req-1"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("set-cookie"),
+            reqwest::header::HeaderValue::from_static("session=secret-cookie"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("authorization"),
+            reqwest::header::HeaderValue::from_static("Bearer secret-token"),
+        );
+        // obs-text は HeaderValue として有効だが to_str() は拒否するためスキップされる。
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-binary"),
+            reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe])
+                .expect("obs-text header value must be valid"),
+        );
+
+        let mapped = response_header_map(&headers);
+        assert_eq!(mapped.get("retry-after").map(String::as_str), Some("2"));
+        assert_eq!(
+            mapped.get("x-request-id").map(String::as_str),
+            Some("req-1")
+        );
+        assert!(!mapped.contains_key("set-cookie"));
+        assert!(!mapped.contains_key("authorization"));
+        assert!(!mapped.contains_key("x-binary"));
+        assert!(!mapped.values().any(|value| value.contains("secret")));
+
+        let full_body = format!("{{\"error\":\"{}\"}}", "x".repeat(2_000));
+        let preview = error_body_preview(&full_body, 500);
+        let error = ProviderError::api_error_with_headers(
+            503,
+            format!("503 Service Unavailable: {preview}"),
+            Some(mapped.clone()),
+            Some(preview.clone()),
+        );
+
+        assert_eq!(error.status_code(), Some(503));
+        assert_eq!(error.response_headers(), Some(&mapped));
+        assert_eq!(error.response_body(), Some(preview.as_str()));
+        assert!(preview.len() <= 503);
+        assert!(!error.to_string().contains("secret"));
+
+        let parsed = crate::provider::parse_api_call_error("mistral", &error);
+        match parsed {
+            crate::provider::ParsedAPICallError::ApiError {
+                status_code,
+                is_retryable,
+                response_headers,
+                response_body,
+                ..
+            } => {
+                assert_eq!(status_code, Some(503));
+                assert!(is_retryable, "503 must stay retryable");
+                assert_eq!(response_headers, Some(mapped));
+                let body = response_body.expect("503 body preview must be preserved");
+                assert!(body.len() <= 503);
+                assert!(body.ends_with("..."));
+                assert!(!body.contains(&full_body));
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
     }
 
     #[tokio::test]
