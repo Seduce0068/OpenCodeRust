@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T22:28:46+09:00"
+  at: "2026-11-19T23:02:21+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2291 件（all-features は 2290 件）
+  テスト総数 594 → 2309 件（all-features は 2308 件）
 
 ### Changed
 
@@ -421,6 +421,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs` / `server` / `ci`: opencode-pty 削除後のドキュメント追随、
   OPENCODE_NO_AUTH の fail-open 判定修正、all-features の test/clippy ゲート追加
   （swarm-coding R1-R6、R4 の未検証指摘を R5 でローカル実行）
+- `cli` / `tui` / `config`: attach パスワードの Bearer 配線、CLI の fail-open 判定、
+  well-known トークン再注入、認証通知の一本化、with_auth_token の panic 排除
+  （swarm-coding R1-R6、R4 の残存指摘を R5 で修正）
 
 ## [0.1.0]
 
