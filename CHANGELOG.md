@@ -360,6 +360,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cli` / `util`: TUI セッション中のみログをファイルへ出力し stdout 描画干渉を解消、
   WorkerGuard を main ローカルで保持して終了時フラッシュを保証（swarm-coding
   R1-R6、R4 の static 保持/コメント不一致指摘を R5 で修正）(L-04)
+- `renovate.json`: 依存更新検知を Renovate へ委譲する最小設定を追加
+  （App 有効化は外部サービス操作のためユーザー判断として残す）(M-34)
 
 ## [0.1.0]
 
