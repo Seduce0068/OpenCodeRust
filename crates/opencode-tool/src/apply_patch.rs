@@ -760,8 +760,12 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, ToolError> {
     let mut lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
     let mut offset = 0isize;
 
-    for hunk in hunks {
-        // Validate hunk line counts against declared counts
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
+        let hunk_no = hunk_index + 1;
+
+        // 宣言された行数と hunk 本体の行数が食い違う場合は stale/不正なパッチとして
+        // 拒否する（従来は warn のみで黙って適用していたため、行数ずれで静かに
+        // ファイルが壊れる可能性があった）。
         let actual_old = hunk
             .lines
             .iter()
@@ -773,24 +777,31 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, ToolError> {
             .filter(|l| matches!(l, PatchLine::Add(_) | PatchLine::Context(_)))
             .count();
 
-        if hunk.old_count > 0 && actual_old != hunk.old_count {
-            tracing::warn!(
-                "Hunk old_count mismatch: declared {} but found {} lines",
-                hunk.old_count,
-                actual_old
-            );
+        if actual_old != hunk.old_count {
+            return Err(ToolError::InvalidArguments(format!(
+                "Hunk {} old_count mismatch: declared {} but found {} lines",
+                hunk_no, hunk.old_count, actual_old
+            )));
         }
-        if hunk.new_count > 0 && actual_new != hunk.new_count {
-            tracing::warn!(
-                "Hunk new_count mismatch: declared {} but found {} lines",
-                hunk.new_count,
-                actual_new
-            );
+        if actual_new != hunk.new_count {
+            return Err(ToolError::InvalidArguments(format!(
+                "Hunk {} new_count mismatch: declared {} but found {} lines",
+                hunk_no, hunk.new_count, actual_new
+            )));
         }
 
-        let start = (hunk.old_start as isize + offset - 1).max(0) as usize;
+        let start_signed = hunk.old_start as isize + offset - 1;
+        if start_signed < 0 || start_signed as usize > lines.len() {
+            return Err(ToolError::ExecutionError(format!(
+                "Hunk {} start line {} is out of range for file with {} lines",
+                hunk_no,
+                hunk.old_start,
+                lines.len()
+            )));
+        }
+        let start = start_signed as usize;
 
-        // Cross-check: expected new position should align with new_start
+        // 従来どおり位置のズレはデバッグログに残す（致命エラーにはしない）。
         let expected_new_pos = (hunk.new_start as isize - 1).max(0) as usize;
         if hunk.new_start > 0 && start != expected_new_pos && offset != 0 {
             tracing::debug!(
@@ -802,33 +813,49 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, ToolError> {
             );
         }
 
-        let mut remove_count = 0;
-        let add_lines: Vec<String> = hunk
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                PatchLine::Add(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
+        // Context/Remove 行は「元ファイルの対応位置」のテキストと完全一致しなければ
+        // ならない。不一致・範囲外は stale パッチとしてエラーにし、ここで即座に
+        // 戻ることで部分的な適用（ファイル書換え）を防ぐ。
+        // 前方の hunk による差分は offset と lines に反映済みなので、
+        // start 位置の lines が元ファイルの old_start 位置に対応する。
+        let mut cursor = start;
+        let mut rebuilt: Vec<String> = Vec::with_capacity(lines.len());
+        rebuilt.extend_from_slice(&lines[..start]);
 
         for line in &hunk.lines {
-            if matches!(line, PatchLine::Remove(_)) {
-                remove_count += 1;
+            match line {
+                PatchLine::Context(expected) | PatchLine::Remove(expected) => {
+                    if cursor >= lines.len() {
+                        return Err(ToolError::ExecutionError(format!(
+                            "Hunk {} references line {} which is out of range for file with {} lines",
+                            hunk_no,
+                            cursor + 1,
+                            lines.len()
+                        )));
+                    }
+                    let actual = &lines[cursor];
+                    if actual != expected {
+                        return Err(ToolError::ExecutionError(format!(
+                            "Hunk {} context/remove line {} mismatch: expected '{}' but found '{}'",
+                            hunk_no,
+                            cursor + 1,
+                            expected,
+                            actual
+                        )));
+                    }
+                    // Context 行はそのまま残し、Remove 行は落とす。
+                    if matches!(line, PatchLine::Context(_)) {
+                        rebuilt.push(actual.clone());
+                    }
+                    cursor += 1;
+                }
+                PatchLine::Add(added_line) => {
+                    rebuilt.push(added_line.clone());
+                }
             }
         }
-
-        let insert_pos = start.min(lines.len());
-
-        if insert_pos + remove_count <= lines.len() {
-            for _ in 0..remove_count {
-                lines.remove(insert_pos);
-            }
-        }
-
-        for (i, add_line) in add_lines.into_iter().enumerate() {
-            lines.insert(insert_pos + i, add_line);
-        }
+        rebuilt.extend_from_slice(&lines[cursor..]);
+        lines = rebuilt;
 
         let added = hunk
             .lines
@@ -1227,5 +1254,177 @@ mod tests {
             asks.iter().any(|r| r.permission == "external_directory"),
             "a non-existent destination outside project_root must still request external_directory"
         );
+    }
+
+    // ---- stale patch 検証 (R2 regression) ------------------------------------
+
+    #[test]
+    fn apply_hunks_applies_valid_interleaved_context() {
+        // 正常系: Context を挟む hunk が従来どおり適用できること。
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                PatchLine::Context("line1".into()),
+                PatchLine::Remove("line2".into()),
+                PatchLine::Add("NEW2".into()),
+                PatchLine::Context("line3".into()),
+            ],
+        };
+        assert_eq!(
+            apply_hunks("line1\nline2\nline3", &[hunk]).unwrap(),
+            "line1\nNEW2\nline3"
+        );
+    }
+
+    #[test]
+    fn apply_hunks_rejects_remove_text_mismatch_without_partial_result() {
+        // 1 つ目の hunk は成功するが、2 つ目の Remove 行が食い違う。
+        // エラーが返り、部分的な結果（文字列）が一切出ないことを確認する。
+        let hunks = vec![
+            Hunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    PatchLine::Remove("line1".into()),
+                    PatchLine::Add("NEW1".into()),
+                ],
+            },
+            Hunk {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+                lines: vec![
+                    PatchLine::Remove("WRONG".into()),
+                    PatchLine::Add("NEW2".into()),
+                ],
+            },
+        ];
+        let err = apply_hunks("line1\nline2\nline3", &hunks).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ExecutionError(_)),
+            "stale Remove text must be an ExecutionError, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn apply_hunks_rejects_context_text_mismatch() {
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                PatchLine::Context("line1".into()),
+                PatchLine::Remove("line2".into()),
+                PatchLine::Add("NEW2".into()),
+                PatchLine::Context("WRONG".into()),
+            ],
+        };
+        let err = apply_hunks("line1\nline2\nline3", &[hunk]).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ExecutionError(_)),
+            "stale Context text must be an ExecutionError, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn apply_hunks_rejects_declared_count_mismatch() {
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 5, // 実際の Remove+Context は 1 行
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                PatchLine::Remove("line1".into()),
+                PatchLine::Add("NEW".into()),
+            ],
+        };
+        let err = apply_hunks("line1\nline2", &[hunk]).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::InvalidArguments(_)),
+            "declared/actual line-count mismatch must be an InvalidArguments error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn apply_hunks_rejects_out_of_range_hunk() {
+        let hunk = Hunk {
+            old_start: 99,
+            old_count: 1,
+            new_start: 99,
+            new_count: 1,
+            lines: vec![
+                PatchLine::Remove("line1".into()),
+                PatchLine::Add("NEW".into()),
+            ],
+        };
+        let err = apply_hunks("line1\nline2", &[hunk]).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ExecutionError(_)),
+            "out-of-range hunk must be an ExecutionError, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_patches_are_rejected_and_leave_file_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        let original = "alpha\nbeta\ngamma\n";
+
+        let stale_patches = [
+            // 行番号ずれ: old_start=2 だが 2 行目の Context は "alpha" ではない。
+            concat!(
+                "--- a/file.txt\n",
+                "+++ b/file.txt\n",
+                "@@ -2,3 +2,3 @@\n",
+                " alpha\n",
+                "-beta\n",
+                "+BETA\n",
+                " gamma\n"
+            ),
+            // テキスト不一致: 行番号は正しいが Remove 行が実ファイルと食い違う。
+            concat!(
+                "--- a/file.txt\n",
+                "+++ b/file.txt\n",
+                "@@ -2,1 +2,1 @@\n",
+                "-WRONG\n",
+                "+BETA\n"
+            ),
+            // 範囲外: ファイルの行数より後ろを指す hunk。
+            concat!(
+                "--- a/file.txt\n",
+                "+++ b/file.txt\n",
+                "@@ -90,1 +90,1 @@\n",
+                "-alpha\n",
+                "+BETA\n"
+            ),
+        ];
+
+        for patch in stale_patches {
+            std::fs::write(&file, original).unwrap();
+            let (ctx, _asks) = recording_context(&root);
+            let result = ApplyPatchTool
+                .execute(serde_json::json!({ "patchText": patch }), ctx)
+                .await;
+            assert!(result.is_err(), "stale patch must be rejected: {}", patch);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                original,
+                "file must remain unchanged for stale patch: {}",
+                patch
+            );
+        }
     }
 }

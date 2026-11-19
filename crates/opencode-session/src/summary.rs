@@ -283,6 +283,30 @@ fn fallback_message_title(text: &str) -> String {
     generate_title_from_messages(&[text.to_string()])
 }
 
+/// Return the longest prefix of `text` that fits within `max_bytes` bytes and
+/// ends on a UTF-8 character boundary.
+///
+/// A plain `&text[..max_bytes]` slice panics when a multibyte character
+/// straddles the byte limit. This helper mirrors `str::floor_char_boundary`
+/// using `char_indices` (the same approach as `system::trim_for_prompt`), so it
+/// stays safe for Japanese and any other multibyte input while producing
+/// byte-identical results for ASCII.
+fn truncate_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
 async fn generate_message_title_llm(
     text: &str,
     provider: &dyn Provider,
@@ -340,7 +364,7 @@ async fn generate_message_title_llm(
     if cleaned.is_empty() {
         Some(fallback)
     } else if cleaned.len() > 100 {
-        Some(format!("{}...", &cleaned[..97]))
+        Some(format!("{}...", truncate_bytes(&cleaned, 97)))
     } else {
         Some(cleaned)
     }
@@ -493,7 +517,7 @@ pub fn generate_title_from_messages(messages: &[String]) -> String {
 
     let title = words.join(" ");
     if title.len() > 100 {
-        format!("{}...", &title[..97])
+        format!("{}...", truncate_bytes(&title, 97))
     } else {
         title
     }
@@ -815,5 +839,58 @@ mod tests {
     fn test_unquote_git_path_octal_max_three_digits() {
         // 3 octal digits are consumed; the 4th remains a literal char.
         assert_eq!(unquote_git_path("\"\\1012\""), "A2");
+    }
+
+    #[test]
+    fn test_truncate_bytes_multibyte_boundary() {
+        // 'あ' is 3 bytes: byte 97 lands inside the 33rd character, so a raw
+        // `&text[..97]` slice would panic. The result must stop at 96 bytes.
+        let text = "あ".repeat(40);
+        let truncated = truncate_bytes(&text, 97);
+        assert_eq!(truncated, "あ".repeat(32));
+        assert!(truncated.len() <= 97);
+        assert!(!truncated.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn test_generate_title_from_messages_ascii_truncation_unchanged() {
+        let msgs = vec!["a".repeat(150)];
+        assert_eq!(
+            generate_title_from_messages(&msgs),
+            format!("{}...", "a".repeat(97))
+        );
+    }
+
+    #[test]
+    fn test_generate_title_from_messages_multibyte_boundary() {
+        // 40 * 3 = 120 bytes > 100, and byte 97 splits a 3-byte character.
+        let msgs = vec!["あ".repeat(40)];
+        let title = generate_title_from_messages(&msgs);
+        assert_eq!(title, format!("{}...", "あ".repeat(32)));
+        assert!(!title.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn test_generate_message_title_llm_multibyte_boundary() {
+        let provider = MockProvider {
+            model: ModelInfo {
+                id: "mock-model".to_string(),
+                name: "Mock".to_string(),
+                provider: "mock".to_string(),
+                context_window: 8192,
+                max_output_tokens: 1024,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            },
+            title: "あ".repeat(40),
+        };
+
+        let title = generate_message_title_llm("test input", &provider, "mock-model")
+            .await
+            .expect("title generation should succeed");
+        assert_eq!(title, format!("{}...", "あ".repeat(32)));
+        assert!(!title.contains('\u{fffd}'));
     }
 }
