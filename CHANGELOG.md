@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T23:02:21+09:00"
+  at: "2026-11-20T00:23:29+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2309 件（all-features は 2308 件）
+  テスト総数 594 → 2343 件（all-features は 2342 件）
 
 ### Changed
 
@@ -424,6 +424,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cli` / `tui` / `config`: attach パスワードの Bearer 配線、CLI の fail-open 判定、
   well-known トークン再注入、認証通知の一本化、with_auth_token の panic 排除
   （swarm-coding R1-R6、R4 の残存指摘を R5 で修正）
+- `cli` / `tool` / `util` / `storage` / `mcp`: review+discovery の high 11 件を修正
+  （/model 実切替、run flags 必須化、Bash 動的実行ガード、WebFetch DNS 固定と URL マスク、
+  ログ 0600/フォールバック/エスケープ、SessionRow fail-loud、summary 往復、
+  AgentRegistry fail-closed、Content-Length 上限。swarm-coding R1-R6、
+  R4 の stdin ガード/URL 露出指摘を R5 で修正）
 
 ## [0.1.0]
 
