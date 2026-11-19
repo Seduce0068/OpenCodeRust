@@ -79,6 +79,18 @@ impl ConfigLoader {
         }
 
         let global_config_path = get_global_config_path();
+        let Some(config_dir) = global_config_path.parent() else {
+            return Ok(());
+        };
+        self.load_global_from(config_dir)
+    }
+
+    /// Read the global config from an explicit directory.
+    ///
+    /// Kept separate from `load_global` so the read-only invariants of this
+    /// path can be tested without touching the real user config directory.
+    fn load_global_from(&mut self, config_dir: &Path) -> Result<()> {
+        let global_config_path = config_dir.join("opencode");
 
         for ext in &["jsonc", "json"] {
             let path = global_config_path.with_extension(ext);
@@ -88,15 +100,9 @@ impl ConfigLoader {
             }
         }
 
-        if let Some(global_config_dir) = global_config_path.parent() {
-            if let Some(migrated_path) =
-                migrate_legacy_toml_config(global_config_dir, &mut self.config)
-            {
-                if !self.config_paths.contains(&migrated_path) {
-                    self.config_paths.push(migrated_path);
-                }
-            }
-        }
+        // Read-only: legacy TOML migration is a destructive, one-time startup
+        // step and is now performed explicitly by the CLI via
+        // `migrate_global_config()`, never as a side effect of loading config.
 
         Ok(())
     }
@@ -156,7 +162,7 @@ impl ConfigLoader {
     /// 4. .opencode directories (agents, commands, plugins, modes, config)
     /// 5. Inline config (OPENCODE_CONFIG_CONTENT)
     /// 6. Managed config directory (enterprise, highest priority)
-    ///    Then: legacy migrations, flag overrides, plugin dedup
+    ///    Then: legacy field migrations, flag overrides, plugin dedup
     pub fn load_all<P: AsRef<Path>>(&mut self, project_dir: P) -> Result<Config> {
         let project_dir = project_dir.as_ref();
 
@@ -210,11 +216,20 @@ impl ConfigLoader {
                 self.config.agent = Some(agent_configs);
             }
 
-            // Load plugins from .ts/.js files
-            let plugins = load_plugins_from_dir(dir);
-            for plugin in plugins {
-                if !self.config.plugin.contains(&plugin) {
-                    self.config.plugin.push(plugin);
+            // Load plugins from .ts/.js files. An explicitly empty `plugin`
+            // array (from global or project config) is a clear directive:
+            // directory plugins must not be re-added, or the user's "disable
+            // all plugins" choice would silently resurrect them on restart.
+            // Distinguish `is_empty` from `is_explicit`: an omitted key still
+            // allows the additive directory scan.
+            let plugin_explicitly_cleared =
+                self.config.plugin.is_explicit() && self.config.plugin.is_empty();
+            if !plugin_explicitly_cleared {
+                let plugins = load_plugins_from_dir(dir);
+                for plugin in plugins {
+                    if !self.config.plugin.contains(&plugin) {
+                        self.config.plugin.push(plugin);
+                    }
                 }
             }
         }
@@ -225,7 +240,7 @@ impl ConfigLoader {
         // Load managed config (enterprise, highest priority)
         self.load_managed_config()?;
 
-        // Apply legacy migrations and flag overrides
+        // Apply legacy field migrations and flag overrides
         apply_post_load_transforms(&mut self.config);
 
         eprintln!(
@@ -290,6 +305,46 @@ fn get_global_config_path() -> PathBuf {
     };
 
     config_dir.join("opencode/opencode")
+}
+
+/// Explicitly migrate the legacy global TOML config into `opencode.json`.
+///
+/// This is the mutating counterpart of the file readers such as
+/// `ConfigLoader::load_from_file`: on success it writes `opencode.json`,
+/// creates `config.bak` and removes the original `config` file. Keeping this
+/// behavior in a dedicated public API makes the destructive side effects
+/// visible to callers instead of hiding them inside `load_global`.
+///
+/// The operation is guarded by `migrate_global_config_if_absent`, so it is a
+/// no-op when a current JSON(C) config already exists. This makes it safe to
+/// call once during CLI startup.
+pub fn migrate_global_config() -> Result<Option<PathBuf>> {
+    let global_config_path = get_global_config_path();
+    let Some(config_dir) = global_config_path.parent() else {
+        return Ok(None);
+    };
+    let mut config = Config::default();
+    Ok(migrate_global_config_if_absent(config_dir, &mut config))
+}
+
+/// Guarded compatibility wrapper for the legacy TOML migration.
+///
+/// Called only by the explicit [`migrate_global_config`] startup path; the
+/// config readers (`load_global` / `load_config`) never invoke it. Because the
+/// raw migration is destructive (it rewrites `opencode.json` and removes the
+/// source `config`), it is only run when neither `opencode.json` nor
+/// `opencode.jsonc` exists. Once a JSON config exists the guard short-circuits,
+/// so an existing user config is never overwritten and the destructive
+/// migration effectively happens at most once.
+fn migrate_global_config_if_absent(config_dir: &Path, config: &mut Config) -> Option<PathBuf> {
+    if config_dir.join("opencode.json").exists() || config_dir.join("opencode.jsonc").exists() {
+        tracing::debug!(
+            dir = %config_dir.display(),
+            "skipping legacy TOML migration: a current JSON config already exists"
+        );
+        return None;
+    }
+    migrate_legacy_toml_config(config_dir, config)
 }
 
 /// Migrate legacy global TOML config (`~/.config/opencode/config`) into
@@ -1486,9 +1541,8 @@ fn apply_post_load_transforms(config: &mut Config) {
         compaction.prune = Some(false);
     }
 
-    // Deduplicate plugins
-    let plugins = std::mem::take(&mut config.plugin);
-    config.plugin = deduplicate_plugins(plugins);
+    // Deduplicate plugins, preserving whether the source explicitly set the key.
+    config.plugin = std::mem::take(&mut config.plugin).map_values(deduplicate_plugins);
 
     // Fold the current-schema `providers` map into the runtime `provider` map.
     normalize_provider_configs(config);
@@ -1756,13 +1810,13 @@ mod tests {
     fn test_config_merge() {
         let mut config1 = Config {
             model: Some("model1".to_string()),
-            instructions: vec!["inst1".to_string()],
+            instructions: vec!["inst1".to_string()].into(),
             ..Default::default()
         };
 
         let config2 = Config {
             model: Some("model2".to_string()),
-            instructions: vec!["inst2".to_string()],
+            instructions: vec!["inst2".to_string()].into(),
             ..Default::default()
         };
 
@@ -2390,6 +2444,197 @@ theme = "dark"
             original
         );
         assert!(config_dir.join("opencode.json").exists());
+    }
+
+    #[test]
+    fn load_global_guard_does_not_rewrite_existing_json_config() {
+        let temp = TestDir::new("opencode_guard_existing_json");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let legacy = "model = \"legacy\"\n";
+        fs::write(config_dir.join("config"), legacy).unwrap();
+        let current_json = r#"{"model":"current","theme":"dark"}"#;
+        fs::write(config_dir.join("opencode.json"), current_json).unwrap();
+
+        // Only the explicit startup migration reaches this guard; config
+        // readers never do.
+        let mut config = Config::default();
+        assert!(migrate_global_config_if_absent(&config_dir, &mut config).is_none());
+
+        assert_eq!(
+            fs::read_to_string(config_dir.join("config")).unwrap(),
+            legacy,
+            "legacy source must be left untouched when JSON already exists"
+        );
+        assert_eq!(
+            fs::read_to_string(config_dir.join("opencode.json")).unwrap(),
+            current_json,
+            "existing opencode.json must not be rewritten"
+        );
+        assert!(
+            !config_dir.join("config.bak").exists(),
+            "no backup (and therefore no removal) should be created"
+        );
+        assert!(
+            config.model.is_none(),
+            "a skipped migration must not alter the in-memory config"
+        );
+    }
+
+    #[test]
+    fn load_global_guard_does_not_rewrite_existing_jsonc_config() {
+        let temp = TestDir::new("opencode_guard_existing_jsonc");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let legacy = "model = \"legacy\"\n";
+        fs::write(config_dir.join("config"), legacy).unwrap();
+        let current_jsonc = r#"{"model":"current-jsonc"}"#;
+        fs::write(config_dir.join("opencode.jsonc"), current_jsonc).unwrap();
+
+        let mut config = Config::default();
+        assert!(migrate_global_config_if_absent(&config_dir, &mut config).is_none());
+
+        assert_eq!(
+            fs::read_to_string(config_dir.join("config")).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            fs::read_to_string(config_dir.join("opencode.jsonc")).unwrap(),
+            current_jsonc
+        );
+        assert!(!config_dir.join("opencode.json").exists());
+    }
+
+    #[test]
+    fn load_global_path_never_rewrites_an_existing_config_file() {
+        let temp = TestDir::new("opencode_load_global_readonly");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let legacy = "model = \"legacy-model\"\n";
+        fs::write(config_dir.join("config"), legacy).unwrap();
+        let current = r#"{"model":"current-model","theme":"dark"}"#;
+        fs::write(config_dir.join("opencode.json"), current).unwrap();
+
+        let mut loader = ConfigLoader::new();
+        loader.load_global_from(&config_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(config_dir.join("config")).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            fs::read_to_string(config_dir.join("opencode.json")).unwrap(),
+            current
+        );
+        assert!(!config_dir.join("config.bak").exists());
+        assert_eq!(loader.config().model.as_deref(), Some("current-model"));
+    }
+
+    #[test]
+    fn update_config_with_empty_plugin_array_clears_existing_plugins() {
+        let temp = TestDir::new("opencode_update_clear_plugins");
+
+        let initial: Config =
+            serde_json::from_str(r#"{"plugin":["plugin-a","plugin-b"]}"#).unwrap();
+        update_config(&temp.path, &initial).unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"plugin":[]}"#).unwrap();
+        assert!(patch.plugin.is_explicit());
+        update_config(&temp.path, &patch).unwrap();
+
+        let content = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
+        let reloaded: Config = serde_json::from_str(&content).unwrap();
+        assert!(
+            reloaded.plugin.is_empty(),
+            "plugin: [] must remove previously persisted plugins"
+        );
+    }
+
+    #[test]
+    fn update_config_without_plugin_key_preserves_existing_plugins() {
+        let temp = TestDir::new("opencode_update_keep_plugins");
+
+        let initial: Config = serde_json::from_str(r#"{"plugin":["plugin-a"]}"#).unwrap();
+        update_config(&temp.path, &initial).unwrap();
+
+        // A patch that never mentions `plugin` must not clear it.
+        let patch: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(!patch.plugin.is_explicit());
+        update_config(&temp.path, &patch).unwrap();
+
+        let content = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
+        let reloaded: Config = serde_json::from_str(&content).unwrap();
+        assert_eq!(reloaded.plugin, vec!["plugin-a".to_string()]);
+    }
+
+    #[test]
+    fn explicit_empty_plugin_array_ignores_opencode_plugin_directory() {
+        let temp = TestDir::new("opencode_explicit_empty_plugin_dir");
+        let plugins_dir = temp.path.join(".opencode/plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+        fs::write(plugins_dir.join("local.ts"), "export default {}").unwrap();
+        fs::write(temp.path.join("opencode.json"), r#"{"plugin":[]}"#).unwrap();
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let config = loader.load_all(&temp.path).unwrap();
+
+        assert!(config.plugin.is_explicit());
+        assert!(
+            config.plugin.is_empty(),
+            "explicit plugin: [] must suppress files found in .opencode/plugins"
+        );
+    }
+
+    #[test]
+    fn absent_plugin_key_still_discovers_opencode_plugin_directory() {
+        let temp = TestDir::new("opencode_absent_plugin_dir");
+        let plugins_dir = temp.path.join(".opencode/plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+        fs::write(plugins_dir.join("local.ts"), "export default {}").unwrap();
+        fs::write(temp.path.join("opencode.json"), r#"{"theme":"dark"}"#).unwrap();
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let config = loader.load_all(&temp.path).unwrap();
+
+        assert!(
+            config
+                .plugin
+                .iter()
+                .any(|plugin| plugin.contains("local.ts")),
+            "an omitted plugin key must keep the additive .opencode/plugins scan"
+        );
+    }
+
+    #[test]
+    fn update_config_empty_plugin_array_survives_reload_without_revival() {
+        let temp = TestDir::new("opencode_reload_empty_plugin");
+        let plugins_dir = temp.path.join(".opencode/plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+        fs::write(plugins_dir.join("local.js"), "module.exports = {}").unwrap();
+
+        let initial: Config = serde_json::from_str(r#"{"plugin":["plugin-a"]}"#).unwrap();
+        update_config(&temp.path, &initial).unwrap();
+        let patch: Config = serde_json::from_str(r#"{"plugin":[]}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        let written = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            value.get("plugin"),
+            Some(&serde_json::json!([])),
+            "the explicit empty array must be persisted, not omitted"
+        );
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let config = loader.load_all(&temp.path).unwrap();
+        assert!(config.plugin.is_explicit());
+        assert!(
+            config.plugin.is_empty(),
+            "plugins from .opencode/plugins must not revive after reload"
+        );
     }
 }
 

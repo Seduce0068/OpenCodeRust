@@ -110,7 +110,10 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
     worktrees
 }
 
-pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+/// 同期実装。git サブプロセスの終了を待つため、axum の非同期ハンドラからは
+/// 直接呼ばず `list_worktrees_async` を利用すること。同期テストからは
+/// このモジュール内で参照できる。
+fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
     if !is_git_repo(repo_path) {
         return Err(WorktreeError::NotGitRepo);
     }
@@ -130,7 +133,9 @@ fn branch_exists(repo_path: &Path, branch_name: &str) -> bool {
     run_git(&["show-ref", "--verify", "--quiet", &refname], repo_path).is_ok()
 }
 
-pub fn create_worktree(
+/// 同期実装。axum の非同期ハンドラからは直接呼ばず
+/// `create_worktree_async` を利用すること。
+fn create_worktree(
     repo_path: &Path,
     branch: Option<&str>,
     target_path: Option<&str>,
@@ -193,7 +198,9 @@ pub fn create_worktree(
     })
 }
 
-pub fn remove_worktree(
+/// 同期実装。axum の非同期ハンドラからは直接呼ばず
+/// `remove_worktree_async` を利用すること。
+fn remove_worktree(
     repo_path: &Path,
     worktree_path: &str,
     force: bool,
@@ -211,13 +218,68 @@ pub fn remove_worktree(
     Ok(())
 }
 
-pub fn prune_worktrees(repo_path: &Path) -> Result<(), WorktreeError> {
+/// 同期実装。axum の非同期ハンドラからは直接呼ばず
+/// `prune_worktrees_async` を利用すること。
+fn prune_worktrees(repo_path: &Path) -> Result<(), WorktreeError> {
     if !is_git_repo(repo_path) {
         return Err(WorktreeError::NotGitRepo);
     }
 
     run_git(&["worktree", "prune"], repo_path)?;
     Ok(())
+}
+
+/// 同期 git 処理を tokio のブロッキングプールへ逃がす共通ヘルパー。
+///
+/// `git` サブプロセスの終了待ちの間、axum のワーカースレッドを占有しないようにする。
+/// `JoinError` の文言には任意のパニックメッセージが含まれ得るため、呼び出し側へ
+/// 返すエラーは固定文言にしてパスや秘密情報の漏洩を防ぐ。
+async fn spawn_blocking_git<T, F>(f: F) -> Result<T, WorktreeError>
+where
+    F: FnOnce() -> Result<T, WorktreeError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| WorktreeError::GitError("blocking task failed".to_string()))?
+}
+
+/// `list_worktrees` をブロッキングプールで実行する非同期ラッパー。
+pub async fn list_worktrees_async(repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+    let repo_path = repo_path.to_path_buf();
+    spawn_blocking_git(move || list_worktrees(&repo_path)).await
+}
+
+/// `create_worktree` をブロッキングプールで実行する非同期ラッパー。
+pub async fn create_worktree_async(
+    repo_path: &Path,
+    branch: Option<&str>,
+    target_path: Option<&str>,
+) -> Result<WorktreeInfo, WorktreeError> {
+    let repo_path = repo_path.to_path_buf();
+    let branch = branch.map(str::to_owned);
+    let target_path = target_path.map(str::to_owned);
+    spawn_blocking_git(move || {
+        create_worktree(&repo_path, branch.as_deref(), target_path.as_deref())
+    })
+    .await
+}
+
+/// `remove_worktree` をブロッキングプールで実行する非同期ラッパー。
+pub async fn remove_worktree_async(
+    repo_path: &Path,
+    worktree_path: &str,
+    force: bool,
+) -> Result<(), WorktreeError> {
+    let repo_path = repo_path.to_path_buf();
+    let worktree_path = worktree_path.to_owned();
+    spawn_blocking_git(move || remove_worktree(&repo_path, &worktree_path, force)).await
+}
+
+/// `prune_worktrees` をブロッキングプールで実行する非同期ラッパー。
+pub async fn prune_worktrees_async(repo_path: &Path) -> Result<(), WorktreeError> {
+    let repo_path = repo_path.to_path_buf();
+    spawn_blocking_git(move || prune_worktrees(&repo_path)).await
 }
 
 #[cfg(test)]
@@ -423,5 +485,101 @@ detached
         assert_eq!(trees[2].path, "/repo/detached-last");
         assert_eq!(trees[2].branch, "HEAD");
         assert_eq!(trees[2].head, "cccccccccccccccccccccccccccccccccccccccc");
+    }
+
+    /// 回帰テスト: 同期 git 実行が async ワーカー上で直接走らないこと。
+    ///
+    /// current_thread ランタイムの唯一のスレッドをブロック処理で占有してしまうと、
+    /// 並行する async タスクのハートビートがタイムアウトする。ブロッキングプールへ
+    /// 逃がしていれば、git の終了待ち中もハートビートは進行する。
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_blocking_git_does_not_block_async_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+
+        // 未来を明示的に spawn してポーリングさせ、並行タスクとして走らせる。
+        let blocking = tokio::spawn(spawn_blocking_git(move || {
+            started_flag.store(true, Ordering::SeqCst);
+            // git サブプロセスの終了待ちを模擬した同期待機。
+            let _ = release_rx.recv();
+            Ok::<(), WorktreeError>(())
+        }));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking task should start");
+
+        let heartbeat = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            42
+        })
+        .await
+        .expect("async worker must not be blocked while git runs");
+        assert_eq!(heartbeat, 42);
+
+        release_tx
+            .send(())
+            .expect("release channel should be alive");
+        blocking
+            .await
+            .expect("blocking task should complete")
+            .expect("blocking task result should be ok");
+    }
+
+    /// 4 つの非同期ラッパーが同期実装と同じエラーを伝播すること。
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_wrappers_propagate_not_git_repo() {
+        let dir = temp_dir();
+        assert!(matches!(
+            list_worktrees_async(&dir).await,
+            Err(WorktreeError::NotGitRepo)
+        ));
+        assert!(matches!(
+            create_worktree_async(&dir, None, None).await,
+            Err(WorktreeError::NotGitRepo)
+        ));
+        assert!(matches!(
+            remove_worktree_async(&dir, "/nonexistent-worktree", false).await,
+            Err(WorktreeError::NotGitRepo)
+        ));
+        assert!(matches!(
+            prune_worktrees_async(&dir).await,
+            Err(WorktreeError::NotGitRepo)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 非同期ラッパー経由でも既存の作成・一覧・削除が成立すること。
+    #[tokio::test]
+    async fn async_worktree_round_trip() {
+        let repo = init_git_repo();
+        let target = worktree_target(&repo);
+
+        let info = create_worktree_async(&repo, Some("feature-async"), Some(target.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(info.path, target);
+        assert_eq!(info.branch, "feature-async");
+
+        let listed = list_worktrees_async(&repo).await.unwrap();
+        assert!(listed
+            .iter()
+            .any(|w| w.path == target && w.branch == "feature-async"));
+
+        remove_worktree_async(&repo, target.as_str(), true)
+            .await
+            .unwrap();
+        // git が worktree ディレクトリを削除するため、リポジトリのみ片付ける。
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 }
