@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct ThemeOption {
     pub id: String,
@@ -21,6 +23,7 @@ pub struct ThemeListDialog {
     initial_theme: String,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl ThemeListDialog {
@@ -34,6 +37,7 @@ impl ThemeListDialog {
             initial_theme: "opencode@dark".to_string(),
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -110,6 +114,15 @@ impl ThemeListDialog {
             .map(|theme| theme.id.clone())
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     fn filter(&mut self) {
         let query = self.query.to_lowercase();
         self.filtered = self
@@ -132,6 +145,7 @@ impl ThemeListDialog {
         }
 
         let dialog_area = centered_rect(58, 16, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -185,7 +199,10 @@ impl ThemeListDialog {
                 .bg(theme.background_element)
                 .add_modifier(Modifier::BOLD),
         );
-        frame.render_stateful_widget(list, layout[1], &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, layout[1], &mut state);
+        self.click_map
+            .set_list(layout[1], state.offset(), self.filtered.len());
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![

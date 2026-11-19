@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct Tag {
     pub id: String,
@@ -20,6 +22,7 @@ pub struct TagDialog {
     pub selected_tags: Vec<String>,
     pub state: ListState,
     pub open: bool,
+    click_map: DialogClickMap,
 }
 
 impl TagDialog {
@@ -29,6 +32,7 @@ impl TagDialog {
             selected_tags: Vec::new(),
             state: ListState::default(),
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -79,6 +83,15 @@ impl TagDialog {
         &self.selected_tags
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open || self.tags.is_empty() {
             return;
@@ -87,6 +100,7 @@ impl TagDialog {
         let height = (self.tags.len() as u16 + 2).min(15);
         let width = 40u16;
         let popup_area = super::centered_rect(width, height, area);
+        self.click_map.set_area(popup_area);
         let block = Block::default()
             .title(" Select Tags ")
             .borders(Borders::ALL)
@@ -112,6 +126,7 @@ impl TagDialog {
         let list = List::new(items).highlight_style(Style::default().fg(theme.primary));
 
         frame.render_widget(list, content_area);
+        self.click_map.set_list(content_area, 0, self.tags.len());
     }
 }
 

@@ -8,12 +8,15 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 pub struct SkillListDialog {
     skills: Vec<String>,
     filtered: Vec<usize>,
     query: String,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl SkillListDialog {
@@ -26,6 +29,7 @@ impl SkillListDialog {
             query: String::new(),
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -81,6 +85,15 @@ impl SkillListDialog {
         self.skills.get(*idx).map(String::as_str)
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     fn filter(&mut self) {
         let query = self.query.to_ascii_lowercase();
         self.filtered = self
@@ -103,6 +116,7 @@ impl SkillListDialog {
         }
 
         let dialog_area = centered_rect(72, 18, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -149,6 +163,7 @@ impl SkillListDialog {
                 .collect::<Vec<_>>()
         };
 
+        let mut state = self.state;
         frame.render_stateful_widget(
             List::new(items).highlight_style(
                 Style::default()
@@ -156,8 +171,15 @@ impl SkillListDialog {
                     .add_modifier(Modifier::BOLD),
             ),
             layout[1],
-            &mut self.state.clone(),
+            &mut state,
         );
+        // 空のときはプレースホルダ行が 1 つあるだけなので選択不可能にする。
+        let count = if self.filtered.is_empty() {
+            0
+        } else {
+            self.filtered.len()
+        };
+        self.click_map.set_list(layout[1], state.offset(), count);
 
         frame.render_widget(
             Paragraph::new("Enter insert /skill  Esc close")

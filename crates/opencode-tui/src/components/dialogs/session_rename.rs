@@ -8,10 +8,13 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 pub struct SessionRenameDialog {
     open: bool,
     session_id: Option<String>,
     input: String,
+    click_map: DialogClickMap,
 }
 
 impl SessionRenameDialog {
@@ -20,6 +23,7 @@ impl SessionRenameDialog {
             open: false,
             session_id: None,
             input: String::new(),
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -37,6 +41,12 @@ impl SessionRenameDialog {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Return `true` when the click landed on the dialog frame, so the app
+    /// keeps the dialog open.
+    pub fn handle_click(&self, col: u16, row: u16) -> bool {
+        self.click_map.contains(col, row)
     }
 
     pub fn handle_input(&mut self, c: char) {
@@ -63,6 +73,7 @@ impl SessionRenameDialog {
         }
 
         let dialog_area = centered_rect(70, 8, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

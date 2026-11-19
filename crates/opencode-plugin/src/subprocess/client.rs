@@ -14,7 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use super::protocol::{RpcError, RpcRequest, RpcResponse};
+use super::protocol::{
+    default_protocol_version, validate_jsonrpc_envelope, RpcError, RpcRequest, RpcResponse,
+    PROTOCOL_VERSION,
+};
 use super::runtime::JsRuntime;
 
 /// 受信する JSON-RPC フレーム本体の上限（10 MiB）。
@@ -66,6 +69,22 @@ impl From<RpcError> for PluginSubprocessError {
     }
 }
 
+/// Reject an `initialize` handshake whose protocol version differs from ours.
+///
+/// The field is optional on the wire for backward compatibility (older hosts
+/// omit it and are treated as `PROTOCOL_VERSION`), but a host that advertises
+/// a *different* version must fail the handshake instead of being silently
+/// accepted.
+fn check_protocol_version(version: u32) -> Result<(), PluginSubprocessError> {
+    if version == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(PluginSubprocessError::Protocol(format!(
+            "plugin protocol version mismatch: expected {PROTOCOL_VERSION}, got {version}"
+        )))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Result types (deserialized from host responses)
 // ---------------------------------------------------------------------------
@@ -75,6 +94,9 @@ pub struct InitializeResult {
     pub name: String,
     pub hooks: Vec<String>,
     pub auth: Option<AuthMeta>,
+    /// Handshake contract version reported by the host.
+    #[serde(rename = "protocolVersion", default = "default_protocol_version")]
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,12 +218,16 @@ impl PluginSubprocess {
             timeout: Duration::from_secs(30),
         };
 
-        // Send initialize
+        // Send initialize, advertising the handshake contract version so the
+        // host can reject a mismatched client just as we reject a mismatched
+        // host result below.
         let params = serde_json::json!({
             "pluginPath": plugin_path,
             "context": context,
+            "protocolVersion": PROTOCOL_VERSION,
         });
         let result: InitializeResult = this.call("initialize", Some(params)).await?;
+        check_protocol_version(result.protocol_version)?;
 
         this.name = result.name;
         this.hooks = result.hooks;
@@ -392,6 +418,16 @@ impl PluginSubprocess {
                     },
                 };
 
+                if let Err(message) = validate_jsonrpc_envelope(&raw) {
+                    Self::report_stream_error(
+                        &chunk_tx,
+                        &mut start_tx,
+                        PluginSubprocessError::Protocol(message),
+                    )
+                    .await;
+                    break;
+                }
+
                 if raw.get("id").and_then(Value::as_u64) == Some(id) {
                     let response: RpcResponse = match serde_json::from_value(raw) {
                         Ok(response) => response,
@@ -575,6 +611,9 @@ impl PluginSubprocess {
                     return Err(err);
                 }
             };
+            // Reject a malformed/unsupported envelope as a protocol error even
+            // when its id does not match, so a bad host cannot keep us waiting.
+            validate_jsonrpc_envelope(&raw).map_err(PluginSubprocessError::Protocol)?;
             if raw.get("id").and_then(Value::as_u64) != Some(expected_id) {
                 continue;
             }
@@ -865,5 +904,98 @@ mod tests {
             matches!(&error, PluginSubprocessError::Protocol(_)),
             "unexpected error: {error}"
         );
+    }
+
+    // -- Version negotiation regression tests -------------------------------
+
+    #[test]
+    fn initialize_result_defaults_protocol_version_when_absent() {
+        // Backward compatibility: an older host that omits `protocolVersion`
+        // is treated as the current version so existing hosts still work.
+        let result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "name": "legacy-host",
+            "hooks": [],
+            "auth": null,
+        }))
+        .expect("legacy initialize result should deserialize");
+        assert_eq!(result.protocol_version, PROTOCOL_VERSION);
+        assert!(check_protocol_version(result.protocol_version).is_ok());
+    }
+
+    #[test]
+    fn initialize_result_detects_protocol_version_mismatch() {
+        let matching: InitializeResult = serde_json::from_value(serde_json::json!({
+            "name": "host",
+            "hooks": [],
+            "auth": null,
+            "protocolVersion": PROTOCOL_VERSION,
+        }))
+        .expect("matching initialize result should deserialize");
+        assert!(check_protocol_version(matching.protocol_version).is_ok());
+
+        let mismatched: InitializeResult = serde_json::from_value(serde_json::json!({
+            "name": "host",
+            "hooks": [],
+            "auth": null,
+            "protocolVersion": PROTOCOL_VERSION + 1,
+        }))
+        .expect("mismatched initialize result should deserialize");
+        let error = check_protocol_version(mismatched.protocol_version)
+            .expect_err("protocol version mismatch must fail the handshake");
+        assert!(matches!(&error, PluginSubprocessError::Protocol(_)));
+        assert!(
+            error.to_string().contains("mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Build a subprocess whose stdout replays a single caller-supplied frame.
+    async fn framed_plugin_subprocess(body: &str) -> PluginSubprocess {
+        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut child = Command::new("printf")
+            .arg(frame)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn printf fixture");
+        let stdin = child.stdin.take().expect("take stdin");
+        let stdout = child.stdout.take().expect("take stdout");
+        PluginSubprocess {
+            name: String::new(),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            rpc_lock: Arc::new(Mutex::new(())),
+            process: Mutex::new(child),
+            request_id: AtomicU64::new(1),
+            hooks: Vec::new(),
+            auth_meta: None,
+            timeout: Duration::from_millis(500),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_with_wrong_jsonrpc_is_protocol_error() {
+        let sub = framed_plugin_subprocess(r#"{"jsonrpc":"1.0","id":1}"#).await;
+        let error = sub
+            .read_response_for_id(1)
+            .await
+            .expect_err("non-2.0 response must be rejected");
+        assert!(matches!(&error, PluginSubprocessError::Protocol(_)));
+        assert!(
+            error.to_string().contains("jsonrpc"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_with_valid_jsonrpc_is_accepted() {
+        let sub = framed_plugin_subprocess(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).await;
+        let response = sub
+            .read_response_for_id(1)
+            .await
+            .expect("JSON-RPC 2.0 response should be accepted");
+        assert_eq!(response.jsonrpc, "2.0");
+        assert_eq!(response.result, Some(serde_json::json!(1)));
     }
 }

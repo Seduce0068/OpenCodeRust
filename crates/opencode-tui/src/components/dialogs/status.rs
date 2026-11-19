@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub enum StatusLineKind {
     Title,
@@ -71,6 +73,7 @@ impl StatusLine {
 pub struct StatusDialog {
     lines: Vec<StatusLine>,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl StatusDialog {
@@ -78,6 +81,7 @@ impl StatusDialog {
         Self {
             lines: Vec::new(),
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -101,12 +105,19 @@ impl StatusDialog {
         self.open
     }
 
+    /// Return `true` when the click landed on the dialog frame, so the app
+    /// keeps the dialog open.
+    pub fn handle_click(&self, col: u16, row: u16) -> bool {
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
         }
 
         let dialog_area = centered_rect(90, 24, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

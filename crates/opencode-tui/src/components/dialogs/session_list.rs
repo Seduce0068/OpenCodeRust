@@ -9,6 +9,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct SessionItem {
     pub id: String,
@@ -35,6 +37,7 @@ pub struct SessionListDialog {
     pending_delete_session_id: Option<String>,
     rename_session_id: Option<String>,
     rename_input: String,
+    click_map: DialogClickMap,
 }
 
 impl SessionListDialog {
@@ -51,6 +54,7 @@ impl SessionListDialog {
             pending_delete_session_id: None,
             rename_session_id: None,
             rename_input: String::new(),
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -128,6 +132,17 @@ impl SessionListDialog {
                 self.pending_delete_session_id = None;
             }
         }
+    }
+
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if !self.is_renaming() {
+            if let Some(index) = self.click_map.item_at(col, row) {
+                self.state.select(Some(index));
+            }
+        }
+        self.click_map.contains(col, row)
     }
 
     pub fn selected_session_id(&self) -> Option<String> {
@@ -215,6 +230,7 @@ impl SessionListDialog {
         }
 
         let dialog_area = centered_rect(82, 24, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -306,7 +322,10 @@ impl SessionListDialog {
                 .bg(theme.background_element)
                 .add_modifier(Modifier::BOLD),
         );
-        frame.render_stateful_widget(list, layout[1], &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, layout[1], &mut state);
+        self.click_map
+            .set_list(layout[1], state.offset(), self.filtered.len());
 
         let action_line = if self.is_renaming() {
             Line::from(vec![

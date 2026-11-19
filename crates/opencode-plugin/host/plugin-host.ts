@@ -40,6 +40,12 @@ interface PluginContext {
 
 type UnknownRecord = Record<string, unknown>;
 
+/**
+ * Initialize handshake version. Must match `PROTOCOL_VERSION` in Rust's
+ * `crates/opencode-plugin/src/subprocess/protocol.rs`.
+ */
+const PROTOCOL_VERSION = 1;
+
 interface Hooks {
   [key: string]: ((input: unknown, output: unknown) => Promise<unknown>) | unknown;
 }
@@ -134,7 +140,22 @@ async function readMessage(): Promise<JsonRpcRequest | null> {
 
   const contentLength = parseInt(match[1], 10);
   const body = await readExact(contentLength);
-  return JSON.parse(decoder.decode(body));
+
+  const parsed: unknown = JSON.parse(decoder.decode(body));
+  const record =
+    typeof parsed === "object" && parsed !== null ? (parsed as UnknownRecord) : null;
+  if (record?.["jsonrpc"] !== "2.0") {
+    const received = record?.["jsonrpc"];
+    const message = `Invalid JSON-RPC version: expected "2.0", got ${JSON.stringify(received)}`;
+    // Reply with a JSON-RPC error when an id is available; the main loop then
+    // breaks and the host exits, so a mismatched peer cannot keep running.
+    const id = record?.["id"];
+    if (typeof id === "number") {
+      sendError(id, -32600, message);
+    }
+    throw new Error(message);
+  }
+  return parsed as JsonRpcRequest;
 }
 
 function send(response: JsonRpcResponse): void {
@@ -496,8 +517,23 @@ function validatePluginImportPath(pluginPath: unknown): ValidatedPluginPath {
 
 async function handleInitialize(
   id: number,
-  params: { pluginPath: string; context: PluginContext },
+  params: { pluginPath: string; context: PluginContext; protocolVersion?: number },
 ): Promise<void> {
+  // Both sides advertise the version. A missing field is accepted for
+  // compatibility with older clients (treated as the current version), but an
+  // explicit mismatch fails the handshake.
+  if (
+    params?.protocolVersion !== undefined &&
+    params.protocolVersion !== PROTOCOL_VERSION
+  ) {
+    sendError(
+      id,
+      -32600,
+      `Protocol version mismatch: expected ${PROTOCOL_VERSION}, got ${params.protocolVersion}`,
+    );
+    return;
+  }
+
   const validated = validatePluginImportPath(params?.pluginPath);
   if (!validated.ok) {
     sendError(id, -32602, `Rejected plugin import: ${validated.reason}`);
@@ -544,6 +580,7 @@ async function handleInitialize(
     }
 
     sendResult(id, {
+      protocolVersion: PROTOCOL_VERSION,
       name: validated.importPath.split("/").pop()?.replace(/\.[tj]s$/, "") ?? "unknown",
       hooks: hookNames,
       auth: authMeta,
