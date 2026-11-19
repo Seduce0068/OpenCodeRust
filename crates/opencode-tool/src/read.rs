@@ -177,7 +177,7 @@ impl Tool for ReadTool {
         if metadata.is_dir() {
             ctx.do_file_time_read(path_str.clone()).await?;
             ctx.do_lsp_touch_file(path_str.clone(), false).await?;
-            return read_directory(&path, offset, limit, title);
+            return read_directory(&path, offset, limit, title).await;
         }
 
         let content = fs::read(&path).await.map_err(|e| {
@@ -287,31 +287,42 @@ fn handle_binary_file(
     })
 }
 
-fn read_directory(
+async fn read_directory(
     path: &Path,
     offset: usize,
     limit: usize,
     title: String,
 ) -> Result<ToolResult, ToolError> {
-    let mut entries: Vec<String> = Vec::new();
+    // 走査は同期 I/O なので、所有値を move したクロージャを spawn_blocking に
+    // 逃がし、tokio ワーカーを占有しないようにする。
+    let path_buf = path.to_path_buf();
+    let mut entries: Vec<String> = tokio::task::spawn_blocking(move || {
+        let mut entries: Vec<String> = Vec::new();
 
-    for entry in WalkDir::new(path)
-        .max_depth(1)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.path() == path {
-            continue;
+        for entry in WalkDir::new(&path_buf)
+            .max_depth(1)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path() == path_buf.as_path() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().is_dir() {
+                entries.push(format!("{}/", name));
+            } else {
+                entries.push(name);
+            }
         }
 
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry.file_type().is_dir() {
-            entries.push(format!("{}/", name));
-        } else {
-            entries.push(name);
-        }
-    }
+        entries
+    })
+    .await
+    .map_err(|e| {
+        ToolError::execution_with_source(format!("directory scan task failed: {}", e), e)
+    })?;
 
     entries.sort();
 
