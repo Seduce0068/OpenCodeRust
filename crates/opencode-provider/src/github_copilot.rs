@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use tracing;
@@ -430,27 +430,59 @@ impl GitHubCopilotProvider {
             ));
         }
 
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk_result| match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" {
-                                return Ok(StreamEvent::Done);
+        // bytes_stream() のチャンクは SSE 行の途中で終わり得るため、
+        // SseLineBuffer に生バイトのまま積み、改行が確定した完全な行だけを
+        // デコードしてパーサへ渡す。イベントは行の順番どおりに放出する。
+        // Responses API 経由のストリーム（responses.rs）は変更しない。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                crate::stream::SseLineBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, buffer, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            for line in buffer.push(bytes.as_ref()) {
+                                push_copilot_sse_line(&line, &mut pending);
                             }
-                            if let Some(event) = parse_copilot_sse(data) {
-                                return Ok(event);
+                        }
+                        Some(Err(err)) => return Err(ProviderError::StreamError(err.to_string())),
+                        None => {
+                            exhausted = true;
+                            for line in buffer.flush() {
+                                push_copilot_sse_line(&line, &mut pending);
                             }
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
+    }
+}
+
+/// 完全な SSE 行をパースし、生成されたイベントを `pending` へ積む。
+///
+/// `[DONE]` と `data: ` で始まらない行（イベント名や空行）の扱いは従来どおり。
+fn push_copilot_sse_line(line: &str, pending: &mut VecDeque<StreamEvent>) {
+    if let Some(data) = line.strip_prefix("data: ") {
+        if data == "[DONE]" {
+            pending.push_back(StreamEvent::Done);
+        } else if let Some(event) = parse_copilot_sse(data) {
+            pending.push_back(event);
+        }
     }
 }
 
@@ -793,5 +825,33 @@ mod tests {
 
         unregister_custom_fetch_proxy("github-copilot");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sse_buffer_reassembles_split_line_and_multibyte_text() {
+        let mut buffer = crate::stream::SseLineBuffer::new();
+        let mut pending = VecDeque::new();
+
+        let text = "こんにちは";
+        let text_bytes = text.as_bytes();
+        assert_eq!(text_bytes[0], 0xE3);
+
+        let mut first = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        first.extend_from_slice(&text_bytes[..1]);
+        for line in buffer.push(&first) {
+            push_copilot_sse_line(&line, &mut pending);
+        }
+        assert!(pending.is_empty(), "行が確定する前はイベントを出さない");
+
+        let mut second = text_bytes[1..].to_vec();
+        second.extend_from_slice(b"\"}}]}\n\ndata: [DONE]\n\n");
+        for line in buffer.push(&second) {
+            push_copilot_sse_line(&line, &mut pending);
+        }
+
+        let events: Vec<StreamEvent> = pending.into_iter().collect();
+        assert_eq!(events.len(), 2, "イベントは行の順番どおり: {events:?}");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(delta) if delta == text));
+        assert!(matches!(&events[1], StreamEvent::Done));
     }
 }

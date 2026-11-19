@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, ModelInfo, Provider, ProviderError, StreamEvent, StreamResult,
@@ -129,24 +130,57 @@ impl Provider for PerplexityProvider {
             return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
         }
 
-        let stream = response
-            .bytes_stream()
-            .map(|chunk_result| match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if let Some(event) = crate::stream::parse_openai_sse(data) {
-                                return Ok(event);
-                            }
+        // bytes_stream のチャンク境界をまたぐ SSE 行を SseLineBuffer で組み立てる。
+        // 完全な行が確定してからデコードするため、UTF-8 文字の途中でチャンクが
+        // 切れても U+FFFD に置換されずに復元される。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                crate::stream::SseLineBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, buffer, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            push_openai_sse_lines(buffer.push(bytes.as_ref()), &mut pending);
+                        }
+                        Some(Err(err)) => {
+                            return Err(ProviderError::StreamError(err.to_string()));
+                        }
+                        None => {
+                            exhausted = true;
+                            // 終端で改行のない末尾行を処理する。
+                            push_openai_sse_lines(buffer.flush(), &mut pending);
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
+    }
+}
+
+/// SseLineBuffer が返した完全な SSE 行のうち `data: ` 行だけを OpenAI 互換パーサへ渡す。
+///
+/// `data: ` で始まらない行（イベント名や空行）は従来どおり無視する。
+fn push_openai_sse_lines(lines: Vec<String>, pending: &mut VecDeque<StreamEvent>) {
+    for line in lines {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(event) = crate::stream::parse_openai_sse(data) {
+                pending.push_back(event);
+            }
+        }
     }
 }
 
@@ -270,5 +304,36 @@ mod tests {
 
         assert!(models.is_empty());
         assert_eq!(provider.models().len(), 4);
+    }
+
+    #[test]
+    fn sse_line_buffer_reassembles_split_openai_event() {
+        use crate::stream::SseLineBuffer;
+
+        let mut buffer = SseLineBuffer::new();
+        let mut pending = VecDeque::new();
+        let text = "こんにちは";
+        let line = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n");
+        let bytes = line.as_bytes();
+        // "こ" の先頭バイト 0xE3 の直後で分割し、UTF-8 途中分割を再現する。
+        let split = bytes
+            .iter()
+            .position(|byte| *byte == 0xE3)
+            .expect("UTF-8 先頭バイト")
+            + 1;
+
+        push_openai_sse_lines(buffer.push(&bytes[..split]), &mut pending);
+        assert!(pending.is_empty(), "完全な行が揃うまでイベントを出さない");
+
+        push_openai_sse_lines(buffer.push(&bytes[split..]), &mut pending);
+        assert!(
+            matches!(pending.pop_front(), Some(StreamEvent::TextDelta(delta)) if delta == text),
+            "分割されたマルチバイト文字は U+FFFD に置換されず復元される必要がある"
+        );
+        assert!(pending.is_empty());
+
+        push_openai_sse_lines(buffer.push(b"data: [DONE]\n"), &mut pending);
+        assert!(matches!(pending.pop_front(), Some(StreamEvent::Done)));
+        assert!(pending.is_empty());
     }
 }

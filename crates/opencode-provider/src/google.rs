@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, Choice, Content, Message, ModelInfo, Provider, ProviderError, Role,
@@ -229,24 +230,58 @@ impl Provider for GoogleProvider {
             return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
         }
 
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk_result| match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if let Some(event) = parse_google_sse(data) {
-                                return Ok(event);
+        // bytes_stream() のチャンクは SSE 行の途中で終わり得るため、
+        // SseLineBuffer に生バイトのまま積み、改行が確定した完全な行だけを
+        // デコードしてパーサへ渡す。イベントは行の順番どおりに放出する。
+        // parse_google_sse の usage_metadata / finish_reason の扱いは変更しない。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                crate::stream::SseLineBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, buffer, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            for line in buffer.push(bytes.as_ref()) {
+                                push_google_sse_line(&line, &mut pending);
+                            }
+                        }
+                        Some(Err(err)) => return Err(ProviderError::StreamError(err.to_string())),
+                        None => {
+                            exhausted = true;
+                            for line in buffer.flush() {
+                                push_google_sse_line(&line, &mut pending);
                             }
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
+    }
+}
+
+/// 完全な SSE 行をパースし、生成されたイベントを `pending` へ積む。
+///
+/// `data: ` で始まらない行（イベント名や空行）は従来どおり無視する。
+/// `usage_metadata` / `finish_reason` は `parse_google_sse` が従来どおり扱う。
+fn push_google_sse_line(line: &str, pending: &mut VecDeque<StreamEvent>) {
+    if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(event) = parse_google_sse(data) {
+            pending.push_back(event);
+        }
     }
 }
 
@@ -558,5 +593,39 @@ mod tests {
             parse_google_sse(r#"{"candidates":[{"content":{"parts":[],"role":"model"}}]}"#)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sse_buffer_reassembles_split_line_and_keeps_google_parse_semantics() {
+        let mut buffer = crate::stream::SseLineBuffer::new();
+        let mut pending = VecDeque::new();
+
+        let text = "こんにちは";
+        let text_bytes = text.as_bytes();
+        assert_eq!(text_bytes[0], 0xE3);
+
+        let mut first = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"".to_vec();
+        first.extend_from_slice(&text_bytes[..1]);
+        for line in buffer.push(&first) {
+            push_google_sse_line(&line, &mut pending);
+        }
+        assert!(pending.is_empty(), "行が確定する前はイベントを出さない");
+
+        let mut second = text_bytes[1..].to_vec();
+        // finish_reason / usage_metadata を含めても parse_google_sse の挙動は不変。
+        second.extend_from_slice(
+            b"\"}],\"role\":\"model\"},\"finish_reason\":\"STOP\"}],\"usage_metadata\":{\"prompt_token_count\":1,\"candidates_token_count\":2,\"total_token_count\":3}}\n\n",
+        );
+        for line in buffer.push(&second) {
+            push_google_sse_line(&line, &mut pending);
+        }
+
+        let events: Vec<StreamEvent> = pending.into_iter().collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "usage_metadata/finish_reason は追加イベントを出さない: {events:?}"
+        );
+        assert!(matches!(&events[0], StreamEvent::TextDelta(delta) if delta == text));
     }
 }

@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, Choice, Content, Message, ModelInfo, Provider, ProviderError, Role,
@@ -180,25 +181,41 @@ impl Provider for VercelProvider {
             ));
         }
 
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk_result| match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" {
-                                return Ok(StreamEvent::Done);
-                            }
-                            if let Some(event) = parse_vercel_sse(data) {
-                                return Ok(event);
-                            }
+        // チャンク境界で SSE 行や UTF-8 文字が分断されても取りこぼさないよう、
+        // 生バイトを SseLineBuffer に保持し、行が確定してからパースする。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                crate::stream::SseLineBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut line_buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, line_buffer, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            push_vercel_events(line_buffer.push(bytes.as_ref()), &mut pending);
+                        }
+                        Some(Err(e)) => {
+                            return Err(ProviderError::StreamError(e.to_string()));
+                        }
+                        None => {
+                            exhausted = true;
+                            // 改行の無い末尾行も処理する。
+                            push_vercel_events(line_buffer.flush(), &mut pending);
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -346,6 +363,23 @@ fn parse_vercel_sse(data: &str) -> Option<StreamEvent> {
     }
 
     None
+}
+
+/// 確定した SSE 行を Vercel パーサへ渡し、生成されたイベントを `pending` に積む。
+///
+/// `[DONE]` は従来どおり `StreamEvent::Done` に変換する。
+fn push_vercel_events(lines: Vec<String>, pending: &mut VecDeque<StreamEvent>) {
+    for line in lines {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                pending.push_back(StreamEvent::Done);
+                continue;
+            }
+            if let Some(event) = parse_vercel_sse(data) {
+                pending.push_back(event);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
