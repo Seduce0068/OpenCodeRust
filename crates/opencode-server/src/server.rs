@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use axum::{
     extract::State,
-    http::{header, header::HeaderValue, request::Parts, HeaderName, Method, Request, StatusCode},
+    http::{header, header::HeaderValue, request::Parts, HeaderName, Method, Request},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    Json,
 };
 use futures::StreamExt;
 use once_cell::sync::Lazy;
@@ -39,6 +38,7 @@ use opencode_session::SessionManager;
 use opencode_storage::InputRepository;
 use opencode_storage::{Database, MessageRepository, SessionRepository};
 
+use crate::error::ApiError;
 use crate::pty::PtyManager;
 use crate::routes;
 
@@ -1165,6 +1165,25 @@ async fn request_span_middleware(request: Request<axum::body::Body>, next: Next)
     next.run(request).instrument(span).await
 }
 
+/// CORS の `Access-Control-Allow-Headers` に明示的に含めるヘッダ名。
+///
+/// - `x-opencode-directory`: cross-origin の session create が作業ディレクトリを
+///   指定するために送るヘッダ。
+/// - `x-request-id`: フロントエンドから渡す相関ログ ID（`request_span_middleware`
+///   がスパン属性として記録する）。
+///
+/// `AllowHeaders::mirror_request()` はリクエストが要求したヘッダを無条件に許可
+/// するため、ここでは許可ヘッダを明示的に列挙する方式を採用した。
+fn cors_allow_headers() -> [HeaderName; 5] {
+    [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+        HeaderName::from_static("x-opencode-directory"),
+        HeaderName::from_static("x-request-id"),
+    ]
+}
+
 fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
@@ -1179,7 +1198,37 @@ fn cors_layer() -> CorsLayer {
             Method::PATCH,
             Method::DELETE,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .allow_headers(cors_allow_headers())
+}
+
+/// `auth_middleware` の判定を外部状態なしで検証するための純粋関数。
+///
+/// `Misconfigured` は fail-open を防ぐための分岐（認証有効・トークン未設定）で、
+/// 呼び出し側は 500 を返す。トークン値は判定にのみ使い、ログへは出さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthDecision {
+    Pass,
+    Unauthorized,
+    Misconfigured,
+}
+
+fn auth_decision(
+    auth_enabled: bool,
+    expected_token: Option<&str>,
+    supplied_bearer: Option<&str>,
+) -> AuthDecision {
+    if !auth_enabled {
+        return AuthDecision::Pass;
+    }
+
+    let Some(expected) = expected_token else {
+        return AuthDecision::Misconfigured;
+    };
+
+    match supplied_bearer {
+        Some(token) if token == expected => AuthDecision::Pass,
+        _ => AuthDecision::Unauthorized,
+    }
 }
 
 async fn auth_middleware(
@@ -1187,33 +1236,34 @@ async fn auth_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if !is_auth_enabled() {
-        return next.run(request).await;
-    }
-
-    let expected_token = state.auth_token.as_deref();
-    let Some(expected) = expected_token else {
-        return next.run(request).await;
-    };
-
-    let headers = request.headers();
-    let auth_header = headers
+    let supplied_bearer = request
+        .headers()
         .get(HeaderName::from_static("authorization"))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
+    let decision = auth_decision(
+        is_auth_enabled(),
+        state.auth_token.as_deref(),
+        supplied_bearer,
+    );
 
-    match auth_header {
-        Some(token) if token == expected => next.run(request).await,
-        _ => {
+    match decision {
+        AuthDecision::Pass => next.run(request).await,
+        AuthDecision::Unauthorized => {
             tracing::warn!("Authentication failed: invalid or missing token");
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "unauthorized",
-                    "message": "Invalid or missing authentication token"
-                })),
-            )
+            ApiError::Unauthorized("Invalid or missing authentication token".to_owned())
                 .into_response()
+        }
+        AuthDecision::Misconfigured => {
+            // 認証が有効なのにトークンが未設定なら全リクエストを素通しさせず
+            // 500 で拒否する（設定不変条件違反）。トークン値は出力しない。
+            tracing::error!(
+                "authentication is enabled but no auth token is configured; refusing request"
+            );
+            ApiError::InternalError(
+                "Authentication is enabled but no token is configured".to_owned(),
+            )
+            .into_response()
         }
     }
 }
@@ -2105,5 +2155,257 @@ mod tests {
         assert!(is_allowed_origin("https://opencode.ai"));
         assert!(is_allowed_origin("https://www.opencode.ai"));
         assert!(!is_allowed_origin("http://opencode.ai"));
+    }
+
+    // ---- R2 回帰テスト: CORS カスタムヘッダ / 401 スキーマ / fail-open ----
+    use axum::http::StatusCode;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn cors_allow_headers_include_custom_headers_for_session_and_telemetry() {
+        let headers = cors_allow_headers();
+        let names: Vec<&str> = headers.iter().map(|h| h.as_str()).collect();
+        assert!(names.contains(&"x-opencode-directory"));
+        assert!(names.contains(&"x-request-id"));
+        assert!(names.contains(&"authorization"));
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"accept"));
+    }
+
+    /// ループバックのテストサーバへ素の HTTP/1.1 リクエストを送り、
+    /// (status, ヘッダ(小文字), body) を返す。
+    ///
+    /// tower が workspace から削除済みのため `ServiceExt::oneshot` は使えず、
+    /// routes.rs の既存パターンに倣い tokio + axum のみで実ミドルウェアを通す。
+    async fn http_exchange(addr: SocketAddr, raw_request: &str) -> (StatusCode, String, String) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect to loopback test server");
+            stream
+                .write_all(raw_request.as_bytes())
+                .await
+                .expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.expect("read response");
+            let raw = String::from_utf8(raw).expect("response should be utf-8");
+            let status: u16 = raw
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("status line")
+                .parse()
+                .expect("numeric status");
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+            (
+                StatusCode::from_u16(status).expect("valid status"),
+                head.to_ascii_lowercase(),
+                body.to_string(),
+            )
+        })
+        .await
+        .expect("http exchange should not hang")
+    }
+
+    async fn start_test_server(
+        app: axum::Router,
+    ) -> Option<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("SKIPPED: loopback bind unavailable ({err})");
+                return None;
+            }
+        };
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("test server stopped: {err}");
+            }
+        });
+        Some((addr, server))
+    }
+
+    fn auth_test_app(state: Arc<ServerState>) -> axum::Router {
+        axum::Router::new()
+            .route("/protected", axum::routing::get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state,
+                |State(state): State<Arc<ServerState>>,
+                 request: Request<axum::body::Body>,
+                 next: Next| async move { auth_middleware(state, request, next).await },
+            ))
+    }
+
+    fn parse_json_body(body: &str) -> serde_json::Value {
+        // chunked 転送のフレームが付いても JSON オブジェクト部分だけを拾う。
+        let start = body.find('{').expect("JSON object in body");
+        let end = body.rfind('}').expect("JSON object in body");
+        serde_json::from_str(&body[start..=end]).expect("valid JSON body")
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_session_directory_and_request_id_headers() {
+        // 設定そのものの検証は loopback 可否に依存させない（必ず走るガード）。
+        cors_allow_headers_include_custom_headers_for_session_and_telemetry();
+
+        let app = axum::Router::new()
+            .route("/session", axum::routing::get(|| async { "ok" }))
+            .layer(cors_layer());
+        let Some((addr, server)) = start_test_server(app).await else {
+            return;
+        };
+
+        let request = concat!(
+            "OPTIONS /session HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Origin: http://localhost:3000\r\n",
+            "Access-Control-Request-Method: POST\r\n",
+            "Access-Control-Request-Headers: x-opencode-directory, x-request-id, content-type\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        let (status, headers, _) = http_exchange(addr, request).await;
+        assert_eq!(status, StatusCode::OK, "preflight should be permitted");
+        let allow_headers = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("access-control-allow-headers:"))
+            .expect("preflight must return Access-Control-Allow-Headers")
+            .trim()
+            .to_ascii_lowercase();
+        assert!(
+            allow_headers.contains("x-opencode-directory"),
+            "cross-origin session create must be allowed: {allow_headers}"
+        );
+        assert!(
+            allow_headers.contains("x-request-id"),
+            "correlation header must be allowed: {allow_headers}"
+        );
+        assert!(allow_headers.contains("content-type"));
+        server.abort();
+    }
+
+    #[test]
+    fn auth_decision_fails_closed_when_auth_enabled_but_token_missing() {
+        assert_eq!(
+            auth_decision(true, None, Some("candidate")),
+            AuthDecision::Misconfigured
+        );
+        assert_eq!(auth_decision(true, None, None), AuthDecision::Misconfigured);
+        // 明示的な認証無効化は既存どおり素通し（後方互換）。
+        assert_eq!(auth_decision(false, None, None), AuthDecision::Pass);
+        assert_eq!(auth_decision(false, Some("t"), None), AuthDecision::Pass);
+    }
+
+    #[test]
+    fn auth_decision_accepts_only_exact_bearer_token() {
+        assert_eq!(
+            auth_decision(true, Some("test-token-abc123"), Some("test-token-abc123")),
+            AuthDecision::Pass
+        );
+        assert_eq!(
+            auth_decision(true, Some("test-token-abc123"), None),
+            AuthDecision::Unauthorized
+        );
+        assert_eq!(
+            auth_decision(true, Some("test-token-abc123"), Some("wrong-token")),
+            AuthDecision::Unauthorized
+        );
+    }
+
+    // current_thread ランタイムで実行され、ガードは環境変数の復元のためだけに
+    // 短く保持する。他テストとの直列化が必要なため allow を局所的に付与する。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auth_middleware_returns_common_error_schema_on_401() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+        std::env::remove_var("OPENCODE_NO_AUTH"); // auth enabled
+
+        let state = Arc::new(ServerState::new());
+        let token = state.auth_token.clone().expect("generated token");
+        let app = auth_test_app(state);
+        let Some((addr, server)) = start_test_server(app).await else {
+            return;
+        };
+
+        let request = "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        let (status, _, body) = http_exchange(addr, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let parsed = parse_json_body(&body);
+        assert_eq!(parsed["error"]["type"], "unauthorized");
+        assert_eq!(
+            parsed["error"]["message"],
+            "Invalid or missing authentication token"
+        );
+        assert_eq!(
+            parsed["message"], "Invalid or missing authentication token",
+            "legacy top-level message must remain for existing clients"
+        );
+        assert!(
+            !parsed.to_string().contains(&token),
+            "auth token value must never appear in an error body"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auth_middleware_fails_closed_with_500_when_token_is_missing() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+        std::env::remove_var("OPENCODE_NO_AUTH"); // auth enabled
+
+        let mut state = ServerState::new();
+        let token = state.auth_token.take().expect("generated token");
+        let app = auth_test_app(Arc::new(state));
+        let Some((addr, server)) = start_test_server(app).await else {
+            return;
+        };
+
+        let request = "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        let (status, _, body) = http_exchange(addr, request).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing token must fail closed with 500"
+        );
+        let parsed = parse_json_body(&body);
+        assert_eq!(parsed["error"]["type"], "internal_error");
+        assert!(
+            !parsed.to_string().contains(&token),
+            "auth token value must never appear in an error body"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auth_middleware_still_allows_valid_bearer_token() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+        std::env::remove_var("OPENCODE_NO_AUTH"); // auth enabled
+
+        let state = Arc::new(ServerState::new());
+        let token = state.auth_token.clone().expect("generated token");
+        let app = auth_test_app(state);
+        let Some((addr, server)) = start_test_server(app).await else {
+            return;
+        };
+
+        let request = format!(
+            "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let (status, _, body) = http_exchange(addr, &request).await;
+        assert_eq!(status, StatusCode::OK, "valid token must still pass");
+        assert!(body.contains("ok"));
+        server.abort();
     }
 }

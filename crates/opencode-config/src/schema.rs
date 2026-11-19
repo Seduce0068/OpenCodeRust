@@ -1,5 +1,143 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+
+/// A string list that records whether its JSON key was explicitly present.
+///
+/// Config sources are merged from low to high precedence. Previously an omitted
+/// key and an explicit empty array were indistinguishable, which made it
+/// impossible to clear accumulated values such as `plugin`. Keeping the
+/// presence bit lets `Config::merge` retain additive behavior for omitted keys
+/// while treating an explicit empty array as a replacement (clear) operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExplicitStringList {
+    items: Vec<String>,
+    explicitly_set: bool,
+}
+
+impl ExplicitStringList {
+    /// Create a list as if its key was absent from the source document.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Values held by this list.
+    pub fn as_slice(&self) -> &[String] {
+        &self.items
+    }
+
+    /// Consume the list and return its values.
+    pub fn into_inner(self) -> Vec<String> {
+        self.items
+    }
+
+    /// Whether the source document explicitly contained this key.
+    pub fn is_explicit(&self) -> bool {
+        self.explicitly_set
+    }
+
+    /// Whether the list holds no values.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Whether serialization should omit this key.
+    ///
+    /// Only a key that was absent from every config source is omitted. An
+    /// explicit empty array must be written back so a later load still sees the
+    /// "clear the list" directive instead of treating the key as missing.
+    pub fn should_skip_serializing(&self) -> bool {
+        !self.explicitly_set
+    }
+
+    /// Build a list from values, recording the key as explicitly present.
+    pub fn from_values(items: Vec<String>) -> Self {
+        Self {
+            items,
+            explicitly_set: true,
+        }
+    }
+
+    /// Rebuild values while preserving the original presence bit.
+    pub fn map_values(self, f: impl FnOnce(Vec<String>) -> Vec<String>) -> Self {
+        Self {
+            items: f(self.items),
+            explicitly_set: self.explicitly_set,
+        }
+    }
+
+    /// Replace values and record the key as explicitly present.
+    pub fn replace_values(&mut self, items: Vec<String>) {
+        self.items = items;
+        self.explicitly_set = true;
+    }
+}
+
+impl Deref for ExplicitStringList {
+    type Target = Vec<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl DerefMut for ExplicitStringList {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+impl From<Vec<String>> for ExplicitStringList {
+    fn from(items: Vec<String>) -> Self {
+        Self::from_values(items)
+    }
+}
+
+impl FromIterator<String> for ExplicitStringList {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        Self::from_values(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for ExplicitStringList {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ExplicitStringList {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl PartialEq<Vec<String>> for ExplicitStringList {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        self.items == *other
+    }
+}
+
+impl Serialize for ExplicitStringList {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExplicitStringList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let items = Vec::<String>::deserialize(deserializer)?;
+        Ok(Self {
+            items,
+            explicitly_set: true,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -34,8 +172,13 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watcher: Option<WatcherConfig>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub plugin: Vec<String>,
+    // An explicit `plugin: []` is a clear directive, not "nothing to write":
+    // omitting it would let a later load resurrect plugins from other layers.
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub plugin: ExplicitStringList,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<bool>,
@@ -102,8 +245,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lsp: Option<LspConfig>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub instructions: Vec<String>,
+    #[serde(default, skip_serializing_if = "ExplicitStringList::is_empty")]
+    pub instructions: ExplicitStringList,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<LayoutMode>,
@@ -1351,6 +1494,25 @@ fn append_unique_keep_order(target: &mut Vec<String>, source: Vec<String>) {
     }
 }
 
+/// Merge one config layer's string list into the accumulated one.
+///
+/// Omitted keys (`explicitly_set == false`) leave the target untouched so
+/// lower-precedence sources still contribute values. An explicit empty array
+/// is a deletion list: it replaces the target with an empty list instead of
+/// being silently ignored as "nothing to add". Non-empty explicit lists keep
+/// the additive, order-preserving behavior across config layers.
+fn merge_explicit_string_list(target: &mut ExplicitStringList, source: ExplicitStringList) {
+    if !source.is_explicit() {
+        return;
+    }
+    if source.is_empty() {
+        target.replace_values(Vec::new());
+        return;
+    }
+    append_unique_keep_order(&mut target.items, source.into_inner());
+    target.explicitly_set = true;
+}
+
 impl DeepMerge for KeybindsConfig {
     fn deep_merge(&mut self, other: Self) {
         merge_option_replace(&mut self.leader, other.leader);
@@ -1852,8 +2014,8 @@ impl Config {
         merge_option_deep(&mut self.experimental, other.experimental);
         merge_option_map_overwrite_values(&mut self.env, other.env);
 
-        append_unique_keep_order(&mut self.plugin, other.plugin);
-        append_unique_keep_order(&mut self.instructions, other.instructions);
+        merge_explicit_string_list(&mut self.plugin, other.plugin);
+        merge_explicit_string_list(&mut self.instructions, other.instructions);
 
         if !other.disabled_providers.is_empty() {
             self.disabled_providers = other.disabled_providers;
@@ -1952,14 +2114,14 @@ mod tests {
     #[test]
     fn plugin_and_instruction_arrays_append_unique_keep_order() {
         let mut base = Config {
-            plugin: vec!["a".to_string(), "b".to_string()],
-            instructions: vec!["one".to_string(), "two".to_string()],
+            plugin: vec!["a".to_string(), "b".to_string()].into(),
+            instructions: vec!["one".to_string(), "two".to_string()].into(),
             ..Default::default()
         };
 
         let overlay = Config {
-            plugin: vec!["b".to_string(), "c".to_string()],
-            instructions: vec!["two".to_string(), "three".to_string()],
+            plugin: vec!["b".to_string(), "c".to_string()].into(),
+            instructions: vec!["two".to_string(), "three".to_string()].into(),
             ..Default::default()
         };
 
@@ -1973,6 +2135,48 @@ mod tests {
             base.instructions,
             vec!["one".to_string(), "two".to_string(), "three".to_string()]
         );
+    }
+
+    #[test]
+    fn explicit_empty_array_clears_accumulated_plugins_and_instructions() {
+        let mut base = Config {
+            plugin: vec!["a".to_string(), "b".to_string()].into(),
+            instructions: vec!["one.md".to_string(), "two.md".to_string()].into(),
+            ..Default::default()
+        };
+
+        let clear: Config = serde_json::from_str(r#"{"plugin": [], "instructions": []}"#).unwrap();
+        assert!(clear.plugin.is_explicit());
+        assert!(clear.instructions.is_explicit());
+
+        base.merge(clear);
+
+        assert!(
+            base.plugin.is_empty(),
+            "plugin: [] must remove existing plugins"
+        );
+        assert!(
+            base.instructions.is_empty(),
+            "instructions: [] must remove existing instructions"
+        );
+    }
+
+    #[test]
+    fn omitted_array_key_keeps_accumulated_plugins() {
+        let mut base = Config {
+            plugin: vec!["a".to_string()].into(),
+            instructions: vec!["one.md".to_string()].into(),
+            ..Default::default()
+        };
+
+        let theme_only: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        assert!(!theme_only.plugin.is_explicit());
+        assert!(!theme_only.instructions.is_explicit());
+
+        base.merge(theme_only);
+
+        assert_eq!(base.plugin, vec!["a".to_string()]);
+        assert_eq!(base.instructions, vec!["one.md".to_string()]);
     }
 
     #[test]
@@ -2480,6 +2684,22 @@ mod tests {
         let mut target = vec!["a".to_owned(), "b".to_owned()];
         append_unique_keep_order(&mut target, vec!["b".to_owned(), "c".to_owned()]);
         assert_eq!(target, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn explicit_empty_plugin_list_serializes_but_absent_key_is_omitted() {
+        let explicit: Config = serde_json::from_str(r#"{"plugin":[]}"#).unwrap();
+        assert!(explicit.plugin.is_explicit());
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json.get("plugin"), Some(&serde_json::json!([])));
+
+        let absent = Config::default();
+        assert!(!absent.plugin.is_explicit());
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json.get("plugin").is_none(),
+            "an omitted plugin key must stay omitted"
+        );
     }
 
     /// Runtime proof for P-06: `timezone` is parsed; upstream-only keys are

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use opencode_agent::{AgentExecutor, AgentInfo, AgentRegistry};
 use opencode_command::{CommandContext, CommandRegistry};
-use opencode_config::loader::load_config;
+use opencode_config::loader::{load_config, migrate_global_config};
 use opencode_config::{LspConfig, LspServerConfig as ConfigLspServerConfig};
 use opencode_grep::{FileSearchOptions, Ripgrep};
 use opencode_lsp::{LspClient, LspServerConfig};
@@ -64,6 +64,22 @@ fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(cwd.to_path_buf(), config.clone());
     Ok(config)
+}
+
+/// One-time, startup-only migration of the legacy global TOML config.
+///
+/// `load_config` / `load_global` are read-only, so this mutating step must run
+/// before the first `config_for` read to make the migrated JSON visible in the
+/// same process. `OnceLock` makes the "at most once" guarantee explicit even if
+/// this helper is reached more than once.
+fn migrate_global_config_once() {
+    static MIGRATION_DONE: OnceLock<()> = OnceLock::new();
+    MIGRATION_DONE.get_or_init(|| {
+        if let Err(error) = migrate_global_config() {
+            // tracing is not initialized yet at startup; use stderr.
+            eprintln!("Warning: failed to migrate legacy global config: {error}");
+        }
+    });
 }
 
 #[derive(Parser)]
@@ -613,6 +629,11 @@ enum GithubCommands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // レガシーなグローバル TOML config のマイグレーションは起動時に一度だけ。
+    // 最初の config_for() 読み込みより前に実行し、同じプロセスで移行後の
+    // JSON が読めるようにする（config ローダ側は読み取り専用）。
+    migrate_global_config_once();
 
     // L-04: TUI は stdout 上で alternate screen を開始するため、tracing の
     // stdout 出力が描画を汚す。Cli::parse() 後にコマンド種別を判定し、
@@ -5983,6 +6004,75 @@ mod tests {
                 "OPENCODE_NO_AUTH={value:?} must keep the enabled notice (fail-closed)"
             );
         }
+    }
+
+    /// `XDG_CONFIG_HOME` を書き換えるテストを直列化する。
+    static MIGRATION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static MIGRATION_TEST_SEQ: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct RestoreXdgConfigHome(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreXdgConfigHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_global_config_is_migrated_once_at_startup() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "opencoderust_global_migration_{}_{}",
+            std::process::id(),
+            MIGRATION_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let config_dir = temp.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config"),
+            "provider = \"anthropic\"\nmodel = \"claude-3-5-sonnet\"\ntheme = \"dark\"\n",
+        )
+        .unwrap();
+
+        let _restore = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        std::env::set_var("XDG_CONFIG_HOME", &temp);
+
+        // 起動時の一度だけのマイグレーション（config ローダは読み取り専用）。
+        migrate_global_config_once();
+
+        assert!(config_dir.join("opencode.json").exists());
+        assert!(!config_dir.join("config").exists());
+        assert!(config_dir.join("config.bak").exists());
+        let migrated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(migrated["model"], "anthropic/claude-3-5-sonnet");
+        assert_eq!(migrated["theme"], "dark");
+
+        // 2 回目は no-op。レガシー状態を再現しても再マイグレーションしない。
+        fs::write(
+            config_dir.join("config"),
+            "provider = \"openai\"\nmodel = \"gpt\"\n",
+        )
+        .unwrap();
+        let _ = fs::remove_file(config_dir.join("opencode.json"));
+        migrate_global_config_once();
+        assert!(
+            !config_dir.join("opencode.json").exists(),
+            "startup migration must run at most once per process"
+        );
+        assert!(config_dir.join("config").exists());
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     // --- R2 no-op 回帰テスト -------------------------------------------------

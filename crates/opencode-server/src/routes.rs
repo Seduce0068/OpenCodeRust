@@ -29,7 +29,7 @@ use crate::mcp_oauth::{
 };
 use crate::oauth::{ProviderAuth, ProviderAuthError};
 use crate::pty::{PtySession as PtySessionStruct, PtySubscription};
-use crate::worktree::{self, WorktreeInfo as WorktreeInfoStruct};
+use crate::worktree::{self, WorktreeError, WorktreeInfo as WorktreeInfoStruct};
 use crate::{ApiError, Result, ServerState};
 use opencode_agent::{AgentInfo as AgentConfigInfo, AgentMode, AgentRegistry, BuiltinAgent};
 use opencode_config::{
@@ -5021,10 +5021,31 @@ impl From<WorktreeInfoStruct> for WorktreeInfo {
     }
 }
 
-async fn list_worktrees() -> Json<Vec<WorktreeInfo>> {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let worktrees = worktree::list_worktrees(&cwd).unwrap_or_default();
-    Json(worktrees.into_iter().map(|w| w.into()).collect())
+/// worktree 層のエラーを API エラーへ変換する。
+///
+/// git の stderr や `io::Error` には絶対パス・利用者固有の情報が含まれ得るため、
+/// レスポンス本文にはバリアントに応じた固定文言のみを載せる（情報漏洩防止）。
+fn map_worktree_error(err: WorktreeError) -> ApiError {
+    match err {
+        WorktreeError::NotGitRepo => ApiError::BadRequest("not a git repository".to_string()),
+        WorktreeError::GitError(_) => ApiError::ProviderError("git command failed".to_string()),
+        WorktreeError::NotFound(_) => ApiError::NotFound("worktree not found".to_string()),
+        WorktreeError::IoError(_) => ApiError::InternalError("io error".to_string()),
+    }
+}
+
+/// 作業ディレクトリ取得失敗も、パスを含めない固定文言で返す。
+fn current_dir_for_worktree() -> Result<PathBuf> {
+    std::env::current_dir()
+        .map_err(|_| ApiError::BadRequest("cannot determine current directory".to_string()))
+}
+
+async fn list_worktrees() -> Result<Json<Vec<WorktreeInfo>>> {
+    let cwd = current_dir_for_worktree()?;
+    let worktrees = worktree::list_worktrees_async(&cwd)
+        .await
+        .map_err(map_worktree_error)?;
+    Ok(Json(worktrees.into_iter().map(|w| w.into()).collect()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5034,10 +5055,11 @@ pub struct CreateWorktreeRequest {
 }
 
 async fn create_worktree(Json(req): Json<CreateWorktreeRequest>) -> Result<Json<WorktreeInfo>> {
-    let cwd = std::env::current_dir().map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let cwd = current_dir_for_worktree()?;
 
-    let info = worktree::create_worktree(&cwd, req.branch.as_deref(), req.path.as_deref())
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let info = worktree::create_worktree_async(&cwd, req.branch.as_deref(), req.path.as_deref())
+        .await
+        .map_err(map_worktree_error)?;
 
     Ok(Json(info.into()))
 }
@@ -5049,18 +5071,21 @@ pub struct RemoveWorktreeRequest {
 }
 
 async fn remove_worktree(Json(req): Json<RemoveWorktreeRequest>) -> Result<Json<bool>> {
-    let cwd = std::env::current_dir().map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let cwd = current_dir_for_worktree()?;
 
-    worktree::remove_worktree(&cwd, &req.path, req.force.unwrap_or(false))
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    worktree::remove_worktree_async(&cwd, &req.path, req.force.unwrap_or(false))
+        .await
+        .map_err(map_worktree_error)?;
 
     Ok(Json(true))
 }
 
 async fn reset_worktree() -> Result<Json<bool>> {
-    let cwd = std::env::current_dir().map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let cwd = current_dir_for_worktree()?;
 
-    worktree::prune_worktrees(&cwd).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    worktree::prune_worktrees_async(&cwd)
+        .await
+        .map_err(map_worktree_error)?;
 
     Ok(Json(true))
 }
@@ -6762,5 +6787,57 @@ mod patch_summary_persistence_tests {
         assert_eq!(reloaded_summary.deletions, 7);
         assert_eq!(reloaded_summary.files, 3);
         assert!(reloaded_summary.diffs.as_ref().is_some_and(Vec::is_empty));
+    }
+}
+
+#[cfg(test)]
+mod worktree_error_mapping_tests {
+    use super::*;
+
+    /// git の stderr / io エラーに含まれるパスをレスポンスへ漏らさず、
+    /// バリアントごとの固定ステータスへ変換することを検証する。
+    #[tokio::test]
+    async fn map_worktree_error_maps_statuses_and_hides_paths() {
+        let secret_path = "/home/private/secret-worktree";
+        let cases = [
+            (
+                WorktreeError::NotGitRepo,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                WorktreeError::GitError(format!("fatal: cannot open '{}'", secret_path)),
+                StatusCode::BAD_GATEWAY,
+                "provider_error",
+            ),
+            (
+                WorktreeError::NotFound(secret_path.to_string()),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                WorktreeError::IoError(std::io::Error::other(secret_path.to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        ];
+
+        for (err, expected_status, expected_type) in cases {
+            let response = map_worktree_error(err).into_response();
+            assert_eq!(response.status(), expected_status);
+
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable");
+            let body = String::from_utf8(bytes.to_vec()).expect("body should be utf-8");
+            assert!(
+                !body.contains(secret_path),
+                "error body leaked a path: {}",
+                body
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&body).expect("body should be JSON");
+            assert_eq!(value["error"]["type"], expected_type);
+        }
     }
 }
