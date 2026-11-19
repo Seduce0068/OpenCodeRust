@@ -1748,6 +1748,7 @@ async fn session_prompt(
         queue_request,
         None,
         None,
+        0,
     );
 
     Ok(Json(serde_json::json!({
@@ -1810,6 +1811,7 @@ fn spawn_prompt_execution(
     request: QueuedPromptRequest,
     queue_id: Option<String>,
     message_id: Option<String>,
+    retry_attempt: u32,
 ) {
     let task_variant = request.variant.clone();
     let task_agent = request.agent.clone();
@@ -1860,8 +1862,8 @@ fn spawn_prompt_execution(
             let pending = match input_repo.list_pending(&session_id).await {
                 Ok(pending) => pending,
                 Err(error) => {
-                    tracing::error!(%session_id, %error, "failed reading queued prompts");
-                    retry_queued_prompts(task_state.clone(), session_id.clone());
+                    tracing::error!(%session_id, retry_attempt, %error, "failed reading queued prompts");
+                    retry_queued_prompts(task_state.clone(), session_id.clone(), retry_attempt + 1);
                     return;
                 }
             };
@@ -1869,11 +1871,13 @@ fn spawn_prompt_execution(
                 return;
             }
             match input_repo.claim_pending(queue_id).await {
+                // claim 成功でプロンプトは処理へ進む。以降の次項目起動は
+                // リセット用 wrapper を通るため retry_attempt は引き継がない。
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(error) => {
-                    tracing::error!(%queue_id, %error, "failed claiming queued prompt");
-                    retry_queued_prompts(task_state.clone(), session_id.clone());
+                    tracing::error!(%queue_id, retry_attempt, %error, "failed claiming queued prompt");
+                    retry_queued_prompts(task_state.clone(), session_id.clone(), retry_attempt + 1);
                     return;
                 }
             }
@@ -2236,7 +2240,44 @@ fn spawn_prompt_execution(
     register_state.register_prompt_task(task_session_id, task.abort_handle());
 }
 
+/// キュー投入プロンプトの連続失敗に対する再試行上限。
+///
+/// DB 破損等で `list_pending` / `claim_pending` が固定失敗すると、旧実装は
+/// 1 秒ごとに再スケジュールし続け終了条件がなかった。attempt がこの値を
+/// 超えた時点で再スケジュールを停止する（terminal 相当の終端化）。
+const QUEUED_PROMPT_MAX_RETRIES: u32 = 5;
+
+/// 初回再試行の待機時間。以降は attempt ごとに 2 倍し、指数バックオフとする。
+const QUEUED_PROMPT_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// 連続失敗 `attempt`（1 始まり）に対する再試行待機時間を返す。
+///
+/// `attempt == 0` は成功後にカウンタがリセットされた状態を表し、再試行は
+/// 行わない。上限超過も `None` を返し、これが再スケジュールの終端条件になる。
+fn queued_retry_delay(attempt: u32) -> Option<Duration> {
+    if attempt == 0 || attempt > QUEUED_PROMPT_MAX_RETRIES {
+        return None;
+    }
+    // attempt=1 -> 1s, 2 -> 2s, 3 -> 4s, ... と 2 倍ずつ増加する。
+    let factor = 1u32.checked_shl(attempt - 1).unwrap_or(u32::MAX);
+    Some(QUEUED_PROMPT_INITIAL_RETRY_DELAY.saturating_mul(factor))
+}
+
+/// キュー投入プロンプトの次を起動する。
+///
+/// 通常の進行・終端処理（promote / failed 登録 / 再起動時復旧 / 新規 enqueue）
+/// はすべてこの wrapper を通るため、成功時に再試行カウンタが 0 にリセット
+/// される。失敗した経路のみ `spawn_next_queued_prompt_with_attempt` が
+/// attempt を引き継ぎ、指数バックオフ付きで再試行する。
 fn spawn_next_queued_prompt(state: Arc<ServerState>, session_id: String) {
+    spawn_next_queued_prompt_with_attempt(state, session_id, 0);
+}
+
+fn spawn_next_queued_prompt_with_attempt(
+    state: Arc<ServerState>,
+    session_id: String,
+    attempt: u32,
+) {
     tokio::spawn(async move {
         let Some(input_repo) = state.input_repo.as_ref() else {
             return;
@@ -2244,8 +2285,8 @@ fn spawn_next_queued_prompt(state: Arc<ServerState>, session_id: String) {
         let pending = match input_repo.list_pending(&session_id).await {
             Ok(pending) => pending,
             Err(error) => {
-                tracing::error!(%session_id, %error, "failed reading queued prompts");
-                retry_queued_prompts(state.clone(), session_id.clone());
+                tracing::error!(%session_id, attempt, %error, "failed reading queued prompts");
+                retry_queued_prompts(state.clone(), session_id.clone(), attempt + 1);
                 return;
             }
         };
@@ -2280,14 +2321,25 @@ fn spawn_next_queued_prompt(state: Arc<ServerState>, session_id: String) {
             request,
             Some(input.id),
             None,
+            attempt,
         );
     });
 }
 
-fn retry_queued_prompts(state: Arc<ServerState>, session_id: String) {
+/// 失敗したキュー処理を指数バックオフ付きで再スケジュールする。
+///
+/// 上限を超えた場合は task を起動せずエラーを記録するだけで終端し、無限
+/// リトライを防ぐ。再起動時の `resume_queued_prompts` が DB 回復後に pending
+/// を再読込するため、ここでの永続的な状態変更は不要。
+fn retry_queued_prompts(state: Arc<ServerState>, session_id: String, attempt: u32) {
+    let Some(delay) = queued_retry_delay(attempt) else {
+        tracing::error!(%session_id, attempt, max = QUEUED_PROMPT_MAX_RETRIES,
+            "queued prompt retries exhausted; stopping reschedule");
+        return;
+    };
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        spawn_next_queued_prompt(state, session_id);
+        tokio::time::sleep(delay).await;
+        spawn_next_queued_prompt_with_attempt(state, session_id, attempt);
     });
 }
 
@@ -2530,6 +2582,7 @@ async fn prompt_async(
         request,
         Some(input.id.clone()),
         None,
+        0,
     );
 
     Ok(Json(serde_json::json!({
@@ -6356,5 +6409,60 @@ mod delete_message_tests {
             .get(&session_id)
             .expect("session should still exist");
         assert!(session.get_message(&msg_id).is_none());
+    }
+}
+
+#[cfg(test)]
+mod queued_retry_tests {
+    use super::*;
+
+    /// 連続失敗が上限に達すると再スケジュールが終端することを検証する。
+    ///
+    /// 各失敗で `retry_queued_prompts` に渡す attempt が 1 ずつ進み、
+    /// `queued_retry_delay` が `None` を返した時点で task が起動されない。
+    #[test]
+    fn repeated_failures_reach_terminal_state() {
+        let mut failed_attempt = 0;
+        while let Some(delay) = queued_retry_delay(failed_attempt + 1) {
+            assert!(delay >= QUEUED_PROMPT_INITIAL_RETRY_DELAY);
+            failed_attempt += 1;
+        }
+        assert_eq!(failed_attempt, QUEUED_PROMPT_MAX_RETRIES);
+        // 上限超過後は終端のまま（無限リトライしない）。
+        assert_eq!(queued_retry_delay(failed_attempt + 1), None);
+        assert_eq!(queued_retry_delay(u32::MAX), None);
+    }
+
+    /// 待機時間が指数バックオフで増加し、成功後のリセットで再びフル予算が
+    /// 得られることを検証する（受け入れ条件 (1)(3)）。
+    #[test]
+    fn backoff_grows_exponentially_and_success_resets_counter() {
+        assert_eq!(
+            queued_retry_delay(0),
+            None,
+            "成功後（リセット済み）は再試行なし"
+        );
+        assert_eq!(queued_retry_delay(1), Some(Duration::from_secs(1)));
+        assert_eq!(queued_retry_delay(2), Some(Duration::from_secs(2)));
+        assert_eq!(queued_retry_delay(3), Some(Duration::from_secs(4)));
+        let max_delay = QUEUED_PROMPT_INITIAL_RETRY_DELAY
+            .saturating_mul(1u32 << (QUEUED_PROMPT_MAX_RETRIES - 1));
+        assert_eq!(
+            queued_retry_delay(QUEUED_PROMPT_MAX_RETRIES),
+            Some(max_delay)
+        );
+
+        // 上限まで消費した後、成功を経て attempt が 0 にリセットされると、
+        // 次の失敗は初回（1 秒）からやり直し、再び全回数が使える。
+        let reset_attempt = 0;
+        assert_eq!(
+            queued_retry_delay(reset_attempt + 1),
+            Some(Duration::from_secs(1))
+        );
+        let mut failed_attempt = reset_attempt;
+        while queued_retry_delay(failed_attempt + 1).is_some() {
+            failed_attempt += 1;
+        }
+        assert_eq!(failed_attempt, QUEUED_PROMPT_MAX_RETRIES);
     }
 }

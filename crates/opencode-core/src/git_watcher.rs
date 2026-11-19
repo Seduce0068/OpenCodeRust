@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// Git リポジトリ内で発生した変更種別。
+///
+/// `.git` 配下の任意の変更（config / HEAD / refs / logs / index 等）を
+/// `IndexChanged` として配信する。以前定義されていた
+/// デッドバリアント（workspace 内に購読者・発行箇所とも無し）は
+/// 削除した（L-18）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GitEvent {
-    /// ブランチが切り替わった。
-    BranchChanged,
-    /// 新しいコミットが作られた。
-    CommitMade,
-    /// インデックスが変更された。
+    /// `.git` 配下で何らかの変更が発生した（インデックスに限らない）。
     IndexChanged,
 }
 
@@ -30,7 +31,8 @@ impl GitWatcher {
         // Watch .git directory
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(_event) = res {
-                // Simplified: notify on any change in .git
+                // .git 配下の変更は現在すべて IndexChanged として配信する
+                // （他バリアントは未購読・未発行のため削除済み、L-18）。
                 let _ = event_tx_clone.send(GitEvent::IndexChanged);
             }
         })?;
