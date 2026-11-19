@@ -47,6 +47,28 @@ const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
 /// `x-request-id` ヘッダ値の最大長（文字数）。超過分は先頭のみ採用する。
 const MAX_REQUEST_ID_LEN: usize = 128;
 
+/// `ask()` の待機 future が abort 等でドロップされたときに pending map から
+/// エントリを削除するガード。
+///
+/// pending map は `std::sync::Mutex` で保持し、`Drop` 内では同期ロック Only で
+/// 削除する。これにより `Drop` から非同期ロックを取得せず（＝ロックを跨がず）、
+/// ランタイム上でのデッドロックを回避する。通常の応答経路（reply/reject）では
+/// 先にエントリが取り出されるため、ここでの `remove` は no-op になる。
+struct PendingEntryGuard<'a, T> {
+    id: String,
+    pending: &'a StdMutex<HashMap<String, T>>,
+}
+
+impl<T> Drop for PendingEntryGuard<'_, T> {
+    fn drop(&mut self) {
+        let mut map = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.remove(&self.id);
+    }
+}
+
 fn generate_auth_token() -> String {
     use base64::Engine;
     use rand::Rng;
@@ -86,14 +108,14 @@ pub enum PermissionResponse {
 }
 
 pub struct PermissionBroker {
-    pending: Mutex<HashMap<String, PendingPermission>>,
+    pending: StdMutex<HashMap<String, PendingPermission>>,
     event_bus: broadcast::Sender<String>,
 }
 
 impl PermissionBroker {
     pub fn new(event_bus: broadcast::Sender<String>) -> Self {
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: StdMutex::new(HashMap::new()),
             event_bus,
         }
     }
@@ -104,11 +126,22 @@ impl PermissionBroker {
             info: info.clone(),
             responder: tx,
         };
+        let id = info.id.clone();
 
         {
-            let mut pending_map = self.pending.lock().await;
-            pending_map.insert(info.id.clone(), pending);
+            let mut pending_map = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending_map.insert(id.clone(), pending);
         }
+
+        // 待機 future がドロップされても pending map に残骸が残らないよう、
+        // 待機期間全体をガードで覆う（Drop でエントリを削除する）。
+        let _cleanup = PendingEntryGuard {
+            id: id.clone(),
+            pending: &self.pending,
+        };
 
         // Broadcast permission request event
         let _ = self.event_bus.send(
@@ -130,12 +163,16 @@ impl PermissionBroker {
 
     pub async fn reply(&self, id: &str, response: PermissionResponse) -> bool {
         let pending = {
-            let mut pending_map = self.pending.lock().await;
+            let mut pending_map = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_map.remove(id)
         };
 
         if let Some(pending) = pending {
-            let _ = pending.responder.send(response.clone());
+            // 受け手が既にドロップされている場合は配信失敗とし、false を返す。
+            let delivered = pending.responder.send(response.clone()).is_ok();
 
             // Broadcast permission reply event
             let _ = self.event_bus.send(
@@ -155,15 +192,23 @@ impl PermissionBroker {
                 })
                 .to_string(),
             );
-            true
+            delivered
         } else {
             false
         }
     }
 
     pub async fn list(&self) -> Vec<PermissionRequestInfo> {
-        let pending_map = self.pending.lock().await;
-        pending_map.values().map(|p| p.info.clone()).collect()
+        let pending_map = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_map
+            .values()
+            // 受け手が消失した残骸は返さない（ガードが効かなかった場合の防御）。
+            .filter(|p| !p.responder.is_closed())
+            .map(|p| p.info.clone())
+            .collect()
     }
 }
 
@@ -187,14 +232,14 @@ struct PendingQuestion {
 }
 
 pub struct QuestionBroker {
-    pending: Mutex<HashMap<String, PendingQuestion>>,
+    pending: StdMutex<HashMap<String, PendingQuestion>>,
     event_bus: broadcast::Sender<String>,
 }
 
 impl QuestionBroker {
     pub fn new(event_bus: broadcast::Sender<String>) -> Self {
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: StdMutex::new(HashMap::new()),
             event_bus,
         }
     }
@@ -205,11 +250,22 @@ impl QuestionBroker {
             info: info.clone(),
             responder: tx,
         };
+        let id = info.id.clone();
 
         {
-            let mut pending_map = self.pending.lock().await;
-            pending_map.insert(info.id.clone(), pending);
+            let mut pending_map = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending_map.insert(id.clone(), pending);
         }
+
+        // 待機 future がドロップされても pending map に残骸が残らないよう、
+        // 待機期間全体をガードで覆う（Drop でエントリを削除する）。
+        let _cleanup = PendingEntryGuard {
+            id: id.clone(),
+            pending: &self.pending,
+        };
 
         tracing::info!(
             question_id = %info.id,
@@ -236,7 +292,10 @@ impl QuestionBroker {
 
     pub async fn reply(&self, id: &str, answers: Vec<Vec<String>>) -> bool {
         let pending = {
-            let mut pending_map = self.pending.lock().await;
+            let mut pending_map = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_map.remove(id)
         };
 
@@ -248,9 +307,11 @@ impl QuestionBroker {
                 "question answered"
             );
 
-            let _ = pending
+            // 受け手が既にドロップされている場合は配信失敗とし、false を返す。
+            let delivered = pending
                 .responder
-                .send(QuestionResponse::Answered(answers.clone()));
+                .send(QuestionResponse::Answered(answers.clone()))
+                .is_ok();
 
             // Broadcast question reply event
             let _ = self.event_bus.send(
@@ -262,7 +323,7 @@ impl QuestionBroker {
                 })
                 .to_string(),
             );
-            true
+            delivered
         } else {
             tracing::warn!(question_id = %id, "reply for unknown question request");
             false
@@ -271,7 +332,10 @@ impl QuestionBroker {
 
     pub async fn reject(&self, id: &str) -> bool {
         let pending = {
-            let mut pending_map = self.pending.lock().await;
+            let mut pending_map = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_map.remove(id)
         };
 
@@ -282,7 +346,8 @@ impl QuestionBroker {
                 "question rejected"
             );
 
-            let _ = pending.responder.send(QuestionResponse::Rejected);
+            // 受け手が既にドロップされている場合は配信失敗とし、false を返す。
+            let delivered = pending.responder.send(QuestionResponse::Rejected).is_ok();
 
             // Broadcast question rejection event
             let _ = self.event_bus.send(
@@ -293,7 +358,7 @@ impl QuestionBroker {
                 })
                 .to_string(),
             );
-            true
+            delivered
         } else {
             tracing::warn!(question_id = %id, "reject for unknown question request");
             false
@@ -301,8 +366,16 @@ impl QuestionBroker {
     }
 
     pub async fn list(&self) -> Vec<QuestionRequestInfo> {
-        let pending_map = self.pending.lock().await;
-        let mut result: Vec<_> = pending_map.values().map(|p| p.info.clone()).collect();
+        let pending_map = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut result: Vec<_> = pending_map
+            .values()
+            // 受け手が消失した残骸は返さない（ガードが効かなかった場合の防御）。
+            .filter(|p| !p.responder.is_closed())
+            .map(|p| p.info.clone())
+            .collect();
         result.sort_by(|a, b| a.id.cmp(&b.id));
         result
     }
@@ -1512,6 +1585,161 @@ mod tests {
         assert!(!broker.reply("missing", Vec::new()).await);
         assert!(!broker.reject("missing").await);
         assert!(broker.list().await.is_empty());
+    }
+
+    /// 非同期条件が満たされるまで待つテストヘルパ（タイムアウトで失敗させる）。
+    async fn wait_until<F, Fut>(mut predicate: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !predicate().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition should be satisfied within timeout");
+    }
+
+    fn permission_info(id: &str) -> PermissionRequestInfo {
+        PermissionRequestInfo {
+            id: id.to_string(),
+            session_id: "ses_test".to_string(),
+            tool: "bash".to_string(),
+            input: serde_json::json!({}),
+            message: "test permission".to_string(),
+            permission_type: "bash".to_string(),
+            patterns: Vec::new(),
+            metadata: HashMap::new(),
+            always: Vec::new(),
+        }
+    }
+
+    fn question_info(id: &str) -> QuestionRequestInfo {
+        QuestionRequestInfo {
+            id: id.to_string(),
+            session_id: "ses_test".to_string(),
+            questions: question_defs(),
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_broker_removes_pending_when_ask_task_is_aborted() {
+        let (tx, _rx) = broadcast::channel(16);
+        let broker = Arc::new(PermissionBroker::new(tx));
+        let ask_broker = broker.clone();
+        let handle =
+            tokio::spawn(async move { ask_broker.ask(permission_info("per_aborted")).await });
+
+        wait_until(|| async { !broker.list().await.is_empty() }).await;
+        assert_eq!(broker.list().await.len(), 1);
+
+        handle.abort();
+        let _ = handle.await;
+
+        // Drop ガードにより pending map 自体から削除されていること。
+        wait_until(|| async { broker.pending.lock().unwrap().is_empty() }).await;
+        assert!(broker.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn question_broker_removes_pending_when_ask_task_is_aborted() {
+        let (tx, _rx) = broadcast::channel(16);
+        let broker = Arc::new(QuestionBroker::new(tx));
+        let ask_broker = broker.clone();
+        let handle =
+            tokio::spawn(async move { ask_broker.ask(question_info("qst_aborted")).await });
+
+        wait_until(|| async { !broker.list().await.is_empty() }).await;
+        assert_eq!(broker.list().await.len(), 1);
+
+        handle.abort();
+        let _ = handle.await;
+
+        wait_until(|| async { broker.pending.lock().unwrap().is_empty() }).await;
+        assert!(broker.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_broker_reply_returns_false_when_receiver_is_dropped() {
+        let (tx, _rx) = broadcast::channel(16);
+        let broker = PermissionBroker::new(tx);
+        let info = permission_info("per_dead");
+        let (sender, receiver) = oneshot::channel::<PermissionResponse>();
+        drop(receiver);
+        broker.pending.lock().unwrap().insert(
+            info.id.clone(),
+            PendingPermission {
+                info,
+                responder: sender,
+            },
+        );
+
+        // 受け手消失エントリは list() に露出しない（防御レイヤ）。
+        assert!(broker.list().await.is_empty());
+        // send() の Err を検知して false を返す（false success の回帰）。
+        assert!(!broker.reply("per_dead", PermissionResponse::Once).await);
+        assert!(broker.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn question_broker_reply_and_reject_return_false_when_receiver_is_dropped() {
+        for id in ["qst_dead_reply", "qst_dead_reject"] {
+            let (tx, _rx) = broadcast::channel(16);
+            let broker = QuestionBroker::new(tx);
+            let info = question_info(id);
+            let (sender, receiver) = oneshot::channel::<QuestionResponse>();
+            drop(receiver);
+            broker.pending.lock().unwrap().insert(
+                info.id.clone(),
+                PendingQuestion {
+                    info,
+                    responder: sender,
+                },
+            );
+
+            assert!(broker.list().await.is_empty());
+            let delivered = if id == "qst_dead_reply" {
+                broker.reply(id, vec![vec!["Yes".to_string()]]).await
+            } else {
+                broker.reject(id).await
+            };
+            assert!(!delivered, "send to a dropped receiver must report failure");
+            assert!(broker.pending.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_excludes_only_closed_pending_entries() {
+        let (tx, _rx) = broadcast::channel(16);
+        let broker = QuestionBroker::new(tx);
+        let live = question_info("qst_live");
+        let dead = question_info("qst_dead_list");
+        let (live_sender, _live_receiver) = oneshot::channel::<QuestionResponse>();
+        let (dead_sender, dead_receiver) = oneshot::channel::<QuestionResponse>();
+        drop(dead_receiver);
+        {
+            let mut map = broker.pending.lock().unwrap();
+            map.insert(
+                live.id.clone(),
+                PendingQuestion {
+                    info: live,
+                    responder: live_sender,
+                },
+            );
+            map.insert(
+                dead.id.clone(),
+                PendingQuestion {
+                    info: dead,
+                    responder: dead_sender,
+                },
+            );
+        }
+
+        let listed = broker.list().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "qst_live");
     }
 
     #[test]

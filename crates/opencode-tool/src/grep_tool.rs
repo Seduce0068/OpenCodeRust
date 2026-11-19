@@ -174,8 +174,13 @@ impl Tool for GrepTool {
             let mut matches: Vec<GrepMatch> = Vec::new();
             let mut has_errors = false;
 
+            // 外部ディレクトリの権限チェックは検索ルート base_dir に対して
+            // 走査前に一度だけ行われる。シンボリックリンクを辿ると、
+            // プロジェクト内のリンクが外部ディレクトリ／ファイルを指す場合に
+            // そのチェックをすり抜けて外部の内容を読み出してしまうため、辿らない。
+            // follow_links(false) は symlink cycle による無限走査も構造的に防ぐ。
             for entry in WalkDir::new(&base_dir_buf)
-                .follow_links(true)
+                .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| {
                     if include_hidden {
@@ -187,6 +192,13 @@ impl Tool for GrepTool {
                 })
                 .filter_map(|e| e.ok())
             {
+                // follow_links(false) でも WalkDir はリンク自身をエントリとして
+                // 返す。path.is_file() / File::open はリンク先を辿るため、
+                // 外部ファイルの内容を返さないようリンクを明示的に除外する。
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
+
                 let path = entry.path();
                 if !path.is_file() {
                     continue;
@@ -504,6 +516,68 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 検索ルート内の symlink がプロジェクト外のファイル／ディレクトリを
+    /// 指しても、その内容を返してはならない
+    /// （external_directory 権限のすり抜け回帰テスト）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_does_not_follow_external_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let outside =
+            std::env::temp_dir().join(format!("opencode-grep-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP_SECRET_NEVER_RETURNED\n").unwrap();
+
+        // 外部ディレクトリを指す symlink と、外部ファイルを直接指す symlink。
+        symlink(&outside, dir.join("outside_link")).unwrap();
+        symlink(outside.join("secret.txt"), dir.join("secret_link.txt")).unwrap();
+
+        let result = GrepTool::new()
+            .execute(
+                serde_json::json!({
+                    "pattern": "TOP_SECRET_NEVER_RETURNED",
+                    "path": dir.to_string_lossy()
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        // output には検索タイトル（パターン文字列）が含まれるため、マッチ数で検証する。
+        assert_eq!(result.metadata["matches"], 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// 自分自身を指す symlink（cycle）があっても走査が完了することを確認する。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_cyclic_symlink_does_not_hang() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "hello world\n").unwrap();
+        symlink(".", dir.join("self_link")).unwrap();
+
+        let result = GrepTool::new()
+            .execute(
+                serde_json::json!({
+                    "pattern": "hello",
+                    "path": dir.to_string_lossy()
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["matches"], 1);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
