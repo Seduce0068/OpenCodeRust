@@ -333,37 +333,21 @@ status: current
   — — `main.rs:999-1003` / R1-ST07 / 中
 - [ ] **プラグイン host/builtin スクリプトが予測可能な共有キャッシュへ symlink 追従で書き込まれる**
   — — `loader.rs:68-74,164-178` / R1-IV08 / 中
-- [ ] **HTTP 5xx を含む全完了リクエストが INFO で記録されアラートが機能しない**
-  — — `server.rs:1091-1110` / R1-OB04 / 中
-- [ ] **生成 request_id がレスポンスへ返されず相関ログ照合が不能**
-  — — `server.rs:1116-1138` / R1-OB05 / 中
-- [ ] **ログタイムスタンプにタイムゾーン/ミリ秒が欠け共有 LAST_TIMESTAMP で誤読**
-  — — `logging.rs:39,100-107` / R1-OB06 / 中
-- [ ] **認証失敗ログに送信元 IP が含まれず発生元を特定できない**
-  — `server.rs:1116-1192` / R1-OB07 / 中
-- [ ] **LLM 再試行時に StreamProcessor の蓄積状態がリセットされない**
-  — `llm.rs:324-407` / R1-E04 / 中
 - [ ] **subsessions メタデータのデシリアライズ失敗が次の保存で削除される**
   — `prompt.rs:1777-1796` / R1-E05 / 中
 - [ ] **revert が Snapshot::track 失敗を空文字として保存**
   — `revert.rs:101-116` / R1-E06 / 中
-- [ ] **ツール引数 JSON のパース失敗が Value::Null にされて実行される**
-  — `executor.rs:351-357` / R1-E07 / 中
-- [ ] **compaction の is_overflow が usable=0 のとき常に true**
-  — `compaction.rs:224-235` / R1-E08 / 中
-- [ ] **Snapshot::revert が checkout 失敗を無視して成功を返す**
-  — `snapshot.rs:57-71` / R1-E09 / 中
 - [ ] **compaction が要約メッセージを先に永続化し LLM 失敗時に残す**
   — `compaction.rs:466-471,659-666` / R1-E10 / 中
 - [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
   — `renovate.json:3-5` / R1-DP02 / 中
 - [ ] **reqwest 既定 feature で rustls と native-tls が二重搭載**
   — `Cargo.toml:85`, `Cargo.lock:3493-3538` / R1-DP04 / 中
-- [ ] **SQLite DB のバックアップ・復旧 Runbook が存在しない**
-  — `docs/opencode-storage.md:9-41` / R1-DP06 / 中
 
 ## 完了
 
+- [x] **[観測性/整合性 9 件]** ログ・相関 ID・retry・Runbook
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[Bash/Web/CI 8 件]** env 検証・上限・audit/TSRV/release ゲート
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[Slash クリック・ADR 整合]** ポップアップ選択と 6 文書の追随
@@ -621,6 +605,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（観測性/整合性 9 件の修正時、記録のみ）: Snapshot::revert は
+  1 ファイル失敗でも他を復元する部分適用状態で Err を返す（all-or-nothing 化は
+  設計判断）。ToolCallEnd.input が未参照のため Delta を出さないプロバイダでは
+  不正 JSON を取りこぼす可能性（confidence 0.4、Delta 専用が前提）。
+  README の -D warnings 主張は共通ワークフロー v1 の既定値に依存し未検証。
+  docs/architecture.md:110-119 の検証コマンドも CI と不整合（scope 外）。
 - 2026-11-20 R4 残存（Bash/Web/CI 8 件の修正時、記録のみ）: process group kill が
   外部 `kill` バイナリ依存で、最小コンテナ等で失敗すると無音フォールバックする
   （nix 等の syscall ラッパ導入は設計判断）。schedule 実行の失敗通知運用は
