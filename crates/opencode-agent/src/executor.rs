@@ -168,7 +168,8 @@ impl AgentExecutor {
                 .await
                 .map_err(|e| AgentError::ProviderError(e.to_string()))?;
 
-            let (response, reasoning, tool_calls) = self.process_stream(stream).await?;
+            let (response, reasoning, tool_calls, invalid_arguments) =
+                self.process_stream(stream).await?;
 
             if tool_calls.is_empty() {
                 final_response = response.clone();
@@ -184,12 +185,9 @@ impl AgentExecutor {
             );
 
             for tool_call in tool_calls {
-                let result = self.execute_tool(&tool_call).await;
-
-                let (content, is_error) = match result {
-                    Ok(output) => (output, false),
-                    Err(e) => (e.to_string(), true),
-                };
+                let (content, is_error) = self
+                    .run_tool_call(&tool_call, invalid_arguments.get(&tool_call.id), true)
+                    .await;
 
                 self.conversation.add_tool_result(
                     &tool_call.id,
@@ -236,7 +234,8 @@ impl AgentExecutor {
                 .await
                 .map_err(|e| AgentError::ProviderError(e.to_string()))?;
 
-            let (response, reasoning, tool_calls) = self.process_stream(stream).await?;
+            let (response, reasoning, tool_calls, invalid_arguments) =
+                self.process_stream(stream).await?;
 
             if tool_calls.is_empty() {
                 final_response = response.clone();
@@ -252,12 +251,9 @@ impl AgentExecutor {
             );
 
             for tool_call in tool_calls {
-                let result = self.execute_tool_without_subsessions(&tool_call).await;
-
-                let (content, is_error) = match result {
-                    Ok(output) => (output, false),
-                    Err(e) => (e.to_string(), true),
-                };
+                let (content, is_error) = self
+                    .run_tool_call(&tool_call, invalid_arguments.get(&tool_call.id), false)
+                    .await;
 
                 self.conversation.add_tool_result(
                     &tool_call.id,
@@ -318,14 +314,48 @@ impl AgentExecutor {
         }
     }
 
+    /// 引数 JSON のパース失敗を表す `ToolError` を生成する。
+    ///
+    /// 生の引数文字列はパスや秘密情報を含む可能性があるため、エラーには含めない。
+    fn invalid_arguments_error(tool_name: &str) -> ToolError {
+        ToolError::InvalidArguments(format!(
+            "Tool '{tool_name}' received arguments that are not valid JSON; retry with a well-formed JSON object"
+        ))
+    }
+
+    /// 単一のツール呼び出しを実行し、LLM へ返す (content, is_error) を求める。
+    ///
+    /// 引数パース失敗済みの呼び出しは実行せず、`InvalidArguments` エラーを
+    /// エラー ToolResult として記録し、LLM に修正を促す。
+    async fn run_tool_call(
+        &self,
+        tool_call: &ToolCall,
+        invalid: Option<&ToolError>,
+        allow_subsessions: bool,
+    ) -> (String, bool) {
+        if let Some(error) = invalid {
+            return (error.to_string(), true);
+        }
+        let result = if allow_subsessions {
+            self.execute_tool(tool_call).await
+        } else {
+            self.execute_tool_without_subsessions(tool_call).await
+        };
+        match result {
+            Ok(output) => (output, false),
+            Err(e) => (e.to_string(), true),
+        }
+    }
+
     async fn process_stream(
         &mut self,
         mut stream: opencode_provider::StreamResult,
-    ) -> Result<(String, String, Vec<ToolCall>), AgentError> {
+    ) -> Result<(String, String, Vec<ToolCall>, HashMap<String, ToolError>), AgentError> {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut tool_args_buffers: HashMap<String, String> = HashMap::new();
+        let mut invalid_arguments: HashMap<String, ToolError> = HashMap::new();
 
         while let Some(event) = stream.next().await {
             match event {
@@ -348,11 +378,24 @@ impl AgentExecutor {
                         buf.push_str(&input);
                     }
                 }
-                Ok(StreamEvent::ToolCallEnd { id, .. }) => {
+                Ok(StreamEvent::ToolCallEnd { id, name, input: _ }) => {
                     if let Some(args_str) = tool_args_buffers.remove(&id) {
                         if let Some(tc) = tool_calls.iter_mut().find(|t| t.id == id) {
-                            tc.arguments =
-                                serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
+                            // 空文字は「引数なし」として扱い、それ以外の不正 JSON は
+                            // Null をツールへ渡さず InvalidArguments として記録する。
+                            if args_str.trim().is_empty() {
+                                tc.arguments = serde_json::json!({});
+                            } else {
+                                match serde_json::from_str::<serde_json::Value>(&args_str) {
+                                    Ok(args) => tc.arguments = args,
+                                    Err(_) => {
+                                        invalid_arguments.insert(
+                                            id.clone(),
+                                            Self::invalid_arguments_error(&name),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -367,7 +410,7 @@ impl AgentExecutor {
             }
         }
 
-        Ok((content, reasoning, tool_calls))
+        Ok((content, reasoning, tool_calls, invalid_arguments))
     }
 
     async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String, ToolError> {
@@ -966,5 +1009,100 @@ mod tests {
             executor.ensure_tool_allowed("edit", &target).is_err(),
             "a path escaping the project root must not inherit the src/* allow rule"
         );
+    }
+
+    /// 不正な引数 JSON は Null に丸められず InvalidArguments として扱われること。
+    #[tokio::test]
+    async fn process_stream_marks_invalid_tool_arguments() {
+        let events = vec![
+            Ok::<StreamEvent, opencode_provider::ProviderError>(StreamEvent::ToolCallStart {
+                id: "bad".to_string(),
+                name: "read".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallDelta {
+                id: "bad".to_string(),
+                input: "{invalid /secret/path}".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                id: "bad".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!("{invalid /secret/path}"),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                id: "good".to_string(),
+                name: "write".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallDelta {
+                id: "good".to_string(),
+                input: "{\"file_path\":\"a.txt\"}".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                id: "good".to_string(),
+                name: "write".to_string(),
+                input: serde_json::json!({"file_path": "a.txt"}),
+            }),
+            Ok(StreamEvent::Done),
+        ];
+        let stream: opencode_provider::StreamResult = Box::pin(futures::stream::iter(events));
+        let mut executor = build_executor(AgentInfo::general());
+
+        let (_, _, tool_calls, invalid) = executor
+            .process_stream(stream)
+            .await
+            .expect("stream processing should succeed");
+
+        assert_eq!(tool_calls.len(), 2);
+        assert!(
+            matches!(
+                invalid.get("bad"),
+                Some(error) if matches!(error, ToolError::InvalidArguments(_))
+            ),
+            "malformed JSON must become InvalidArguments"
+        );
+        assert!(!invalid.contains_key("good"));
+        assert_eq!(
+            tool_calls[1].arguments,
+            serde_json::json!({"file_path": "a.txt"})
+        );
+        let rendered = invalid.get("bad").expect("error").to_string();
+        assert!(
+            rendered.contains("Invalid arguments"),
+            "LLM needs a correction hint: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/secret/path"),
+            "raw arguments must not leak into the error"
+        );
+    }
+
+    /// InvalidArguments はツールを実行せず、エラー ToolResult として記録されること。
+    #[tokio::test]
+    async fn invalid_arguments_are_recorded_as_error_tool_result() {
+        let mut executor = build_executor(AgentInfo::general());
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::Value::Null,
+        };
+        let error = AgentExecutor::invalid_arguments_error("read");
+
+        let (content, is_error) = executor.run_tool_call(&tool_call, Some(&error), true).await;
+        executor
+            .conversation
+            .add_tool_result(&tool_call.id, &tool_call.name, &content, is_error);
+
+        let recorded = executor
+            .conversation
+            .messages
+            .last()
+            .expect("tool result must be recorded");
+        assert!(
+            is_error,
+            "invalid arguments must be reported as a tool error"
+        );
+        assert!(matches!(recorded.role, crate::MessageRole::Tool));
+        assert!(recorded.is_error);
+        assert!(recorded.content.contains("Invalid arguments"));
+        assert!(!recorded.content.contains("/secret/path"));
     }
 }

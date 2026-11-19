@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{
-    extract::State,
-    http::{header, header::HeaderValue, request::Parts, HeaderName, Method, Request},
+    extract::{ConnectInfo, State},
+    http::{header, header::HeaderValue, request::Parts, HeaderName, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -9,7 +9,7 @@ use futures::StreamExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -1118,6 +1118,38 @@ fn sanitize_request_id(raw: &str) -> Option<String> {
     Some(cleaned.chars().take(MAX_REQUEST_ID_LEN).collect())
 }
 
+/// 完了ログの深刻度。
+///
+/// 5xx はアラート対象のため ERROR、4xx は WARN、それ以外は INFO。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// `outcome` から完了ログのレベルを決める純粋関数（回帰テストから直接検証可能）。
+fn completion_log_level(outcome: &str) -> CompletionLogLevel {
+    match outcome {
+        "server_error" => CompletionLogLevel::Error,
+        "client_error" => CompletionLogLevel::Warn,
+        _ => CompletionLogLevel::Info,
+    }
+}
+
+/// HTTP status を完了ログの outcome 文字列へ変換する純粋関数。
+fn completion_outcome(status: StatusCode) -> &'static str {
+    if status.is_server_error() {
+        "server_error"
+    } else if status.is_client_error() {
+        "client_error"
+    } else if status.is_redirection() {
+        "redirect"
+    } else {
+        "success"
+    }
+}
+
 /// レスポンス完了時に status / latency / outcome をリクエストスパンへ記録する。
 #[derive(Clone, Debug)]
 struct RequestCompletionLog;
@@ -1125,26 +1157,65 @@ struct RequestCompletionLog;
 impl<B> OnResponse<B> for RequestCompletionLog {
     fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
-        let outcome = if status.is_server_error() {
-            "server_error"
-        } else if status.is_client_error() {
-            "client_error"
-        } else if status.is_redirection() {
-            "redirect"
-        } else {
-            "success"
-        };
-        tracing::info!(
-            parent: span,
-            status = status.as_u16(),
-            latency_ms = latency.as_millis() as u64,
-            outcome = outcome,
-            "http_request completed"
-        );
+        let outcome = completion_outcome(status);
+        let status_code = status.as_u16();
+        let latency_ms = latency.as_millis() as u64;
+
+        // 5xx を INFO のまま埋もれさせず、ERROR/WARN としてアラートに拾わせる。
+        // トークンやクエリ文字列はフィールドに含めない。
+        match completion_log_level(outcome) {
+            CompletionLogLevel::Error => tracing::error!(
+                parent: span,
+                status = status_code,
+                latency_ms = latency_ms,
+                outcome = outcome,
+                "http_request completed"
+            ),
+            CompletionLogLevel::Warn => tracing::warn!(
+                parent: span,
+                status = status_code,
+                latency_ms = latency_ms,
+                outcome = outcome,
+                "http_request completed"
+            ),
+            CompletionLogLevel::Info => tracing::info!(
+                parent: span,
+                status = status_code,
+                latency_ms = latency_ms,
+                outcome = outcome,
+                "http_request completed"
+            ),
+        }
     }
 }
 
-/// リクエストごとの構造化スパンを生成し、request id / session id をログ文脈に伝播させる。
+/// `into_make_service_with_connect_info` が挿入したピアアドレスから IP だけを取り出す。
+///
+/// ConnectInfo が無い経路（例: 直接 Router を呼ぶテスト）でも panic せず `None` を返す。
+/// 実装差を吸収するため `ConnectInfo<SocketAddr>` と `SocketAddr` の両方を確認する。
+fn client_ip_from_request(request: &Request<axum::body::Body>) -> Option<IpAddr> {
+    if let Some(info) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return Some(info.0.ip());
+    }
+    request.extensions().get::<SocketAddr>().map(SocketAddr::ip)
+}
+
+/// サニタイズ済み request id をレスポンスヘッダへ安全に変換する。
+///
+/// `sanitize_request_id` は制御文字を除くが、非 ASCII 等は残り得るため
+/// `HeaderValue` 変換に失敗した場合は固定値へフォールバックする（入力を反射しない）。
+fn request_id_header_value(request_id: &str) -> HeaderValue {
+    if !request_id.is_ascii() {
+        return HeaderValue::from_static("invalid-request-id");
+    }
+    match HeaderValue::from_str(request_id) {
+        Ok(value) => value,
+        Err(_) => HeaderValue::from_static("invalid-request-id"),
+    }
+}
+
+/// リクエストごとの構造化スパンを生成し、request id / session id / client ip を
+/// ログ文脈に伝播させる。また決定した request id をレスポンスヘッダで返す。
 ///
 /// トークン・クエリ文字列・ボディはスパン属性に含めない。
 async fn request_span_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
@@ -1155,6 +1226,7 @@ async fn request_span_middleware(request: Request<axum::body::Body>, next: Next)
         .and_then(sanitize_request_id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let session_id = session_id_from_path(request.uri().path()).map(str::to_owned);
+    let client_ip = client_ip_from_request(&request);
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
 
@@ -1164,12 +1236,21 @@ async fn request_span_middleware(request: Request<axum::body::Body>, next: Next)
         method = %method,
         path = %path,
         session_id = tracing::field::Empty,
+        client_ip = tracing::field::Empty,
     );
     if let Some(session_id) = &session_id {
         span.record("session_id", session_id);
     }
+    if let Some(ip) = &client_ip {
+        span.record("client_ip", tracing::field::display(ip));
+    }
 
-    next.run(request).instrument(span).await
+    let mut response = next.run(request).instrument(span).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        request_id_header_value(&request_id),
+    );
+    response
 }
 
 /// CORS の `Access-Control-Allow-Headers` に明示的に含めるヘッダ名。
@@ -1206,6 +1287,9 @@ fn cors_layer() -> CorsLayer {
             Method::DELETE,
         ])
         .allow_headers(cors_allow_headers())
+        // ブラウザの fetch から相関 ID を読めるようにする（allow_headers は
+        // リクエスト側の許可のみでレスポンスヘッダの露出は制御しない）。
+        .expose_headers([HeaderName::from_static("x-request-id")])
 }
 
 /// 2 つの文字列を固定時間で比較する（新規依存なしの自前実装）。
@@ -1266,6 +1350,7 @@ async fn auth_middleware(
         .get(HeaderName::from_static("authorization"))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
+    let client_ip = client_ip_from_request(&request);
     let decision = auth_decision(
         state.auth_enabled,
         state.auth_token.as_deref(),
@@ -1275,7 +1360,14 @@ async fn auth_middleware(
     match decision {
         AuthDecision::Pass => next.run(request).await,
         AuthDecision::Unauthorized => {
-            tracing::warn!("Authentication failed: invalid or missing token");
+            // 送信元 IP を構造化フィールドとして残し、トークン値は決して出さない。
+            match client_ip {
+                Some(ip) => tracing::warn!(
+                    client_ip = %ip,
+                    "Authentication failed: invalid or missing token"
+                ),
+                None => tracing::warn!("Authentication failed: invalid or missing token"),
+            }
             ApiError::Unauthorized("Invalid or missing authentication token".to_owned())
                 .into_response()
         }
@@ -1329,7 +1421,11 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
 
     tracing::info!("Server listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1362,7 +1458,11 @@ pub async fn run_server_with_state(
 
     tracing::info!("Server listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -2183,7 +2283,7 @@ mod tests {
     }
 
     // ---- R2 回帰テスト: CORS カスタムヘッダ / 401 スキーマ / fail-open ----
-    use axum::http::StatusCode;
+    // StatusCode は上位モジュールの import を `use super::*` で共有する。
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2245,7 +2345,13 @@ mod tests {
         };
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, app).await {
+            // 本番と同じく ConnectInfo を注入し、client_ip 経路もテストで通す。
+            if let Err(err) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 eprintln!("test server stopped: {err}");
             }
         });
@@ -2562,6 +2668,145 @@ mod tests {
         let (status, _, body) = http_exchange(addr, &request).await;
         assert_eq!(status, StatusCode::OK, "valid token must still pass");
         assert!(body.contains("ok"));
+        server.abort();
+    }
+
+    // ---- R2 観測性回帰テスト: 5xx レベル / request id 返却 / client_ip ----
+
+    #[test]
+    fn completion_log_level_escalates_server_and_client_errors() {
+        assert_eq!(
+            completion_log_level("server_error"),
+            CompletionLogLevel::Error,
+            "5xx must be ERROR so alerts can pick it up"
+        );
+        assert_eq!(
+            completion_log_level("client_error"),
+            CompletionLogLevel::Warn
+        );
+        assert_eq!(completion_log_level("redirect"), CompletionLogLevel::Info);
+        assert_eq!(completion_log_level("success"), CompletionLogLevel::Info);
+    }
+
+    #[test]
+    fn completion_outcome_classifies_http_status() {
+        assert_eq!(
+            completion_outcome(StatusCode::INTERNAL_SERVER_ERROR),
+            "server_error"
+        );
+        assert_eq!(completion_outcome(StatusCode::BAD_GATEWAY), "server_error");
+        assert_eq!(completion_outcome(StatusCode::UNAUTHORIZED), "client_error");
+        assert_eq!(completion_outcome(StatusCode::NOT_FOUND), "client_error");
+        assert_eq!(completion_outcome(StatusCode::FOUND), "redirect");
+        assert_eq!(completion_outcome(StatusCode::OK), "success");
+        assert_eq!(completion_outcome(StatusCode::CREATED), "success");
+    }
+
+    #[test]
+    fn client_ip_from_request_reads_connect_info_extension() {
+        let addr: SocketAddr = "127.0.0.1:45678".parse().expect("valid socket addr");
+        let mut request = Request::new(axum::body::Body::empty());
+        assert_eq!(client_ip_from_request(&request), None);
+
+        request.extensions_mut().insert(ConnectInfo(addr));
+        assert_eq!(client_ip_from_request(&request), Some(addr.ip()));
+    }
+
+    #[test]
+    fn request_id_header_value_never_reflects_invalid_bytes() {
+        assert_eq!(
+            request_id_header_value("correlation-abc-123")
+                .to_str()
+                .unwrap(),
+            "correlation-abc-123"
+        );
+        // 非 ASCII は HeaderValue にできないため固定値へフォールバックする。
+        assert_eq!(
+            request_id_header_value("日本語-id").to_str().unwrap(),
+            "invalid-request-id"
+        );
+    }
+
+    /// 指定した関数定義の本文を `include_str!` から切り出す（補助）。
+    fn source_fn_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("function must exist in source");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("function closing brace");
+        &rest[..end]
+    }
+
+    #[test]
+    fn server_wires_connect_info_and_records_client_ip() {
+        let source = include_str!("server.rs");
+        let connect_info_calls = source
+            .matches("into_make_service_with_connect_info::<SocketAddr>()")
+            .count();
+        assert!(
+            connect_info_calls >= 2,
+            "both run_server and run_server_with_state must inject ConnectInfo"
+        );
+
+        let span_body = source_fn_body(source, "async fn request_span_middleware(");
+        assert!(
+            span_body.contains("client_ip"),
+            "HTTP span must carry client_ip"
+        );
+
+        let auth_body = source_fn_body(source, "async fn auth_middleware(");
+        assert!(
+            auth_body.contains("client_ip"),
+            "authentication failure warn must carry client_ip"
+        );
+        assert!(
+            !auth_body.contains("supplied_bearer = %"),
+            "token value must not be logged"
+        );
+    }
+
+    fn request_id_test_app() -> axum::Router {
+        axum::Router::new()
+            .route("/ping", axum::routing::get(|| async { "pong" }))
+            .layer(middleware::from_fn(request_span_middleware))
+    }
+
+    #[tokio::test]
+    async fn response_echoes_supplied_request_id_header() {
+        let Some((addr, server)) = start_test_server(request_id_test_app()).await else {
+            return;
+        };
+        let request = concat!(
+            "GET /ping HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "x-request-id: correlation-abc-123\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        let (status, headers, _) = http_exchange(addr, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers.contains("x-request-id: correlation-abc-123"),
+            "input request id must be echoed verbatim: {headers}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_returns_generated_uuid_when_request_id_is_absent() {
+        let Some((addr, server)) = start_test_server(request_id_test_app()).await else {
+            return;
+        };
+        let request = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        let (status, headers, _) = http_exchange(addr, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let value = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("x-request-id:"))
+            .expect("response must carry x-request-id")
+            .trim();
+        assert!(
+            Uuid::parse_str(value).is_ok(),
+            "generated request id must be a UUID: {value}"
+        );
         server.abort();
     }
 }

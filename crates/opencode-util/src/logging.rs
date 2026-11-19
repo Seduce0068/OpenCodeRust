@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::{Local, SecondsFormat};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,9 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-static LAST_TIMESTAMP: Mutex<i64> = Mutex::new(0);
+// LAST_TIMESTAMP はロガー単位の `Arc<Mutex<i64>>` へ移行した（下記 struct を参照）。
+// グローバル共有すると他スレッド／他ロガーの前回時刻を差分の基準にしてしまい、
+// `+NNms` が他人の時刻として誤読されるため。
 static LOGGERS: LazyLock<Mutex<HashMap<String, CachedLogger>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -125,16 +127,42 @@ fn escape_log_field(input: &str) -> String {
     escaped
 }
 
+/// RFC3339（UTC オフセット付き・ミリ秒）のタイムスタンプと、同一ロガー内での
+/// 前回ログからの経過ミリ秒を返す。
+///
+/// `last_timestamp` はロガー単位で保持するため、他スレッド／他ロガーの時刻を
+/// 基準にした誤読が起きない。ロックは `into_inner()` でポイズンから回復する。
+fn format_timestamp(last_timestamp: &Mutex<i64>) -> (String, i64) {
+    // ロック取得後に現在時刻を取り、clone 間で順序が入れ替わっても
+    // 過去へ巻き戻さないよう max で更新する。
+    let mut last = last_timestamp
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Local::now();
+    let timestamp = now.to_rfc3339_opts(SecondsFormat::Millis, false);
+    let now_ms = now.timestamp_millis();
+
+    // 初回（0 は未初期化sentinel）は差分 0 とし、epoch 全体を差分としない。
+    let diff = if *last == 0 { 0 } else { now_ms - *last };
+    *last = (*last).max(now_ms);
+
+    (timestamp, diff)
+}
+
 struct CachedLogger {
     tags: HashMap<String, String>,
     level: LogLevel,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// 直前の絶対時刻（epoch millis）。ロガーごとに保持する。
+    last_timestamp: Arc<Mutex<i64>>,
 }
 
 pub struct Logger {
     tags: HashMap<String, String>,
     level: LogLevel,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// 直前の絶対時刻（epoch millis）。clone 間では共有するが他ロガーとは独立。
+    last_timestamp: Arc<Mutex<i64>>,
 }
 
 impl Clone for Logger {
@@ -143,6 +171,7 @@ impl Clone for Logger {
             tags: self.tags.clone(),
             level: self.level,
             writer: Arc::clone(&self.writer),
+            last_timestamp: Arc::clone(&self.last_timestamp),
         }
     }
 }
@@ -157,6 +186,7 @@ impl Logger {
             tags,
             level,
             writer,
+            last_timestamp: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -182,13 +212,7 @@ impl Logger {
         message: &str,
         extra: Option<&HashMap<String, String>>,
     ) -> String {
-        let mut last = LAST_TIMESTAMP.lock().unwrap();
-        let now = Local::now();
-        let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
-        let diff = now.timestamp_millis() - *last;
-        *last = now.timestamp_millis();
-        drop(last);
-
+        let (timestamp, diff) = format_timestamp(&self.last_timestamp);
         let mut parts = vec![timestamp, format!("+{}ms", diff)];
 
         for (key, value) in &self.tags {
@@ -261,6 +285,7 @@ impl Logger {
             tags,
             writer: Arc::clone(&self.writer),
             level: self.level,
+            last_timestamp: Arc::clone(&self.last_timestamp),
         }
     }
 }
@@ -269,6 +294,8 @@ pub struct TaggedLogger {
     tags: HashMap<String, String>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     level: LogLevel,
+    /// 元の Logger と同じ時刻系を共有する（タグ違いで差分が壊れないように）。
+    last_timestamp: Arc<Mutex<i64>>,
 }
 
 impl Clone for TaggedLogger {
@@ -277,6 +304,7 @@ impl Clone for TaggedLogger {
             tags: self.tags.clone(),
             writer: Arc::clone(&self.writer),
             level: self.level,
+            last_timestamp: Arc::clone(&self.last_timestamp),
         }
     }
 }
@@ -344,13 +372,7 @@ impl TaggedLogger {
         message: &str,
         extra: Option<&HashMap<String, String>>,
     ) -> String {
-        let mut last = LAST_TIMESTAMP.lock().unwrap();
-        let now = Local::now();
-        let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
-        let diff = now.timestamp_millis() - *last;
-        *last = now.timestamp_millis();
-        drop(last);
-
+        let (timestamp, diff) = format_timestamp(&self.last_timestamp);
         let mut parts = vec![timestamp, format!("+{}ms", diff)];
 
         for (key, value) in &self.tags {
@@ -390,6 +412,7 @@ impl Log {
                         tags: cached.tags.clone(),
                         level: cached.level,
                         writer: Arc::clone(&cached.writer),
+                        last_timestamp: Arc::clone(&cached.last_timestamp),
                     };
                 }
             }
@@ -407,6 +430,7 @@ impl Log {
                         tags: tags.clone(),
                         level: logger.level,
                         writer: Arc::clone(&writer),
+                        last_timestamp: Arc::clone(&logger.last_timestamp),
                     },
                 );
             }
@@ -665,5 +689,59 @@ mod tests {
             tracing_subscriber::registry().try_init().is_err(),
             "ファイル失敗時に stderr フォールバック subscriber が初期化されていない"
         );
+    }
+
+    #[test]
+    fn format_timestamp_is_rfc3339_with_offset_and_millis() {
+        let last = Mutex::new(0);
+        let (timestamp, diff) = format_timestamp(&last);
+        assert_eq!(diff, 0, "初回は epoch 全体を差分にしない");
+
+        let parsed = chrono::DateTime::parse_from_rfc3339(&timestamp)
+            .expect("timestamp must be RFC3339 with an explicit offset");
+        assert_eq!(
+            parsed.to_rfc3339_opts(SecondsFormat::Millis, false),
+            timestamp
+        );
+        assert!(timestamp.contains('.'), "ミリ秒が含まれること: {timestamp}");
+
+        let offset = &timestamp[timestamp.len() - 6..];
+        assert!(
+            offset.starts_with('+') || offset.starts_with('-'),
+            "UTC オフセットが明示されること: {timestamp}"
+        );
+        assert!(offset.contains(':'), "オフセットは HH:MM 形式: {timestamp}");
+    }
+
+    #[test]
+    fn loggers_have_independent_timestamp_state_and_recover_from_poison() {
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(Vec::new())));
+        let first = Logger::new(HashMap::new(), Arc::clone(&writer));
+        let second = Logger::new(HashMap::new(), Arc::clone(&writer));
+        assert!(
+            !Arc::ptr_eq(&first.last_timestamp, &second.last_timestamp),
+            "ロガー間で LAST_TIMESTAMP を共有しない"
+        );
+
+        // 片方のロックをポイズンしても into_inner() で回復し、ログ生成が続く。
+        let poisoned = Arc::clone(&first.last_timestamp);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison on purpose");
+        })
+        .join();
+
+        let line = first.build_message(LogLevel::Info, "after poison", None);
+        assert!(line.contains("after poison"));
+        let other_line = second.build_message(LogLevel::Info, "independent", None);
+        assert!(other_line.contains("independent"));
+    }
+
+    #[test]
+    fn tagged_logger_shares_timestamp_state_with_source_logger() {
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(Vec::new())));
+        let logger = Logger::new(HashMap::new(), Arc::clone(&writer));
+        let tagged = logger.tag("component", "test");
+        assert!(Arc::ptr_eq(&logger.last_timestamp, &tagged.last_timestamp));
     }
 }

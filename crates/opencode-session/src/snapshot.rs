@@ -25,13 +25,14 @@ impl Snapshot {
     }
 
     pub fn revert(directory: &Path, patches: Vec<SnapshotPatch>) -> Result<()> {
-        Self::revert_with_ls_tree(directory, patches, git_output)
+        Self::revert_with_git_ops(directory, patches, git_output_allow_failure, git_output)
     }
 
     /// Same as [`Snapshot::revert`], but allows the `ls-tree` probe to be supplied by callers.
     ///
     /// Keeping the probe injectable lets tests exercise the fail-closed branch without
     /// depending on git internals failing in a particular way.
+    #[cfg(test)]
     fn revert_with_ls_tree<F>(
         directory: &Path,
         patches: Vec<SnapshotPatch>,
@@ -40,8 +41,26 @@ impl Snapshot {
     where
         F: Fn(&Path, &Path, &[&str]) -> Result<Output>,
     {
+        Self::revert_with_git_ops(directory, patches, git_output_allow_failure, ls_tree)
+    }
+
+    /// Core revert with both git probes injectable so failed restorations can be
+    /// tested deterministically.
+    fn revert_with_git_ops<C, L>(
+        directory: &Path,
+        patches: Vec<SnapshotPatch>,
+        checkout: C,
+        ls_tree: L,
+    ) -> Result<()>
+    where
+        C: Fn(&Path, &Path, &[&str]) -> Result<Output>,
+        L: Fn(&Path, &Path, &[&str]) -> Result<Output>,
+    {
         let git_dir = ensure_snapshot_repo(directory)?;
         let mut seen = HashSet::new();
+        // Only a count is retained: paths and hashes must never enter an error
+        // message (see the no-leak requirement in the session integrity task).
+        let mut failed = 0usize;
 
         for patch in patches {
             for file in patch.files {
@@ -54,55 +73,67 @@ impl Snapshot {
                     continue;
                 }
 
-                let checkout = git_output_allow_failure(
+                let checkout = match checkout(
                     directory,
                     &git_dir,
-                    &["checkout", &patch.hash, "--", &relative],
-                )?;
+                    &["checkout", patch.hash.as_str(), "--", relative.as_str()],
+                ) {
+                    Ok(output) => output,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
                 if checkout.status.success() {
                     continue;
                 }
 
                 // Only a "pathspec is not in the tree" failure is eligible for deletion.
                 // Other checkout failures (permission, lock, conflict, ...) must not
-                // be mistaken for an absent path.
-                if !checkout_failure_is_missing_path(&checkout) {
-                    continue;
+                // be mistaken for an absent path — they are restoration failures.
+                if checkout_failure_is_missing_path(&checkout) {
+                    // Confirm absence with ls-tree. If the probe itself fails, the
+                    // file is counted as unrestorable rather than deleted.
+                    let tree_output = match ls_tree(
+                        directory,
+                        &git_dir,
+                        &["ls-tree", patch.hash.as_str(), "--", relative.as_str()],
+                    ) {
+                        Ok(output) => output,
+                        Err(_) => {
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    let exists_in_tree = !String::from_utf8_lossy(&tree_output.stdout)
+                        .trim()
+                        .is_empty();
+                    if !exists_in_tree {
+                        let absolute = if file_path.is_absolute() {
+                            file_path
+                        } else {
+                            directory.join(&relative)
+                        };
+                        match fs::remove_file(&absolute) {
+                            Ok(()) => continue,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                // Already gone; the desired end state is satisfied.
+                                continue;
+                            }
+                            Err(_) => {
+                                failed += 1;
+                                continue;
+                            }
+                        }
+                    }
                 }
 
-                // Confirm absence with ls-tree. If the probe itself fails, bail out
-                // instead of deleting: we can no longer prove the file is absent.
-                let tree_output = ls_tree(
-                    directory,
-                    &git_dir,
-                    &["ls-tree", &patch.hash, "--", &relative],
-                )?;
-                let exists_in_tree = !String::from_utf8_lossy(&tree_output.stdout)
-                    .trim()
-                    .is_empty();
-                if exists_in_tree {
-                    continue;
-                }
-
-                let absolute = if file_path.is_absolute() {
-                    file_path
-                } else {
-                    directory.join(&relative)
-                };
-                match fs::remove_file(&absolute) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        // Already gone; the desired end state is satisfied.
-                    }
-                    Err(err) => {
-                        anyhow::bail!(
-                            "failed to delete file absent from snapshot: {}: {}",
-                            absolute.display(),
-                            err
-                        );
-                    }
-                }
+                failed += 1;
             }
+        }
+
+        if failed > 0 {
+            anyhow::bail!("snapshot revert failed to restore {failed} file(s); paths are omitted");
         }
         Ok(())
     }
@@ -357,6 +388,7 @@ fn is_worktree_relative(relative: &str) -> bool {
 mod tests {
     use super::{checkout_failure_is_missing_path, git_output, Snapshot, SnapshotPatch};
     use std::fs;
+    use std::path::Path;
     use std::process::Output;
     use tempfile::tempdir;
 
@@ -537,6 +569,63 @@ mod tests {
         assert!(
             outside.exists(),
             "file outside worktree must not be deleted"
+        );
+    }
+
+    /// 1 ファイルでも復元できなければ Err を返し、パスやハッシュを露出しないこと。
+    #[test]
+    fn revert_returns_err_when_any_file_cannot_be_restored() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        let good = root.join("good.txt");
+        let bad = root.join("bad.txt");
+        fs::write(&good, "v1\n").expect("write good file");
+        fs::write(&bad, "v1\n").expect("write bad file");
+        let hash = Snapshot::track(root).expect("track snapshot");
+        fs::write(&good, "changed\n").expect("modify good file");
+        fs::write(&bad, "changed\n").expect("modify bad file");
+
+        let result = Snapshot::revert_with_git_ops(
+            root,
+            vec![SnapshotPatch {
+                hash: hash.clone(),
+                files: vec![
+                    good.to_string_lossy().to_string(),
+                    bad.to_string_lossy().to_string(),
+                ],
+            }],
+            |directory: &Path, git_dir: &Path, args: &[&str]| -> anyhow::Result<Output> {
+                if args.iter().any(|arg| arg.ends_with("bad.txt")) {
+                    let mut output = std::process::Command::new("git")
+                        .arg("not-a-git-subcommand")
+                        .output()
+                        .expect("produce a failed git status");
+                    output.stderr = b"error: restore blocked\n".to_vec();
+                    Ok(output)
+                } else {
+                    git_output(directory, git_dir, args)
+                }
+            },
+            git_output,
+        );
+
+        let err = result.expect_err("a single failed file must make revert return Err");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("1 file"),
+            "error must report failure count only: {rendered}"
+        );
+        assert!(!rendered.contains("good.txt"), "path must not leak");
+        assert!(!rendered.contains("bad.txt"), "path must not leak");
+        assert!(
+            !rendered.contains(hash.as_str()),
+            "snapshot hash must not leak"
+        );
+        assert_eq!(fs::read_to_string(&good).expect("read good"), "v1\n");
+        assert_eq!(
+            fs::read_to_string(&bad).expect("read bad"),
+            "changed\n",
+            "unrestorable file must be left untouched"
         );
     }
 }

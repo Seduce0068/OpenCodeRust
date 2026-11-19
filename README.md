@@ -155,13 +155,26 @@ The complete 22-crate map and major execution paths are documented in
 
 ## Development and validation
 
+CI is defined in `.github/workflows/ci.yml` and delegated to the shared
+`Seduce0068/workflows/.github/workflows/rust-gates.yml@v1` workflow.
+`Cargo.lock` is committed, so cargo commands use `--locked`; a `cargo audit`
+gate is also enabled. The four `extra_gates` below mirror the CI job exactly.
+
 ```bash
-cargo fmt
-cargo check
-cargo clippy --workspace --all-targets
-cargo nextest run --workspace
-cargo check --workspace --all-targets --all-features
+cargo check --workspace --all-features --all-targets --locked
+cargo test --workspace --all-features --all-targets --locked
+cargo clippy --workspace --all-features --all-targets --locked -- \
+  -D warnings -D clippy::undocumented_unsafe_blocks
+cargo build --workspace --release --locked
 ```
+
+The default-feature gates (fmt / check / test / clippy) also run with
+`locked: true`, `audit: true`, and
+`clippy_args: -D clippy::undocumented_unsafe_blocks`, so `-D warnings` and
+the unsafe-block lint apply to both feature sets.
+
+`cargo nextest run --workspace` remains available as a faster local test
+runner; CI uses `cargo test` (see the gates above).
 
 Minimal check (typical):
 
