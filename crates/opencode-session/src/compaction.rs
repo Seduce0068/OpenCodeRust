@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use opencode_core::bus::{Bus, BusEventDef};
 use opencode_plugin::{HookContext, HookEvent};
 use serde::{Deserialize, Serialize};
 
@@ -20,9 +19,6 @@ const PRUNE_MINIMUM: u64 = 20_000;
 const PRUNE_PROTECT: u64 = 40_000;
 
 const PRUNE_PROTECTED_TOOLS: &[&str] = &["skill"];
-
-/// Bus event definition for session.compacted (mirrors TS Event.Compacted).
-pub const EVENT_COMPACTED: BusEventDef = BusEventDef::new("session.compacted");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
@@ -196,17 +192,11 @@ pub struct CreateCompactionInput {
 
 pub struct CompactionEngine {
     config: CompactionConfig,
-    bus: Option<Arc<Bus>>,
 }
 
 impl CompactionEngine {
     pub fn new(config: CompactionConfig) -> Self {
-        Self { config, bus: None }
-    }
-
-    pub fn with_bus(mut self, bus: Arc<Bus>) -> Self {
-        self.bus = Some(bus);
-        self
+        Self { config }
     }
 
     /// Check whether the conversation has overflowed the context window.
@@ -648,15 +638,6 @@ When constructing the summary, try to stick to this template:
                         ops.update_part(&input.session_id, &continue_msg_id, continue_part)
                             .await?;
                     }
-                }
-
-                // TS: Bus.publish(Event.Compacted, { sessionID: input.sessionID })
-                if let Some(ref bus) = self.bus {
-                    bus.publish(
-                        &EVENT_COMPACTED,
-                        serde_json::json!({ "sessionID": input.session_id }),
-                    )
-                    .await;
                 }
 
                 // Fire the session.compacting hook to notify plugins that
@@ -1388,11 +1369,6 @@ mod tests {
         assert_eq!(json, "\"completed\"");
         let deserialized: ToolPartStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, ToolPartStatus::Completed);
-    }
-
-    #[test]
-    fn test_event_compacted_def() {
-        assert_eq!(EVENT_COMPACTED.event_type, "session.compacted");
     }
 
     #[test]

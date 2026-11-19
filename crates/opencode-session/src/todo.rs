@@ -1,4 +1,3 @@
-use opencode_core::bus::{Bus, BusEventDef};
 use opencode_storage::TodoRepository;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,17 +13,13 @@ pub struct TodoInfo {
 pub struct TodoManager {
     state: Arc<RwLock<HashMap<String, Vec<TodoInfo>>>>,
     db: Option<Arc<TodoRepository>>,
-    bus: Option<Arc<Bus>>,
 }
-
-pub static TODO_UPDATED_EVENT: BusEventDef = BusEventDef::new("todo.updated");
 
 impl TodoManager {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(HashMap::new())),
             db: None,
-            bus: None,
         }
     }
 
@@ -32,15 +27,6 @@ impl TodoManager {
         Self {
             state: Arc::new(RwLock::new(HashMap::new())),
             db: Some(Arc::new(TodoRepository::new(pool))),
-            bus: None,
-        }
-    }
-
-    pub fn with_bus(bus: Arc<Bus>) -> Self {
-        Self {
-            state: Arc::new(RwLock::new(HashMap::new())),
-            db: None,
-            bus: Some(bus),
         }
     }
 
@@ -49,11 +35,9 @@ impl TodoManager {
     ///
     /// Persistence is best-effort and is not part of this method's success
     /// contract: `delete_for_session` / `upsert` failures are recorded with
-    /// `tracing::warn!` and do not prevent the in-memory update or the
-    /// `todo.updated` event. Callers that require a durable write must use
-    /// `opencode_storage::TodoRepository` directly.
+    /// `tracing::warn!` and do not prevent the in-memory update. Callers that
+    /// require a durable write must use `opencode_storage::TodoRepository` directly.
     pub async fn update(&self, session_id: &str, todos: Vec<TodoInfo>) {
-        let todos_payload = todos.clone();
         if let Some(ref db) = self.db {
             if let Err(e) = db.delete_for_session(session_id).await {
                 tracing::warn!(
@@ -86,17 +70,6 @@ impl TodoManager {
             state.remove(session_id);
         } else {
             state.insert(session_id.to_string(), todos);
-        }
-
-        if let Some(ref bus) = self.bus {
-            bus.publish(
-                &TODO_UPDATED_EVENT,
-                serde_json::json!({
-                    "sessionID": session_id,
-                    "todos": todos_payload,
-                }),
-            )
-            .await;
         }
     }
 
@@ -250,38 +223,6 @@ impl TodoManager {
 impl Default for TodoManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::{timeout, Duration};
-
-    #[tokio::test]
-    async fn todo_updated_event_is_published() {
-        let bus = Arc::new(Bus::new());
-        let mut rx = bus.subscribe_channel();
-        let manager = TodoManager::with_bus(bus.clone());
-
-        manager
-            .update(
-                "session-1",
-                vec![TodoInfo {
-                    content: "write tests".to_string(),
-                    status: "pending".to_string(),
-                    priority: "high".to_string(),
-                }],
-            )
-            .await;
-
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("event timeout")
-            .expect("event channel closed");
-        assert_eq!(event.event_type, TODO_UPDATED_EVENT.event_type);
-        assert_eq!(event.properties["sessionID"], "session-1");
-        assert_eq!(event.properties["todos"][0]["content"], "write tests");
     }
 }
 

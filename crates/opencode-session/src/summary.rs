@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use opencode_core::bus::Bus;
 use opencode_provider::{ChatRequest, Content, Message, Provider, Role};
 
 use crate::message_v2::{MessageInfo, MessageWithParts, Part, StepFinishPart, StepStartPart};
@@ -198,10 +197,8 @@ pub struct SummarizeInput {
 /// This mirrors the TS `SessionSummary.summarize` which runs both
 /// `summarizeSession` and `summarizeMessage` in parallel.
 pub async fn summarize(
-    input: &SummarizeInput,
     messages: &[MessageWithParts],
     worktree: &std::path::Path,
-    bus: Option<&Bus>,
 ) -> SessionSummaryData {
     let diffs = clean_diffs(compute_diff(messages, worktree));
 
@@ -211,16 +208,6 @@ pub async fn summarize(
         files: diffs.len() as u64,
         diffs: diffs.clone(),
     };
-
-    // Publish diff event if bus is available
-    if let Some(bus) = bus {
-        let diff_event = opencode_core::bus::define_event("session.diff");
-        let diff_data = serde_json::json!({
-            "sessionID": input.session_id,
-            "diff": diffs,
-        });
-        bus.publish(&diff_event, diff_data).await;
-    }
 
     summary
 }
@@ -426,9 +413,8 @@ pub async fn summarize_into_session(
     worktree: &std::path::Path,
     provider: Option<&dyn Provider>,
     model_id: Option<&str>,
-    bus: Option<&Bus>,
 ) -> anyhow::Result<SessionSummaryData> {
-    let summary = summarize(input, messages, worktree, bus).await;
+    let summary = summarize(messages, worktree).await;
     set_session_summary(session, &summary);
     persist_session_diffs(session, &input.session_id, &summary.diffs)?;
     summarize_message_for_session(
