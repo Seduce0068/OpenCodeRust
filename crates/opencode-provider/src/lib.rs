@@ -46,7 +46,7 @@ pub mod retry;
 pub(crate) mod stream;
 pub mod together;
 pub(crate) mod tools;
-pub mod transform;
+pub(crate) mod transform;
 pub mod vercel;
 pub mod vertex;
 pub mod xai;

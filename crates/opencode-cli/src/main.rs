@@ -36,7 +36,7 @@ use opencode_session::snapshot::Snapshot;
 use opencode_session::system::{EnvironmentContext, SystemPrompt};
 use opencode_storage::{Database, MessageRepository, SessionRepository};
 use opencode_tool::skill::list_available_skills;
-use opencode_tool::{registry::create_default_registry, ToolContext};
+use opencode_tool::{create_default_registry, ToolContext};
 use opencode_types::{MessagePart, Session, SessionMessage};
 
 #[derive(Parser)]
