@@ -90,9 +90,10 @@ ADR-0002 の `PermissionBroker` と同一パターンで実装する。
 - タイムアウトは設けない。ユーザーの回答待ちは正常系であり、
   打ち切ると回答不能なセッションが残るため。停止したい場合は
   セッションを cancel するかサーバを再起動する
-- 保留エントリはメモリ上のみで保持する。タスク abort や panic で
-  `ask` future が破棄された場合、保留エントリが `list()` に残り得る
-  （PermissionBroker と同一の既知の制約。プロセス再起動で消滅する）
+- `ask` future が abort / panic で破棄されても `PendingEntryGuard::drop` が
+  保留エントリを削除し、`list()` も closed responder を除外するため、
+  残骸が `list()` に残ることはない。残る制約は保留エントリをメモリ上のみで
+  保持することだけ（プロセス再起動で消滅する）
 - `PermissionBroker` と `QuestionBroker` は現時点で別実装である。
   ペイロードと応答型が異なるため共通化は将来の課題とする
 - TUI は回答・拒否 API の失敗をトーストで通知する。空の質問配列を

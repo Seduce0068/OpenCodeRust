@@ -60,6 +60,12 @@ pub(super) struct DialogClickMap {
 }
 
 impl DialogClickMap {
+    /// Discard recorded geometry (e.g. when the popup becomes invisible).
+    pub(super) fn clear(&self) {
+        *self.area.borrow_mut() = None;
+        *self.list.borrow_mut() = None;
+    }
+
     /// Record the full frame of the dialog, borders included.
     pub(super) fn set_area(&self, area: Rect) {
         *self.area.borrow_mut() = Some(area);

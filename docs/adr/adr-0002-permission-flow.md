@@ -39,7 +39,9 @@ generated:
 ### 3. ルート接続
 
 - `GET /permission` → `broker.list()`
-- `POST /permission/reply` → `broker.reply()`
+- `POST /permission/{id}/reply` → `broker.reply()`
+  （`routes.rs` の `permission_routes()` が `/{id}/reply` を定義し、
+  TUI の `api.rs::reply_permission()` が同パスへ POST する）
 
 ### 4. プロンプト側コールバック配線（`opencode-session`）
 
@@ -63,12 +65,16 @@ generated:
 
 ## Consequences
 
-- ツール実行前に必ずユーザー確認（`always` 選択時は以降スキップ）
+- ツール実行前に必ずユーザー確認を行う
+- `always` 選択は永続化されず、現呼出しのみ permissive として扱う
+  （`PermissionResponse::Always` は callback で `Ok(())` に変換されるだけで、
+  以降のリクエストを自動許可する状態は残らない）。永続化の配線は将来課題
 - TUI/HTTP 両方で統一 UX
 - `OPENCODE_NO_AUTH=1` でも権限フローは独立動作
 
 ## Links
 
 - [ADR-0000: プロジェクト憲章](20260115-rust-reimplementation-charter.md)
-- 実装: `server.rs:66-157, 238-247`, `routes.rs:1724-1760, 1833-1841`,
-  `prompt.rs:32-112, 872-891`
+- 実装: `server.rs:62-70, 129-231`（Broker と PendingEntryGuard）,
+  `routes.rs:1994-2022, 3995-4032`（コールバック生成と `/permission/{id}/reply`）,
+  `prompt.rs:1502-1510`（`with_ask` 注入）
