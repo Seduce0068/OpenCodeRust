@@ -90,11 +90,16 @@ status: current
     stale（server/mcp_oauth.rs:519-564, routes.rs:3228-3240）。state 省略による
     CSRF バイパス（保存 state をエコーして比較が空になる）を修正し、state 必須化
     ＋400 化の回帰テスト 2 件を追加。
-  - 未対応: 保存済み Bearer トークンが MCP HTTP/SSE 接続へ注入されない
-    （set_oauth_manager の呼び出し 0 件、registry が単一 Option スロット。
-     per-server manager map 化が必要）、discovery.rs の HTTP テスト、
-    `try_unfold` を通す実 HTTP モックハーネス、RFC8707 resource の永続化。
-    `openai.rs:954` 等にも per-chunk from_utf8_lossy の残存あり。
+  - 2026-11-19 対応済み: registry の OAuth manager を server 名キー HashMap 化し
+    `add_http` / `add_sse` へ注入。server `connect()` は Authorized 時に
+    `oauth_client_for` の manager を登録（複数 OAuth サーバのトークン誤送信を防止）。
+    ログアウト時に manager を削除、read guard を跨ぐ await を解消。
+    discovery.rs に loopback HTTP モック（新規依存なし・false green 回避）で
+    7 件の実 HTTP テストを追加。テスト +11 件。
+  - 未対応: RFC8707 resource の永続化、`try_unfold` を通す実 HTTP モックハーネス、
+    `openai.rs:954` 等の per-chunk from_utf8_lossy 残存。
+    SSE transport は RemoteMcpConfig に選択肢が無く server connect から未到達
+    （add_sse 側の注入自体は実装済み）。
   - 残存（R4 記録）: ループバック bind 失敗時の graceful skip は false green、
     2 チャンク到達の明示的検証なし、イベント検証が完全一致でない。
     実行時は `NO_PROXY=127.0.0.1,localhost` 付与が必須（テスト doc に明記済み）。
@@ -240,6 +245,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-11 一部]** OAuth トークン注入と discovery HTTP テスト
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[FK 統一 / M-11 一部]** Storage::new の FK cascade と OAuth CSRF 修正
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[L-16/L-18/L-19]** キュー終端化・GitWatcher 整理・LLM 切断検知
@@ -451,6 +458,9 @@ status: current
 
 ## メモ
 
+- M-11 R4 の残存（2026-11-19、記録のみ）: `add_sse` の OAuth 注入は実装済みだが
+  `RemoteMcpConfig` に transport 選択肢が無く server `connect()` は `add_http` のみ。
+  SSE リモートをサポートするなら transport 指定を追加して `add_sse` を選択する。
 - M-11/P-04 R2 の残存（2026-11-19、記録のみ）:
   - MCP OAuth のストアは env グローバル free function ＋ static OnceLock マネージャで
     DI ポイントが無い。テストは env 書換＋static Mutex で直列化しており並列不安全。
