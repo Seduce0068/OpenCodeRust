@@ -86,9 +86,15 @@ status: current
     さらに全 16 アダプタを共通 `SseLineBuffer` ベースへ変更（4 エージェント並列）、
     空 TextDelta プレースホルダを全アダプタで廃止、azure/cohere/cerebras/deepinfra は
     try_unfold + 終端 flush 化（R4 の混在/flush 指摘を R5 で修正）。テスト +16 件。
-  - 未対応: MCP OAuth callback（ストア注入方針が未確定）、discovery.rs の HTTP テスト、
-    `try_unfold` を通す実 HTTP モックテスト（`bytes_stream` モック共通ハーネス）。
-    `openai.rs:954` 等にも per-chunk from_utf8_lossy の残存あり（横断タスク候補）。
+  - 2026-11-19 調査で判明: MCP OAuth callback は実装・配線・テスト済みで旧 TODO は
+    stale（server/mcp_oauth.rs:519-564, routes.rs:3228-3240）。state 省略による
+    CSRF バイパス（保存 state をエコーして比較が空になる）を修正し、state 必須化
+    ＋400 化の回帰テスト 2 件を追加。
+  - 未対応: 保存済み Bearer トークンが MCP HTTP/SSE 接続へ注入されない
+    （set_oauth_manager の呼び出し 0 件、registry が単一 Option スロット。
+     per-server manager map 化が必要）、discovery.rs の HTTP テスト、
+    `try_unfold` を通す実 HTTP モックハーネス、RFC8707 resource の永続化。
+    `openai.rs:954` 等にも per-chunk from_utf8_lossy の残存あり。
   - 残存（R4 記録）: ループバック bind 失敗時の graceful skip は false green、
     2 チャンク到達の明示的検証なし、イベント検証が完全一致でない。
     実行時は `NO_PROXY=127.0.0.1,localhost` 付与が必須（テスト doc に明記済み）。
@@ -199,11 +205,15 @@ status: current
     （現行 schema.rs:1224-1238、旧 todo の「5 件」は古い）も runtime
     参照 0 件。未対応の旨は MAPPING.md の「設定スキーマの追随状況」に明記済み。
     未対応は実際の配線（TUI/CLI 側の改修が必要）
-- [ ] **[P-04]** interleaved thinking の runtime 反映（no-op は削除済み）
-  - 空本体の `normalize_interleaved_field` と呼び出しを削除済み（挙動不変）。
-    未対応は `transform_messages` 経路自体が未呼び出しで、`InterleavedConfig` を渡す
-    引数追加＋呼び出し側（bootstrap 等）の改修が必要。model.interleaved → runtime
-    capabilities への変換自体は bootstrap.rs で別経路配線済み
+- [ ] **[P-04]** interleaved thinking の runtime 反映（現状維持・定義を再設定）
+  - 2026-11-19 調査: 推奨は**現状維持（明記のみ）**。model.interleaved → runtime
+    capabilities の変換は bootstrap.rs:965-971 で完了済み。未配線は transform 側だけ
+    ではなく、(a) RuntimeModelInfo が capabilities を落とし config が届かない
+    (b) PartType::Reasoning が prompt/server の変換で破棄され transform が no-op
+    (c) Anthropic wire が thinking ブロック/signature 非対応、の複合。
+    `transform_messages` の一括配線は unsupported_parts/normalize/remap の適用で
+    wire 回帰リスクあり。完全対応は 4-6 ファイル・60-150 行超（speculative）で
+    別タスク。現状は `apply_caching` のみが本番使用。
 - [ ] **[P-05]** MCP protocol Auto の probe（実挙動は明記済み）
   - doc と MAPPING.md を実挙動へ修正済み: Auto は Legacy と同じ `"2025-11-25"`
     を送り、probe/fallback は未実装、新 revision は明示指定が必要。回帰テスト追加済み。
@@ -230,6 +240,8 @@ status: current
 
 ## 完了
 
+- [x] **[FK 統一 / M-11 一部]** Storage::new の FK cascade と OAuth CSRF 修正
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[L-16/L-18/L-19]** キュー終端化・GitWatcher 整理・LLM 切断検知
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[L-10〜L-17 一部]** 入力検証・デッドコード・CORS 等を修正
@@ -439,6 +451,16 @@ status: current
 
 ## メモ
 
+- M-11/P-04 R2 の残存（2026-11-19、記録のみ）:
+  - MCP OAuth のストアは env グローバル free function ＋ static OnceLock マネージャで
+    DI ポイントが無い。テストは env 書換＋static Mutex で直列化しており並列不安全。
+    AuthStore trait 注入 or manager 単位パス保持は ServerState 移行とセットで判断。
+  - discovery.rs は http_client() が private 固定で注入点なし、dev-dep 未整備。
+    server 側 mcp_oauth.rs:1128-1241 に axum 実 HTTP モックがあるため DRY に注意。
+  - provider_integration.rs の std::net モックは 1 接続 1 ショットで discovery の
+    複数リクエスト/path 分岐にそのまま使えない。bind 失敗 SKIPPED は false green。
+  - P-04 は「bootstrap 変換済み／transform 未配線／reasoning 破棄／provider 非対応」
+    と定義を再設定。一括 transform 置換は wire 回帰リスクで見送り。
 - L-16/18/19 R4 の残存（2026-11-19、記録のみ）:
   - リトライ上限到達時にキュー項目が pending/processing のまま残り、再起動時の
     reset_processing/resume まで同一セッションの後続キューがブロックされうる

@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T17:39:36+09:00"
+  at: "2026-11-19T18:06:37+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2192 件
+  テスト総数 594 → 2196 件
 
 ### Changed
 
@@ -385,6 +385,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server` / `core` / `session`: キューリトライの指数バックオフと終端化、
   GitWatcher のデッドバリアント削除、LLM ストリームの切断即検知（swarm-coding
   R1-R6、R4 の命名不一致指摘を R5 で修正）(L-16/L-18/L-19)
+- `storage` / `server`: Storage::new の FK cascade 有効化、MCP OAuth callback の
+  state 必須化（CSRF バイパス対応）。P-04 は現状維持として定義を再設定
+  （swarm-coding R1-R6）(M-11 残り / FK 統一 / P-04)
 
 ## [0.1.0]
 
