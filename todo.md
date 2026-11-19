@@ -87,10 +87,11 @@ status: current
     （モック OAuth／callback）
   - 補足: provider/convert.rs は lib.rs から未配線のスタブで、テストを追加しても
     本クレートでは実行されない（2026-11-18 発見、追加は差し戻し済み）
-- [ ] **[M-15]** 依存ピン留めの残課題（CI locked と集約 6 件は対応済み）
-  - 残り 22 件の workspace バイパス＋9 件の未集約依存は段階的集約が必要。特に serde_json は
-    `preserve_order` feature の挙動影響を事前評価。厳密ピン拡充（8/61）は複数バージョン併存
-    リスクの精査が必要（Cargo.lock コミット＋CI locked で再現性は担保済み）
+- [x] **[M-15]** 依存の workspace 集約を完了（2026-11-19、swarm-coding R1-R6）
+  - L-07 の 20 件＋残り 3 件（dashmap / jsonc-parser / toml）を集約。クレート側
+    feature（jsonc-parser の serde）は維持し実効仕様不変。Cargo.lock 差分なし。
+    厳密ピン拡充（8/61）は Cargo.lock コミット＋CI locked で再現性担保済みのため
+    複数バージョン併存リスクの精査は不要と判断。
   - version/edition/authors/license の workspace 継承は 7 クレートとも完了済み
 - [ ] **[M-16]** 依存方向の逆転（sqlx 未使用 derive は削除済み）
   - 未使用の `SessionID` の sqlx::Type derive は削除済み。`SessionStatus` は storage が
@@ -109,11 +110,13 @@ status: current
     依存更新検知は Renovate（renovate.json 追加＋GitHub App 有効化が別判断）へ委譲。
     `scripts/opencode_llm_mcp.rs` は workspace member 外で `--locked` 再現性の観点から
     ゲート化を見送り（恒久対策は member 化）。脆弱性監査は `audit: true` で既にゲート済み。
-- [ ] **[M-37 残り]** 他の同期 I/O
-  - 2026-11-19 対応済み: find 系の spawn_blocking 化に続き、read_file の tokio::fs 化と
-    get_file_status の git subprocess を tokio::process 化。
-  - 残存: list_files、current_project_info の git subprocess、共通 canonicalize
-    ヘルパ async 化、tool 側 glob/read の WalkDir。性能改善の実測は未実施。
+- [ ] **[M-37 残り]** 共通 canonicalize ヘルパと tool 側 WalkDir
+  - 2026-11-19 対応済み: find 系 spawn_blocking、read_file の tokio::fs 化、
+    get_file_status / current_project_info の git subprocess を tokio::process 化、
+    list_files の read_dir/next_entry/file_type/metadata を非同期化（R4 の
+    next_entry Err 打ち切り指摘を R5 で修正、旧 flatten のスキップ継続を復元）。
+  - 残存: is_within_root / canonicalize_within_root の async 化（呼び出し 5 箇所に波及）、
+    tool 側 glob/read の WalkDir。性能改善の実測は未実施。
 - [x] **[M-38 一部]** /stream の初期切断検知を追加（2026-11-19、swarm-coding R1-R6）
   - chat_stream().await を tx.closed() と biased select! で競合、切断時に future を
     ドロップし永続化してから早期リターン（R4 の永続化回帰指摘を R5 で修正）。
@@ -376,6 +379,13 @@ status: current
 
 ## メモ
 
+- M-11 調査結果（2026-11-19、swarm-coding R2）: provider の統合テスト 8 件は
+  registry / 純粋ビルダーのみで chat/chat_stream を一度も呼ばない。HTTP モックは
+  新規依存不要で std::net::TcpListener + std::thread の 1 ショットが最小。
+  推奨次の 1 件はAnthropic chat_stream の SSE 分割フレームテスト＋バッファ修正
+  （base_url 注入が既存で本番変更なし、既知残存 H-19 を実 HTTP 境界で潰せる）。
+  同一の per-chunk lines() パターンは 15 アダプタに重複。OAuth callback の E2E は
+  ストア注入方針が未確定で後回し（discovery.rs の HTTP テストは別件として残す）。
 - M-17 調査結果（2026-11-19、swarm-coding R2）: 推奨は「ファサード先行・段階的
   pub(crate) 化」。transform（session/prompt.rs の import 1 行）と registry
   （cli/main.rs の import 1 行）は即時縮小可能。bootstrap / skill は
