@@ -392,6 +392,56 @@ pub fn parse_anthropic_sse(data: &str) -> Option<StreamEvent> {
     AnthropicSseParser::new().push(data)
 }
 
+/// `bytes_stream()` のチャンク境界をまたぐ SSE 行を組み立てるバッファ。
+///
+/// 生バイトを保持し、改行が揃った時点で初めて UTF-8 デコードを行うため、
+/// JSON の途中やマルチバイト文字の途中でチャンクが切れても文字化けしない。
+pub(crate) struct SseLineBuffer {
+    bytes: Vec<u8>,
+}
+
+impl Default for SseLineBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SseLineBuffer {
+    pub(crate) fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    /// チャンクを追加し、改行が確定した行（末尾 CR 除去済み）を返す。
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.bytes.extend_from_slice(chunk);
+        self.drain_lines(false)
+    }
+
+    /// ストリーム終端で、改行のない末尾行を返す。
+    pub(crate) fn flush(&mut self) -> Vec<String> {
+        self.drain_lines(true)
+    }
+
+    fn drain_lines(&mut self, flush_remainder: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(idx) = self.bytes.iter().position(|&byte| byte == b'\n') {
+            let line = self.bytes[..idx].to_vec();
+            self.bytes.drain(..=idx);
+            lines.push(decode_sse_line(&line));
+        }
+        if flush_remainder && !self.bytes.is_empty() {
+            let tail = std::mem::take(&mut self.bytes);
+            lines.push(decode_sse_line(&tail));
+        }
+        lines
+    }
+}
+
+fn decode_sse_line(bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    decoded.strip_suffix('\r').unwrap_or(&decoded).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

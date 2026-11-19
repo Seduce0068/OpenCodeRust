@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, ModelInfo, Provider, ProviderError, StreamEvent, StreamResult,
@@ -163,41 +164,115 @@ impl Provider for DeepInfraProvider {
             return Err(ProviderError::ApiError(error_text));
         }
 
-        let stream = response
-            .bytes_stream()
-            .then(|result| async move {
-                match result {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        let mut events: Vec<Result<StreamEvent, ProviderError>> = Vec::new();
-
-                        for line in text.lines() {
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if data == "[DONE]" {
-                                    events.push(Ok(StreamEvent::Done));
-                                    continue;
-                                }
-
-                                if let Some(event) = crate::stream::parse_openai_sse(data) {
-                                    events.push(Ok(event));
-                                }
-                            }
-                        }
-
-                        events
+        // bytes_stream のチャンク境界をまたぐ SSE 行を SseLineBuffer で組み立てる。
+        // 完全な行が確定してからデコードするため、UTF-8 文字の途中でチャンクが
+        // 切れても U+FFFD に置換されずに復元される。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                crate::stream::SseLineBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, buffer, pending, exhausted))));
                     }
-                    Err(e) => vec![Err(ProviderError::StreamError(e.to_string()))],
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            push_openai_sse_lines(buffer.push(bytes.as_ref()), &mut pending);
+                        }
+                        Some(Err(err)) => {
+                            return Err(ProviderError::StreamError(err.to_string()));
+                        }
+                        None => {
+                            exhausted = true;
+                            // 終端で改行のない末尾行を処理する。
+                            push_openai_sse_lines(buffer.flush(), &mut pending);
+                        }
+                    }
                 }
-            })
-            .flat_map(futures::stream::iter);
+            },
+        );
 
         Ok(Box::pin(stream))
+    }
+}
+
+/// SseLineBuffer が返した完全な SSE 行のうち `data: ` 行だけを OpenAI 互換パーサへ渡す。
+///
+/// `data: ` で始まらない行（イベント名や空行）は従来どおり無視する。
+fn push_openai_sse_lines(lines: Vec<String>, pending: &mut VecDeque<StreamEvent>) {
+    for line in lines {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(event) = crate::stream::parse_openai_sse(data) {
+                pending.push_back(event);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_line_buffer_reassembles_split_multibyte_and_multiple_lines() {
+        let mut buffer = crate::stream::SseLineBuffer::new();
+
+        let first = serde_json::json!({
+            "choices": [{ "delta": { "content": "こんにちは" } }]
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "choices": [{ "delta": { "content": "world" } }]
+        })
+        .to_string();
+        let payload = format!("data: {first}\n\ndata: {second}\n\n");
+
+        // "こ" (E3 81 93) の 1 バイト目直後でチャンクを分割する。
+        let split = payload.find("こんにちは").expect("text should be present") + 1;
+        let bytes = payload.as_bytes();
+        assert!(buffer.push(&bytes[..split]).is_empty());
+        let lines = buffer.push(&bytes[split..]);
+
+        let mut pending = VecDeque::new();
+        push_openai_sse_lines(lines, &mut pending);
+        let events: Vec<StreamEvent> = pending.into_iter().collect();
+
+        assert_eq!(events.len(), 2, "1 チャンクの複数行を全て順序どおり返す");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "こんにちは"));
+        assert!(matches!(&events[1], StreamEvent::TextDelta(t) if t == "world"));
+    }
+
+    #[test]
+    fn sse_buffer_flushes_trailing_data_line_without_newline() {
+        let mut buffer = crate::stream::SseLineBuffer::new();
+        let mut pending = VecDeque::new();
+
+        push_openai_sse_lines(
+            buffer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"),
+            &mut pending,
+        );
+        // 改行のない終端行は push では確定しない。
+        assert!(buffer.push(b"data: [DONE]").is_empty());
+        assert_eq!(pending.len(), 1);
+
+        push_openai_sse_lines(buffer.flush(), &mut pending);
+
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(StreamEvent::TextDelta(ref text)) if text == "hi"
+        ));
+        assert!(matches!(pending.pop_front(), Some(StreamEvent::Done)));
+    }
 
     // 外部 HTTP を呼ばず、ダミーキーだけで検証できる純粋ロジックに限定する。
     fn provider() -> DeepInfraProvider {

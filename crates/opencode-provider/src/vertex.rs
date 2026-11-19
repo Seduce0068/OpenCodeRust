@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, Choice, Content, Message, ModelInfo, Provider, ProviderError, Role,
@@ -275,27 +276,41 @@ impl Provider for GoogleVertexProvider {
             ));
         }
 
-        let stream = response.bytes_stream().map(move |chunk_result| {
-            match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if let Some(event) = parse_vertex_sse(data) {
-                                return Ok(event);
-                            }
-                        } else if !line.is_empty() && !line.starts_with(':') {
-                            // Vertex sometimes returns raw JSON without "data: " prefix
-                            if let Some(event) = parse_vertex_sse(line) {
-                                return Ok(event);
-                            }
+        // チャンク境界で SSE 行や UTF-8 文字が分断されても取りこぼさないよう、
+        // 生バイトを SseLineBuffer に保持し、行が確定してからパースする。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                crate::stream::SseLineBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut line_buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, line_buffer, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            push_vertex_events(line_buffer.push(bytes.as_ref()), &mut pending);
+                        }
+                        Some(Err(e)) => {
+                            return Err(ProviderError::StreamError(e.to_string()));
+                        }
+                        None => {
+                            exhausted = true;
+                            // 改行の無い末尾行も処理する。
+                            push_vertex_events(line_buffer.flush(), &mut pending);
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            }
-        });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -496,6 +511,25 @@ fn parse_vertex_sse(data: &str) -> Option<StreamEvent> {
         .clone()?;
 
     Some(StreamEvent::TextDelta(text))
+}
+
+/// 確定した SSE 行を Vertex パーサへ渡し、生成されたイベントを `pending` に積む。
+///
+/// Vertex は `data: ` プレフィックスの無い生 JSON を返すことがあるため、
+/// 従来どおりその場合も行全体をパースする。空行とコメント行（`:` 始まり）は無視する。
+fn push_vertex_events(lines: Vec<String>, pending: &mut VecDeque<StreamEvent>) {
+    for line in lines {
+        let payload = match line.strip_prefix("data: ") {
+            Some(data) => Some(data),
+            None if !line.is_empty() && !line.starts_with(':') => Some(line.as_str()),
+            None => None,
+        };
+        if let Some(payload) = payload {
+            if let Some(event) = parse_vertex_sse(payload) {
+                pending.push_back(event);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
