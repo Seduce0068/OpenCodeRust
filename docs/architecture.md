@@ -25,14 +25,13 @@ session、agent、tool、provider、MCP、LSP などの機能を組み合わせ�
 
 ## ワークスペース
 
-Workspace は `Cargo.toml` の `members` に列挙された22 crate から成る。
+Workspace は `Cargo.toml` の `members` に列挙された21 crate から成る。
 
 ### 起動・ユーザーインターフェース
 
 - `opencode-cli`: `opencoderust` バイナリ、コマンド解析、実行モード選択。
 - `opencode-tui`: 対話型 terminal user interface。
 - `opencode-server`: HTTP、SSE、WebSocket API とサーバー状態管理。
-- `opencode-pty`: pseudo-terminal の生成と入出力中継。
 
 ### Session・agent 実行
 
