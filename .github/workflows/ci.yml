@@ -33,5 +33,10 @@ jobs:
       clippy_args: -D clippy::undocumented_unsafe_blocks
       # 既定ゲートはデフォルト feature のみ。all-features（例: opencode-lsp の
       # feature 追加で 591→899 行の差分）も CI で検証する。
+      # clippy は all-features 用に独立で再実行する。clippy_args は既定 feature の
+      # 標準 clippy ゲートへ渡す入力なので、ここでは重複させず -D warnings を
+      # 直接指定する（共通ワークフロー側の変更は不要・競合なし）。
       extra_gates: |
         cargo check --workspace --all-features --all-targets --locked
+        cargo test --workspace --all-features --all-targets --locked
+        cargo clippy --workspace --all-features --all-targets --locked -- -D warnings

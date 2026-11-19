@@ -45,7 +45,8 @@ upstream は v1 monolith (`packages/opencode/src/*`) と v2 engine
 | `packages/core` (v2 engine) | `opencode-core` ほか (責務別) |
 
 v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
-`pty`、`lsp`、`mcp`、`storage`、`config`、`command`) は同名 crate に存在する。
+`lsp`、`mcp`、`storage`、`config`、`command`) は同名 crate に存在する。`pty` は
+独立 crate を廃止し、`opencode-server` の `PtyManager` に統合済み。
 
 ## 欠落・未分化の領域
 
@@ -203,7 +204,7 @@ snapshot ハッシュ)、provider 側の `enable_experimental` /
   git / id / repository。同名だが責務が異なる。
 - 共有型は upstream `schema` ↔ Rust `opencode-types`。
 - Rust 独自の crate 名: `opencode-grep`、`opencode-watcher`、
-  `opencode-pty`、`opencode-command` (upstream は `core/src` の module)。
+  `opencode-command` (upstream は `core/src` の module)。
 - `opencode-local-llm` は upstream に対応物がない (Ollama 用 stdio MCP)。
 - バイナリ名は `opencoderust` (upstream は `opencode`)。
 

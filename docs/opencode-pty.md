@@ -1,25 +1,16 @@
 ---
 type: Reference
-description: PTY の生成、子 process、terminal input/output を説明する。
-tags: [pty, terminal, process, crate]
+description: PTY 機能の現在の実装先（opencode-server）を案内する。
+tags: [pty, terminal, process, server]
 ---
 
-# opencode-pty
+# PTY (opencode-server)
 
-`opencode-pty` wraps native pseudo-terminal allocation and exposes sessions for
-command execution and output streaming.
+`opencode-pty` crate は 2026-11-19 に削除された。PTY 機能は `opencode-server` の
+`PtyManager` に統合済みで、独立 crate としては存在しない。
 
-## Responsibilities
+## 参照先
 
-- Allocate a PTY pair and spawn a command.
-- Expose the master writer for interactive input.
-- Stream terminal output through a Tokio channel.
-
-## Core API
-
-- `PtyManager::new` creates the native PTY manager.
-- `PtyManager::spawn` starts a command with the default terminal dimensions.
-- `PtySession::stream_output` reads output on a blocking worker and forwards
-  UTF-8-lossy chunks through a bounded channel.
-
-Implementation: `crates/opencode-pty/src/lib.rs`.
+- 実装: `crates/opencode-server/src/pty.rs`
+- モジュール文書: [opencode-server](opencode-server.md)
+- HTTP ルート: `/pty/*`

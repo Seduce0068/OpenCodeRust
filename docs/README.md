@@ -46,7 +46,7 @@ This documentation set describes the current **OpenCodeRust** codebase
 - [Local LLM](opencode-local-llm.md) – Ollama-backed stdio MCP server
 - [MCP](opencode-mcp.md) – Client, OAuth, and transport layer
 - [Permission](opencode-permission.md) – Rules and decision engine
-- [PTY](opencode-pty.md) – Pseudo-terminal process sessions
+- [PTY](opencode-server.md) – Pseudo-terminal sessions in Server
 - [Plugin](opencode-plugin.md) – Hooks and TypeScript subprocess bridge
 - [Provider](opencode-provider.md) – Multi-provider model adapters
 - [Server](opencode-server.md) – HTTP routes and event stream

@@ -77,8 +77,27 @@ fn generate_auth_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// `OPENCODE_NO_AUTH` の値をパースし、認証を無効化すべきかどうかを返す純粋関数。
+///
+/// `true` / `1` / `yes`（大小文字無視、前後の空白は除去）の場合のみ `true` を返す。
+/// 未設定・空文字・`0` / `false`・不正値はすべて fail-closed として認証を有効にする。
+/// 環境変数を直接読まないため、単体テストから値を渡して検証できる。
+fn parse_no_auth(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        let normalized = raw.trim();
+        normalized == "1"
+            || normalized.eq_ignore_ascii_case("true")
+            || normalized.eq_ignore_ascii_case("yes")
+    })
+}
+
+/// 認証が有効かどうかを返す。
+///
+/// `OPENCODE_NO_AUTH` が明示的に無効化を要求する値の場合のみ `false`。
+/// 起動時の warning は `run_server` / `run_server_with_state` 側で 1 回だけ出力する
+/// （M-14 の既存警告と二重に出さないため、ここではログを出さない）。
 fn is_auth_enabled() -> bool {
-    std::env::var("OPENCODE_NO_AUTH").is_err()
+    !parse_no_auth(std::env::var("OPENCODE_NO_AUTH").ok().as_deref())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1300,6 +1319,99 @@ mod tests {
         );
         assert_eq!(sanitize_request_id("  "), None);
         assert_eq!(sanitize_request_id("\n\r\u{0000}"), None);
+    }
+
+    #[test]
+    fn parse_no_auth_disables_auth_only_for_explicit_true_values() {
+        // 明示的な無効化値（大小文字無視・前後空白許容）のみ true。
+        let disabling: [Option<&str>; 8] = [
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("TRUE"),
+            Some("YES"),
+            Some("True"),
+            Some(" true "),
+            Some("\tyes\n"),
+        ];
+        for value in disabling {
+            assert!(
+                parse_no_auth(value),
+                "explicit NO_AUTH value must disable auth: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_no_auth_keeps_auth_enabled_for_all_other_values() {
+        // 未設定・空・0/false・不正値は fail-closed（認証有効）。
+        let not_disabling: [Option<&str>; 9] = [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+            Some("no"),
+            Some("garbage"),
+            Some("2"),
+        ];
+        for value in not_disabling {
+            assert!(
+                !parse_no_auth(value),
+                "non-explicit NO_AUTH value must keep auth enabled: {value:?}"
+            );
+        }
+    }
+
+    /// 環境変数を書き換えるテストを直列化するためのロック。
+    static AUTH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// テスト終了時に `OPENCODE_NO_AUTH` を元の状態へ戻すガード。
+    struct RestoreNoAuth(Option<String>);
+
+    impl Drop for RestoreNoAuth {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("OPENCODE_NO_AUTH", value),
+                None => std::env::remove_var("OPENCODE_NO_AUTH"),
+            }
+        }
+    }
+
+    #[test]
+    fn is_auth_enabled_matches_parsed_no_auth_value() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+
+        // 未設定
+        std::env::remove_var("OPENCODE_NO_AUTH");
+        assert!(
+            is_auth_enabled(),
+            "unset OPENCODE_NO_AUTH must keep auth enabled"
+        );
+
+        let cases: [(&str, bool); 9] = [
+            ("1", false),
+            ("true", false),
+            ("yes", false),
+            ("TRUE", false),
+            ("YES", false),
+            ("0", true),
+            ("false", true),
+            ("", true),
+            ("garbage", true),
+        ];
+        for (value, expected_enabled) in cases {
+            std::env::set_var("OPENCODE_NO_AUTH", value);
+            assert_eq!(
+                is_auth_enabled(),
+                expected_enabled,
+                "OPENCODE_NO_AUTH={value:?} should yield is_auth_enabled={expected_enabled}"
+            );
+        }
     }
 
     fn state_with_repos(
