@@ -4216,8 +4216,9 @@ async fn delete_pty(
 #[derive(Debug, Deserialize)]
 pub struct PtyConnectQuery {
     /// Byte cursor from which to replay buffered output.
-    /// `-1` means skip all buffered output and only receive live data.
-    /// Omitted or `0` means replay from the beginning of the retained buffer.
+    /// Any negative value (including `-1`) means skip all buffered output and
+    /// only receive live data. Omitted or `0` means replay from the beginning
+    /// of the retained buffer.
     pub cursor: Option<i64>,
 }
 
@@ -4252,28 +4253,63 @@ async fn pty_connect(
         .into_response()
 }
 
-async fn handle_pty_websocket(mut socket: WebSocket, sub: PtySubscription, cursor_param: i64) {
-    // --- Phase 1: Replay buffered output ---
-    // Determine the byte offset to start replaying from.
-    let from = if cursor_param == -1 {
-        // Skip all buffered output.
-        sub.cursor
+/// Map a client-supplied PTY cursor to the absolute byte offset from which to
+/// replay buffered output.
+///
+/// - Any negative value (`-1`, `-2`, ...) means "skip all buffered output" and
+///   maps to `cursor` (the end of the retained buffer). Treating *all* negative
+///   values this way — rather than only exactly `-1` — prevents a malformed
+///   negative cursor from falling through to `0` and replaying the entire
+///   retained buffer (up to 2 MiB) in 64 KiB chunks.
+/// - `0` means replay from the beginning of the retained buffer.
+/// - A positive value is used directly as an absolute byte offset.
+fn pty_replay_from(cursor_param: i64, cursor: usize) -> usize {
+    if cursor_param < 0 {
+        cursor
     } else if cursor_param > 0 {
         cursor_param as usize
     } else {
         0
-    };
+    }
+}
 
-    if from < sub.cursor && !sub.buffer.is_empty() {
-        let offset = from.saturating_sub(sub.buffer_start);
-        if offset < sub.buffer.len() {
-            let replay = &sub.buffer[offset..];
-            // Send in 64 KiB chunks to avoid oversized frames (matching TS).
-            for chunk in replay.chunks(64 * 1024) {
-                let bytes = axum::body::Bytes::copy_from_slice(chunk);
-                if socket.send(Message::Binary(bytes)).await.is_err() {
-                    return;
-                }
+/// Resolve the byte offset into the retained buffer at which replay starts.
+///
+/// Returns `None` when no buffered output should be replayed, i.e. when the
+/// resolved `from` offset is at or past the current cursor (client is already
+/// up to date) or when the retained buffer is empty. Offsets below
+/// `buffer_start` are clamped to the start of the retained buffer.
+fn compute_pty_replay_offset(
+    cursor_param: i64,
+    buffer_start: usize,
+    cursor: usize,
+    buffer_len: usize,
+) -> Option<usize> {
+    let from = pty_replay_from(cursor_param, cursor);
+    if from >= cursor || buffer_len == 0 {
+        return None;
+    }
+    let offset = from.saturating_sub(buffer_start);
+    if offset < buffer_len {
+        Some(offset)
+    } else {
+        None
+    }
+}
+
+async fn handle_pty_websocket(mut socket: WebSocket, sub: PtySubscription, cursor_param: i64) {
+    // --- Phase 1: Replay buffered output ---
+    // Resolve the replay slice up front via a pure helper so cursor boundary
+    // handling is testable without driving the full async WebSocket handler.
+    if let Some(offset) =
+        compute_pty_replay_offset(cursor_param, sub.buffer_start, sub.cursor, sub.buffer.len())
+    {
+        let replay = &sub.buffer[offset..];
+        // Send in 64 KiB chunks to avoid oversized frames (matching TS).
+        for chunk in replay.chunks(64 * 1024) {
+            let bytes = axum::body::Bytes::copy_from_slice(chunk);
+            if socket.send(Message::Binary(bytes)).await.is_err() {
+                return;
             }
         }
     }
@@ -4361,6 +4397,104 @@ async fn handle_pty_websocket(mut socket: WebSocket, sub: PtySubscription, curso
     }
 
     forward_task.abort();
+}
+
+#[cfg(test)]
+mod pty_cursor_tests {
+    use super::*;
+
+    /// Representative snapshot: the retained buffer covers bytes [100, 200).
+    const BUFFER_START: usize = 100;
+    const CURSOR: usize = 200;
+    const BUFFER_LEN: usize = 100;
+
+    #[test]
+    fn negative_cursor_maps_to_end_of_buffer() {
+        // The documented `-1` and every other negative value must skip all
+        // buffered output. A negative value must never fall through to `0`,
+        // otherwise the whole retained buffer would be replayed.
+        assert_eq!(pty_replay_from(-1, CURSOR), CURSOR);
+        assert_eq!(pty_replay_from(-2, CURSOR), CURSOR);
+        assert_eq!(pty_replay_from(-100, CURSOR), CURSOR);
+        assert_eq!(pty_replay_from(i64::MIN, CURSOR), CURSOR);
+    }
+
+    #[test]
+    fn zero_and_positive_cursor_map_to_absolute_offsets() {
+        assert_eq!(pty_replay_from(0, CURSOR), 0);
+        assert_eq!(pty_replay_from(1, CURSOR), 1);
+        assert_eq!(pty_replay_from(150, CURSOR), 150);
+    }
+
+    #[test]
+    fn replay_offset_boundaries() {
+        // -1 / -2 -> skip all buffered output (no replay). This is the
+        // regression: -2 used to resolve to `0` and replay the whole buffer.
+        assert_eq!(
+            compute_pty_replay_offset(-1, BUFFER_START, CURSOR, BUFFER_LEN),
+            None
+        );
+        assert_eq!(
+            compute_pty_replay_offset(-2, BUFFER_START, CURSOR, BUFFER_LEN),
+            None
+        );
+
+        // 0 -> replay from the beginning of the retained buffer.
+        assert_eq!(
+            compute_pty_replay_offset(0, BUFFER_START, CURSOR, BUFFER_LEN),
+            Some(0)
+        );
+
+        // 1 (below buffer_start) -> saturating_sub clamps to the beginning.
+        assert_eq!(
+            compute_pty_replay_offset(1, BUFFER_START, CURSOR, BUFFER_LEN),
+            Some(0)
+        );
+        assert_eq!(
+            compute_pty_replay_offset(50, BUFFER_START, CURSOR, BUFFER_LEN),
+            Some(0)
+        );
+
+        // Inside the buffer -> offset relative to the retained buffer.
+        assert_eq!(
+            compute_pty_replay_offset(150, BUFFER_START, CURSOR, BUFFER_LEN),
+            Some(50)
+        );
+
+        // At / above cursor -> nothing to replay (client is already current).
+        assert_eq!(
+            compute_pty_replay_offset(200, BUFFER_START, CURSOR, BUFFER_LEN),
+            None
+        );
+        assert_eq!(
+            compute_pty_replay_offset(250, BUFFER_START, CURSOR, BUFFER_LEN),
+            None
+        );
+        assert_eq!(
+            compute_pty_replay_offset(i64::MAX, BUFFER_START, CURSOR, BUFFER_LEN),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_buffer_never_replays() {
+        for cursor_param in [-1_i64, -2, 0, 1, 50] {
+            assert_eq!(
+                compute_pty_replay_offset(cursor_param, 0, 0, 0),
+                None,
+                "cursor_param={cursor_param}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_session_buffer_starts_at_zero() {
+        // buffer_start == 0: 0 replays everything, 1 starts at byte 1.
+        assert_eq!(compute_pty_replay_offset(0, 0, 50, 50), Some(0));
+        assert_eq!(compute_pty_replay_offset(1, 0, 50, 50), Some(1));
+        assert_eq!(compute_pty_replay_offset(25, 0, 50, 50), Some(25));
+        assert_eq!(compute_pty_replay_offset(-2, 0, 50, 50), None);
+    }
 }
 
 fn question_routes() -> Router<Arc<ServerState>> {

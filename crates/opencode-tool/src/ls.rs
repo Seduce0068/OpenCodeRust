@@ -154,11 +154,22 @@ impl Tool for LsTool {
         }
 
         let mut files: Vec<String> = Vec::new();
+        // 外部ディレクトリの権限チェックは走査ルート base_dir に対して走査前に
+        // 一度だけ行われる。シンボリックリンクを辿ると、ディレクトリ内のリンクが
+        // 外部を指す場合にそのチェックをすり抜けて外部のファイル名を返してしまう
+        // ため、辿らない。follow_links(false) は symlink cycle も構造的に防ぐ。
         for entry in WalkDir::new(&base_dir)
-            .follow_links(true)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
         {
+            // follow_links(false) でも WalkDir はリンク自身をエントリとして返す。
+            // path.is_file() / File::open はリンク先を辿るため、外部のファイル名を
+            // 返さないようリンクを明示的に除外する。
+            if entry.file_type().is_symlink() {
+                continue;
+            }
+
             let rel_path = entry.path().strip_prefix(&base_dir).unwrap_or(entry.path());
             let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
@@ -423,5 +434,37 @@ mod tests {
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 一覧対象ディレクトリ内の symlink が外部のファイル／ディレクトリを指して
+    /// も、その外部のファイル名を返してはならない（権限すり抜け回帰テスト）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_does_not_follow_external_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let outside =
+            std::env::temp_dir().join(format!("opencode-ls-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP_SECRET").unwrap();
+        std::fs::write(dir.join("normal.txt"), "normal").unwrap();
+
+        symlink(&outside, dir.join("outside_link")).unwrap();
+        symlink(outside.join("secret.txt"), dir.join("secret_link.txt")).unwrap();
+
+        let result = LsTool::new()
+            .execute(serde_json::json!({}), context(&dir))
+            .await
+            .unwrap();
+
+        // 通常ファイルだけが返り、外部を指す symlink の名前は漏れない。
+        assert_eq!(result.metadata["count"], 1);
+        assert!(result.output.contains("normal.txt"));
+        assert!(!result.output.contains("outside_link"));
+        assert!(!result.output.contains("secret_link.txt"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 }

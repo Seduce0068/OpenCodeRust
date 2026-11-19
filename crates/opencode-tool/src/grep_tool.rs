@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
+use crate::tool::parse_bool_arg;
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 const MAX_LINE_LENGTH: usize = 2000;
@@ -35,23 +36,10 @@ struct GrepMatch {
     line_text: String,
 }
 
-/// Parse an optional boolean argument. A missing or `null` value keeps
-/// `default`; any other JSON type is rejected instead of being silently
-/// coerced to `false`.
-fn parse_bool_arg(args: &serde_json::Value, key: &str, default: bool) -> Result<bool, ToolError> {
-    let value = &args[key];
-    if value.is_null() {
-        return Ok(default);
-    }
-    value
-        .as_bool()
-        .ok_or_else(|| ToolError::InvalidArguments(format!("{} must be a boolean", key)))
-}
-
 /// Largest byte index `<= index` that is a valid UTF-8 character boundary in `s`.
 ///
-/// Mirrors read.rs's private `floor_char_boundary`; kept local because tool
-/// modules in this write scope do not share a helper module. `- 1` steps never
+/// Mirrors read.rs's private `floor_char_boundary`; kept local because the
+/// shared helpers in `crate::tool` cover argument parsing only. `- 1` steps never
 /// underflow because the loop stops at `0`, which is always a boundary.
 fn floor_char_boundary(s: &str, index: usize) -> usize {
     let mut i = index.min(s.len());
