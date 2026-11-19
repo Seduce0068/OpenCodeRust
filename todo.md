@@ -178,15 +178,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **SSE リスナースレッドが App 終了を検知せずデタッチ残存** — `app.rs:3850,3945-4056` / TUI-08
-- [ ] **長いセッションで scroll_offset が u16 に丸められる** — `session.rs:884` / TUI-09
-- [ ] **極小ターミナル時に screen_lines スナップショットが古いまま残る** — `app.rs:3377-3379` / TUI-10
-- [ ] **plugin auth callback が単一スロットで並行 OAuth フローが上書きされる**
-  — `plugin-host.ts:168,597-638` / PLUG-AUTH-SLOT
 - [ ] **plugin host が stdin EOF を検知せず自終了できない**
   — `plugin-host.ts:87-104,120-128` / PLUG-HOST-EOF
-- [ ] **local-llm の model 引数が未検証で CLI オプションとして解釈されうる**
-  — `local-llm/main.rs:343-359` / LLM-ARG-INJECTION
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -210,8 +203,6 @@ status: current
     O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
-- [ ] **worktree 一覧だけがエラーを握り潰しエラー契約が不整合** — `routes.rs:5023` / R1-AR07
-- [ ] **CHANGELOG のカバレッジ増減が逆記述（49.19% を微減と記載）** — `CHANGELOG.md:45-46` / R1-TS01
 - [ ] **README のクレート数が 22 で現行 21 と不一致** — `README.md:142` / R1-TS02
 - [ ] **opencode-config.md の cwd 未対応記述が実装と矛盾**
   — — `docs/opencode-config.md:71` / R1-TS05
@@ -290,18 +281,11 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **リトライ判定が IsRetryable と parse_api_call_error で乖離（OpenAI 404）**
-  — `provider.rs:103-133,282-285` / P-05
-- [ ] **source 付きエラーが常に非リトライで下位ネットワークエラーが無視される** — `provider.rs:122-123` / P-06
 - [ ] **認証キーのローテーションが無く 1 プロバイダ 1 キー固定** — `auth.rs:57-64,179-193` / P-07
 - [ ] **Bedrock の autoload 判定と Provider 生成で認証方式が不一致**
   — `bootstrap.rs:553-581,2217-2241` / P-08
-- [ ] **ModelsRegistry が失敗をキャッシュせず 10 秒タイムアウトを毎回繰り返す**
-  — `models.rs:114-164` / P-09
 - [ ] **モデル ID 解決が HashMap 順依存で非決定的**
   — `bootstrap.rs:1714-1726`, `provider.rs:390-397` / P-10
-- [ ] **Paste イベントがモーダル状態を無視してプロンプトへ挿入** — `app.rs:709-711` / TUI-04
-- [ ] **SSE 再接続にバックオフが無く成功直後 EOF で hot loop** — `app.rs:3874-3922` / TUI-05
 - [ ] **CodeMode の timeoutMs がホストツール呼び出しを拘束できない**
   — `tools.rs:78-82` / CM-HOST-TIMEOUT
 - [ ] **local-llm がリクエストを直列処理し 300 秒間キャンセル不能**
@@ -311,19 +295,8 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
-- [ ] **CORS allow_headers に x-opencode-directory / x-request-id が欠落**
-  — — `server.rs:1155` / R1-AR01 / 中
-- [ ] **401 レスポンスだけが共通エラースキーマと不一致** — `server.rs:1182-1189` / R1-AR02 / 中
 - [ ] **per-instance ServerState と process-global な CORS/plugin/fetch-proxy 状態が矛盾**
   — — `server.rs:491-516,996` / R1-AR03 / 中
-- [ ] **設定読み込み API（load_config）がユーザー設定ファイルを破壊的に書き換え**
-  — — `loader.rs:76-99,371-427` / R1-AR04 / 中
-- [ ] **worktree API が非同期ハンドラ内で同期 git サブプロセスを実行**
-  — — `routes.rs:5021-5060`, `worktree.rs:25-38` / R1-AR06 / 中
-- [ ] **auth_token が None の ServerState で認証が fail-open**
-  — — `server.rs:99-101,1167-1170` / R1-AR09 / 中
-- [ ] **update_config が plugin/instructions を追記のみで空配列削除不可**
-  — — `loader.rs:1571-1589`, `schema.rs:1855` / R1-AR10 / 中
 - [ ] **CLI clear が履歴を消去せずメッセージのみ出力** — `main.rs:1649-1652` / R1-ST02 / 中
 - [ ] **run --format json のローカル実行で JSON 以外が標準出力に混在**
   — — `main.rs:1515-1524` / R1-ST05 / 中
@@ -346,6 +319,8 @@ status: current
 
 ## 完了
 
+- [x] **[重複整理 18 件]** 過去ラウンドで対応済みの未着手を完了へ
+  （2026-11-20、親が実コードで確認）
 - [x] **[観測性/整合性 9 件]** ログ・相関 ID・retry・Runbook
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[Bash/Web/CI 8 件]** env 検証・上限・audit/TSRV/release ゲート
@@ -605,6 +580,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（TUI/retry/plugin の修正時、記録のみ）: App::drop の
+  JoinHandle::join が SSE 読み出しタイムアウト（120s）までブロックしうる
+  （blocking reqwest のため設計判断）。TS 側で auth.callback が失敗すると
+  pending フローが TTL 10 分まで残存（再試行意図なら正常）。terminal::restore が
+  run() と Drop で二重呼び出し（crossterm は冪等と推定）。Retry-After のキー比較が
+  provider 側は大小文字無視・session 側は小文字完全一致（本番は小文字化され実害なし）。
 - 2026-11-20 R4 残存（観測性/整合性 9 件の修正時、記録のみ）: Snapshot::revert は
   1 ファイル失敗でも他を復元する部分適用状態で Err を返す（all-or-nothing 化は
   設計判断）。ToolCallEnd.input が未参照のため Delta を出さないプロバイダでは
