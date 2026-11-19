@@ -30,7 +30,9 @@ OpenCodeRust サーバモード（`opencoderust serve`）はローカル開発�
 
 - 起動時に 32 バイト乱数トークン生成、ログ出力
 - `Authorization: Bearer <token>` ヘッダー必須
-- 環境変数 `OPENCODE_NO_AUTH=1` で明示的に無効化可能（開発用のみ）
+- 環境変数 `OPENCODE_NO_AUTH` で明示的に無効化可能（開発用のみ）:
+  - 無効化とみなす値は `1` / `true` / `yes` のみ（大小文字無視・前後空白除去）
+  - 未設定・空文字・`0` / `false`・不正値は認証有効（fail-closed）
 
 ### 2. CORS 厳格化（Origin 完全一致）
 
@@ -59,7 +61,7 @@ OpenCodeRust サーバモード（`opencoderust serve`）はローカル開発�
 ## Consequences
 
 - 既存スクリプトはトークン取得・ヘッダー付与必要
-- `OPENCODE_NO_AUTH=1` は非推奨・本番禁止を明記
+- `OPENCODE_NO_AUTH` による無効化は非推奨・本番禁止を明記
 - Tauri/Web 連携は既存オリジン維持で互換性確保
 
 ## Links

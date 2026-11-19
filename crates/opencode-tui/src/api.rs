@@ -1,4 +1,5 @@
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -324,9 +325,30 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    /// 認証なしのクライアントを生成する（従来どおりの挙動）。
     pub fn new(base_url: String) -> Self {
+        Self::with_auth_token(base_url, None)
+    }
+
+    /// `Authorization: Bearer <token>` を全リクエストへ付与するクライアントを生成する。
+    ///
+    /// `token` が `None` の場合は `new` と同一（ヘッダを付与しない）。
+    /// トークン値はログ・エラー・デバッグ出力へ一切含めない。
+    pub fn with_auth_token(base_url: String, token: Option<&str>) -> Self {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = token {
+            // SSE 側（app.rs の spawn_server_event_listener）と同一方針:
+            // HeaderValue 生成が失敗したら panic せず、トークンを付けずに進む。
+            // エラー文言・ログにはトークン値を一切含めない。
+            if let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                headers.insert(AUTHORIZATION, header);
+            } else {
+                tracing::warn!("invalid auth token value; skipping Authorization header");
+            }
+        }
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .default_headers(headers)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -1650,5 +1672,175 @@ mod tests {
         // 一般エラー（500 等）は型付きエラーへ誤ってダウンキャストされない。
         let generic = anyhow::anyhow!("Failed to list skills: 500 - boom");
         assert!(generic.downcast_ref::<UnsupportedEndpointError>().is_none());
+    }
+
+    // --- attach の password が Authorization: Bearer として届くことの回帰テスト ---
+    // loopback モックへ実際にリクエストを送り、ヘッダの有無を検証する（外部送信なし）。
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Mutex, Once};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn ensure_no_proxy() {
+        static SET_NO_PROXY: Once = Once::new();
+        SET_NO_PROXY.call_once(|| {
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        });
+    }
+
+    /// 1 リクエストを受け取り、ヘッダを記録して空 JSON 配列を返すモック。
+    struct HeaderMock {
+        base_url: String,
+        seen: Arc<Mutex<Vec<String>>>,
+        thread: thread::JoinHandle<()>,
+    }
+
+    impl HeaderMock {
+        fn spawn() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+            let addr = listener.local_addr().expect("loopback addr must succeed");
+            let base_url = format!("http://{addr}");
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let seen_for_thread = Arc::clone(&seen);
+            let thread = thread::spawn(move || {
+                listener
+                    .set_nonblocking(true)
+                    .expect("mock listener must be nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                panic!("mock timed out waiting for a connection");
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => panic!("mock accept failed: {err}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("mock stream read timeout");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).expect("mock must read request");
+                    assert!(read > 0, "unexpected EOF while reading request headers");
+                    buf.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                seen_for_thread
+                    .lock()
+                    .expect("mock seen lock")
+                    .push(String::from_utf8_lossy(&buf[..header_end]).into_owned());
+                let body = "[]";
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .expect("mock must write headers");
+                stream
+                    .write_all(body.as_bytes())
+                    .expect("mock must write body");
+            });
+            Self {
+                base_url,
+                seen,
+                thread,
+            }
+        }
+
+        fn request(self) -> String {
+            self.thread.join().expect("mock thread must not panic");
+            let seen = self.seen.lock().expect("mock seen lock");
+            assert_eq!(seen.len(), 1, "exactly one request must be received");
+            seen[0].clone()
+        }
+    }
+
+    #[test]
+    fn with_auth_token_sends_bearer_authorization_header() {
+        ensure_no_proxy();
+        let mock = HeaderMock::spawn();
+        let client = ApiClient::with_auth_token(mock.base_url.clone(), Some("test-token-123"));
+
+        let agents = client
+            .list_agents()
+            .expect("mock must return an empty agent list");
+        assert!(agents.is_empty());
+
+        let request = mock.request();
+        assert!(
+            request.lines().any(|line| line
+                .trim()
+                .eq_ignore_ascii_case("authorization: Bearer test-token-123")),
+            "request must carry the bearer token: {request}"
+        );
+    }
+
+    #[test]
+    fn new_without_token_sends_no_authorization_header() {
+        ensure_no_proxy();
+        let mock = HeaderMock::spawn();
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let agents = client
+            .list_agents()
+            .expect("mock must return an empty agent list");
+        assert!(agents.is_empty());
+
+        let request = mock.request();
+        assert!(
+            !request
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
+            "request must not carry an authorization header: {request}"
+        );
+    }
+
+    #[test]
+    fn with_auth_token_does_not_panic_on_invalid_header_values() {
+        // CR/LF・NUL 等の制御文字を含むトークンは HeaderValue::from_str が拒否する。
+        // panic せずにクライアントを生成できること（SSE 側と同一方針）を検証する。
+        // ここでは外部送信せず、生成結果の保持のみを確認する。
+        let invalid_tokens = [
+            "bad\nvalue",
+            "bad\rvalue",
+            "bad\0value",
+            "bad\r\ninjected: 1",
+        ];
+        for token in invalid_tokens {
+            let client = ApiClient::with_auth_token("http://127.0.0.1:1".to_string(), Some(token));
+            assert_eq!(client.base_url, "http://127.0.0.1:1");
+        }
+    }
+
+    #[test]
+    fn with_auth_token_skips_header_for_invalid_value() {
+        // 不正値では panic せず、Authorization ヘッダを付けずにリクエストが送られる。
+        ensure_no_proxy();
+        let mock = HeaderMock::spawn();
+        let client = ApiClient::with_auth_token(mock.base_url.clone(), Some("bad\r\ninjected: 1"));
+
+        let agents = client
+            .list_agents()
+            .expect("invalid token must still allow the request to be sent");
+        assert!(agents.is_empty());
+
+        let request = mock.request();
+        assert!(
+            !request
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
+            "invalid token must not produce an Authorization header: {request}"
+        );
     }
 }

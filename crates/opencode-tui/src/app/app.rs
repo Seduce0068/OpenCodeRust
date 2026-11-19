@@ -114,7 +114,12 @@ impl App {
         }
 
         let base_url = resolve_tui_base_url();
-        let api_client = Arc::new(ApiClient::new(base_url.clone()));
+        let auth_token = resolve_tui_auth_token();
+        context.set_auth_token(auth_token.clone());
+        let api_client = Arc::new(ApiClient::with_auth_token(
+            base_url.clone(),
+            auth_token.as_deref(),
+        ));
         context.set_api_client(api_client);
         spawn_server_event_listener(event_tx.clone(), base_url, context.clone());
 
@@ -3736,6 +3741,25 @@ fn provider_from_model(model: &str) -> Option<String> {
     Some(provider.to_string())
 }
 
+/// CLI の attach -p/--password が設定した認証トークンを読み取る。
+///
+/// 値そのものは変更せず保持し、空文字・空白のみは未指定として扱う。
+/// 読み取った直後に env から削除し、メモリ上の `AppContext::auth_token` と
+/// `ApiClient` のみで保持する。子プロセス（シェル／プラグイン）が Bearer トークンを
+/// 継承しないようにするため。SSE リスナーは起動後に env ではなく
+/// `context.auth_token()` を参照するため、削除後も動作する
+/// （`spawn_server_event_listener` を参照）。
+fn resolve_tui_auth_token() -> Option<String> {
+    let token = auth_token_from_env(std::env::var("OPENCODE_TUI_AUTH_TOKEN").ok());
+    // 値の有無にかかわらず env に残さない（空文字・空白のみの場合も含む）。
+    std::env::remove_var("OPENCODE_TUI_AUTH_TOKEN");
+    token
+}
+
+fn auth_token_from_env(value: Option<String>) -> Option<String> {
+    value.filter(|token| !token.trim().is_empty())
+}
+
 fn resolve_tui_base_url() -> String {
     if let Ok(value) = std::env::var("OPENCODE_TUI_BASE_URL") {
         let trimmed = value.trim();
@@ -3824,10 +3848,19 @@ fn spawn_server_event_listener(
     context: Arc<AppContext>,
 ) {
     thread::spawn(move || {
-        let client = match reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-        {
+        // attach 先サーバが認証を有効にしている場合は SSE にも Bearer を付与する。
+        // トークン値はログへ出力しない。
+        let mut builder =
+            reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(2));
+        if let Some(token) = context.auth_token() {
+            // blocking::ClientBuilder には bearer_auth が無いため default_headers を使う。
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+                builder = builder.default_headers(headers);
+            }
+        }
+        let client = match builder.build() {
             Ok(client) => client,
             Err(err) => {
                 tracing::warn!(%err, "failed to initialize server event stream client");
@@ -4314,5 +4347,66 @@ mod tests {
             map_api_run_status(&status(true)),
             SessionStatus::Running
         ));
+    }
+
+    #[test]
+    fn auth_token_from_env_treats_blank_values_as_unset() {
+        assert_eq!(auth_token_from_env(None), None);
+        assert_eq!(auth_token_from_env(Some(String::new())), None);
+        assert_eq!(auth_token_from_env(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn auth_token_from_env_preserves_the_original_value() {
+        assert_eq!(
+            auth_token_from_env(Some(" token with spaces ".to_string())).as_deref(),
+            Some(" token with spaces ")
+        );
+    }
+
+    /// env を書き換えるテストを直列化する。
+    static TUI_AUTH_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// テスト後に `OPENCODE_TUI_AUTH_TOKEN` を元へ戻すガード。
+    struct RestoreTuiAuthToken(Option<String>);
+
+    impl Drop for RestoreTuiAuthToken {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("OPENCODE_TUI_AUTH_TOKEN", value),
+                None => std::env::remove_var("OPENCODE_TUI_AUTH_TOKEN"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_tui_auth_token_clears_env_after_reading_it() {
+        let _guard = TUI_AUTH_TOKEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreTuiAuthToken(std::env::var("OPENCODE_TUI_AUTH_TOKEN").ok());
+
+        std::env::set_var("OPENCODE_TUI_AUTH_TOKEN", "dummy-token-for-test");
+        let token = resolve_tui_auth_token();
+        assert_eq!(token.as_deref(), Some("dummy-token-for-test"));
+        assert!(
+            std::env::var("OPENCODE_TUI_AUTH_TOKEN").is_err(),
+            "auth token must not remain in the TUI process env"
+        );
+    }
+
+    #[test]
+    fn resolve_tui_auth_token_clears_blank_env_value_too() {
+        let _guard = TUI_AUTH_TOKEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreTuiAuthToken(std::env::var("OPENCODE_TUI_AUTH_TOKEN").ok());
+
+        std::env::set_var("OPENCODE_TUI_AUTH_TOKEN", "   ");
+        assert_eq!(resolve_tui_auth_token(), None);
+        assert!(
+            std::env::var("OPENCODE_TUI_AUTH_TOKEN").is_err(),
+            "even a blank auth token env value must be removed"
+        );
     }
 }
