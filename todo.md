@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[discovery high 3 件]** deny 最優先・OAuth 0600・deps 再検証
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery low 3 件]** util symlink・SSE 上限・limit クランプ
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery low 4 件]** read/ls/skill symlink・replace_all・metadata・PTY cursor
@@ -496,6 +498,24 @@ status: current
 
 ## メモ
 
+- 2026-11-19 discovery（swarm57、観点: セキュリティ/CI/テスト）27 件。対応済み 3 件:
+  PermissionEngine の deny 優先化、MCP OAuth ストアの 0600 atomic 化、
+  plugin キャッシュ deps の再検証。残存（要 triage、優先度順）:
+  - **high/medium**: plugin auth bridge の provider 名キー後勝ち上書き、
+    provider/plugin OAuth callback の CSRF state 欠如、MCP discovery の URL 未検証
+    （SSRF・平文 token_url）、OPENCODE_NO_AUTH の fail-open 判定（値を見ない）、
+    plugin spawn 失敗の握りつぶし、McpToolRegistry full_name の名前空間衝突、
+    Bearer 比較の定数時間化。
+  - **medium（設定/CI/ドキュメント）**: opencode-pty 削除後のドキュメント未追随
+    （22→21 crate、arch/README/MAPPING）、all-features ゲートが check のみ、
+    attach -p/--password と run --thinking が no-op、CI master 固定と AGENTS.md の
+    main drift、{file:...} コメント判定の誤判定、well-known キャッシュのトークン
+    再注入漏れ、experimental.todo のサイレント破棄、MCP timeout ドキュメント stale。
+  - **medium（テストギャップ）**: MCP transport のエラー/境界分岐、custom_fetch
+    レジストリの poison/並行、TUI terminal init の部分初期化リーク、
+    InputRepository::claim_pending の並行 CAS、Storage::new 接続失敗経路。
+  - 既知残存: MCP OAuth ストアの read-modify-write 競合（Mutex 化）、
+    汚染済み node_modules の purge、approved パスは hook を通さない（既存仕様）。
 - 2026-11-19 discovery 新規候補（swarm51）: high 2 件（session の UTF-8 境界 panic、
   apply_patch の stale 破壊）は対応済み。残存（要 triage）:
   - **medium**: openrouter.rs の unwrap、glob/grep の symlink 権限すり抜け、
