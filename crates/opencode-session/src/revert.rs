@@ -173,32 +173,25 @@ impl RevertManager {
         let message_id = &revert.message_id;
         let messages = &session.messages;
 
-        let mut preserve: Vec<crate::SessionMessage> = Vec::new();
-        let mut target_msg: Option<crate::SessionMessage> = None;
+        // 本番のメッセージ ID は `msg_<uuid v4>` で、辞書順は時刻順と無関係。
+        // 文字列比較ではなく Vec 上の位置で対象メッセージを特定する。
+        let target_pos = messages.iter().position(|m| &m.id == message_id);
 
-        for msg in messages {
-            if msg.id < *message_id {
-                preserve.push(msg.clone());
-                continue;
-            }
-            if msg.id > *message_id {
-                continue;
-            }
-            if revert.part_id.is_some() {
-                target_msg = Some(msg.clone());
-                continue;
-            }
-        }
+        // 対象が見つからない場合は何も削除しない（全メッセージを保持）。
+        let mut preserve: Vec<crate::SessionMessage> = match target_pos {
+            Some(pos) => messages.iter().take(pos).cloned().collect(),
+            None => messages.clone(),
+        };
 
-        if let (Some(part_id), Some(mut target)) = (&revert.part_id, target_msg) {
-            let remove_start = target.parts.iter().position(|p| &p.id == part_id);
-
-            if let Some(start) = remove_start {
+        if let (Some(pos), Some(part_id)) = (target_pos, &revert.part_id) {
+            let mut target = messages[pos].clone();
+            if let Some(start) = target.parts.iter().position(|p| &p.id == part_id) {
                 let preserve_parts: Vec<crate::MessagePart> =
                     target.parts.iter().take(start).cloned().collect();
                 target.parts = preserve_parts;
-                preserve.push(target);
             }
+            // part_id が見つからない場合も target をそのまま保持する（M-64）。
+            preserve.push(target);
         }
 
         if let Some(session) = manager.get_mut(session_id) {
@@ -499,5 +492,154 @@ mod tests {
             Some(bad_snapshot.as_str()),
             "the snapshot reference must remain available for retry"
         );
+    }
+
+    /// テスト用メッセージ。ID を明示して cleanup の辞書順比較を安定させる。
+    fn test_message(id: &str, session_id: &str, part_ids: &[&str]) -> crate::SessionMessage {
+        let mut msg = crate::SessionMessage::user(session_id, "text");
+        msg.id = id.to_string();
+        let template = msg.parts[0].clone();
+        msg.parts = part_ids
+            .iter()
+            .map(|part_id| {
+                let mut part = template.clone();
+                part.id = (*part_id).to_string();
+                part
+            })
+            .collect();
+        msg
+    }
+
+    /// msg-0001 / msg-0002 / msg-0003 を保持するセッションを用意する。
+    fn manager_with_three_messages(second_part_ids: &[&str]) -> (SessionManager, String) {
+        let mut manager = SessionManager::new();
+        let session = manager.create("project", "/tmp");
+        let session_id = session.id.clone();
+        let fixtures = [
+            ("msg-0001", vec!["prt-0001"]),
+            ("msg-0002", second_part_ids.to_vec()),
+            ("msg-0003", vec!["prt-0003"]),
+        ];
+        for (id, parts) in fixtures {
+            manager.update_message(&session_id, test_message(id, &session_id, &parts));
+        }
+        (manager, session_id)
+    }
+
+    /// 部分一致なし（part_id=None）: 対象メッセージ以降を削除し、以前のみ保持する。
+    #[test]
+    fn cleanup_without_part_id_removes_target_and_later_messages() {
+        let (mut manager, session_id) = manager_with_three_messages(&["prt-a", "prt-b"]);
+        let revert = RevertInfo {
+            message_id: "msg-0002".into(),
+            part_id: None,
+            snapshot: None,
+            diff: None,
+        };
+
+        cleanup(&session_id, &revert, &mut manager).expect("cleanup should succeed");
+
+        let session = manager.get(&session_id).expect("session exists");
+        let ids: Vec<_> = session.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["msg-0001"]);
+        assert!(session.revert.is_none(), "revert state should be cleared");
+    }
+
+    /// 部分一致あり: 一致した part 以降を切り詰め、target を保持する。
+    #[test]
+    fn cleanup_with_matching_part_id_preserves_prefix_parts() {
+        let (mut manager, session_id) = manager_with_three_messages(&["prt-a", "prt-b", "prt-c"]);
+        let revert = RevertInfo {
+            message_id: "msg-0002".into(),
+            part_id: Some("prt-b".into()),
+            snapshot: None,
+            diff: None,
+        };
+
+        cleanup(&session_id, &revert, &mut manager).expect("cleanup should succeed");
+
+        let session = manager.get(&session_id).expect("session exists");
+        let ids: Vec<_> = session.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["msg-0001", "msg-0002"]);
+
+        let target = session.messages.last().expect("target preserved");
+        let part_ids: Vec<_> = target.parts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(part_ids, ["prt-a"]);
+        assert!(session.revert.is_none(), "revert state should be cleared");
+    }
+
+    /// 部分不一致（M-64）: part が見つからなくても target を無変更で保持する。
+    #[test]
+    fn cleanup_with_unmatched_part_id_preserves_whole_target_message() {
+        let (mut manager, session_id) = manager_with_three_messages(&["prt-a", "prt-b"]);
+        let revert = RevertInfo {
+            message_id: "msg-0002".into(),
+            part_id: Some("prt-missing".into()),
+            snapshot: None,
+            diff: None,
+        };
+
+        cleanup(&session_id, &revert, &mut manager).expect("cleanup should succeed");
+
+        let session = manager.get(&session_id).expect("session exists");
+        let ids: Vec<_> = session.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["msg-0001", "msg-0002"]);
+
+        let target = session.messages.last().expect("target must not be dropped");
+        let part_ids: Vec<_> = target.parts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(part_ids, ["prt-a", "prt-b"], "parts must be unchanged");
+        assert!(session.revert.is_none(), "revert state should be cleared");
+    }
+
+    /// 本番 ID は `msg_<uuid v4>` で辞書順が時刻順と無関係（R5）。
+    /// 時刻順 [first, target, last] を辞書順が target < last < first になる
+    /// ID で構成し、target より前の first が preserve されることを固定する。
+    #[test]
+    fn cleanup_uses_message_order_not_lexicographic_id_order() {
+        let mut manager = SessionManager::new();
+        let session = manager.create("project", "/tmp");
+        let session_id = session.id.clone();
+
+        // 時刻順は first -> target -> last。辞書順は target < last < first。
+        let first = "msg_ffffffff-0000-4000-8000-000000000000";
+        let target = "msg_00000000-0000-4000-8000-000000000000";
+        let last = "msg_aaaaaaaa-0000-4000-8000-000000000000";
+
+        assert!(
+            target < last && last < first,
+            "fixture must invert lexicographic vs time order"
+        );
+
+        manager.update_message(
+            &session_id,
+            test_message(first, &session_id, &["prt-first"]),
+        );
+        manager.update_message(
+            &session_id,
+            test_message(target, &session_id, &["prt-1", "prt-2"]),
+        );
+        manager.update_message(&session_id, test_message(last, &session_id, &["prt-last"]));
+
+        let revert = RevertInfo {
+            message_id: target.into(),
+            part_id: Some("prt-2".into()),
+            snapshot: None,
+            diff: None,
+        };
+
+        cleanup(&session_id, &revert, &mut manager).expect("cleanup should succeed");
+
+        let session = manager.get(&session_id).expect("session exists");
+        let ids: Vec<_> = session.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [first, target],
+            "messages before the target must be preserved in time order"
+        );
+
+        let preserved = session.messages.last().expect("target preserved");
+        let part_ids: Vec<_> = preserved.parts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(part_ids, ["prt-1"]);
+        assert!(session.revert.is_none(), "revert state should be cleared");
     }
 }

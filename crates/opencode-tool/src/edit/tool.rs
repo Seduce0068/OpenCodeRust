@@ -126,13 +126,31 @@ impl Tool for EditTool {
         let new_string_clone = new_string.clone();
 
         with_file_lock(&path_str, || async {
-            let content = fs::read_to_string(&path_clone).await.map_err(|e| {
-                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+            // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
+            // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
+            // がスキップされ、並行編集による上書きを防げなくなる（write.rs の M-58 と同種）。
+            // メタデータ取得が失敗した場合は「新規」へ丸めずエラーを伝播させる。
+            // 権限不足等で既存ファイルを新規扱いすると stale 検出をすり抜けるため。
+            let existed = fs::try_exists(&path_clone).await.map_err(|e| {
+                ToolError::execution_with_source(
+                    format!("Failed to check file existence: {}", e),
+                    e,
+                )
             })?;
+
+            // 新規ファイル（パス未存在）は読取りに失敗するため空文字列として扱い、
+            // 既存の「old_string が空なら新規作成」経路を従来どおり通す。
+            // 既存ファイルの読取りエラーは従来どおり伝播させる。
+            let content = if existed {
+                fs::read_to_string(&path_clone).await.map_err(|e| {
+                    ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+                })?
+            } else {
+                String::new()
+            };
 
             let content = normalize_line_endings(&content);
 
-            let existed = !content.is_empty();
             if existed {
                 ctx_clone
                     .do_file_time_assert(path_str_clone.clone())
@@ -432,6 +450,9 @@ fn normalize_line_endings(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn identity_and_schema() {
@@ -471,5 +492,193 @@ mod tests {
         let diff = create_diff("a.rs", "a\nb", "a");
         assert!(!diff.contains("-a\n"));
         assert!(diff.contains("-b\n"));
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opencode-edit-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
+    /// file_time_assert の呼び出し回数と publish_bus のイベントを記録するコンテキスト。
+    fn observing_context(
+        directory: &Path,
+        assert_calls: Arc<AtomicUsize>,
+        events: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> ToolContext {
+        context(directory)
+            .with_file_time_assert(move |_session_id, _file_path| {
+                let assert_calls = assert_calls.clone();
+                async move {
+                    assert_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), ToolError>(())
+                }
+            })
+            .with_publish_bus(move |event_type, properties| {
+                let events = events.clone();
+                async move {
+                    events.lock().unwrap().push((event_type, properties));
+                }
+            })
+    }
+
+    fn watcher_event(events: &[(String, serde_json::Value)]) -> &serde_json::Value {
+        &events
+            .iter()
+            .find(|(event_type, _)| event_type == "file_watcher.updated")
+            .expect("file_watcher.updated が発行されること")
+            .1
+    }
+
+    // 既存判定を内容の空・非空ではなくパスの存在で行うことの回帰テスト（M-67）。
+
+    #[tokio::test]
+    async fn execute_existing_empty_file_asserts_file_time_and_reports_change() {
+        let dir = temp_dir();
+        let file = dir.join("empty.txt");
+        // 既存だが内容が空のファイル（旧実装では新規作成と誤判定されていた）
+        std::fs::write(&file, "").unwrap();
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        EditTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "",
+                    "new_string": "new content"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            1,
+            "既存の空ファイルでも file_time_assert が呼ばれること"
+        );
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(watcher_event(&events)["event"], "change");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new content");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_new_file_skips_file_time_assert_and_reports_add() {
+        let dir = temp_dir();
+        let file = dir.join("new.txt"); // まだ存在しない
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        EditTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "",
+                    "new_string": "created"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            0,
+            "新規ファイルでは file_time_assert をスキップすること"
+        );
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(watcher_event(&events)["event"], "add");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "created");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_existing_nonempty_file_asserts_file_time_and_reports_change() {
+        let dir = temp_dir();
+        let file = dir.join("nonempty.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        EditTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "old",
+                    "new_string": "new"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            1,
+            "既存の非空ファイルでは file_time_assert が呼ばれること"
+        );
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(watcher_event(&events)["event"], "change");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_propagates_existence_check_error() {
+        let dir = temp_dir();
+        // NUL を含むパスはメタデータ取得が InvalidInput で失敗するため、
+        // 存在確認エラーが「新規ファイル」へ丸められないことを固定できる。
+        let invalid_path = dir.join("bad\0name.txt");
+
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = observing_context(&dir, assert_calls.clone(), events.clone());
+
+        let error = EditTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": invalid_path.to_string_lossy(),
+                    "old_string": "",
+                    "new_string": "created"
+                }),
+                ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, ToolError::ExecutionWithSource { .. }),
+            "存在確認のエラーは新規扱いへ丸めず伝播すること（{}）",
+            error
+        );
+        assert_eq!(assert_calls.load(Ordering::SeqCst), 0);
+        assert!(events.lock().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -95,6 +95,17 @@ pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeErr
     Ok(worktrees)
 }
 
+/// 指定した名前のローカルブランチが厳密に存在するかを判定する。
+///
+/// `git branch --list <name>` は `<name>` を glob パターンとして解釈し、
+/// 例えば `feature` に対して `feature/child` が存在する場合も接頭辞一致で
+/// 検出してしまう。`git show-ref --verify` は ref 名の完全一致のみを検証するため、
+/// この誤判定を避けられる（`--verify` はワイルドカードを一切許さない）。
+fn branch_exists(repo_path: &Path, branch_name: &str) -> bool {
+    let refname = format!("refs/heads/{}", branch_name);
+    run_git(&["show-ref", "--verify", "--quiet", &refname], repo_path).is_ok()
+}
+
 pub fn create_worktree(
     repo_path: &Path,
     branch: Option<&str>,
@@ -128,22 +139,10 @@ pub fn create_worktree(
             .to_string()
     };
 
-    let branch_exists = run_git(&["branch", "--list", branch_name], repo_path)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-
-    if branch_exists {
-        run_git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch_name,
-                &full_path,
-                branch_name,
-            ],
-            repo_path,
-        )?;
+    if branch_exists(repo_path, branch_name) {
+        // 既存ブランチに -b を付けると同名ブランチの新規作成になり失敗するため、
+        // -b を外して既存ブランチをそのまま checkout する。
+        run_git(&["worktree", "add", &full_path, branch_name], repo_path)?;
     } else {
         let default_branch = run_git(&["symbolic-ref", "--short", "HEAD"], repo_path)
             .unwrap_or_else(|_| "main".to_string());
@@ -253,5 +252,90 @@ mod tests {
         let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], root).unwrap();
         assert!(!branch.is_empty());
         assert!(!branch.contains('\n'));
+    }
+
+    /// 1 コミット済みの一時 git リポジトリを作る。
+    fn init_git_repo() -> std::path::PathBuf {
+        let dir = temp_dir();
+        run_git(&["init", "-q"], &dir).unwrap();
+        run_git(&["config", "user.email", "worktree-test@example.com"], &dir).unwrap();
+        run_git(&["config", "user.name", "Worktree Test"], &dir).unwrap();
+        std::fs::write(dir.join("README.md"), "initial\n").unwrap();
+        run_git(&["add", "README.md"], &dir).unwrap();
+        run_git(&["commit", "-q", "-m", "initial"], &dir).unwrap();
+        dir
+    }
+
+    /// 一時リポジトリと衝突しない、兄弟の絶対パスを worktree 先として返す。
+    fn worktree_target(repo: &Path) -> String {
+        format!("{}-wt", repo.to_string_lossy())
+    }
+
+    fn cleanup(repo: &Path, target: &str) {
+        std::fs::remove_dir_all(target).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn branch_exists_is_exact_not_prefix_or_glob() {
+        let repo = init_git_repo();
+        run_git(&["branch", "feature/parent"], &repo).unwrap();
+        run_git(&["branch", "feature1"], &repo).unwrap();
+
+        // `git branch --list feature` は feature/parent を接頭辞一致で返すが、
+        // feature というブランチ自体は存在しない。
+        assert!(!branch_exists(&repo, "feature"));
+        // glob メタ文字も解釈されない（feature[0-9] というブランチは存在しない）。
+        assert!(!branch_exists(&repo, "feature[0-9]"));
+        assert!(branch_exists(&repo, "feature/parent"));
+        assert!(branch_exists(&repo, "feature1"));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn create_worktree_with_new_branch() {
+        let repo = init_git_repo();
+        let target = worktree_target(&repo);
+
+        let info = create_worktree(&repo, Some("feature-new"), Some(target.as_str())).unwrap();
+
+        assert_eq!(info.path, target);
+        assert_eq!(info.branch, "feature-new");
+        assert!(Path::new(info.path.as_str()).join("README.md").exists());
+        assert!(branch_exists(&repo, "feature-new"));
+        let checked_out = run_git(
+            &["symbolic-ref", "--short", "HEAD"],
+            Path::new(info.path.as_str()),
+        )
+        .unwrap();
+        assert_eq!(checked_out, "feature-new");
+
+        cleanup(&repo, target.as_str());
+    }
+
+    #[test]
+    fn create_worktree_with_existing_branch() {
+        let repo = init_git_repo();
+        run_git(&["branch", "feature-existing"], &repo).unwrap();
+        assert!(branch_exists(&repo, "feature-existing"));
+
+        let target = worktree_target(&repo);
+
+        // 修正前はここで `git worktree add -b feature-existing ...` が実行され
+        // 「ブランチは既に存在する」と失敗していた。
+        let info = create_worktree(&repo, Some("feature-existing"), Some(target.as_str())).unwrap();
+
+        assert_eq!(info.path, target);
+        assert_eq!(info.branch, "feature-existing");
+        assert!(Path::new(info.path.as_str()).join("README.md").exists());
+        let checked_out = run_git(
+            &["symbolic-ref", "--short", "HEAD"],
+            Path::new(info.path.as_str()),
+        )
+        .unwrap();
+        assert_eq!(checked_out, "feature-existing");
+
+        cleanup(&repo, target.as_str());
     }
 }
