@@ -22,6 +22,8 @@ struct SessionRow {
     title: String,
     version: String,
     share_url: Option<String>,
+    /// sessions.metadata の JSON 文字列。旧行は NULL（空 HashMap へフォールバック）。
+    metadata: Option<String>,
     summary_additions: Option<i64>,
     summary_deletions: Option<i64>,
     summary_files: Option<i64>,
@@ -123,6 +125,12 @@ impl SessionRow {
             .map_err(|error| (Some("revert"), error))?;
         let permission = Self::decode_json_field("permission", self.permission.as_deref())
             .map_err(|error| (Some("permission"), error))?;
+        // metadata=NULL の旧行は空 HashMap にフォールバックする。
+        // 破損 JSON は decode_json_field が CorruptData を返すため fail-loud。
+        let metadata: HashMap<String, serde_json::Value> =
+            Self::decode_json_field("metadata", self.metadata.as_deref())
+                .map_err(|error| (Some("metadata"), error))?
+                .unwrap_or_default();
 
         Ok(Session {
             id: opencode_types::SessionID(self.id),
@@ -155,10 +163,7 @@ impl SessionRow {
                 },
             }),
             status: self.status,
-            // sessions テーブルには metadata 列が無いため、現状は空で返す。
-            // 往復させるには schema.rs への `metadata TEXT` 列と migration 追加が必要
-            // （本タスクの担当外のため report で提案のみ行う）。
-            metadata: HashMap::new(),
+            metadata,
             created_at: chrono::DateTime::from_timestamp_millis(self.created_at)
                 .unwrap_or_else(chrono::Utc::now),
             updated_at: chrono::DateTime::from_timestamp_millis(self.updated_at)
@@ -181,6 +186,8 @@ impl SessionRepository {
             .summary
             .as_ref()
             .and_then(|s| serde_json::to_string(&s.diffs).ok());
+        let metadata_json = serde_json::to_string(&session.metadata)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         let revert_json = session.revert.as_ref().map(sqlx::types::Json);
         let permission_json = session.permission.as_ref().map(sqlx::types::Json);
@@ -190,12 +197,13 @@ impl SessionRepository {
             r#"
             INSERT INTO sessions (
                 id, project_id, parent_id, slug, directory, title, version, share_url,
+                metadata,
                 summary_additions, summary_deletions, summary_files, summary_diffs,
                 revert, permission,
                 usage_input_tokens, usage_output_tokens, usage_reasoning_tokens,
                 usage_cache_write_tokens, usage_cache_read_tokens, usage_total_cost,
                 status, created_at, updated_at, time_compacting, time_archived
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(session.id.0.clone())
@@ -206,6 +214,7 @@ impl SessionRepository {
         .bind(&session.title)
         .bind(&session.version)
         .bind(share_url)
+        .bind(&metadata_json)
         .bind(session.summary.as_ref().map(|s| s.additions as i64))
         .bind(session.summary.as_ref().map(|s| s.deletions as i64))
         .bind(session.summary.as_ref().map(|s| s.files as i64))
@@ -240,6 +249,7 @@ impl SessionRepository {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"SELECT 
                 id, project_id, parent_id, slug, directory, title, version, share_url,
+                metadata,
                 summary_additions, summary_deletions, summary_files, summary_diffs,
                 revert, permission,
                 usage_input_tokens, usage_output_tokens, usage_reasoning_tokens,
@@ -265,6 +275,7 @@ impl SessionRepository {
             Some(pid) => sqlx::query_as::<_, SessionRow>(
                 r#"SELECT 
                         id, project_id, parent_id, slug, directory, title, version, share_url,
+                        metadata,
                         summary_additions, summary_deletions, summary_files, summary_diffs,
                         revert, permission,
                         usage_input_tokens, usage_output_tokens, usage_reasoning_tokens,
@@ -281,6 +292,7 @@ impl SessionRepository {
             None => sqlx::query_as::<_, SessionRow>(
                 r#"SELECT 
                         id, project_id, parent_id, slug, directory, title, version, share_url,
+                        metadata,
                         summary_additions, summary_deletions, summary_files, summary_diffs,
                         revert, permission,
                         usage_input_tokens, usage_output_tokens, usage_reasoning_tokens,
@@ -340,6 +352,8 @@ impl SessionRepository {
             .summary
             .as_ref()
             .and_then(|s| serde_json::to_string(&s.diffs).ok());
+        let metadata_json = serde_json::to_string(&session.metadata)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         let revert_json = session.revert.clone();
         let permission_json = session
@@ -353,7 +367,7 @@ impl SessionRepository {
         sqlx::query(
             r#"
             UPDATE sessions SET
-                title = ?, version = ?, share_url = ?,
+                title = ?, version = ?, share_url = ?, metadata = ?,
                 summary_additions = ?, summary_deletions = ?, summary_files = ?, summary_diffs = ?,
                 revert = ?, permission = ?,
                 usage_input_tokens = ?, usage_output_tokens = ?, usage_reasoning_tokens = ?,
@@ -365,6 +379,7 @@ impl SessionRepository {
         .bind(&session.title)
         .bind(&session.version)
         .bind(share_url)
+        .bind(&metadata_json)
         .bind(session.summary.as_ref().map(|s| s.additions as i64))
         .bind(session.summary.as_ref().map(|s| s.deletions as i64))
         .bind(session.summary.as_ref().map(|s| s.files as i64))
@@ -403,6 +418,7 @@ impl SessionRepository {
         let rows = sqlx::query_as::<_, SessionRow>(
             r#"SELECT 
                 id, project_id, parent_id, slug, directory, title, version, share_url,
+                metadata,
                 summary_additions, summary_deletions, summary_files, summary_diffs,
                 revert, permission,
                 usage_input_tokens, usage_output_tokens, usage_reasoning_tokens,
@@ -1943,5 +1959,227 @@ mod session_repository_restore_tests {
             "only the healthy row must survive consecutive skips"
         );
         assert_eq!(listed[0].id.0, "good-session");
+    }
+
+    fn metadata_fixture() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("source".to_string(), serde_json::json!("test"));
+        metadata.insert("priority".to_string(), serde_json::json!(7));
+        metadata.insert("tags".to_string(), serde_json::json!(["a", "b"]));
+        metadata
+    }
+
+    #[tokio::test]
+    async fn metadata_round_trips_through_create_get_update_list_and_children() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        let mut session = sample_session("metadata-session");
+        session.metadata = metadata_fixture();
+        repository
+            .create(&session)
+            .await
+            .expect("session created with metadata");
+
+        let loaded = repository
+            .get("metadata-session")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert_eq!(loaded.metadata, session.metadata);
+
+        // list 経由でも往復すること。
+        let listed = repository.list(None, 10).await.expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].metadata, session.metadata);
+
+        // list_children 経由でも往復すること。
+        let mut child = sample_session("metadata-child");
+        child.parent_id = Some(SessionID("metadata-session".to_string()));
+        child.metadata = session.metadata.clone();
+        repository.create(&child).await.expect("child created");
+        let children = repository
+            .list_children("metadata-session")
+            .await
+            .expect("list_children works");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].metadata, session.metadata);
+
+        // update 後の再保存でも失われないこと。
+        session
+            .metadata
+            .insert("after_update".to_string(), serde_json::json!(true));
+        repository.update(&session).await.expect("session updated");
+        let reloaded = repository
+            .get("metadata-session")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert_eq!(reloaded.metadata, session.metadata);
+    }
+
+    #[tokio::test]
+    async fn legacy_row_with_null_metadata_yields_empty_map() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) \
+             VALUES ('legacy', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("legacy session row");
+        let repository = SessionRepository::new(database.pool().clone());
+
+        let loaded = repository
+            .get("legacy")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert!(
+            loaded.metadata.is_empty(),
+            "NULL metadata of a legacy row must fall back to an empty HashMap"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_metadata_fails_loud_in_get_and_list() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("bad-metadata"))
+            .await
+            .expect("session created");
+        sqlx::query("UPDATE sessions SET metadata = 'not-json' WHERE id = 'bad-metadata'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt metadata");
+
+        assert!(matches!(
+            repository.get("bad-metadata").await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+        assert!(matches!(
+            repository.list(None, 10).await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_skipping_corrupt_skips_row_with_corrupt_metadata() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("good-metadata-session"))
+            .await
+            .expect("good session created");
+        repository
+            .create(&sample_session("bad-metadata-session"))
+            .await
+            .expect("bad session created");
+        sqlx::query("UPDATE sessions SET metadata = 'not-json' WHERE id = 'bad-metadata-session'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt metadata");
+
+        let listed = repository
+            .list_skipping_corrupt(None, 100_000)
+            .await
+            .expect("tolerant list works");
+        assert_eq!(listed.len(), 1, "only the healthy row must be returned");
+        assert_eq!(listed[0].id.0, "good-metadata-session");
+        assert!(matches!(
+            repository.get("bad-metadata-session").await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_migration_adds_metadata_column_to_sessions_table() {
+        use sqlx::Row;
+
+        let database = Database::in_memory().await.expect("database initializes");
+        let rows = sqlx::query("PRAGMA table_info(sessions)")
+            .fetch_all(database.pool())
+            .await
+            .expect("table_info readable");
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").expect("column name"))
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "metadata"),
+            "起動時マイグレーションで sessions.metadata 列が追加されること"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_adds_metadata_to_preexisting_legacy_sessions_table() {
+        use sqlx::Row;
+
+        // 旧 DB 相当（metadata 列なしの sessions + user_version=0）を用意する。
+        let path = std::env::temp_dir().join(format!(
+            "storage-session-metadata-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"").expect("create temp db file");
+        let path_str = path.to_string_lossy().into_owned();
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{path_str}"))
+                .await
+                .expect("connect temp db");
+            sqlx::raw_sql(crate::schema::CREATE_SESSIONS_TABLE_LEGACY)
+                .execute(&pool)
+                .await
+                .expect("legacy sessions table");
+            sqlx::query(
+                "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) \
+                 VALUES ('legacy-row', 'project-1', 'test', '.', 'Test', 1, 1)",
+            )
+            .execute(&pool)
+            .await
+            .expect("legacy row");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("user_version"),
+                0,
+                "fresh file DB starts at version 0"
+            );
+        }
+
+        let storage = crate::Storage::new(&path_str)
+            .await
+            .expect("storage connects");
+        storage.migrate().await.expect("migration succeeds");
+        drop(storage);
+
+        let verify = sqlx::SqlitePool::connect(&format!("sqlite:{path_str}"))
+            .await
+            .expect("reopen migrated db");
+        let rows = sqlx::query("PRAGMA table_info(sessions)")
+            .fetch_all(&verify)
+            .await
+            .expect("table_info readable");
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").expect("column name"))
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "metadata"),
+            "既存テーブルにも ALTER で metadata 列が追加されること"
+        );
+
+        let repository = SessionRepository::new(verify.clone());
+        let legacy = repository
+            .get("legacy-row")
+            .await
+            .expect("get works")
+            .expect("legacy row survives migration");
+        assert!(
+            legacy.metadata.is_empty(),
+            "旧行は空 HashMap へフォールバックすること"
+        );
+        drop(verify);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -246,6 +246,7 @@ mod tests {
 
     #[test]
     fn parses_wellknown_auth_entries_from_json() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         let json = r#"{
             "https://corp.example.com": {
                 "type": "wellknown",
@@ -276,6 +277,7 @@ mod tests {
 
     #[test]
     fn wellknown_response_parses_config_field() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         let json = r#"{"config": {"model": "claude-3-opus"}}"#;
         let wk: WellKnownResponse = serde_json::from_str(json).unwrap();
         let config_val = wk.config.unwrap();
@@ -285,6 +287,7 @@ mod tests {
 
     #[test]
     fn wellknown_response_handles_missing_config() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         let json = r#"{"auth": {"command": ["login"]}}"#;
         let wk: WellKnownResponse = serde_json::from_str(json).unwrap();
         assert!(wk.config.is_none());
@@ -292,6 +295,7 @@ mod tests {
 
     #[test]
     fn cache_stores_and_retrieves() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         clear_cache();
         let config = Config {
             model: Some("cached-model".to_string()),
@@ -306,12 +310,15 @@ mod tests {
 
     #[test]
     fn cache_miss_for_unknown_url() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         clear_cache();
         assert!(get_cached("https://unknown.example.com").is_none());
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn load_wellknown_returns_default_when_no_auth_file() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         // With no auth.json, should return default config without error
         let config = load_wellknown().await;
         assert!(config.model.is_none());
@@ -319,6 +326,7 @@ mod tests {
 
     #[test]
     fn safe_env_keys_accept_auth_vars() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         assert!(is_safe_env_key("OPENAI_API_KEY"));
         assert!(is_safe_env_key("GH_TOKEN"));
         assert!(is_safe_env_key("MY_TOKEN_1"));
@@ -326,6 +334,7 @@ mod tests {
 
     #[test]
     fn safe_env_keys_reject_hijacking_names() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
         assert!(!is_safe_env_key("PATH"));
         assert!(!is_safe_env_key("LD_PRELOAD"));
         assert!(!is_safe_env_key("DYLD_INSERT_LIBRARIES"));

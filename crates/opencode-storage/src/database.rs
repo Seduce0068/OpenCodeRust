@@ -11,7 +11,8 @@ use tracing::info;
 ///
 /// 既存 DB は `user_version = 0`（SQLite のデフォルト）なので、
 /// 初回起動時は必ずマイグレーションが実行される。
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// v2: sessions.metadata 列を追加（session_input.metadata は既存）。
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {

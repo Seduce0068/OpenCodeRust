@@ -14,19 +14,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT NOT NULL,
     version TEXT NOT NULL DEFAULT '1.0.0',
     share_url TEXT,
-    
+
     -- Summary fields
     summary_additions INTEGER DEFAULT 0,
     summary_deletions INTEGER DEFAULT 0,
     summary_files INTEGER DEFAULT 0,
     summary_diffs TEXT,
-    
+
     -- Revert info (JSON)
     revert TEXT,
-    
+
     -- Permission ruleset (JSON)
     permission TEXT,
-    
+
     -- Usage stats
     usage_input_tokens INTEGER DEFAULT 0,
     usage_output_tokens INTEGER DEFAULT 0,
@@ -34,10 +34,63 @@ CREATE TABLE IF NOT EXISTS sessions (
     usage_cache_write_tokens INTEGER DEFAULT 0,
     usage_cache_read_tokens INTEGER DEFAULT 0,
     usage_total_cost REAL DEFAULT 0.0,
-    
+
     -- Status
     status TEXT NOT NULL DEFAULT 'active',
-    
+
+    -- Timestamps (milliseconds since epoch)
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    time_compacting INTEGER,
+    time_archived INTEGER,
+
+    -- Arbitrary session metadata (JSON object, HashMap<String, Value>)
+    -- 末尾 ALTER で追加されるカラム順と揃えるため最後に置く。
+    metadata TEXT
+);
+"#;
+
+/// Sessions table の旧スキーマ（metadata 列なし）。
+///
+/// `CREATE TABLE IF NOT EXISTS` は既存テーブルに列を追加しないため、
+/// `ALL_MIGRATIONS` ではこのベースライン CREATE の直後に
+/// [`MIGRATE_SESSION_METADATA`] を実行する。新規 DB は ALTER で列を得るが、
+/// `user_version` により ALL_MIGRATIONS は初回のみ走るため二重追加にならない。
+/// 正規スキーマ（metadata 列を含む）は [`CREATE_SESSIONS_TABLE`] を参照。
+pub const CREATE_SESSIONS_TABLE_LEGACY: &str = r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    parent_id TEXT,
+    slug TEXT NOT NULL,
+    directory TEXT NOT NULL,
+    title TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '1.0.0',
+    share_url TEXT,
+
+    -- Summary fields
+    summary_additions INTEGER DEFAULT 0,
+    summary_deletions INTEGER DEFAULT 0,
+    summary_files INTEGER DEFAULT 0,
+    summary_diffs TEXT,
+
+    -- Revert info (JSON)
+    revert TEXT,
+
+    -- Permission ruleset (JSON)
+    permission TEXT,
+
+    -- Usage stats
+    usage_input_tokens INTEGER DEFAULT 0,
+    usage_output_tokens INTEGER DEFAULT 0,
+    usage_reasoning_tokens INTEGER DEFAULT 0,
+    usage_cache_write_tokens INTEGER DEFAULT 0,
+    usage_cache_read_tokens INTEGER DEFAULT 0,
+    usage_total_cost REAL DEFAULT 0.0,
+
+    -- Status
+    status TEXT NOT NULL DEFAULT 'active',
+
     -- Timestamps (milliseconds since epoch)
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -46,6 +99,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 "#;
 
+/// 旧 sessions テーブルに metadata 列を追加するマイグレーション。
+///
+/// `CREATE_SESSIONS_TABLE_LEGACY` の直後に `ALL_MIGRATIONS` へ載せ、
+/// 新規／旧 DB のどちらでも起動時マイグレーション経由で列を保証する。
+/// `CREATE_SESSIONS_TABLE`（metadata 列入り）を ALL_MIGRATIONS に入れると
+/// 新規 DB で "duplicate column name: metadata" になるため、この ALTER を使う。
+/// `MIGRATE_SESSION_INPUT_METADATA` と異なり `database.rs` の PRAGMA 判定には
+/// 依存しない。
+pub const MIGRATE_SESSION_METADATA: &str = "ALTER TABLE sessions ADD COLUMN metadata TEXT;";
+
 /// Messages table - stores message metadata
 pub const CREATE_MESSAGES_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -53,11 +116,11 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     role TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    
+
     -- Provider/model info
     provider_id TEXT,
     model_id TEXT,
-    
+
     -- Token usage
     tokens_input INTEGER DEFAULT 0,
     tokens_output INTEGER DEFAULT 0,
@@ -65,10 +128,10 @@ CREATE TABLE IF NOT EXISTS messages (
     tokens_cache_read INTEGER DEFAULT 0,
     tokens_cache_write INTEGER DEFAULT 0,
     cost REAL DEFAULT 0.0,
-    
+
     -- Complete message data (JSON)
     data TEXT,
-    
+
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 "#;
@@ -80,13 +143,13 @@ CREATE TABLE IF NOT EXISTS parts (
     message_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    
+
     -- Part type
     part_type TEXT NOT NULL,
-    
+
     -- Text content
     text TEXT,
-    
+
     -- Tool call fields
     tool_name TEXT,
     tool_call_id TEXT,
@@ -94,21 +157,21 @@ CREATE TABLE IF NOT EXISTS parts (
     tool_result TEXT,
     tool_error TEXT,
     tool_status TEXT,
-    
+
     -- File fields
     file_url TEXT,
     file_filename TEXT,
     file_mime TEXT,
-    
+
     -- Reasoning fields
     reasoning TEXT,
-    
+
     -- Sort order
     sort_order INTEGER NOT NULL DEFAULT 0,
-    
+
     -- Complete part data (JSON)
     data TEXT,
-    
+
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -125,7 +188,7 @@ CREATE TABLE IF NOT EXISTS todos (
     position INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    
+
     PRIMARY KEY (session_id, todo_id),
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -149,7 +212,7 @@ CREATE TABLE IF NOT EXISTS session_shares (
     secret TEXT NOT NULL,
     url TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    
+
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 "#;
@@ -213,7 +276,8 @@ CREATE INDEX IF NOT EXISTS idx_session_input_status ON session_input(status);
 
 /// All migration statements to run
 pub const ALL_MIGRATIONS: &[&str] = &[
-    CREATE_SESSIONS_TABLE,
+    CREATE_SESSIONS_TABLE_LEGACY,
+    MIGRATE_SESSION_METADATA,
     CREATE_MESSAGES_TABLE,
     CREATE_PARTS_TABLE,
     CREATE_TODOS_TABLE,
@@ -502,6 +566,40 @@ mod tests {
             "ALTER TABLE session_input ADD COLUMN metadata TEXT;"
         );
         assert!(!ALL_MIGRATIONS.contains(&MIGRATE_SESSION_INPUT_METADATA));
+    }
+
+    /// sessions.metadata は正規 CREATE に宣言しつつ、ALL_MIGRATIONS では
+    /// ベースライン CREATE + ALTER の 2 段で適用する（新規 DB での二重追加回避）。
+    #[test]
+    fn sessions_metadata_is_declared_canonically_and_migrated_at_startup() {
+        // 正規スキーマには metadata 列がある。
+        assert!(CREATE_SESSIONS_TABLE.contains("metadata TEXT"));
+        assert!(!CREATE_SESSIONS_TABLE_LEGACY.contains("metadata"));
+
+        // ALL_MIGRATIONS はベースライン CREATE と ALTER をこの順で 1 回ずつ持つ。
+        assert!(ALL_MIGRATIONS.contains(&CREATE_SESSIONS_TABLE_LEGACY));
+        assert!(!ALL_MIGRATIONS.contains(&CREATE_SESSIONS_TABLE));
+        assert!(ALL_MIGRATIONS.contains(&MIGRATE_SESSION_METADATA));
+        assert_eq!(
+            MIGRATE_SESSION_METADATA,
+            "ALTER TABLE sessions ADD COLUMN metadata TEXT;"
+        );
+        let create_index = ALL_MIGRATIONS
+            .iter()
+            .position(|statement| *statement == CREATE_SESSIONS_TABLE_LEGACY)
+            .expect("legacy sessions CREATE is in ALL_MIGRATIONS");
+        let alter_index = ALL_MIGRATIONS
+            .iter()
+            .position(|statement| *statement == MIGRATE_SESSION_METADATA)
+            .expect("sessions metadata ALTER is in ALL_MIGRATIONS");
+        assert!(
+            create_index < alter_index,
+            "ALTER はベースライン CREATE の後に実行されること"
+        );
+        assert_eq!(
+            count(&migrations_ddl(), "CREATE TABLE IF NOT EXISTS sessions ("),
+            1
+        );
     }
 
     #[test]
