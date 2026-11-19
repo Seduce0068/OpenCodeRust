@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[discovery medium 3 件]** Broker pending 修正・detached worktree・symlink
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[モデルパッチ / OpenRouter]** Update/Move 解釈とヘッダ unwrap 排除
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery high 2 件]** UTF-8 境界 panic と apply_patch stale 破壊
@@ -492,10 +494,9 @@ status: current
 
 - 2026-11-19 discovery 新規候補（swarm51）: high 2 件（session の UTF-8 境界 panic、
   apply_patch の stale 破壊）は対応済み。残存（要 triage）:
-  - **medium**: openrouter.rs:136-155 の HeaderValue::from_str().unwrap()、
-    multiedit の逐次書き込み部分適用、glob/grep の follow_links(true) が
-    external_directory 権限をすり抜ける、worktree.rs:56-93 の detached HEAD 除外、
-    PermissionBroker/QuestionBroker の pending 残留と reply の false success。
+  - **medium**: openrouter.rs の unwrap、glob/grep の symlink 権限すり抜け、
+    worktree.rs の detached HEAD 除外、PermissionBroker/QuestionBroker の pending
+    残留と false success は対応済み。残存は multiedit の逐次書き込み部分適用のみ。
   - **low**: PTY cursor -2 以下の全リプレイ、SseLineBuffer 無上限、
     edit の replace_all 型丸め、read の metadata エラー丸め、limit 上限なし。
   - 2026-11-19 対応済み: `*** Update File:` と `@@` hunk のパース、`*** Move To:` の
@@ -507,6 +508,11 @@ status: current
     hunk 本体の接頭辞なし行がノイズとして無視される（正当行の取りこぼし可能性）、
     裸 `@@` 連続時に old_start を直前 hunk の末尾と仮定（隙間のある正しいパッチが
     拒否されうる）、`@@ -1 +1 @@` の行数省略形は本文から算出する寛容性を採用。
+  - 2026-11-19 R4 残存: glob/grep を `follow_links(false)` にしたため正当 symlink
+    配下のファイルが検索結果から消えた（権限モデルを変えず最小修正を優先）。
+    同種の follow_links(true) が read.rs:327 / ls.rs:158 / skill.rs:161 /
+    util/filesystem.rs:112 に残存（別タスク）。Broker の pending map は std Mutex
+    化で Drop ガードを実装。API クライアントから見た配信失敗時の 404 は意図どおり。
 - M-55 R4 の残存（2026-11-19、記録のみ）: 完全な eventstream フレームデコーダ
   （preamble length / prelude CRC / message CRC）は未実装で、既知 7 キーの JSON テキスト
   検索ヒューリスティックを維持。未知イベント（modelStreamErrorException 等）が
