@@ -348,6 +348,8 @@ status: current
 
 ## 完了
 
+- [x] **[認証・設定の残存 2 件]** 定数時間比較・起動時固定・instructions presence
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[中優先 6 件]** CORS/401/auth・worktree 非同期・config 読み取り専用化
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[R4 残存 5 件]** ストリーミング上限・summary 永続化・URL redaction
@@ -591,10 +593,9 @@ status: current
 - 2026-11-20 R4 残存（中優先 6 件の修正時、記録のみ）: 401 の error フィールドが
   文字列→オブジェクトへ型変更（旧クライアントが error を文字列比較していた場合は
   error.type への移行が必要）、CORS 許可ヘッダの明示列挙（リスト外カスタムヘッダは
-  プリフライト拒否）、GET /worktree の 200+[] → 400/502 への破壊的変更、
-  auth_decision のトークン比較が定数時間でない、is_auth_enabled がリクエスト毎に
-  env を読む（起動時固定化の検討課題）。instructions の skip_serializing_if は
-  plugin のみ修正し未変更。
+  プリフライト拒否）、GET /worktree の 200+[] → 400/502 への破壊的変更。
+  auth_decision の定数時間比較・is_auth_enabled の起動時固定化・
+  instructions の presence 永続化は次イテレーションで対応済み。
 - 2026-11-20 R4 残存（high 11 件の修正時）: うち 5 件は次イテレーションで対応済み
   （WebFetch 5MB 逐次強制、MCP HTTP/SSE 上限＋bounded、bash 行長制限、
   CLI log_dir None、server の summary 復元）。残存は以下のみ:
