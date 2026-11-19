@@ -105,11 +105,24 @@ impl SessionRow {
         }
     }
 
-    /// 行を `Session` に復元する。破損列があった場合は呼び出し側へ伝播する。
+    /// 行を `Session` に復元する。破損列があった場合は呼び出し側へ伝播する（fail-loud）。
     fn into_session(self) -> Result<Session, DatabaseError> {
-        let summary = self.decode_summary()?;
-        let revert = Self::decode_json_field("revert", self.revert.as_deref())?;
-        let permission = Self::decode_json_field("permission", self.permission.as_deref())?;
+        self.into_session_with_field().map_err(|(_, error)| error)
+    }
+
+    /// `into_session` と同じ復元を行うが、破損時にフィールド名も一緒に返す。
+    ///
+    /// 起動時一覧 (`SessionRepository::list_skipping_corrupt`) が warn に
+    /// フィールド名だけを記録するために使う。エラー詳細や設定値・トークン値は
+    /// ログに出さない。
+    fn into_session_with_field(self) -> Result<Session, (Option<&'static str>, DatabaseError)> {
+        let summary = self
+            .decode_summary()
+            .map_err(|error| (Some("summary_diffs"), error))?;
+        let revert = Self::decode_json_field("revert", self.revert.as_deref())
+            .map_err(|error| (Some("revert"), error))?;
+        let permission = Self::decode_json_field("permission", self.permission.as_deref())
+            .map_err(|error| (Some("permission"), error))?;
 
         Ok(Session {
             id: opencode_types::SessionID(self.id),
@@ -242,12 +255,13 @@ impl SessionRepository {
         row.map(|r| r.into_session()).transpose()
     }
 
-    pub async fn list(
+    /// セッション行を取得する共通ヘルパー。`list` と `list_skipping_corrupt` が共有する。
+    async fn fetch_session_rows(
         &self,
         project_id: Option<&str>,
         limit: i64,
-    ) -> Result<Vec<Session>, DatabaseError> {
-        let rows = match project_id {
+    ) -> Result<Vec<SessionRow>, DatabaseError> {
+        match project_id {
             Some(pid) => sqlx::query_as::<_, SessionRow>(
                 r#"SELECT 
                         id, project_id, parent_id, slug, directory, title, version, share_url,
@@ -263,7 +277,7 @@ impl SessionRepository {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| DatabaseError::QueryError(e.to_string()))?,
+            .map_err(|e| DatabaseError::QueryError(e.to_string())),
             None => sqlx::query_as::<_, SessionRow>(
                 r#"SELECT 
                         id, project_id, parent_id, slug, directory, title, version, share_url,
@@ -278,10 +292,47 @@ impl SessionRepository {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| DatabaseError::QueryError(e.to_string()))?,
-        };
+            .map_err(|e| DatabaseError::QueryError(e.to_string())),
+        }
+    }
 
+    /// 既存の fail-loud 一覧。1 行でも破損していれば `CorruptData` を返す。
+    pub async fn list(
+        &self,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Session>, DatabaseError> {
+        let rows = self.fetch_session_rows(project_id, limit).await?;
         rows.into_iter().map(|r| r.into_session()).collect()
+    }
+
+    /// 起動時一覧用の tolerant 版。破損行は warn を出してスキップし、他の行は返す。
+    ///
+    /// `get()` / `list()` の fail-loud 方針は維持したまま、1 行の破損でサーバ
+    /// 全体の起動が止まらないようにするための二層方針の tolerant 側。
+    /// warn にはフィールド名と session id のみを記録し、設定値やトークン値は
+    /// ログに出さない。
+    pub async fn list_skipping_corrupt(
+        &self,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Session>, DatabaseError> {
+        let rows = self.fetch_session_rows(project_id, limit).await?;
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id = row.id.clone();
+            match row.into_session_with_field() {
+                Ok(session) => sessions.push(session),
+                Err((field, _)) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        field = field.unwrap_or("unknown"),
+                        "skipping corrupt session row during startup list"
+                    );
+                }
+            }
+        }
+        Ok(sessions)
     }
 
     pub async fn update(&self, session: &Session) -> Result<(), DatabaseError> {
@@ -1748,5 +1799,149 @@ mod session_repository_restore_tests {
             .expect("session found");
         assert_eq!(loaded.revert, session.revert);
         assert_eq!(loaded.permission, session.permission);
+    }
+
+    #[tokio::test]
+    async fn list_skipping_corrupt_returns_healthy_rows_and_keeps_get_fail_loud() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("good-session"))
+            .await
+            .expect("good session created");
+        repository
+            .create(&sample_session("bad-session"))
+            .await
+            .expect("bad session created");
+        // 1 行だけ permission を壊す（正常行はそのまま）。
+        sqlx::query("UPDATE sessions SET permission = '{broken' WHERE id = 'bad-session'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt permission");
+
+        // (a) 起動時一覧（tolerant）: 破損行をスキップし、正常行を返す。
+        let listed = repository
+            .list_skipping_corrupt(None, 100_000)
+            .await
+            .expect("tolerant list works");
+        assert_eq!(listed.len(), 1, "only the healthy row must be returned");
+        assert_eq!(listed[0].id.0, "good-session");
+
+        // 既存 list() は fail-loud のまま（回帰確認）。
+        assert!(matches!(
+            repository.list(None, 100_000).await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+
+        // (b) 個別 get() は破損行で Err、正常行は Ok のまま（fail-loud 維持）。
+        assert!(matches!(
+            repository.get("bad-session").await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+        assert!(repository
+            .get("good-session")
+            .await
+            .expect("get works")
+            .is_some());
+    }
+
+    /// `into_session_with_field()` の summary_diffs 経路（3 経路のうち 1 つ）が
+    /// tolerant 一覧でスキップされることを固定する。
+    #[tokio::test]
+    async fn list_skipping_corrupt_skips_row_with_corrupt_summary_diffs() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("good-summary-session"))
+            .await
+            .expect("good session created");
+        repository
+            .create(&sample_session("bad-summary-session"))
+            .await
+            .expect("bad session created");
+        // summary_diffs だけを壊す（正常行はそのまま）。
+        sqlx::query(
+            "UPDATE sessions SET summary_diffs = 'not-json' WHERE id = 'bad-summary-session'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("corrupt summary_diffs");
+
+        let listed = repository
+            .list_skipping_corrupt(None, 100_000)
+            .await
+            .expect("tolerant list works");
+        assert_eq!(listed.len(), 1, "only the healthy row must be returned");
+        assert_eq!(listed[0].id.0, "good-summary-session");
+    }
+
+    /// `into_session_with_field()` の revert 経路が tolerant 一覧でスキップされることを固定する。
+    #[tokio::test]
+    async fn list_skipping_corrupt_skips_row_with_corrupt_revert() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("good-revert-session"))
+            .await
+            .expect("good session created");
+        repository
+            .create(&sample_session("bad-revert-session"))
+            .await
+            .expect("bad session created");
+        // revert だけを壊す（正常行はそのまま）。
+        sqlx::query("UPDATE sessions SET revert = 'not-json' WHERE id = 'bad-revert-session'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt revert");
+
+        let listed = repository
+            .list_skipping_corrupt(None, 100_000)
+            .await
+            .expect("tolerant list works");
+        assert_eq!(listed.len(), 1, "only the healthy row must be returned");
+        assert_eq!(listed[0].id.0, "good-revert-session");
+    }
+
+    /// 複数破損行（permission + summary_diffs）が連続しても、正常行のみが返ることを固定する。
+    #[tokio::test]
+    async fn list_skipping_corrupt_skips_multiple_corrupt_rows_consecutively() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("good-session"))
+            .await
+            .expect("good session created");
+        repository
+            .create(&sample_session("bad-permission-session"))
+            .await
+            .expect("bad permission session created");
+        repository
+            .create(&sample_session("bad-summary-session"))
+            .await
+            .expect("bad summary session created");
+        // 2 行を別々のフィールドで壊す（正常行はそのまま）。
+        sqlx::query(
+            "UPDATE sessions SET permission = '{broken' WHERE id = 'bad-permission-session'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("corrupt permission");
+        sqlx::query(
+            "UPDATE sessions SET summary_diffs = 'not-json' WHERE id = 'bad-summary-session'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("corrupt summary_diffs");
+
+        let listed = repository
+            .list_skipping_corrupt(None, 100_000)
+            .await
+            .expect("tolerant list works");
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the healthy row must survive consecutive skips"
+        );
+        assert_eq!(listed[0].id.0, "good-session");
     }
 }

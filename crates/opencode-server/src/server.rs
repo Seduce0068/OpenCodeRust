@@ -664,7 +664,9 @@ impl ServerState {
             return Ok(());
         };
 
-        let stored_sessions = session_repo.list(None, 100_000).await?;
+        // 起動時一覧は tolerant 版を使う。1 行の破損した permission / summary 等で
+        // サーバ全体の起動が止まらないようにする（個別 get() は fail-loud を維持）。
+        let stored_sessions = session_repo.list_skipping_corrupt(None, 100_000).await?;
         let mut manager = self.sessions.lock().await;
 
         for stored in stored_sessions {
