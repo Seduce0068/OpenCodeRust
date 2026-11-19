@@ -79,12 +79,15 @@ status: current
     None。配線には ①session/prompt.rs へコールバック注入 API、②server.rs へ TodoManager
     保持、③routes.rs で broadcast、④TUI の forward_server_event マッピングが必要。
     tool.rs 単独の global static 案は M-21 方針に反するため却下済み
-- [ ] **[M-11]** 重要パスのテストカバレッジ空白（多数対応済み）
-  - 対応済み: storage/database.rs、server/mcp_oauth.rs・oauth.rs・pty.rs、mcp/oauth.rs・
-    protocol.rs、plugin/subprocess/protocol.rs、provider/models.rs・bootstrap.rs、
-    watcher、codemode/tools.rs、tui/context/keybind.rs・command.rs、agent/message.rs
-    など。未対応は provider 統合テストの HTTP／ストリーミング／認証フロー
-    （モック OAuth／callback）
+- [ ] **[M-11 残り]** 他アダプタの HTTP テストと OAuth フロー
+  - 2026-11-19 対応済み: Anthropic chat_stream の SSE 行分割／UTF-8 境界を実 HTTP
+    モック（std::net、新規依存なし）で検証。行バッファを `Vec<u8>` 化し完全行確定後に
+    from_utf8_lossy を適用。他 15 アダプタの per-chunk lines() は未対応。
+  - 未対応: 他アダプタの HTTP／ストリーミング分岐、MCP OAuth callback（ストア注入
+    方針が未確定）、discovery.rs の HTTP テスト。
+  - 残存（R4 記録）: ループバック bind 失敗時の graceful skip は false green、
+    2 チャンク到達の明示的検証なし、イベント検証が完全一致でない。
+    実行時は `NO_PROXY=127.0.0.1,localhost` 付与が必須（テスト doc に明記済み）。
   - 補足: provider/convert.rs は lib.rs から未配線のスタブで、テストを追加しても
     本クレートでは実行されない（2026-11-18 発見、追加は差し戻し済み）
 - [x] **[M-15]** 依存の workspace 集約を完了（2026-11-19、swarm-coding R1-R6）
@@ -110,13 +113,14 @@ status: current
     依存更新検知は Renovate（renovate.json 追加＋GitHub App 有効化が別判断）へ委譲。
     `scripts/opencode_llm_mcp.rs` は workspace member 外で `--locked` 再現性の観点から
     ゲート化を見送り（恒久対策は member 化）。脆弱性監査は `audit: true` で既にゲート済み。
-- [ ] **[M-37 残り]** 共通 canonicalize ヘルパと tool 側 WalkDir
+- [ ] **[M-37 残り]** 共通 canonicalize ヘルパの async 化
   - 2026-11-19 対応済み: find 系 spawn_blocking、read_file の tokio::fs 化、
     get_file_status / current_project_info の git subprocess を tokio::process 化、
     list_files の read_dir/next_entry/file_type/metadata を非同期化（R4 の
-    next_entry Err 打ち切り指摘を R5 で修正、旧 flatten のスキップ継続を復元）。
-  - 残存: is_within_root / canonicalize_within_root の async 化（呼び出し 5 箇所に波及）、
-    tool 側 glob/read の WalkDir。性能改善の実測は未実施。
+    next_entry Err 打ち切り指摘を R5 で修正）、tool 側 glob/read の WalkDir も
+    spawn_blocking 化。
+  - 残存: is_within_root / canonicalize_within_root の async 化（呼び出し 5 箇所に波及）。
+    性能改善の実測は未実施。
 - [x] **[M-38 一部]** /stream の初期切断検知を追加（2026-11-19、swarm-coding R1-R6）
   - chat_stream().await を tx.closed() と biased select! で競合、切断時に future を
     ドロップし永続化してから早期リターン（R4 の永続化回帰指摘を R5 で修正）。
@@ -190,6 +194,10 @@ status: current
 
 ## 完了
 
+- [x] **[M-11 一部]** Anthropic SSE 行バッファと実 HTTP 回帰テスト
+  （2026-11-19、swarm-coding R1-R6）
+- [x] **[M-37 一部]** tool 側 WalkDir の spawn_blocking 化
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-20]** core Bus と全 publish 配線を削除（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-21]** 残存 static 4 件は現状維持（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-37 一部]** read_file/git status の非同期化（2026-11-19、swarm-coding R1-R6）
@@ -379,6 +387,16 @@ status: current
 
 ## メモ
 
+- M-05 調査結果（2026-11-19、swarm-coding R2）: 推奨は**最小配線を入れる**
+  （現状維持は不可）。todowrite が成功を返すのに ToolContext の
+  with_todo_update/with_todo_get が本番未注入で状態が消え、todoread は常に空、
+  GET /session/{id}/todo も常に空配列（ServerState の TodoManager 保持は既に
+  済みだが update() の本番呼び出し 0 件）。TUI の session_ctx.todos にも
+  populate 経路が無く、server→TUI の todo イベントも未定義。
+  最小配線は session/prompt.rs（コールバック注入）＋server/routes.rs（broadcast）
+  ＋tui/app.rs・session_context.rs（イベント受信）の 4 ファイル・80〜150 行
+  （見積りは speculative）。DB 永続化・CLI 実コマンド・TodoStatus 3 重定義は
+  後回し。tool.rs 単独の global static は M-21 方針に反し却下。
 - M-11 調査結果（2026-11-19、swarm-coding R2）: provider の統合テスト 8 件は
   registry / 純粋ビルダーのみで chat/chat_stream を一度も呼ばない。HTTP モックは
   新規依存不要で std::net::TcpListener + std::thread の 1 ショットが最小。
