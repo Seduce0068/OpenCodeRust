@@ -5,7 +5,9 @@ use serde_json;
 use sqlx::{Executor, FromRow, SqlitePool};
 use std::collections::HashMap;
 
-use opencode_types::{MessagePart, MessageRole, Session, SessionMessage, SessionStatus};
+use opencode_types::{
+    FileDiff, MessagePart, MessageRole, Session, SessionMessage, SessionStatus, SessionSummary,
+};
 
 use crate::database::DatabaseError;
 
@@ -40,8 +42,76 @@ struct SessionRow {
 }
 
 impl SessionRow {
-    fn into_session(self) -> Session {
-        Session {
+    /// 保存済み JSON 列を復元する。破損時は黙って捨てず `CorruptData` を返す。
+    ///
+    /// 特に `permission` を `.ok()` で None にすると権限制限が無い状態として
+    /// 扱われ（fail-open）、破損した設定がセキュリティ上安全に失われるため、
+    /// 読み取り側で明示的に失敗させる。
+    fn decode_json_field<T>(field: &str, raw: Option<&str>) -> Result<Option<T>, DatabaseError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match raw {
+            None => Ok(None),
+            Some(value) => serde_json::from_str(value).map(Some).map_err(|e| {
+                tracing::warn!(
+                    field = %field,
+                    error = %e,
+                    "failed to parse stored session JSON field"
+                );
+                DatabaseError::CorruptData(format!("session has invalid {field} JSON: {e}"))
+            }),
+        }
+    }
+
+    /// `summary_additions` / `summary_deletions` / `summary_files` / `summary_diffs`
+    /// を `SessionSummary` に復元する。
+    ///
+    /// `summary_diffs` が NULL でカウントも 0 の行は旧スキーマ／デフォルト値の
+    /// 「要約なし」として扱う。カウントだけが非零で diffs が欠けた行は復元
+    /// できないため fail-loud とし、黙って要約を失わないようにする。
+    fn decode_summary(&self) -> Result<Option<SessionSummary>, DatabaseError> {
+        let additions = self.summary_additions.unwrap_or(0);
+        let deletions = self.summary_deletions.unwrap_or(0);
+        let files = self.summary_files.unwrap_or(0);
+
+        match self.summary_diffs.as_deref() {
+            None => {
+                if additions == 0 && deletions == 0 && files == 0 {
+                    return Ok(None);
+                }
+                tracing::warn!("session summary counts exist but summary_diffs is missing");
+                Err(DatabaseError::CorruptData(
+                    "session has summary counts but no summary_diffs JSON".to_string(),
+                ))
+            }
+            Some(raw) => {
+                let diffs: Vec<FileDiff> = serde_json::from_str(raw).map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to parse stored summary_diffs"
+                    );
+                    DatabaseError::CorruptData(format!(
+                        "session has invalid summary_diffs JSON: {e}"
+                    ))
+                })?;
+                Ok(Some(SessionSummary {
+                    additions: additions.max(0) as u64,
+                    deletions: deletions.max(0) as u64,
+                    files: files.max(0) as u64,
+                    diffs,
+                }))
+            }
+        }
+    }
+
+    /// 行を `Session` に復元する。破損列があった場合は呼び出し側へ伝播する。
+    fn into_session(self) -> Result<Session, DatabaseError> {
+        let summary = self.decode_summary()?;
+        let revert = Self::decode_json_field("revert", self.revert.as_deref())?;
+        let permission = Self::decode_json_field("permission", self.permission.as_deref())?;
+
+        Ok(Session {
             id: opencode_types::SessionID(self.id),
             slug: self.slug,
             project_id: opencode_types::ProjectID(self.project_id),
@@ -56,12 +126,12 @@ impl SessionRow {
                 archived: self.time_archived.map(|t| t as u64),
             },
             messages: Vec::new(),
-            summary: None,
+            summary,
             share: self
                 .share_url
                 .map(|url| opencode_types::SessionShareInfo { url }),
-            revert: self.revert.and_then(|s| serde_json::from_str(&s).ok()),
-            permission: self.permission.and_then(|p| serde_json::from_str(&p).ok()),
+            revert,
+            permission,
             usage: Some(opencode_types::TokenUsage {
                 input: self.usage_input_tokens.unwrap_or(0) as f64,
                 output: self.usage_output_tokens.unwrap_or(0) as f64,
@@ -72,12 +142,15 @@ impl SessionRow {
                 },
             }),
             status: self.status,
+            // sessions テーブルには metadata 列が無いため、現状は空で返す。
+            // 往復させるには schema.rs への `metadata TEXT` 列と migration 追加が必要
+            // （本タスクの担当外のため report で提案のみ行う）。
             metadata: HashMap::new(),
             created_at: chrono::DateTime::from_timestamp_millis(self.created_at)
                 .unwrap_or_else(chrono::Utc::now),
             updated_at: chrono::DateTime::from_timestamp_millis(self.updated_at)
                 .unwrap_or_else(chrono::Utc::now),
-        }
+        })
     }
 }
 
@@ -166,7 +239,7 @@ impl SessionRepository {
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(row.map(|r| r.into_session()))
+        row.map(|r| r.into_session()).transpose()
     }
 
     pub async fn list(
@@ -208,7 +281,7 @@ impl SessionRepository {
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?,
         };
 
-        Ok(rows.into_iter().map(|r| r.into_session()).collect())
+        rows.into_iter().map(|r| r.into_session()).collect()
     }
 
     pub async fn update(&self, session: &Session) -> Result<(), DatabaseError> {
@@ -292,7 +365,7 @@ impl SessionRepository {
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(rows.into_iter().map(|r| r.into_session()).collect())
+        rows.into_iter().map(|r| r.into_session()).collect()
     }
 }
 
@@ -1442,5 +1515,238 @@ mod todo_repository_tests {
                 .expect("lookup works"),
             Some(7)
         );
+    }
+}
+
+#[cfg(test)]
+mod session_repository_restore_tests {
+    use super::SessionRepository;
+    use crate::database::DatabaseError;
+    use crate::Database;
+    use chrono::{TimeZone, Utc};
+    use opencode_types::{
+        CacheUsage, FileDiff, PermissionRuleset, ProjectID, Session, SessionID, SessionRevert,
+        SessionStatus, SessionSummary, TokenUsage,
+    };
+
+    fn sample_session(id: &str) -> Session {
+        let instant = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .expect("valid timestamp");
+        Session {
+            id: SessionID(id.to_string()),
+            slug: "test".to_string(),
+            project_id: ProjectID("project-1".to_string()),
+            directory: ".".to_string(),
+            parent_id: None,
+            title: "Test".to_string(),
+            version: "1.0.0".to_string(),
+            time: opencode_types::TimeInfo {
+                created: 1_700_000_000_000,
+                updated: 1_700_000_000_000,
+                compacting: None,
+                archived: None,
+            },
+            messages: Vec::new(),
+            summary: None,
+            share: None,
+            revert: None,
+            permission: None,
+            usage: Some(TokenUsage {
+                input: 1.0,
+                output: 2.0,
+                reasoning: 0.0,
+                cache: CacheUsage {
+                    read: 0.0,
+                    write: 0.0,
+                },
+            }),
+            status: SessionStatus::Active,
+            metadata: std::collections::HashMap::new(),
+            created_at: instant,
+            updated_at: instant,
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_round_trips_through_create_and_get() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        let mut session = sample_session("summary-session");
+        session.summary = Some(SessionSummary {
+            additions: 3,
+            deletions: 2,
+            files: 1,
+            diffs: vec![FileDiff {
+                path: "src/main.rs".to_string(),
+                additions: 3,
+                deletions: 2,
+            }],
+        });
+
+        repository.create(&session).await.expect("session created");
+        let loaded = repository
+            .get("summary-session")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert_eq!(loaded.summary, session.summary);
+
+        // list 経由でも同じ列が復元されること。
+        let listed = repository.list(None, 10).await.expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary, session.summary);
+
+        // list_children 経由でも同じ列が復元されること。
+        let mut child = sample_session("child-summary");
+        child.parent_id = Some(SessionID("summary-session".to_string()));
+        child.summary = session.summary.clone();
+        repository
+            .create(&child)
+            .await
+            .expect("child session created");
+        let children = repository
+            .list_children("summary-session")
+            .await
+            .expect("list_children works");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].summary, session.summary);
+    }
+
+    #[tokio::test]
+    async fn summary_round_trips_through_update() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        let mut session = sample_session("summary-update");
+        repository.create(&session).await.expect("session created");
+
+        session.summary = Some(SessionSummary {
+            additions: 7,
+            deletions: 4,
+            files: 2,
+            diffs: vec![FileDiff {
+                path: "docs/readme.md".to_string(),
+                additions: 7,
+                deletions: 4,
+            }],
+        });
+        repository.update(&session).await.expect("session updated");
+        let loaded = repository
+            .get("summary-update")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert_eq!(loaded.summary, session.summary);
+    }
+
+    #[tokio::test]
+    async fn legacy_row_without_summary_columns_yields_none() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) \
+             VALUES ('legacy', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("legacy session row");
+        let repository = SessionRepository::new(database.pool().clone());
+
+        let loaded = repository
+            .get("legacy")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert!(loaded.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_counts_without_diffs_fail_loud() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions \
+             (id, project_id, slug, directory, title, created_at, updated_at, \
+              summary_additions, summary_deletions, summary_files) \
+             VALUES ('partial-summary', 'project-1', 'test', '.', 'Test', 1, 1, 3, 2, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("partial summary row");
+        let repository = SessionRepository::new(database.pool().clone());
+
+        assert!(matches!(
+            repository.get("partial-summary").await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_revert_fails_loud_in_get_and_list() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("bad-revert"))
+            .await
+            .expect("session created");
+        sqlx::query("UPDATE sessions SET revert = 'not-json' WHERE id = 'bad-revert'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt revert");
+
+        assert!(matches!(
+            repository.get("bad-revert").await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+        assert!(matches!(
+            repository.list(None, 10).await,
+            Err(DatabaseError::CorruptData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_permission_fails_loud_instead_of_failing_open() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("bad-permission"))
+            .await
+            .expect("session created");
+        sqlx::query("UPDATE sessions SET permission = '{broken' WHERE id = 'bad-permission'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt permission");
+
+        let result = repository.get("bad-permission").await;
+        assert!(
+            matches!(result, Err(DatabaseError::CorruptData(_))),
+            "corrupt permission must not be dropped into an unrestricted session"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_revert_and_permission_round_trip() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        let mut session = sample_session("json-session");
+        session.revert = Some(SessionRevert {
+            message_id: "message-1".to_string(),
+            part_id: Some("part-1".to_string()),
+            snapshot: None,
+            diff: None,
+        });
+        session.permission = Some(PermissionRuleset {
+            allow: vec!["read".to_string()],
+            deny: vec!["write".to_string()],
+            mode: None,
+        });
+
+        repository.create(&session).await.expect("session created");
+        let loaded = repository
+            .get("json-session")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert_eq!(loaded.revert, session.revert);
+        assert_eq!(loaded.permission, session.permission);
     }
 }

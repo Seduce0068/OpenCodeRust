@@ -1,12 +1,20 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::protocol::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use crate::McpClientError;
+
+/// 受信する JSON-RPC フレーム本体の上限（10 MiB）。
+const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+/// 1 フレームのヘッダ行数の上限（空行を含む）。
+const MAX_HEADER_LINES: usize = 64;
+/// 1 ヘッダ行の最大長（改行を除く）。ヘッダ値にトークンが含まれても
+/// エラー本文には出さないため、値そのものはログに残さない。
+const MAX_HEADER_LINE_BYTES: usize = 8192;
 
 // ---------------------------------------------------------------------------
 // Transport trait
@@ -91,6 +99,15 @@ impl StdioTransport {
         })
     }
 
+    /// Protocol violation: kill the child so no further frames are consumed.
+    /// Callers return `ProtocolError` with a generic reason; header/body bytes
+    /// (which may carry credentials) are never echoed into the error.
+    async fn disconnect(&self) {
+        if let Some(child) = self.process.lock().await.as_mut() {
+            let _ = child.kill().await;
+        }
+    }
+
     /// Write one Content-Length framed JSON body to the child process.
     /// Shared by request and notification sends; framing is identical.
     async fn write_frame(&self, content: &str) -> Result<(), McpClientError> {
@@ -141,22 +158,57 @@ impl McpTransport for StdioTransport {
             .ok_or_else(|| McpClientError::TransportError("No stdout".to_string()))?;
 
         let mut content_length: Option<usize> = None;
-        let mut header_line = String::new();
+        let mut header_lines = 0usize;
         loop {
-            header_line.clear();
-            let bytes_read = reader.read_line(&mut header_line).await.map_err(|e| {
-                McpClientError::TransportError(format!("Failed to read header: {}", e))
-            })?;
-
-            if bytes_read == 0 {
-                return Ok(None);
+            // `read_line` には行長制限がないため、上限付きで 1 バイトずつ読む。
+            // BufReader がバッファリングするので効率上の問題はない。
+            let mut line: Vec<u8> = Vec::with_capacity(128);
+            let mut byte = [0u8; 1];
+            loop {
+                let bytes_read = reader.read(&mut byte).await.map_err(|e| {
+                    McpClientError::TransportError(format!("Failed to read header: {}", e))
+                })?;
+                if bytes_read == 0 {
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
+                    self.disconnect().await;
+                    return Err(McpClientError::ProtocolError(
+                        "Truncated header line".to_string(),
+                    ));
+                }
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if line.len() > MAX_HEADER_LINE_BYTES {
+                    self.disconnect().await;
+                    return Err(McpClientError::ProtocolError(
+                        "Header line too long".to_string(),
+                    ));
+                }
             }
 
+            header_lines += 1;
+            if header_lines > MAX_HEADER_LINES {
+                self.disconnect().await;
+                return Err(McpClientError::ProtocolError(
+                    "Too many header lines".to_string(),
+                ));
+            }
+
+            let header_line = String::from_utf8_lossy(&line);
             let trimmed = header_line.trim();
 
             if trimmed.is_empty() {
                 // End of headers: the body follows.
                 if let Some(content_length) = content_length {
+                    if content_length > MAX_FRAME_SIZE {
+                        self.disconnect().await;
+                        return Err(McpClientError::ProtocolError(
+                            "Content-Length exceeds frame size limit".to_string(),
+                        ));
+                    }
                     let mut content_buf = vec![0u8; content_length];
                     reader.read_exact(&mut content_buf).await.map_err(|e| {
                         McpClientError::TransportError(format!("Failed to read content: {}", e))
@@ -173,24 +225,34 @@ impl McpTransport for StdioTransport {
             }
 
             if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-                content_length = Some(value.trim().parse().map_err(|e| {
+                let parsed: usize = value.trim().parse().map_err(|e| {
                     McpClientError::ProtocolError(format!("Invalid content length: {}", e))
-                })?);
+                })?;
+                if parsed > MAX_FRAME_SIZE {
+                    self.disconnect().await;
+                    return Err(McpClientError::ProtocolError(
+                        "Content-Length exceeds frame size limit".to_string(),
+                    ));
+                }
+                content_length = Some(parsed);
             }
         }
     }
 
     async fn close(&self) -> Result<(), McpClientError> {
+        // ロック順序は receive() と同じ stdout → stdin → process にする。
+        // receive() が stdout を保持したまま disconnect() で process を待つ
+        // 間に close() が process を掴むとデッドロックする恐れがある。
+        let mut stdout_guard = self.stdout.lock().await;
+        *stdout_guard = None;
+        let mut stdin_guard = self.stdin.lock().await;
+        *stdin_guard = None;
         let mut process_guard = self.process.lock().await;
         if let Some(mut child) = process_guard.take() {
             child.kill().await.map_err(|e| {
                 McpClientError::TransportError(format!("Failed to kill process: {}", e))
             })?;
         }
-        let mut stdin_guard = self.stdin.lock().await;
-        *stdin_guard = None;
-        let mut stdout_guard = self.stdout.lock().await;
-        *stdout_guard = None;
         Ok(())
     }
 }
@@ -521,5 +583,59 @@ mod stdio_framing_tests {
         }
 
         transport.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_rejected_and_disconnects() {
+        // `printf` はシェルを使わずに不正なフレームを 1 回だけ書き出す。
+        let transport = StdioTransport::new(
+            "printf",
+            &["Content-Length: 10485761\r\n\r\n".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect("spawn framing fixture");
+
+        let error = transport.receive().await.expect_err("must reject");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        // 切断済みなので後続の読み取りはストリーム終端になる。
+        assert!(transport
+            .receive()
+            .await
+            .expect("read after disconnect")
+            .is_none());
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn excessive_header_lines_are_rejected() {
+        let headers = "X-Pad: 1\r\n".repeat(MAX_HEADER_LINES + 8);
+        let transport = StdioTransport::new("printf", &[format!("{headers}\r\n")], None, None)
+            .await
+            .expect("spawn framing fixture");
+        let error = transport.receive().await.expect_err("must reject");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_header_line_is_rejected() {
+        let header = format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LINE_BYTES + 1));
+        let transport = StdioTransport::new("printf", &[header], None, None)
+            .await
+            .expect("spawn framing fixture");
+        let error = transport.receive().await.expect_err("must reject");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        let _ = transport.close().await;
     }
 }

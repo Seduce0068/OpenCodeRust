@@ -120,13 +120,20 @@ enum Commands {
         message: Vec<String>,
         #[arg(long)]
         command: Option<String>,
-        #[arg(short = 'c', long = "continue", default_value_t = false)]
+        // セッション系フラグはリモート（--attach）経由でのみ意味を持つ。
+        // ローカル実行ではサイレントに無視されるため clap 段階で要求する。
+        #[arg(
+            short = 'c',
+            long = "continue",
+            default_value_t = false,
+            requires = "attach"
+        )]
         continue_last: bool,
-        #[arg(short = 's', long)]
+        #[arg(short = 's', long, requires = "attach")]
         session: Option<String>,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, requires = "attach")]
         fork: bool,
-        #[arg(long)]
+        #[arg(long, requires = "attach")]
         share: bool,
         #[arg(short = 'm', long)]
         model: Option<String>,
@@ -1481,9 +1488,12 @@ async fn run_non_interactive(
         .await;
     }
 
+    // clap 段階で --attach を要求しているが、直接呼び出し等でここに到達した場合も
+    // サイレントに無視しないよう明示的に失敗させる。
     if continue_last || session.is_some() || fork || share {
-        eprintln!(
-            "Note: session/share flags are currently applied when using `run --attach <server>`."
+        anyhow::bail!(
+            "--continue, --session, --fork and --share require --attach <server>; \
+             refusing local run because session flags would be ignored"
         );
     }
 
@@ -1591,8 +1601,11 @@ async fn run_chat_session(
     println!("  Commands: exit, quit, help, clear");
     println!();
 
-    let mut executor =
-        AgentExecutor::new(agent_info.clone(), provider_registry.clone(), tool_registry);
+    let mut executor = AgentExecutor::new(
+        agent_info.clone(),
+        provider_registry.clone(),
+        tool_registry.clone(),
+    );
 
     // Build model-specific system prompt + environment context (TS parity: SystemPrompt.provider + SystemPrompt.environment)
     {
@@ -1658,7 +1671,15 @@ async fn run_chat_session(
 
         if input.starts_with("/model ") {
             let model_id = input.strip_prefix("/model ").unwrap().trim();
-            if let Err(e) = select_model(&mut executor, model_id, &provider_registry) {
+            if let Err(e) = select_model(
+                &mut executor,
+                &agent_info,
+                model_id,
+                &provider_registry,
+                tool_registry.clone(),
+            )
+            .await
+            {
                 eprintln!("Error selecting model: {}", e);
             }
             continue;
@@ -1747,19 +1768,33 @@ fn list_providers_interactive(registry: &ProviderRegistry) {
     println!();
 }
 
-fn select_model(
-    _executor: &mut AgentExecutor,
+/// `/model` で指定されたモデルへ executor の使用モデルを切り替える。
+///
+/// `AgentExecutor` にはモデル変更用の pub API が無いため、main.rs 内で
+/// 既存の pub API のみを使って executor を再構築する。会話履歴と
+/// サブセッションは引き継ぐため、モデル切り替えだけが反映される。
+async fn select_model(
+    executor: &mut AgentExecutor,
+    agent_info: &AgentInfo,
     model_id: &str,
-    registry: &ProviderRegistry,
+    registry: &Arc<ProviderRegistry>,
+    tools: Arc<opencode_tool::ToolRegistry>,
 ) -> anyhow::Result<()> {
-    let model = registry
-        .list()
-        .iter()
-        .flat_map(|p| p.models())
-        .find(|m| m.id == model_id)
+    let (provider_id, model) = registry
+        .find_model(model_id)
         .ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-    println!("Selected model: {} ({})\n", model_id, model.name);
+    // `*executor = ...` の評価前に借用を解消させるため、先にスナップショットを取る。
+    let conversation = executor.conversation().clone();
+    let subsessions = executor.export_subsessions().await;
+
+    let switched_agent = agent_info.clone().with_model(model.id.clone(), provider_id);
+    let mut switched = AgentExecutor::new(switched_agent, registry.clone(), tools)
+        .with_persisted_subsessions(subsessions);
+    *switched.conversation_mut() = conversation;
+    *executor = switched;
+
+    println!("Selected model: {} ({})\n", model.id, model.name);
     Ok(())
 }
 
@@ -5943,6 +5978,231 @@ mod tests {
                 String::from_utf8(output).expect("utf8 auth notice"),
                 format!("{}\n", AUTH_ENABLED_NOTICE),
                 "OPENCODE_NO_AUTH={value:?} must keep the enabled notice (fail-closed)"
+            );
+        }
+    }
+
+    // --- R2 no-op 回帰テスト -------------------------------------------------
+
+    #[test]
+    fn run_session_flags_require_attach() {
+        // ローカル実行で無視される session/share フラグは clap 段階で弾く。
+        let cases = vec![
+            vec!["opencoderust", "run", "--continue", "hi"],
+            vec!["opencoderust", "run", "--session", "s-1", "hi"],
+            vec!["opencoderust", "run", "--fork", "--continue", "hi"],
+            vec!["opencoderust", "run", "--share", "hi"],
+        ];
+        for args in cases {
+            let err = Cli::try_parse_from(args.clone())
+                .err()
+                .expect("parse must fail");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "args={args:?} err={err}"
+            );
+            assert!(
+                err.to_string().contains("attach"),
+                "args={args:?} err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_session_flags_are_wired_when_attach_is_present() {
+        let cli = Cli::try_parse_from([
+            "opencoderust",
+            "run",
+            "--attach",
+            "http://127.0.0.1:4096",
+            "--continue",
+            "--share",
+            "--session",
+            "s-1",
+            "hi",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Run {
+                continue_last,
+                session,
+                fork,
+                share,
+                attach,
+                ..
+            }) => {
+                assert!(continue_last);
+                assert!(!fork);
+                assert!(share);
+                assert_eq!(session.as_deref(), Some("s-1"));
+                assert_eq!(attach.as_deref(), Some("http://127.0.0.1:4096"));
+            }
+            _ => panic!("expected Run variant"),
+        }
+
+        // フラグ無しのローカル run は従来どおり通る（過剰な必須化の回帰防止）。
+        let cli = Cli::try_parse_from(["opencoderust", "run", "hi"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Run {
+                attach: None,
+                continue_last: false,
+                fork: false,
+                share: false,
+                ..
+            })
+        ));
+    }
+
+    /// `/model` の回帰テスト用に、要求されたモデル ID を記録するプロバイダ。
+    mod model_switch {
+        use super::*;
+        use opencode_provider::{
+            ChatRequest, ChatResponse, ModelInfo, ProviderError, StreamResult,
+        };
+
+        type SwitchFixture = (
+            Arc<ProviderRegistry>,
+            Arc<Mutex<Vec<String>>>,
+            AgentInfo,
+            Arc<opencode_tool::ToolRegistry>,
+        );
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        struct RecordingProvider {
+            models: Vec<ModelInfo>,
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+
+        fn test_model(id: &str) -> ModelInfo {
+            ModelInfo {
+                id: id.to_string(),
+                name: format!("Test {id}"),
+                provider: "recording".to_string(),
+                context_window: 4096,
+                max_output_tokens: 512,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            }
+        }
+
+        // async_trait を依存に追加せずトレイト契約を満たすための手動 desugar。
+        impl opencode_provider::Provider for RecordingProvider {
+            fn id(&self) -> &str {
+                "recording"
+            }
+
+            fn name(&self) -> &str {
+                "Recording"
+            }
+
+            fn models(&self) -> Vec<ModelInfo> {
+                self.models.clone()
+            }
+
+            fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+                self.models.iter().find(|model| model.id == id)
+            }
+
+            fn chat<'a, 'b>(
+                &'a self,
+                _request: ChatRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, ProviderError>> + Send + 'b>>
+            where
+                'a: 'b,
+                Self: 'b,
+            {
+                Box::pin(async { Err(ProviderError::InvalidRequest("unused".to_string())) })
+            }
+
+            fn chat_stream<'a, 'b>(
+                &'a self,
+                request: ChatRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<StreamResult, ProviderError>> + Send + 'b>>
+            where
+                'a: 'b,
+                Self: 'b,
+            {
+                let seen = self.seen.clone();
+                Box::pin(async move {
+                    seen.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(request.model);
+                    let events: Vec<Result<StreamEvent, ProviderError>> =
+                        vec![Ok(StreamEvent::Done)];
+                    Ok(Box::pin(futures::stream::iter(events)) as StreamResult)
+                })
+            }
+        }
+
+        fn fixture() -> SwitchFixture {
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let mut registry = ProviderRegistry::new();
+            registry.register(RecordingProvider {
+                models: vec![test_model("model-a"), test_model("model-b")],
+                seen: seen.clone(),
+            });
+            (
+                Arc::new(registry),
+                seen,
+                AgentInfo::build().with_model("model-a", "recording"),
+                Arc::new(opencode_tool::ToolRegistry::new()),
+            )
+        }
+
+        #[tokio::test]
+        async fn select_model_switches_executor_model_without_losing_conversation() {
+            let (registry, seen, agent, tools) = fixture();
+            let mut executor = AgentExecutor::new(agent.clone(), registry.clone(), tools.clone());
+
+            let _baseline = executor
+                .execute_streaming("first".to_string())
+                .await
+                .expect("baseline stream");
+            assert_eq!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                vec!["model-a".to_string()]
+            );
+            let messages_before = executor.conversation().messages.len();
+
+            select_model(&mut executor, &agent, "model-b", &registry, tools)
+                .await
+                .expect("model switch must succeed");
+
+            assert_eq!(executor.conversation().messages.len(), messages_before);
+            let _after = executor
+                .execute_streaming("second".to_string())
+                .await
+                .expect("stream after switch");
+            assert_eq!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                vec!["model-a".to_string(), "model-b".to_string()],
+                "/model must change the model actually sent by the executor"
+            );
+        }
+
+        #[tokio::test]
+        async fn select_model_rejects_unknown_model() {
+            let (registry, seen, agent, tools) = fixture();
+            let mut executor = AgentExecutor::new(agent.clone(), registry.clone(), tools.clone());
+
+            let err = select_model(&mut executor, &agent, "does-not-exist", &registry, tools)
+                .await
+                .expect_err("unknown model must be an explicit error, not a no-op");
+            assert!(err.to_string().contains("does-not-exist"));
+
+            let _probe = executor
+                .execute_streaming("probe".to_string())
+                .await
+                .expect("executor must remain usable");
+            assert_eq!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                vec!["model-a".to_string()]
             );
         }
     }

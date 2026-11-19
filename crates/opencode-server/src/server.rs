@@ -1191,10 +1191,12 @@ async fn auth_middleware(
     }
 }
 
-/// Redact an auth token for logging: show only a short prefix and the length.
-fn redact_token(token: &str) -> String {
-    let prefix: String = token.chars().take(4).collect();
-    format!("{}… ({} chars)", prefix, token.len())
+/// Redact an auth token for logging: never emit any part of the secret.
+///
+/// 先頭 prefix や長さを出すと、短いトークンや低エントロピーのトークンが
+/// ログから復元できてしまう。入力値によらず固定のマスクのみを返す。
+fn redact_token(_token: &str) -> String {
+    "[REDACTED]".to_string()
 }
 
 pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
@@ -1856,14 +1858,18 @@ mod tests {
     fn redact_token_hides_secret_body() {
         let token = "abcd1234secret-secret-secret";
         let redacted = redact_token(token);
-        assert!(redacted.starts_with("abcd"));
-        assert!(redacted.contains("28 chars"));
+        assert_eq!(redacted, "[REDACTED]");
+        assert!(!redacted.contains("abcd"));
         assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("28")); // 長さも漏らさない
     }
 
     #[test]
     fn redact_token_handles_short_tokens() {
-        assert_eq!(redact_token("abc"), "abc… (3 chars)");
+        // 短い入力でも元値を返さない（従来の prefix 表示は廃止）。
+        assert_eq!(redact_token("abc"), "[REDACTED]");
+        assert_eq!(redact_token("x"), "[REDACTED]");
+        assert_eq!(redact_token(""), "[REDACTED]");
     }
 
     #[tokio::test]
