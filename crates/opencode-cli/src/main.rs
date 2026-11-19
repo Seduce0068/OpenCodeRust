@@ -16,7 +16,7 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use opencode_agent::{AgentExecutor, AgentInfo, AgentRegistry};
@@ -38,6 +38,33 @@ use opencode_storage::{Database, MessageRepository, SessionRepository};
 use opencode_tool::skill::list_available_skills;
 use opencode_tool::{create_default_registry, ToolContext};
 use opencode_types::{MessagePart, Session, SessionMessage};
+
+/// プロセス全体で共有する設定キャッシュ。キーは設定読み込みに使った cwd。
+///
+/// `load_config` は呼ぶたびに設定ファイルを読み直してパースするため、従来は
+/// 1 プロセス内で最大 11 回の二重パースが発生していた。cwd をキーにしている
+/// のは、`run` / `tui` / `acp` が起動後に `set_current_dir` で cwd を切り替え、
+/// その後の `load_config` が別の設定を返す従来挙動を維持するため。
+static CONFIG_CACHE: OnceLock<RwLock<HashMap<PathBuf, opencode_config::Config>>> = OnceLock::new();
+
+/// `cwd` に対応する設定を返す。初回のみ `load_config` で読み込み、以後は
+/// キャッシュをクローンして返す（設定ファイルの再パースを避ける）。
+///
+/// 読み込みエラーはキャッシュしないため、`?` で失敗する呼び出し箇所は
+/// 従来どおり元の `anyhow::Error`（コンテキストチェーン含む）を伝播する。
+fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
+    let cache = CONFIG_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(config) = cache.read().unwrap_or_else(|e| e.into_inner()).get(cwd) {
+        return Ok(config.clone());
+    }
+
+    let config = load_config(cwd)?;
+    cache
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cwd.to_path_buf(), config.clone());
+    Ok(config)
+}
 
 #[derive(Parser)]
 #[command(name = "opencoderust")]
@@ -592,7 +619,7 @@ async fn main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().ok();
     let startup_log_level = cwd
         .as_ref()
-        .and_then(|cwd| load_config(cwd).ok())
+        .and_then(|cwd| config_for(cwd).ok())
         .and_then(|config| config.log_level);
     // 非 TUI は print=true のため log_dir は init_tracing 側で早期 return され不使用。
     // 第 2 戻り値 (WorkerGuard) を main のローカルとして保持し、終了時にフラッシュさせる。
@@ -1457,7 +1484,7 @@ async fn run_chat_session(
     single_shot: bool,
 ) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
-    let config = load_config(&current_dir)?;
+    let config = config_for(&current_dir)?;
 
     let provider_registry = Arc::new(setup_providers(&config).await?);
 
@@ -2947,7 +2974,7 @@ async fn list_models(
     }
 
     let current_dir = std::env::current_dir()?;
-    let config = load_config(&current_dir)?;
+    let config = config_for(&current_dir)?;
     let registry = setup_providers(&config).await?;
 
     println!("\n╔══════════════════════════════════════════╗");
@@ -3125,7 +3152,7 @@ async fn handle_session_command(action: SessionCommands) -> anyhow::Result<()> {
 
 async fn show_config() -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
-    let config = load_config(&current_dir)?;
+    let config = config_for(&current_dir)?;
 
     println!("\n╔══════════════════════════════════════════╗");
     println!("║         Configuration                      ║");
@@ -3306,7 +3333,7 @@ async fn handle_agent_command(action: AgentCommands) -> anyhow::Result<()> {
     match action {
         AgentCommands::List => {
             let cwd = std::env::current_dir()?;
-            let config = load_config(&cwd)?;
+            let config = config_for(&cwd)?;
             let registry = AgentRegistry::from_config(&config);
             println!("\nAvailable agents:\n");
             for agent in registry.list() {
@@ -3439,7 +3466,7 @@ fn select_lsp_server(
 
 async fn create_lsp_client(file_hint: Option<&Path>) -> anyhow::Result<LspClient> {
     let cwd = std::env::current_dir()?;
-    let config = load_config(&cwd)?;
+    let config = config_for(&cwd)?;
     let (id, server) = select_lsp_server(&config, file_hint)?;
     let command = server.command[0].clone();
     let args = server.command.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -3497,7 +3524,7 @@ async fn handle_debug_command(action: DebugCommands) -> anyhow::Result<()> {
         }
         DebugCommands::Config => {
             let cwd = std::env::current_dir()?;
-            let config = load_config(&cwd)?;
+            let config = config_for(&cwd)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
         }
         DebugCommands::Skill => {
@@ -3688,7 +3715,7 @@ async fn handle_debug_command(action: DebugCommands) -> anyhow::Result<()> {
         },
         DebugCommands::Agent { name, tool, params } => {
             let cwd = std::env::current_dir()?;
-            let config = load_config(&cwd)?;
+            let config = config_for(&cwd)?;
             let registry = AgentRegistry::from_config(&config);
             let Some(agent) = registry.get(&name) else {
                 anyhow::bail!("Agent not found: {}", name);
@@ -4141,7 +4168,7 @@ async fn choose_github_model() -> anyhow::Result<String> {
     }
 
     let cwd = std::env::current_dir()?;
-    let config = load_config(&cwd)?;
+    let config = config_for(&cwd)?;
     if let Some(model) = &config.model {
         if model.contains('/') {
             return Ok(model.clone());
@@ -5121,7 +5148,7 @@ async fn generate_agent_response(
     agent_name: &str,
 ) -> anyhow::Result<String> {
     let cwd = std::env::current_dir()?;
-    let config = load_config(&cwd)?;
+    let config = config_for(&cwd)?;
     let provider_registry = Arc::new(setup_providers(&config).await?);
     if provider_registry.list().is_empty() {
         anyhow::bail!("No providers configured for GitHub run.");
@@ -5369,7 +5396,7 @@ async fn handle_github_command(action: GithubCommands) -> anyhow::Result<()> {
                 .or_else(|| {
                     std::env::current_dir()
                         .ok()
-                        .and_then(|cwd| load_config(cwd).ok())
+                        .and_then(|cwd| config_for(&cwd).ok())
                         .and_then(|c| c.model)
                 });
 
