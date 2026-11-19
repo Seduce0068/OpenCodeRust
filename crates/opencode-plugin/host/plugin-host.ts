@@ -186,8 +186,52 @@ function sendError(id: number, code: number, message: string): void {
 
 let pluginHooks: Hooks = {};
 let authHook: AuthHook | null = null;
-let pendingAuthCallback: ((code?: string) => Promise<unknown>) | null = null;
 let customFetch: typeof globalThis.fetch | null = null;
+
+/**
+ * Lifetime of an unconsumed OAuth flow. Expired flows are never invoked and
+ * are lazily purged on the next authorize/callback (see purgeExpiredAuthFlows).
+ * A timer is deliberately not used so the host's event loop is not kept alive
+ * after stdin EOF.
+ */
+const AUTH_FLOW_TTL_MS = 10 * 60 * 1000;
+
+interface PendingAuthFlow {
+  callback: (code?: string) => Promise<unknown>;
+  /** Wall-clock deadline: Date.now() at creation + AUTH_FLOW_TTL_MS. */
+  expiresAt: number;
+}
+
+/**
+ * One entry per in-flight authorize() call, keyed by the opaque flowId
+ * returned to the caller. Replaces the old single-slot pendingAuthCallback so
+ * concurrent OAuth flows cannot overwrite one another.
+ */
+const pendingAuthFlows = new Map<string, PendingAuthFlow>();
+
+let authFlowCounter = 0;
+
+/** Generate an opaque flow identifier (never derived from a token or code). */
+function generateAuthFlowId(): string {
+  const cryptoObj = (globalThis as UnknownRecord)["crypto"] as
+    | { randomUUID?: () => string }
+    | undefined;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+  return `flow-${Date.now().toString(36)}-${(authFlowCounter++).toString(36)}-${
+    Math.random().toString(36).slice(2)
+  }`;
+}
+
+/** Remove every flow whose deadline has passed. No token/code is inspected. */
+function purgeExpiredAuthFlows(now: number): void {
+  for (const [flowId, flow] of pendingAuthFlows) {
+    if (now >= flow.expiresAt) {
+      pendingAuthFlows.delete(flowId);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Plugin input compatibility helpers
@@ -639,16 +683,26 @@ async function handleAuthAuthorize(
     }
 
     const result = await authHook.authorize(method, params.inputs);
-    // Stash callback for later auth.callback call
-    if (result.callback) {
-      pendingAuthCallback = result.callback;
-    }
-
-    sendResult(id, {
+    const payload: UnknownRecord = {
       url: result.url,
       instructions: result.instructions,
       method: result.method,
-    });
+    };
+
+    if (result.callback) {
+      const now = Date.now();
+      purgeExpiredAuthFlows(now);
+      const flowId = generateAuthFlowId();
+      pendingAuthFlows.set(flowId, {
+        callback: result.callback,
+        expiresAt: now + AUTH_FLOW_TTL_MS,
+      });
+      // New clients correlate callback() with this id. Older clients ignore
+      // the extra field, so the wire response stays backward compatible.
+      payload["flowId"] = flowId;
+    }
+
+    sendResult(id, payload);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     sendError(id, -32603, `auth.authorize failed: ${msg}`);
@@ -657,16 +711,43 @@ async function handleAuthAuthorize(
 
 async function handleAuthCallback(
   id: number,
-  params: { code?: string },
+  params: { code?: string; flowId?: string },
 ): Promise<void> {
-  if (!pendingAuthCallback) {
-    sendError(id, -32601, "No pending auth callback");
+  const now = Date.now();
+  purgeExpiredAuthFlows(now);
+
+  let flowId = params?.flowId;
+  if (flowId === undefined) {
+    // Backward compatibility: legacy single-flow callers omit flowId.
+    // Use the sole pending entry; never guess when several flows are in flight,
+    // since that would reintroduce the wrong-flow overwrite this change fixes.
+    const pendingIds = [...pendingAuthFlows.keys()];
+    if (pendingIds.length === 0) {
+      sendError(id, -32601, "No pending auth callback");
+      return;
+    }
+    if (pendingIds.length > 1) {
+      sendError(id, -32602, "Multiple pending auth flows: flowId is required");
+      return;
+    }
+    const [onlyPendingId] = pendingIds;
+    if (onlyPendingId === undefined) {
+      sendError(id, -32601, "No pending auth callback");
+      return;
+    }
+    flowId = onlyPendingId;
+  }
+
+  const flow = pendingAuthFlows.get(flowId);
+  if (!flow) {
+    sendError(id, -32601, "No pending auth callback for the given flowId");
     return;
   }
 
   try {
-    const result = await pendingAuthCallback(params.code);
-    pendingAuthCallback = null;
+    const result = await flow.callback(params?.code);
+    // Consume only this flow; parallel OAuth flows remain pending.
+    pendingAuthFlows.delete(flowId);
     sendResult(id, result);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

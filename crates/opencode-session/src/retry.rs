@@ -509,6 +509,35 @@ mod tests {
         assert_eq!(retryable(&error).as_deref(), Some("Too Many Requests"));
     }
 
+    /// provider 側の parse がリトライ可と判定したエラーが session 側の
+    /// `retryable()` でも retry hint を返すことを固定する回帰テスト。
+    /// source 由来の一時エラーも同じ `is_retryable` フラグで伝播する。
+    #[test]
+    fn retryable_propagates_provider_retryable_flag() {
+        use opencode_provider::{parse_api_call_error, ParsedAPICallError, ProviderError};
+
+        let parsed = parse_api_call_error("some-provider", &ProviderError::Timeout);
+        let is_retryable = match parsed {
+            ParsedAPICallError::ApiError { is_retryable, .. } => is_retryable,
+            other => panic!("expected ApiError, got {other:?}"),
+        };
+        assert!(is_retryable, "provider parse 側でリトライ可であること");
+
+        let error = crate::MessageError::ApiError {
+            message: "API error: request failed".to_owned(),
+            status_code: None,
+            is_retryable,
+            response_headers: None,
+            response_body: None,
+            metadata: None,
+        };
+        assert_eq!(
+            retryable(&error).as_deref(),
+            Some("API error: request failed"),
+            "トークン値を増幅せず、元のメッセージだけを retry hint に使う"
+        );
+    }
+
     #[test]
     fn retry_state_tracks_attempts() {
         let mut state = RetryState::new(2);
