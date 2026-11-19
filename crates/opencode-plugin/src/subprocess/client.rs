@@ -10,12 +10,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::protocol::{RpcError, RpcRequest, RpcResponse};
 use super::runtime::JsRuntime;
+
+/// 受信する JSON-RPC フレーム本体の上限（10 MiB）。
+const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+/// 1 フレームのヘッダ行数の上限（空行を含む）。
+const MAX_HEADER_LINES: usize = 64;
+/// 1 ヘッダ行の最大長（改行を除く）。値はエラー本文に含めない。
+const MAX_HEADER_LINE_BYTES: usize = 8192;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -485,7 +492,17 @@ impl PluginSubprocess {
     ) -> Result<RpcResponse, PluginSubprocessError> {
         let mut reader = self.stdout.lock().await;
         loop {
-            let raw = Self::read_raw_message(&mut reader).await?;
+            let raw = match Self::read_raw_message(&mut reader).await {
+                Ok(raw) => raw,
+                Err(err) => {
+                    // フレーム同期が壊れたら子プロセスを終了させ、以降の
+                    // 読み取りで無限に待たないようにする（切断）。
+                    if let Ok(mut proc) = self.process.try_lock() {
+                        let _ = proc.kill().await;
+                    }
+                    return Err(err);
+                }
+            };
             if raw.get("id").and_then(Value::as_u64) != Some(expected_id) {
                 continue;
             }
@@ -498,24 +515,54 @@ impl PluginSubprocess {
     async fn read_raw_message(
         reader: &mut BufReader<ChildStdout>,
     ) -> Result<Value, PluginSubprocessError> {
-        // Read headers until empty line
+        // Read headers until empty line. `read_line` has no length bound, so
+        // read one byte at a time with an explicit cap (BufReader buffers IO).
+        // Header values are never included in error messages: they may carry
+        // authorization tokens.
         let mut content_length: Option<usize> = None;
+        let mut header_lines = 0usize;
         loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                return Err(PluginSubprocessError::NotRunning);
+            let mut line: Vec<u8> = Vec::with_capacity(128);
+            let mut byte = [0u8; 1];
+            loop {
+                let n = reader.read(&mut byte).await?;
+                if n == 0 {
+                    return Err(PluginSubprocessError::NotRunning);
+                }
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if line.len() > MAX_HEADER_LINE_BYTES {
+                    return Err(PluginSubprocessError::Protocol(
+                        "header line too long".into(),
+                    ));
+                }
             }
 
-            let trimmed = line.trim();
+            header_lines += 1;
+            if header_lines > MAX_HEADER_LINES {
+                return Err(PluginSubprocessError::Protocol(
+                    "too many header lines".into(),
+                ));
+            }
+
+            let header_line = String::from_utf8_lossy(&line);
+            let trimmed = header_line.trim();
             if trimmed.is_empty() {
                 break;
             }
 
             if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
-                content_length = Some(rest.trim().parse().map_err(|e| {
+                let len: usize = rest.trim().parse().map_err(|e| {
                     PluginSubprocessError::Protocol(format!("bad Content-Length: {e}"))
-                })?);
+                })?;
+                if len > MAX_FRAME_SIZE {
+                    return Err(PluginSubprocessError::Protocol(
+                        "Content-Length exceeds 10 MiB limit".into(),
+                    ));
+                }
+                content_length = Some(len);
             }
         }
 
@@ -571,6 +618,57 @@ mod tests {
         assert!(
             acquired.is_ok(),
             "rpc_lock remained held after stream start timeout"
+        );
+    }
+
+    /// `printf` はシェルを使わずに 1 フレームだけ書き出すテストfixture。
+    async fn framed_child(frame: &str) -> (tokio::process::Child, BufReader<ChildStdout>) {
+        let mut child = Command::new("printf")
+            .arg(frame)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn printf fixture");
+        let stdout = child.stdout.take().expect("take stdout");
+        (child, BufReader::new(stdout))
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_protocol_error() {
+        let (_child, mut reader) = framed_child("Content-Length: 10485761\r\n\r\n").await;
+        let error = PluginSubprocess::read_raw_message(&mut reader)
+            .await
+            .expect_err("must reject oversized frame");
+        assert!(
+            matches!(&error, PluginSubprocessError::Protocol(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn excessive_header_lines_are_protocol_error() {
+        let headers = "X-Pad: 1\r\n".repeat(MAX_HEADER_LINES + 8);
+        let (_child, mut reader) = framed_child(&format!("{headers}\r\n")).await;
+        let error = PluginSubprocess::read_raw_message(&mut reader)
+            .await
+            .expect_err("must reject excessive headers");
+        assert!(
+            matches!(&error, PluginSubprocessError::Protocol(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_header_line_is_protocol_error() {
+        let header = format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LINE_BYTES + 1));
+        let (_child, mut reader) = framed_child(&header).await;
+        let error = PluginSubprocess::read_raw_message(&mut reader)
+            .await
+            .expect_err("must reject oversized header line");
+        assert!(
+            matches!(&error, PluginSubprocessError::Protocol(_)),
+            "unexpected error: {error}"
         );
     }
 }

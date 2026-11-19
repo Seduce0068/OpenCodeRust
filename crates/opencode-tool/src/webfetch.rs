@@ -1,4 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::{Client, Url};
@@ -11,23 +12,40 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 /// 手動で追跡するリダイレクトの上限。reqwest の自動追跡は無効化する。
 const MAX_REDIRECTS: usize = 10;
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
-pub struct WebFetchTool {
-    client: Client,
-}
+pub struct WebFetchTool;
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        Self {
-            client: Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
-                .timeout(std::time::Duration::from_secs(MAX_TIMEOUT_SECS))
-                // リダイレクトは自動追跡せず、追跡先を毎回 SSRF 検証してから個別に送信する。
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
-        }
+        Self
     }
+}
+
+/// SSRF 検証で得た IP に接続先を固定したクライアントを生成する。
+///
+/// `ClientBuilder::resolve()` は検証後に DNS が書き換わっても検証済み IP へ
+/// 接続するため、DNS rebinding を防ぐ。プロキシはこの固定を迂回できるので
+/// 無効化する。IP リテラルは DNS を引かないためオーバーライドは不要。
+fn pinned_client(host: &str, ip: IpAddr) -> Result<Client, ToolError> {
+    let builder = Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(MAX_TIMEOUT_SECS))
+        // リダイレクトは自動追跡せず、追跡先を毎回 SSRF 検証してから個別に送信する。
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+
+    let builder = if literal_ip_from_host(host).is_none() {
+        // ポート 0 はスキームの既定ポートを意味する。URL に明示ポートがあれば
+        // reqwest 側で常にそちらが使われるため、固定的な上書きは不要。
+        builder.resolve(host, SocketAddr::new(ip, 0))
+    } else {
+        builder
+    };
+
+    builder
+        .build()
+        .map_err(|e| ToolError::execution_with_source("Failed to build HTTP client", e))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +166,27 @@ fn forbidden_target_error(url: &Url) -> ToolError {
     ))
 }
 
+/// エラー本文に userinfo / クエリのトークンを含めないための表示用 URL。
+fn redacted_url(url: &Url) -> String {
+    format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or("<no host>"),
+        url.path()
+    )
+}
+
+/// ツール結果の title / metadata["url"] / 画像添付 url に共通して使う表示用 URL。
+/// userinfo とクエリ（トークン）を落とすため、元 URL を直接埋め込まず必ずこれを通す。
+fn result_display_url(url: &Url) -> String {
+    redacted_url(url)
+}
+
+/// 成功時の title を生成する。トークンを含む完全 URL を埋め込まない。
+fn result_title(display_url: &str, content_type: &str) -> String {
+    format!("{} ({})", display_url, content_type)
+}
+
 /// URL のスキームと IP リテラルを検証する（DNS 問い合わせを行わない）。
 fn validate_url_literal(url: &Url) -> Result<(), ToolError> {
     match url.scheme() {
@@ -170,10 +209,12 @@ fn validate_url_literal(url: &Url) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// ホスト名を解決し、解決された「すべての」IP を検査する。
+/// ホスト名を解決し、解決された「すべての」IP を検査して接続先 IP を返す。
 ///
 /// 失敗時は fail-closed（解決不能・拒否どちらもエラー）とする。
-async fn validate_resolved_host(url: &Url) -> Result<(), ToolError> {
+/// 返された IP は `pinned_client()` で reqwest の DNS オーバーライドに使い、
+/// 検証と実際の接続の間で DNS rebinding が起きても別アドレスへ逃げられない。
+async fn validate_resolved_host(url: &Url) -> Result<IpAddr, ToolError> {
     let host = match url.host_str() {
         Some(host) => host,
         None => {
@@ -182,9 +223,10 @@ async fn validate_resolved_host(url: &Url) -> Result<(), ToolError> {
             ))
         }
     };
-    if literal_ip_from_host(host).is_some() {
-        // IP リテラルは validate_url_literal で検査済み。
-        return Ok(());
+    if let Some(ip) = literal_ip_from_host(host) {
+        // IP リテラルは validate_url_literal で検査済み。DNS を引かないので
+        // そのまま接続先として返す。
+        return Ok(ip);
     }
 
     let port = url.port_or_known_default().unwrap_or(80);
@@ -202,11 +244,14 @@ async fn validate_resolved_host(url: &Url) -> Result<(), ToolError> {
     if addresses.iter().any(ip_is_forbidden) {
         return Err(forbidden_target_error(url));
     }
-    Ok(())
+    // すべての解決結果が安全なら先頭を使用する。reqwest は以降 DNS を
+    // 参照しないため、ここで選んだ IP がそのまま接続先になる。
+    Ok(addresses[0])
 }
 
 /// フェッチ対象（初期 URL と各リダイレクト先）の完全な検証。
-async fn validate_url_target(url: &Url) -> Result<(), ToolError> {
+/// 検証済みの接続先 IP を返し、呼び出し元はそれを resolve() に固定する。
+async fn validate_url_target(url: &Url) -> Result<IpAddr, ToolError> {
     validate_url_literal(url)?;
     validate_resolved_host(url).await
 }
@@ -263,7 +308,8 @@ impl Tool for WebFetchTool {
         let parsed_url = Url::parse(&url)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid URL: {e}")))?;
         // 権限確認の前に SSRF 検証を行い、危険な宛先はユーザー承認対象にすらしない。
-        validate_url_target(&parsed_url).await?;
+        // 実際の接続は fetch_with_retry 内で再検証した IP に固定する。
+        let _ = validate_url_target(&parsed_url).await?;
 
         ctx.ask_permission(
             crate::PermissionRequest::new("webfetch")
@@ -334,7 +380,8 @@ impl Tool for WebFetchTool {
             .unwrap_or("")
             .trim()
             .to_lowercase();
-        let title = format!("{} ({})", url, content_type);
+        let display_url = result_display_url(&parsed_url);
+        let title = result_title(&display_url, &content_type);
 
         let is_image = mime.starts_with("image/")
             && mime != "image/svg+xml"
@@ -346,10 +393,10 @@ impl Tool for WebFetchTool {
             let data_url = format!("data:{};base64,{}", mime, base64_content);
             let output = format!(
                 "Image fetched successfully.\n\n<attachment type=\"image\" mimeType=\"{}\" url=\"{}\" size=\"{}\" data=\"{}\" />",
-                mime, url, bytes.len(), data_url
+                mime, display_url, bytes.len(), data_url
             );
             let mut metadata = std::collections::HashMap::new();
-            metadata.insert("url".to_string(), serde_json::json!(url));
+            metadata.insert("url".to_string(), serde_json::json!(display_url));
             metadata.insert("mimeType".to_string(), serde_json::json!(mime));
             metadata.insert("size".to_string(), serde_json::json!(bytes.len()));
             metadata.insert("data".to_string(), serde_json::json!(data_url));
@@ -358,7 +405,7 @@ impl Tool for WebFetchTool {
                 serde_json::json!({
                     "type": "image",
                     "mimeType": mime,
-                    "url": url,
+                    "url": display_url,
                     "size": bytes.len(),
                     "data": data_url
                 }),
@@ -392,7 +439,7 @@ impl Tool for WebFetchTool {
         };
 
         let mut metadata = std::collections::HashMap::new();
-        metadata.insert("url".to_string(), serde_json::json!(url));
+        metadata.insert("url".to_string(), serde_json::json!(display_url));
         metadata.insert("format".to_string(), serde_json::json!(input.format));
         metadata.insert("mimeType".to_string(), serde_json::json!(mime));
         metadata.insert("size".to_string(), serde_json::json!(output.len()));
@@ -416,9 +463,13 @@ impl WebFetchTool {
         let mut current = url.clone();
 
         for _ in 0..=MAX_REDIRECTS {
-            // 初期 URL は execute() で検証済み。リダイレクト先は追跡のたびに再検証する。
-            let mut response = self
-                .client
+            // 初期 URL・リダイレクト先を問わず毎回検証し、得た IP に接続を固定する。
+            // これにより検証後の DNS rebinding で別アドレスへ接続できない。
+            let ip = validate_url_target(&current).await?;
+            let host = current.host_str().unwrap_or("");
+            let client = pinned_client(host, ip)?;
+
+            let mut response = client
                 .get(current.clone())
                 .header("Accept", accept_header)
                 .header("Accept-Language", "en-US,en;q=0.9")
@@ -433,8 +484,7 @@ impl WebFetchTool {
                     .and_then(|v| v.to_str().ok());
 
                 if cf_mitigated == Some("challenge") {
-                    response = self
-                        .client
+                    response = client
                         .get(current.clone())
                         .header("Accept", accept_header)
                         .header("User-Agent", "opencode")
@@ -451,13 +501,15 @@ impl WebFetchTool {
                     .and_then(|value| value.to_str().ok())
                     .ok_or_else(|| {
                         ToolError::ExecutionError(format!(
-                            "Redirect from '{current}' has no valid Location header"
+                            "Redirect from '{}' has no valid Location header",
+                            redacted_url(&current)
                         ))
                     })?;
-                let next = current.join(location).map_err(|e| {
-                    ToolError::ExecutionError(format!("Invalid redirect URL '{location}': {e}"))
-                })?;
-                validate_url_target(&next).await?;
+                let next = current
+                    .join(location)
+                    .map_err(|e| ToolError::ExecutionError(format!("Invalid redirect URL: {e}")))?;
+                // 検証と接続固定はループ先頭で行う。ここで再解決すると
+                // 検証時と接続時の DNS がずれる窓ができるため行わない。
                 current = next;
                 continue;
             }
@@ -729,6 +781,49 @@ mod tests {
         assert_eq!(literal_ip_from_host("example.com"), None);
     }
 
+    #[tokio::test]
+    async fn validate_url_target_returns_validated_literal_ip() {
+        let url = Url::parse("https://8.8.8.8/").unwrap();
+        let ip = validate_url_target(&url).await.expect("validation");
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[tokio::test]
+    async fn pinned_client_uses_validated_ip_instead_of_dns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 512];
+            let read = socket.read(&mut request).await.expect("read request");
+            assert!(read > 0, "server must receive the request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npinned",
+                )
+                .await
+                .expect("write response");
+        });
+
+        // `.invalid` は実 DNS では解決されない。ここへ到達できれば
+        // resolve() による接続先固定が機能していることの証明になる。
+        let client = pinned_client("no-such-host.invalid", IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("build pinned client");
+
+        let response = client
+            .get(format!("http://no-such-host.invalid:{port}/"))
+            .send()
+            .await
+            .expect("request must use the pinned IP");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.expect("body"), "pinned");
+        server.await.expect("server task");
+    }
+
     #[test]
     fn validate_url_literal_rejects_unsafe_targets_without_network() {
         let cases = [
@@ -748,5 +843,34 @@ mod tests {
                 "unexpected validation result for {raw}"
             );
         }
+    }
+
+    /// 回帰テスト（R4 medium）: クエリ / userinfo のトークンが
+    /// title / metadata["url"] / 画像添付 url に露出しないこと。
+    #[test]
+    fn token_in_query_and_userinfo_never_leaks_into_title_or_metadata() {
+        let token = "tok_super_secret_9f8e7d";
+        let url = Url::parse(&format!(
+            "https://api-user:{token}@api.example.com/v1/resource?api_key={token}&page=2"
+        ))
+        .expect("parse url with token");
+
+        // ツール結果が実際に通るヘルパーを使って検証する。
+        let display = result_display_url(&url);
+        let title = result_title(&display, "application/json; charset=utf-8");
+        let metadata_url = serde_json::json!(display).to_string();
+
+        assert!(
+            !display.contains(token),
+            "display url leaked token: {display}"
+        );
+        assert!(!title.contains(token), "title leaked token: {title}");
+        assert!(
+            !metadata_url.contains(token),
+            "serialized metadata leaked token: {metadata_url}"
+        );
+        assert!(!title.contains("api_key"), "query key leaked into title");
+        // スキーム・ホスト・パスは保持され、userinfo / クエリのみ除去される。
+        assert_eq!(display, "https://api.example.com/v1/resource");
     }
 }

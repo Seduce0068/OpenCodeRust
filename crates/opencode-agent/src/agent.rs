@@ -13,6 +13,17 @@ use opencode_permission::{
     PermissionRuleset,
 };
 
+/// `AgentRegistry` の設定読み込み失敗を表すエラー。
+///
+/// 設定値そのもの（トークンや秘密情報を含む可能性のある文字列）は保持せず、
+/// 読み込みを試みたディレクトリのみを記録する。
+#[derive(Debug, thiserror::Error)]
+#[error("failed to load agent configuration from {project_dir:?}; permission settings could not be verified")]
+pub struct AgentConfigLoadError {
+    /// 読み込みを試みたディレクトリ。
+    pub project_dir: String,
+}
+
 const PROMPT_GENERATE: &str = r#"You are an AI agent configuration generator. Given a description of what an agent should do, generate a JSON configuration with:
 - identifier: A unique, lowercase, single-word identifier for the agent (use underscores if needed)
 - whenToUse: A brief description of when this agent should be used
@@ -508,11 +519,41 @@ impl AgentRegistry {
         Self::new()
     }
 
+    /// 設定ファイルを読み込んでレジストリを構築する。
+    ///
+    /// 読み取り・解析に失敗した場合は `AgentConfigLoadError` を返す。
+    /// 権限設定を確認できない状態を黙って受け入れないため、呼び出し側は
+    /// このエラーを握り潰してデフォルト権限へフォールバックしないこと。
+    pub fn try_from_project_dir(
+        project_dir: impl AsRef<Path>,
+    ) -> Result<Self, AgentConfigLoadError> {
+        let dir = project_dir.as_ref();
+        let config = load_config(dir).map_err(|_| AgentConfigLoadError {
+            project_dir: dir.to_string_lossy().into_owned(),
+        })?;
+        Ok(Self::from_config(&config))
+    }
+
+    /// 後方互換 API。設定読み込みに失敗した場合は全エージェントの権限を
+    /// deny-all にした fail-closed レジストリを返す（fail-open に戻さない）。
     pub fn from_project_dir(project_dir: impl AsRef<Path>) -> Self {
-        match load_config(project_dir) {
-            Ok(config) => Self::from_config(&config),
-            Err(_) => Self::new(),
+        match Self::try_from_project_dir(project_dir) {
+            Ok(registry) => registry,
+            Err(_) => Self::fail_closed(),
         }
+    }
+
+    /// 権限設定を確認できない場合に用いる fail-closed レジストリ。
+    fn fail_closed() -> Self {
+        let mut registry = Self::new();
+        for agent in registry.agents.values_mut() {
+            agent.permission = vec![PermissionRule {
+                permission: "*".to_string(),
+                pattern: "*".to_string(),
+                action: PermissionAction::Deny,
+            }];
+        }
+        registry
     }
 
     fn apply_config(&mut self, config: &LoadedConfig) {
@@ -1257,5 +1298,54 @@ mod tests {
             PermissionDecision::Ask
         );
         assert!(!agent.is_tool_allowed_any("write"));
+    }
+
+    fn temp_config_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-agent-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp config dir");
+        dir
+    }
+
+    #[test]
+    fn try_from_project_dir_reports_config_load_error() {
+        let dir = temp_config_dir("bad-config");
+        std::fs::write(dir.join("opencode.json"), "{ this is not valid json")
+            .expect("malformed config written");
+
+        let result = AgentRegistry::try_from_project_dir(&dir);
+        assert!(
+            matches!(result, Err(AgentConfigLoadError { .. })),
+            "malformed config must surface as AgentConfigLoadError"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_project_dir_does_not_fall_back_to_permissive_defaults_on_config_error() {
+        let dir = temp_config_dir("fail-closed");
+        std::fs::write(dir.join("opencode.json"), "{ this is not valid json")
+            .expect("malformed config written");
+
+        let registry = AgentRegistry::from_project_dir(&dir);
+        for agent in registry.list_all() {
+            assert_eq!(
+                PermissionNext::evaluate_any(agent, "bash"),
+                PermissionDecision::Deny,
+                "agent '{}' must fail closed when config cannot be loaded",
+                agent.name
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_from_project_dir_accepts_valid_config() {
+        let dir = temp_config_dir("valid-config");
+        std::fs::write(dir.join("opencode.json"), "{}").expect("valid config written");
+
+        let registry = AgentRegistry::try_from_project_dir(&dir).expect("valid config should load");
+        assert!(registry.get("build").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
