@@ -382,16 +382,6 @@ impl AnthropicSseParser {
     }
 }
 
-/// 既存互換の純粋関数ラッパー。
-///
-/// 1 回の呼び出しで 1 つの SSE データ行のみを処理し、呼び出しをまたぐ状態を保持しない。
-/// そのため `content_block_delta` の `partial_json` に対応する tool_use id は空文字列と
-/// なる。複数ブロック／複数 tool_use を正しく対応付けるには `AnthropicSseParser::push`
-/// を用いること（呼び出し側 `anthropic.rs` の変更が必要）。
-pub fn parse_anthropic_sse(data: &str) -> Option<StreamEvent> {
-    AnthropicSseParser::new().push(data)
-}
-
 /// `bytes_stream()` のチャンク境界をまたぐ SSE 行を組み立てるバッファ。
 ///
 /// 生バイトを保持し、改行が揃った時点で初めて UTF-8 デコードを行うため、
@@ -554,50 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_wrapper_only_finishes_on_terminal_events() {
-        let block_stop = r#"{"type":"content_block_stop","index":0}"#;
-        assert!(
-            !matches!(parse_anthropic_sse(block_stop), Some(StreamEvent::Done)),
-            "content_block_stop は Done を返さないこと"
-        );
-
-        let message_delta_stop = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
-        assert!(matches!(
-            parse_anthropic_sse(message_delta_stop),
-            Some(StreamEvent::Done)
-        ));
-
-        let message_stop = r#"{"type":"message_stop"}"#;
-        assert!(matches!(
-            parse_anthropic_sse(message_stop),
-            Some(StreamEvent::Done)
-        ));
-    }
-
-    #[test]
     fn anthropic_stateful_parser_suppresses_duplicate_done() {
         let mut parser = AnthropicSseParser::new();
         let stop = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         assert!(matches!(parser.push(stop), Some(StreamEvent::Done)));
         assert!(parser.push(r#"{"type":"message_stop"}"#).is_none());
-    }
-
-    #[test]
-    fn anthropic_wrapper_retains_existing_text_and_tool_start_events() {
-        let text =
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
-        assert!(matches!(
-            parse_anthropic_sse(text),
-            Some(StreamEvent::TextDelta(ref s)) if s.as_str() == "hi"
-        ));
-
-        let start = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_x","name":"bash"}}"#;
-        match parse_anthropic_sse(start) {
-            Some(StreamEvent::ToolCallStart { id, name }) => {
-                assert_eq!(id, "toolu_x");
-                assert_eq!(name, "bash");
-            }
-            other => panic!("unexpected event: {:?}", other),
-        }
     }
 }

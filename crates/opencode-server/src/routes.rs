@@ -1156,7 +1156,10 @@ async fn delete_message(
     let session = sessions
         .get_mut(&session_id)
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
-    session.remove_message(&msg_id);
+    // delete_part と契約を統一する: 存在しない ID は 200 deleted:true ではなく 404 を返す。
+    if session.remove_message(&msg_id).is_none() {
+        return Err(ApiError::NotFound(format!("Message not found: {}", msg_id)));
+    }
     drop(sessions);
     persist_sessions_if_enabled(&state).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -6292,5 +6295,66 @@ mod find_files_type_tests {
         assert_eq!(names.len(), 2);
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod delete_message_tests {
+    use super::*;
+
+    async fn state_with_one_message() -> (Arc<ServerState>, String, String) {
+        let state = Arc::new(ServerState::new());
+        let (session_id, msg_id) = {
+            let mut sessions = state.sessions.lock().await;
+            let session_id = sessions.create("default", ".").id;
+            let session = sessions
+                .get_mut(&session_id)
+                .expect("created session should be available for mutation");
+            let msg_id = session.add_user_message("hello").id.clone();
+            (session_id, msg_id)
+        };
+        (state, session_id, msg_id)
+    }
+
+    #[tokio::test]
+    async fn delete_message_returns_not_found_for_unknown_id() {
+        // L-15: 存在しない ID を指定しても 200 deleted:true を返さず、
+        // delete_part と同じ 404 NotFound 契約になることを検証する。
+        let (state, session_id, msg_id) = state_with_one_message().await;
+
+        let error = delete_message(
+            State(state.clone()),
+            Path((session_id.clone(), "msg_missing".to_string())),
+        )
+        .await
+        .expect_err("deleting an unknown message must be rejected");
+        assert!(matches!(&error, ApiError::NotFound(_)));
+        assert_eq!(error.into_response().status(), StatusCode::NOT_FOUND);
+
+        // 失敗時に既存メッセージが削除されていないことも確認する。
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&session_id)
+            .expect("session should still exist");
+        assert!(session.get_message(&msg_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_message_removes_existing_message() {
+        let (state, session_id, msg_id) = state_with_one_message().await;
+
+        let response = delete_message(
+            State(state.clone()),
+            Path((session_id.clone(), msg_id.clone())),
+        )
+        .await
+        .expect("deleting an existing message should succeed");
+        assert_eq!(response.0["deleted"], true);
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&session_id)
+            .expect("session should still exist");
+        assert!(session.get_message(&msg_id).is_none());
     }
 }

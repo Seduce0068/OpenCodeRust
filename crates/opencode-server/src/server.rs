@@ -935,12 +935,14 @@ fn is_allowed_origin(origin: &str) -> bool {
 
     let scheme = parsed.scheme();
     let host = parsed.host_str().unwrap_or("");
-    let port = parsed.port();
 
-    // Allow localhost with any port
-    let is_localhost = matches!(host, "localhost" | "127.0.0.1" | "[::1]")
-        && matches!(scheme, "http" | "https")
-        && port.is_some();
+    // Allow localhost with any port, including when the port is omitted.
+    // Browsers omit the port for the scheme's default (http://localhost => 80,
+    // https://localhost => 443), so requiring an explicit port rejected valid
+    // loopback origins. The host/scheme checks below are the security boundary:
+    // only the loopback hosts over http/https pass, never a remote host.
+    let is_localhost =
+        matches!(host, "localhost" | "127.0.0.1" | "[::1]") && matches!(scheme, "http" | "https");
 
     // Allow tauri
     let is_tauri = matches!(
@@ -1653,5 +1655,57 @@ mod tests {
         assert!(!std::ptr::eq(&first.pty_manager, &second.pty_manager));
         assert!(first.pty_manager.list_sessions().await.is_empty());
         assert!(second.pty_manager.list_sessions().await.is_empty());
+    }
+
+    #[test]
+    fn cors_allows_loopback_origins_with_and_without_explicit_port() {
+        // L-17: ブラウザは既定ポートを省略するため、port なしの localhost Origin も許可する。
+        // 許可範囲は loopback ホスト + http/https に限定したまま拡張する。
+        for origin in [
+            "http://localhost",
+            "http://localhost/",
+            "http://localhost:80",
+            "http://localhost:3000",
+            "https://localhost",
+            "https://localhost:443",
+            "https://localhost:8443",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "http://[::1]",
+            "http://[::1]:3000",
+        ] {
+            assert!(
+                is_allowed_origin(origin),
+                "loopback origin should be allowed: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_rejects_remote_hosts_and_non_http_schemes() {
+        // セキュリティ境界: localhost 以外は port の有無にかかわらず決して許可しない。
+        for origin in [
+            "http://example.com",
+            "http://example.com:3000",
+            "https://example.com",
+            "http://localhost.example.com",
+            "http://localhost.example.com:3000",
+            "http://127.0.0.1.example.com",
+            "ftp://localhost",
+        ] {
+            assert!(
+                !is_allowed_origin(origin),
+                "remote/non-http origin must be rejected: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_preserves_existing_tauri_and_opencode_ai_allowlist() {
+        assert!(is_allowed_origin("tauri://localhost"));
+        assert!(is_allowed_origin("http://tauri.localhost"));
+        assert!(is_allowed_origin("https://opencode.ai"));
+        assert!(is_allowed_origin("https://www.opencode.ai"));
+        assert!(!is_allowed_origin("http://opencode.ai"));
     }
 }

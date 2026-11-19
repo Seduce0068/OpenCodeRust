@@ -35,6 +35,32 @@ struct GrepMatch {
     line_text: String,
 }
 
+/// Parse an optional boolean argument. A missing or `null` value keeps
+/// `default`; any other JSON type is rejected instead of being silently
+/// coerced to `false`.
+fn parse_bool_arg(args: &serde_json::Value, key: &str, default: bool) -> Result<bool, ToolError> {
+    let value = &args[key];
+    if value.is_null() {
+        return Ok(default);
+    }
+    value
+        .as_bool()
+        .ok_or_else(|| ToolError::InvalidArguments(format!("{} must be a boolean", key)))
+}
+
+/// Largest byte index `<= index` that is a valid UTF-8 character boundary in `s`.
+///
+/// Mirrors read.rs's private `floor_char_boundary`; kept local because tool
+/// modules in this write scope do not share a helper module. `- 1` steps never
+/// underflow because the loop stops at `0`, which is always a boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 #[async_trait]
 impl Tool for GrepTool {
     fn id(&self) -> &str {
@@ -91,9 +117,9 @@ impl Tool for GrepTool {
 
         let glob_filter: Option<String> = args["glob"].as_str().map(|s| s.to_string());
 
-        let ignore_case: bool = args["ignore_case"].as_bool().unwrap_or(false);
+        let ignore_case: bool = parse_bool_arg(&args, "ignore_case", false)?;
 
-        let include_hidden: bool = args["hidden"].as_bool().unwrap_or(false);
+        let include_hidden: bool = parse_bool_arg(&args, "hidden", false)?;
 
         let base_dir = if search_path.is_empty() {
             &self.directory
@@ -129,9 +155,15 @@ impl Tool for GrepTool {
         let regex = Regex::new(&regex_pattern)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid regex: {}", e)))?;
 
-        let glob_pattern = glob_filter
-            .as_ref()
-            .and_then(|g| glob::Pattern::new(g).ok());
+        // A malformed glob must not silently degrade into "no filter" (which
+        // would scan every file). Match glob_tool.rs and fail with
+        // InvalidArguments instead.
+        let glob_pattern = match glob_filter.as_ref() {
+            Some(g) => Some(glob::Pattern::new(g).map_err(|e| {
+                ToolError::InvalidArguments(format!("Invalid glob pattern: {}", e))
+            })?),
+            None => None,
+        };
 
         let limit = 100;
 
@@ -180,7 +212,8 @@ impl Tool for GrepTool {
                         if let Ok(line) = line_result {
                             if regex.is_match(&line) {
                                 let truncated_line = if line.len() > MAX_LINE_LENGTH {
-                                    format!("{}...", &line[..MAX_LINE_LENGTH])
+                                    let end = floor_char_boundary(&line, MAX_LINE_LENGTH);
+                                    format!("{}...", &line[..end])
                                 } else {
                                     line.clone()
                                 };
@@ -370,11 +403,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn floor_char_boundary_respects_multibyte_boundaries() {
+        // 'あ' is 3 bytes; byte offset 2000 lands in the middle of it.
+        let s = "a".repeat(1999) + "あ";
+        assert!(!s.is_char_boundary(MAX_LINE_LENGTH));
+        let end = floor_char_boundary(&s, MAX_LINE_LENGTH);
+        assert_eq!(end, 1999);
+        assert!(s.is_char_boundary(end));
+        assert_eq!(&s[..end], "a".repeat(1999).as_str());
+    }
+
+    #[tokio::test]
+    async fn execute_truncates_long_multibyte_line_without_panic() {
+        let dir = temp_dir();
+        let line = format!("{}あ{}", "a".repeat(1999), "tail");
+        assert!(line.len() > MAX_LINE_LENGTH);
+        assert!(!line.is_char_boundary(MAX_LINE_LENGTH));
+        std::fs::write(dir.join("a.txt"), line.as_bytes()).unwrap();
+
+        let result = GrepTool::new()
+            .execute(
+                serde_json::json!({ "pattern": "a", "glob": "*.txt" }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["matches"], 1);
+        assert!(result.output.contains("..."));
+        assert!(result.output.contains("a".repeat(1999).as_str()));
+        assert!(!result.output.contains("tail"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn execute_rejects_invalid_regex() {
         let dir = temp_dir();
         let error = GrepTool::new()
             .execute(serde_json::json!({ "pattern": "[" }), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_glob() {
+        let dir = temp_dir();
+        let error = GrepTool::new()
+            .execute(
+                serde_json::json!({ "pattern": "hello", "glob": "[" }),
+                context(&dir),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_boolean_ignore_case() {
+        let dir = temp_dir();
+        let error = GrepTool::new()
+            .execute(
+                serde_json::json!({ "pattern": "hello", "ignore_case": "yes" }),
+                context(&dir),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_boolean_hidden() {
+        let dir = temp_dir();
+        let error = GrepTool::new()
+            .execute(
+                serde_json::json!({ "pattern": "hello", "hidden": 1 }),
+                context(&dir),
+            )
             .await
             .unwrap_err();
 

@@ -94,10 +94,11 @@ impl Tool for LsTool {
         args: serde_json::Value,
         ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let input: LsInput = serde_json::from_value(args).unwrap_or(LsInput {
-            path: None,
-            ignore: None,
-        });
+        // Do not fall back to `LsInput { path: None, .. }` on a type error:
+        // that silently rewrites e.g. `"path": 123` into `"."` and triggers an
+        // unintended permission prompt. Reject malformed arguments instead.
+        let input: LsInput = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid ls arguments: {}", e)))?;
 
         let requested_path = input.path.unwrap_or_else(|| ".".to_string());
         let mut base_dir = if Path::new(&requested_path).is_absolute() {
@@ -397,6 +398,30 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::ExecutionError(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_string_path() {
+        let dir = temp_dir();
+        let error = LsTool::new()
+            .execute(serde_json::json!({ "path": 123 }), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_array_ignore() {
+        let dir = temp_dir();
+        let error = LsTool::new()
+            .execute(serde_json::json!({ "ignore": "*.log" }), context(&dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
