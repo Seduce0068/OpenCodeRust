@@ -919,31 +919,37 @@ impl SessionManager {
     }
 
     /// List sessions with filters
+    ///
+    /// When `filter.limit` is `Some(n)`, at most `n` sessions are returned after
+    /// all other filters have been applied. `Some(0)` returns an empty list,
+    /// while `None` keeps the previous behaviour of returning every match.
     pub fn list_filtered(&self, filter: SessionFilter) -> Vec<&Session> {
-        self.sessions
-            .values()
-            .filter(|s| {
-                if let Some(ref dir) = filter.directory {
-                    if s.directory != *dir {
-                        return false;
-                    }
-                }
-                if filter.roots && s.parent_id.is_some() {
+        let sessions = self.sessions.values().filter(|s| {
+            if let Some(ref dir) = filter.directory {
+                if s.directory != *dir {
                     return false;
                 }
-                if let Some(start) = filter.start {
-                    if s.time.updated < start {
-                        return false;
-                    }
+            }
+            if filter.roots && s.parent_id.is_some() {
+                return false;
+            }
+            if let Some(start) = filter.start {
+                if s.time.updated < start {
+                    return false;
                 }
-                if let Some(ref search) = filter.search {
-                    if !s.title.to_lowercase().contains(&search.to_lowercase()) {
-                        return false;
-                    }
+            }
+            if let Some(ref search) = filter.search {
+                if !s.title.to_lowercase().contains(&search.to_lowercase()) {
+                    return false;
                 }
-                true
-            })
-            .collect()
+            }
+            true
+        });
+
+        match filter.limit {
+            Some(limit) => sessions.take(limit).collect(),
+            None => sessions.collect(),
+        }
     }
 
     /// Get children of a session
@@ -1309,5 +1315,123 @@ mod tests {
         let diffs = session.diff();
         assert_eq!(diffs.len(), 2);
         assert_eq!(diffs[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn test_list_filtered_respects_limit() {
+        let mut manager = SessionManager::new();
+        for _ in 0..5 {
+            manager.create("project-1", "/path/to/project");
+        }
+
+        // None keeps the legacy behaviour: every session is returned.
+        let all = manager.list_filtered(SessionFilter::default());
+        assert_eq!(all.len(), 5);
+
+        // Some(n) returns at most n sessions in the same (HashMap iteration)
+        // order as the unlimited listing.
+        let limited = manager.list_filtered(SessionFilter {
+            limit: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(limited.len(), 2);
+        let all_ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        let limited_ids: Vec<&str> = limited.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(limited_ids.as_slice(), &all_ids[..2]);
+
+        // Some(0) yields an empty list.
+        let zero = manager.list_filtered(SessionFilter {
+            limit: Some(0),
+            ..Default::default()
+        });
+        assert!(zero.is_empty());
+
+        // A limit above the number of sessions returns all of them.
+        let oversized = manager.list_filtered(SessionFilter {
+            limit: Some(100),
+            ..Default::default()
+        });
+        assert_eq!(oversized.len(), 5);
+    }
+
+    #[test]
+    fn test_list_filtered_limit_after_directory_and_search_filters() {
+        let mut manager = SessionManager::new();
+        for i in 0..3 {
+            let session = manager.create("project-1", "/wanted");
+            manager.get_mut(&session.id).unwrap().title = format!("alpha-{}", i);
+        }
+        for i in 0..2 {
+            let session = manager.create("project-1", "/other");
+            manager.get_mut(&session.id).unwrap().title = format!("beta-{}", i);
+        }
+
+        // Directory filter is applied first, then the limit.
+        let by_dir = manager.list_filtered(SessionFilter {
+            directory: Some("/wanted".into()),
+            limit: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(by_dir.len(), 2);
+        assert!(by_dir.iter().all(|s| s.directory == "/wanted"));
+
+        // Case-insensitive search filter is applied first, then the limit.
+        let by_search = manager.list_filtered(SessionFilter {
+            search: Some("ALPHA".into()),
+            limit: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(by_search.len(), 2);
+        assert!(by_search.iter().all(|s| s.title.starts_with("alpha-")));
+
+        // A limit above the filtered count returns every match and never
+        // leaks a session that failed the filter.
+        let all_matches = manager.list_filtered(SessionFilter {
+            search: Some("alpha".into()),
+            limit: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(all_matches.len(), 3);
+        assert!(all_matches.iter().all(|s| s.title.starts_with("alpha-")));
+    }
+
+    #[test]
+    fn test_list_filtered_limit_after_roots_and_start_filters() {
+        let mut manager = SessionManager::new();
+        let parent = manager.create("project-1", "/path/to/project");
+        let parent_id = parent.id.clone();
+        let base_time = parent.time.updated;
+
+        let child = manager.create_child(&parent_id).unwrap();
+        manager.get_mut(&child.id).unwrap().time.updated = base_time;
+        let child2 = manager.create_child(&parent_id).unwrap();
+        manager.get_mut(&child2.id).unwrap().time.updated = base_time;
+
+        let threshold = base_time + 1;
+        for i in 0..3 {
+            let session = manager.create("project-1", "/path/to/project");
+            let stored = manager.get_mut(&session.id).unwrap();
+            stored.title = format!("recent-{}", i);
+            stored.time.updated = threshold;
+        }
+
+        // `roots` drops the two children; the limit then applies to the roots.
+        let roots = manager.list_filtered(SessionFilter {
+            roots: true,
+            limit: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().all(|s| s.parent_id.is_none()));
+
+        // `start` keeps only sessions updated at or after the threshold, then
+        // the limit applies to that reduced set.
+        let recent = manager.list_filtered(SessionFilter {
+            start: Some(threshold),
+            limit: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(recent.len(), 1);
+        assert!(recent.iter().all(|s| s.time.updated >= threshold));
     }
 }

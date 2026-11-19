@@ -382,12 +382,22 @@ impl AnthropicSseParser {
     }
 }
 
+/// 1 行分の SSE バッファが保持するバイト数の上限（16 MiB）。
+///
+/// 改行を送らない上流や巨大な一行、不正レスポンスによるメモリの際限ない増加を防ぐ。
+/// 上限超過時は古いバイトを破棄して警告する方式を採る。これにより `push` の
+/// 戻り値型を変えずに済み、16 アダプタの呼び出し側を修正する必要がない。
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// `bytes_stream()` のチャンク境界をまたぐ SSE 行を組み立てるバッファ。
 ///
 /// 生バイトを保持し、改行が揃った時点で初めて UTF-8 デコードを行うため、
 /// JSON の途中やマルチバイト文字の途中でチャンクが切れても文字化けしない。
+/// 保持バイト数は `MAX_SSE_LINE_BYTES` を上限とし、超過時は古いバイトを破棄する。
 pub(crate) struct SseLineBuffer {
     bytes: Vec<u8>,
+    /// 連続するオーバーフローの間に既に警告済みか（ログ洪水を防ぐ）。
+    overflow_warned: bool,
 }
 
 impl Default for SseLineBuffer {
@@ -398,18 +408,41 @@ impl Default for SseLineBuffer {
 
 impl SseLineBuffer {
     pub(crate) fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            overflow_warned: false,
+        }
     }
 
     /// チャンクを追加し、改行が確定した行（末尾 CR 除去済み）を返す。
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         self.bytes.extend_from_slice(chunk);
-        self.drain_lines(false)
+        // 完全行を先に確定させ、残った未確定行（改行を含まない末尾）だけを上限で縛る。
+        let lines = self.drain_lines(false);
+        self.enforce_limit();
+        lines
     }
 
     /// ストリーム終端で、改行のない末尾行を返す。
     pub(crate) fn flush(&mut self) -> Vec<String> {
         self.drain_lines(true)
+    }
+
+    /// 未確定行が上限を超えた場合、古いバイトを破棄して一度だけ警告する。
+    fn enforce_limit(&mut self) {
+        if self.bytes.len() <= MAX_SSE_LINE_BYTES {
+            return;
+        }
+        let excess = self.bytes.len() - MAX_SSE_LINE_BYTES;
+        self.bytes.drain(..excess);
+        if !self.overflow_warned {
+            tracing::warn!(
+                limit = MAX_SSE_LINE_BYTES,
+                dropped_bytes = excess,
+                "SSE line exceeded buffered byte limit; dropping oldest bytes"
+            );
+            self.overflow_warned = true;
+        }
     }
 
     fn drain_lines(&mut self, flush_remainder: bool) -> Vec<String> {
@@ -422,6 +455,10 @@ impl SseLineBuffer {
         if flush_remainder && !self.bytes.is_empty() {
             let tail = std::mem::take(&mut self.bytes);
             lines.push(decode_sse_line(&tail));
+        }
+        // バッファが空になれば次の行からやり直しなので、警告フラグをリセットする。
+        if self.bytes.is_empty() {
+            self.overflow_warned = false;
         }
         lines
     }
@@ -549,5 +586,51 @@ mod tests {
         let stop = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         assert!(matches!(parser.push(stop), Some(StreamEvent::Done)));
         assert!(parser.push(r#"{"type":"message_stop"}"#).is_none());
+    }
+
+    #[test]
+    fn sse_line_buffer_caps_unterminated_line_growth() {
+        let mut buffer = SseLineBuffer::new();
+        let chunk = [b'x'; 64 * 1024];
+        // 上限の 3 倍のバイトを改行なしで少しずつ送り続ける。
+        let pushes = MAX_SSE_LINE_BYTES / chunk.len() * 3;
+        for _ in 0..pushes {
+            // 改行がないので行は確定せず、panic もしない。
+            assert!(buffer.push(&chunk).is_empty());
+        }
+        assert!(pushes * chunk.len() >= MAX_SSE_LINE_BYTES * 3);
+        // 際限なく増えず、上限内に留まること。
+        assert!(
+            buffer.bytes.len() <= MAX_SSE_LINE_BYTES,
+            "unbounded growth: {} bytes",
+            buffer.bytes.len()
+        );
+    }
+
+    #[test]
+    fn sse_line_buffer_recovers_after_overflow() {
+        let mut buffer = SseLineBuffer::new();
+        let chunk = [b'x'; 64 * 1024];
+        for _ in 0..(MAX_SSE_LINE_BYTES / chunk.len() + 2) {
+            buffer.push(&chunk);
+        }
+        // 改行が来れば切り捨て後の行が 1 行確定し、状態がリセットされる。
+        let lines = buffer.push(b"\n");
+        assert_eq!(lines.len(), 1);
+        assert!(buffer.bytes.is_empty());
+        // その後も通常の SSE 行が従来どおり読める。
+        assert_eq!(buffer.push(b"data: ok\n"), vec!["data: ok".to_string()]);
+    }
+
+    #[test]
+    fn sse_line_buffer_keeps_normal_split_lines() {
+        let mut buffer = SseLineBuffer::new();
+        let expected = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+        let payload = expected.as_bytes();
+        let split = payload.len() / 2;
+        // 数 KB 程度の通常行はチャンク境界をまたいでも従来どおり組み立てられる。
+        assert!(buffer.push(&payload[..split]).is_empty());
+        assert!(buffer.push(&payload[split..]).is_empty());
+        assert_eq!(buffer.push(b"\r\n"), vec![expected.to_string()]);
     }
 }
