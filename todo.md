@@ -262,13 +262,6 @@ status: current
     固定化される。eventstream は長さ付きフレームで 1 チャンク収まり保証が無い。
     空 TextDelta プレースホルダも残存（confirmed）。
   - 対応: フレーム長/CRC を読むバイト単位 stateful デコーダ、完全フレーム単位で JSON パース。
-- [ ] **[M-67]** edit/tool.rs の空ファイル存在判定（write.rs と同種）
-  - `tool/edit/tool.rs:135` も `exists = !content.is_empty()` のため空ファイル編集時に
-    file_time_assert をスキップしイベントも "add" になる。write.rs は M-58 で
-    `try_exists` へ修正済み。multiedit.rs は問題なし（2026-11-19 発見）。
-- [ ] **[M-60]** create_worktree が既存ブランチにも -b を付け常に失敗
-  - `server/worktree.rs:131-146`。branch_exists=true で
-    `git worktree add -b <branch> ...` を
     実行し同名ブランチで失敗。既存ブランチなら -b を外す分岐へ（confirmed）。
 - [ ] **[M-61]** TodoManager のメモリ index と DB todo_id が remove 後に不一致
   - `session/todo.rs:49-56,198-219,133-161,168-191`。remove(0) 後も DB は
@@ -282,9 +275,6 @@ status: current
   - `watcher/lib.rs:76-84,127-201`。単一 `RwLock<Option<Watcher>>` を上書きし 1 つ目の監視が
     止まるが watched_paths に残る。2 回目以降 NonRecursive、unwatch も実解除しない。
     crate 未配線（M-03）のため実害は限定的（confirmed）。
-- [ ] **[M-64]** RevertManager::cleanup が part_id 不一致でメッセージ全体を失う
-  - `session/revert.rs:171-205`。target_msg は見つかるが part.id 不一致だと preserve に
-    追加されずメッセージ丸ごと削除。不一致時は target を保持（confirmed）。
 - [ ] **[M-65]** SQLite の foreign_keys PRAGMA 未設定で ON DELETE CASCADE が無効
   - `storage/schema.rs:72,112-113 等` の 6 FK に対し `storage/database.rs:130-147` に
     after_connect / PRAGMA が無い。parts / session_shares / permissions は CRUD 皆無。
@@ -297,6 +287,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-60/M-64/M-67]** worktree・cleanup・edit を修正
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-56〜M-59]** SSE/境界/存在判定/type フィルタを修正
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[H-26/H-27]** revert 経路のデータ損失を修正（2026-11-19、swarm-coding R1-R6）
@@ -498,6 +490,14 @@ status: current
 
 ## メモ
 
+- M-60/M-64/M-67 R4 の残存（2026-11-19、記録のみ）:
+  - 既存ブランチが元リポジトリ/別 worktree でチェックアウト済みの場合、
+    `git worktree add <path> <branch>` は git 側で拒否される（修正前も別エラーで
+    失敗しており回帰ではない）。`WorktreeError` の区別化は別タスク。
+  - edit の存在確認エラーを `map_err` + `?` で伝播したが、write.rs:104 は
+    まだ `try_exists().unwrap_or(false)`（M-58 の同一弱点）。別タスク候補。
+  - edit の Err 伝播テストは NUL パスに依存（Linux では決定的、他 OS で不安定なら
+    注入可能な存在確認リファクタへ差し替え）。
 - M-56〜59 R4 の low/info 指摘（2026-11-19、記録のみ）:
   - responses.rs の reqwest 経路で `flush()` 未呼び出し（改行なし末尾行は旧実装も
     実質未処理のため機能回帰ではない）、CRLF が LF へ正規化（フレーム解析は等価）。
