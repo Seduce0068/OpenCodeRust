@@ -104,9 +104,9 @@ status: current
     session は実質 composition root として provider/tool/mcp/lsp/plugin を直接
     参照するのは設計上説明可能。大規模なトレイト注入反転（90 参照超、
     plugin グローバル singleton の注入化が前提）はコスト対効果で見送り。
-    例外として `opencode_permission::BashArity`（permission 自身が使わない純粋関数、
-    tool の 3 呼び出しのみ）と `opencode_lsp::detect_language` は中和クレートへ
-    移動が低コスト（任意・低優先）。
+    2026-11-19 実施済み: `opencode_permission::BashArity` を tool 内へ移動し
+    tool→permission 依存を解消（R4 の 2 トークン panic 指摘を R5 で修正）。
+    残存は `opencode_lsp::detect_language` の移動（任意・低優先）。
   - 未使用の `SessionID` の sqlx::Type derive は削除済み。`SessionStatus` は storage が
     実使用し orphan rule で storage への直接移管は不可（newtype＋From/Into 案は未検証）。
 - [x] **[M-17 一部]** transform / registry を pub(crate) 化
@@ -138,11 +138,15 @@ status: current
 ### 優先度: 低
 
 - [ ] **[L-04 残り]** tracing の残課題
+  - 2026-11-19 調査（swarm-coding R2）: 推奨は **TUI セッション中だけログを
+    ファイルシンクへ切り替える最小配線**（cli/main.rs と util/logging.rs の
+    2 ファイル・20〜30 行・見積りは speculative）。6 件中でユーザー可視の
+    実害があるのは TUI の stdout 描画干渉のみ。print=false 経路は現状未配線
+    のため WorkerGuard / rolling は dead path（有効化時に F3 のガード保持も
+    同時修正が必要）。F1（prompt/stream ログ）・F2（/log extra 平坦化）・
+    F5（load_config 二重化）は observability/効率の問題で後回し。
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
-    未対応: prompt/stream ハンドラの開始・完了・切断ログ、/log の extra 平坦化、
-    WorkerGuard 早期ドロップ、rolling 未使用、load_config 二重化、
-    TUI の stdout ログ（いずれも他クレート変更・API 変更・契約変更を伴う）。
 - [ ] **[L-14 残り]** スナップショット全件 clone の実害計測（現状維持）
   - list_messages の後方互換 pagination は対応済み。2026-11-19 調査で「Arc による
     メッセージ COW」という前提は誤りと判明: メッセージは所有 `Vec<SessionMessage>` で、
@@ -177,6 +181,14 @@ status: current
 ### 優先度: 中（残タスク調査で追加）
 
 - [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
+  - 2026-11-19 調査（swarm-coding R2）: 推奨は**現状維持（明記のみ）**。
+    11 フィールドはいずれも serde parse・known_config_keys・DeepMerge に参加し
+    起動失敗やデータ損失は無い。唯一の配線候補は `Config.keybinds`（GET /config
+    が値を返すため API 追加不要、TUI 側マージのみ）だが TUI 直接検証が scope 外
+    で別タスク。他 10 件は意味論未確定／型不一致／既存経路との競合。
+    `Config.enterprise` は loader の managed config（OS 固定ディレクトリ）と
+    無関係、`experimental.mcp_timeout` は実効の `McpConfig::timeout` と別経路。
+    follow-up: MAPPING.md:168 の loader.rs 参照を 538-548 → 629-637 へ更新。
   - `Config.keybinds` が TUI の `KeybindRegistry::new()` へ渡されずハードコード固定。
     `snapshot` / `autoupdate` / `enterprise` / `experimental` と
     `ExperimentalConfig` の **6 サブフィールド**
@@ -207,6 +219,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-16 一部]** BashArity を tool 内へ移動し依存を解消
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** Anthropic SSE 行バッファと実 HTTP 回帰テスト
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-37 一部]** tool 側 WalkDir の spawn_blocking 化
