@@ -93,29 +93,41 @@ impl Tool for GlobTool {
         let glob_pattern = glob::Pattern::new(&pattern)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid glob pattern: {}", e)))?;
 
-        let mut files_with_mtime: Vec<(String, SystemTime)> = Vec::new();
+        // 走査は同期 I/O なので、所有値を move したクロージャを spawn_blocking に
+        // 逃がし、tokio ワーカーを占有しないようにする。
+        let base_dir_buf = base_dir.to_path_buf();
+        let mut files_with_mtime: Vec<(String, SystemTime)> =
+            tokio::task::spawn_blocking(move || {
+                let mut files_with_mtime: Vec<(String, SystemTime)> = Vec::new();
 
-        for entry in WalkDir::new(base_dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
+                for entry in WalkDir::new(&base_dir_buf)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
 
-            let rel_path = path.strip_prefix(base_dir).unwrap_or(path);
-            let rel_str = rel_path.to_string_lossy();
+                    let rel_path = path.strip_prefix(&base_dir_buf).unwrap_or(path);
+                    let rel_str = rel_path.to_string_lossy();
 
-            if glob_pattern.matches(&rel_str) {
-                let mtime = path
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                files_with_mtime.push((path.to_string_lossy().to_string(), mtime));
-            }
-        }
+                    if glob_pattern.matches(&rel_str) {
+                        let mtime = path
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        files_with_mtime.push((path.to_string_lossy().to_string(), mtime));
+                    }
+                }
+
+                files_with_mtime
+            })
+            .await
+            .map_err(|e| {
+                ToolError::execution_with_source(format!("glob scan task failed: {}", e), e)
+            })?;
 
         files_with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
 

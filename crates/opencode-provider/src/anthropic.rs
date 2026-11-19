@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, Choice, Message, ModelInfo, Provider, ProviderError, StreamEvent,
@@ -215,28 +216,104 @@ impl Provider for AnthropicProvider {
 
         // ストリーム全体で 1 つのパーサを共有し、content_block_start で得た tool_use id を
         // 後続の content_block_delta (partial_json) へ対応付ける。
-        // move クロージャが parser を所有し、FnMut として呼ばれるたびに
-        // push(&mut self) で状態を更新するため、束縛を mut にする必要がある。
-        let mut parser = crate::stream::AnthropicSseParser::new();
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk_result| match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if let Some(event) = parser.push(data) {
-                                return Ok(event);
-                            }
+        // try_unfold の状態としてパーサを保持し、各行を push するたびに状態を更新する。
+        let parser = crate::stream::AnthropicSseParser::new();
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                Vec::<u8>::new(),
+                parser,
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut buffer, mut parser, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, buffer, parser, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            // 生バイトのままバッファへ積み、行が確定してからデコードする。
+                            buffer.extend_from_slice(bytes.as_ref());
+                            pending.extend(drain_anthropic_sse_events(
+                                &mut buffer,
+                                &mut parser,
+                                false,
+                            ));
+                        }
+                        Some(Err(err)) => {
+                            return Err(ProviderError::StreamError(err.to_string()));
+                        }
+                        None => {
+                            exhausted = true;
+                            pending.extend(drain_anthropic_sse_events(
+                                &mut buffer,
+                                &mut parser,
+                                true,
+                            ));
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
+}
+
+/// 完全な SSE 行 1 行をパーサへ渡し、生成されたイベントを収集する。
+///
+/// UTF-8 変換は行が確定したここで初めて行う。チャンク単位で
+/// `String::from_utf8_lossy` を呼ぶとマルチバイト文字がチャンク境界で分断された
+/// 際に U+FFFD へ置換されるため、生バイトを保持してからデコードする。
+/// `str::lines()` と同じく CRLF の `\r` を取り除くため、wire format の違いで
+/// JSON の末尾に `\r` が残ることを防ぐ。`data: ` で始まらない行（イベント名や
+/// 空行）は従来どおり無視する。
+fn handle_anthropic_sse_line(
+    line: &[u8],
+    parser: &mut crate::stream::AnthropicSseParser,
+    events: &mut Vec<StreamEvent>,
+) {
+    let decoded = String::from_utf8_lossy(line);
+    let decoded = decoded.as_ref();
+    let line = decoded.strip_suffix('\r').unwrap_or(decoded);
+    if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(event) = parser.push(data) {
+            events.push(event);
+        }
+    }
+}
+
+/// 行バッファから改行が揃った `data: ...` 行だけを取り出してパーサへ渡す。
+///
+/// `bytes_stream()` の 1 チャンクは SSE 行の途中（JSON の途中や UTF-8 文字の
+/// 途中を含む）で終わる可能性があるため、改行が見つかるまでは生バイトの
+/// `buffer` に保持する。UTF-8 デコードは完全な行単位で行う。
+/// `flush_remainder` はストリーム終端で末尾の改行なし行を処理するために使う。
+fn drain_anthropic_sse_events(
+    buffer: &mut Vec<u8>,
+    parser: &mut crate::stream::AnthropicSseParser,
+    flush_remainder: bool,
+) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+
+    while let Some(newline_idx) = buffer.iter().position(|&byte| byte == b'\n') {
+        let line = buffer[..newline_idx].to_vec();
+        buffer.drain(..=newline_idx);
+        handle_anthropic_sse_line(&line, parser, &mut events);
+    }
+
+    if flush_remainder && !buffer.is_empty() {
+        let tail = std::mem::take(buffer);
+        handle_anthropic_sse_line(&tail, parser, &mut events);
+    }
+
+    events
 }
 
 #[derive(Debug, Serialize)]
@@ -421,5 +498,92 @@ mod tests {
             result.choices[0].message.content,
             Content::Text(ref text) if text.is_empty()
         ));
+    }
+
+    #[test]
+    fn sse_buffer_reassembles_split_data_line() {
+        let mut buffer = Vec::new();
+        let mut parser = crate::stream::AnthropicSseParser::new();
+
+        buffer.extend_from_slice(b"event: message_start\n");
+        assert!(drain_anthropic_sse_events(&mut buffer, &mut parser, false).is_empty());
+
+        buffer.extend_from_slice(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n",
+        );
+        let usage_events = drain_anthropic_sse_events(&mut buffer, &mut parser, false);
+        assert!(matches!(
+            usage_events.as_slice(),
+            [StreamEvent::Usage {
+                prompt_tokens: 7,
+                completion_tokens: 0
+            }]
+        ));
+
+        // データ行の途中でチャンクが終わってもイベントを出さず、バッファに残す。
+        buffer.extend_from_slice(b"event: content_block_delta\n");
+        buffer.extend_from_slice(
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel",
+        );
+        assert!(drain_anthropic_sse_events(&mut buffer, &mut parser, false).is_empty());
+        assert!(buffer.ends_with(b"\"text\":\"hel"));
+
+        buffer.extend_from_slice(
+            b"lo\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = drain_anthropic_sse_events(&mut buffer, &mut parser, false);
+        assert_eq!(events.len(), 2, "イベントは行の順番どおりに出る");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "hello"));
+        assert!(matches!(&events[1], StreamEvent::Done));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn sse_buffer_flushes_trailing_line_without_newline() {
+        let mut buffer = Vec::new();
+        let mut parser = crate::stream::AnthropicSseParser::new();
+
+        buffer.extend_from_slice(b"data: {\"type\":\"message_stop\"}");
+        assert!(drain_anthropic_sse_events(&mut buffer, &mut parser, false).is_empty());
+        let events = drain_anthropic_sse_events(&mut buffer, &mut parser, true);
+        assert!(matches!(events.as_slice(), [StreamEvent::Done]));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn sse_buffer_tolerates_crlf_and_ignores_non_data_lines() {
+        let mut buffer = Vec::new();
+        let mut parser = crate::stream::AnthropicSseParser::new();
+
+        buffer.extend_from_slice(b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n");
+        let events = drain_anthropic_sse_events(&mut buffer, &mut parser, true);
+        assert!(matches!(events.as_slice(), [StreamEvent::Done]));
+    }
+
+    #[test]
+    fn sse_buffer_preserves_multibyte_text_split_mid_character() {
+        let mut buffer = Vec::new();
+        let mut parser = crate::stream::AnthropicSseParser::new();
+
+        let text = "こんにちは";
+        let prefix = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"";
+        let text_bytes = text.as_bytes();
+        // "こ" の UTF-8 は E3 81 93。先頭 1 バイト目の直後で分割する。
+        assert_eq!(&text_bytes[..3], &[0xE3u8, 0x81, 0x93]);
+
+        buffer.extend_from_slice(prefix.as_bytes());
+        buffer.extend_from_slice(&text_bytes[..1]);
+        assert!(drain_anthropic_sse_events(&mut buffer, &mut parser, false).is_empty());
+        assert!(buffer.ends_with(&[0xE3u8]));
+
+        buffer.extend_from_slice(&text_bytes[1..]);
+        buffer.extend_from_slice(b"\"}}\n\n");
+        let events = drain_anthropic_sse_events(&mut buffer, &mut parser, false);
+        assert_eq!(events.len(), 1, "イベント数が想定と異なる: {events:?}");
+        assert!(
+            matches!(events.first(), Some(StreamEvent::TextDelta(delta)) if delta.as_str() == text),
+            "分割されたマルチバイト文字は U+FFFD に置換されず復元される必要がある: {events:?}"
+        );
+        assert!(buffer.is_empty());
     }
 }
