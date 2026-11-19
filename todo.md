@@ -81,12 +81,14 @@ status: current
     /event 再接続時の GET /session/{id}/todo 再同期を追加。
   - 残存: DB 永続化（with_database）、CLI 実コマンド、TodoStatus 3 重定義の統合、
     SessionPrompt::new のデフォルトコールバック None（本番経路は注入済み）。
-- [ ] **[M-11 残り]** 他アダプタの HTTP テストと OAuth フロー
-  - 2026-11-19 対応済み: Anthropic chat_stream の SSE 行分割／UTF-8 境界を実 HTTP
-    モック（std::net、新規依存なし）で検証。行バッファを `Vec<u8>` 化し完全行確定後に
-    from_utf8_lossy を適用。他 15 アダプタの per-chunk lines() は未対応。
-  - 未対応: 他アダプタの HTTP／ストリーミング分岐、MCP OAuth callback（ストア注入
-    方針が未確定）、discovery.rs の HTTP テスト。
+- [ ] **[M-11 残り]** HTTP テストと OAuth フロー（SSE 行バッファは全adapter対応済み）
+  - 2026-11-19 対応済み: Anthropic の SSE 行分割／UTF-8 境界を実 HTTP モックで検証。
+    さらに全 16 アダプタを共通 `SseLineBuffer` ベースへ変更（4 エージェント並列）、
+    空 TextDelta プレースホルダを全アダプタで廃止、azure/cohere/cerebras/deepinfra は
+    try_unfold + 終端 flush 化（R4 の混在/flush 指摘を R5 で修正）。テスト +16 件。
+  - 未対応: MCP OAuth callback（ストア注入方針が未確定）、discovery.rs の HTTP テスト、
+    `try_unfold` を通す実 HTTP モックテスト（`bytes_stream` モック共通ハーネス）。
+    `openai.rs:954` 等にも per-chunk from_utf8_lossy の残存あり（横断タスク候補）。
   - 残存（R4 記録）: ループバック bind 失敗時の graceful skip は false green、
     2 チャンク到達の明示的検証なし、イベント検証が完全一致でない。
     実行時は `NO_PROXY=127.0.0.1,localhost` 付与が必須（テスト doc に明記済み）。
@@ -221,6 +223,7 @@ status: current
 
 ## 完了
 
+- [x] **[M-11 一部]** 全 16 アダプタの SSE 行バッファ化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-34 一部]** renovate.json を追加（2026-11-19、親が直接実施）
 - [x] **[L-04 一部]** TUI ログをファイル出力へ切替（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-16 一部]** BashArity を tool 内へ移動し依存を解消
@@ -418,6 +421,11 @@ status: current
 
 ## メモ
 
+- M-11 R4 の low 指摘（2026-11-19、記録のみ）: 既存 reassemble 系テストは
+  SseLineBuffer と各 parse_* を直接呼ぶだけで try_unfold の pending/exhausted
+  キューイングを通さない。vertex/together/vercel/xai には UTF-8 途中分割/CRLF の
+  再組立テストが無い（他 12 ファイルにはある）。共通 `bytes_stream` モック
+  ハーネスの整備を推奨。
 - M-05 の R4 誤検知（2026-11-19、親が grep で confirmed）: R4 は
   「TodoWriteTool の session_id 引数が他セッションの TODO を上書きできる」と
   指摘したが、tool/todo.rs:178 の `ctx.do_todo_update(new_todos)` は session_id を

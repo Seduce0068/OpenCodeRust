@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T12:31:13+09:00"
+  at: "2026-11-19T13:46:54+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2106 件
+  テスト総数 594 → 2122 件
 
 ### Changed
 
@@ -362,6 +362,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   R1-R6、R4 の static 保持/コメント不一致指摘を R5 で修正）(L-04)
 - `renovate.json`: 依存更新検知を Renovate へ委譲する最小設定を追加
   （App 有効化は外部サービス操作のためユーザー判断として残す）(M-34)
+- `provider`: 全 16 アダプタの SSE ストリームを共通 SseLineBuffer ベースへ変更し、
+  チャンク境界・UTF-8 途中分割・終端行の取りこぼしを解消（swarm-coding R1-R6、
+  4 エージェント並列、R4 の混在/flush 指摘を R5 で修正）(M-11)
 
 ## [0.1.0]
 
