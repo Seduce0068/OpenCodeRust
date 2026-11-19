@@ -681,7 +681,7 @@ impl ServerState {
                     archived: stored.time.archived.map(|t| t as i64),
                 },
                 messages: stored_messages,
-                summary: None,
+                summary: stored.summary.map(restore_session_summary),
                 share: stored
                     .share
                     .map(|s| opencode_session::SessionShare { url: s.url }),
@@ -776,6 +776,33 @@ impl ServerState {
         }
 
         Ok(())
+    }
+}
+
+/// 永続化された要約 (`opencode_types::SessionSummary`) を in-memory の
+/// `opencode_session::SessionSummary` へ変換する。
+///
+/// storage 側は `diffs: Vec<FileDiff>`、session 側は `Option<Vec<FileDiff>>` と
+/// 型が異なるため明示的な変換が必要。空の diffs も「要約あり」として保持し、
+/// `stored.summary` が `Some` のとき復元後の `Session.summary` も `Some` になるようにする。
+fn restore_session_summary(
+    summary: opencode_types::SessionSummary,
+) -> opencode_session::SessionSummary {
+    opencode_session::SessionSummary {
+        additions: summary.additions,
+        deletions: summary.deletions,
+        files: summary.files,
+        diffs: Some(
+            summary
+                .diffs
+                .into_iter()
+                .map(|diff| opencode_session::FileDiff {
+                    path: diff.path,
+                    additions: diff.additions,
+                    deletions: diff.deletions,
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -1465,6 +1492,19 @@ mod tests {
                 part.created_at = fixed_assistant_time;
             }
 
+            // storage に保存された summary が復元時に破棄されないことを検証するため、
+            // 既存の roundtrip テストに summary を乗せる。
+            session.set_summary(opencode_session::SessionSummary {
+                additions: 5,
+                deletions: 3,
+                files: 2,
+                diffs: Some(vec![opencode_session::FileDiff {
+                    path: "src/main.rs".to_string(),
+                    additions: 5,
+                    deletions: 3,
+                }]),
+            });
+
             (session_id, fixed_user_time, fixed_assistant_time)
         };
 
@@ -1491,6 +1531,20 @@ mod tests {
         assert_eq!(session.messages[1].created_at, assistant_created_at);
         assert_eq!(session.messages[0].get_text(), "hello");
         assert_eq!(session.messages[1].get_text(), "world");
+
+        // stored.summary が Some のとき server 側 Session.summary も Some になること。
+        let summary = session
+            .summary
+            .as_ref()
+            .expect("summary should survive storage roundtrip");
+        assert_eq!(summary.additions, 5);
+        assert_eq!(summary.deletions, 3);
+        assert_eq!(summary.files, 2);
+        let diffs = summary.diffs.as_ref().expect("diffs should be restored");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "src/main.rs");
+        assert_eq!(diffs[0].additions, 5);
+        assert_eq!(diffs[0].deletions, 3);
     }
 
     #[tokio::test]

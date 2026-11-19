@@ -672,7 +672,10 @@ async fn set_session_summary(
                 additions: req.additions.unwrap_or(0),
                 deletions: req.deletions.unwrap_or(0),
                 files: req.files.unwrap_or(0),
-                diffs: None,
+                // R4(high): diffs=None は直列化時に省略され、永続化側の
+                // opencode_types::SessionSummary.diffs (Vec, serde(default) なし) が
+                // "missing field `diffs`" で復元失敗 → 要約が失われる。空配列で正規化する。
+                diffs: Some(Vec::new()),
             },
         )
         .ok_or_else(|| ApiError::SessionNotFound(id.clone()))?;
@@ -6695,5 +6698,69 @@ mod queued_retry_tests {
             failed_attempt += 1;
         }
         assert_eq!(failed_attempt, QUEUED_PROMPT_MAX_RETRIES);
+    }
+}
+
+#[cfg(test)]
+mod patch_summary_persistence_tests {
+    use super::*;
+
+    /// R4(high) 回帰: PATCH 要約リクエストに diffs が無い (None) 場合でも、
+    /// 永続化同期の `to_value(session)` -> `from_value::<opencode_types::Session>`
+    /// が "missing field `diffs`" で失敗せず、要約が失われないことを検証する。
+    #[tokio::test]
+    async fn patch_summary_without_diffs_survives_persistence_roundtrip() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id.clone()
+        };
+
+        // PATCH /session/:id/summary と同じ入力（diffs はリクエストに存在しない）。
+        let response = set_session_summary(
+            State(state.clone()),
+            Path(session_id.clone()),
+            Json(SetSummaryRequest {
+                additions: Some(11),
+                deletions: Some(7),
+                files: Some(3),
+            }),
+        )
+        .await
+        .expect("PATCH summary should succeed");
+        assert_eq!(response.0.summary.as_ref().map(|s| s.additions), Some(11));
+        assert_eq!(response.0.summary.as_ref().map(|s| s.deletions), Some(7));
+        assert_eq!(response.0.summary.as_ref().map(|s| s.files), Some(3));
+
+        // sync_sessions_to_storage と同一の変換。ここで diffs=None のままなら
+        // "missing field `diffs`" で from_value が失敗していた。
+        let stored: opencode_types::Session = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(&session_id)
+                .expect("session should exist after PATCH");
+            let value = serde_json::to_value(session).expect("session should serialize");
+            serde_json::from_value(value).expect("session should deserialize into storage type")
+        };
+
+        let stored_summary = stored
+            .summary
+            .as_ref()
+            .expect("summary should reach storage (not be skipped)");
+        assert_eq!(stored_summary.additions, 11);
+        assert_eq!(stored_summary.deletions, 7);
+        assert_eq!(stored_summary.files, 3);
+        assert!(stored_summary.diffs.is_empty());
+
+        // load_sessions_from_storage の restore_session_summary と同じ復元を行い、
+        // 要約が残ることを確認する（diffs は Some(空配列) として戻る）。
+        let reloaded_summary: opencode_session::SessionSummary = serde_json::from_value(
+            serde_json::to_value(stored_summary).expect("stored summary should serialize"),
+        )
+        .expect("stored summary should deserialize into session summary");
+        assert_eq!(reloaded_summary.additions, 11);
+        assert_eq!(reloaded_summary.deletions, 7);
+        assert_eq!(reloaded_summary.files, 3);
+        assert!(reloaded_summary.diffs.as_ref().is_some_and(Vec::is_empty));
     }
 }

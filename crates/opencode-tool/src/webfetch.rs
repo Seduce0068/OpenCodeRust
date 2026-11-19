@@ -61,6 +61,43 @@ fn default_format() -> String {
     "markdown".to_string()
 }
 
+/// Content-Length に依存せず、`bytes_stream()` の累計バイトで 5MB 上限を強制する。
+/// 超過時はここでストリームをドロップし、残りのボディ受信を破棄する。
+/// Content-Length は欠落・虚偽があり得るため、上限の強制には使わない。
+async fn read_body_limited(response: reqwest::Response) -> Result<Vec<u8>, ToolError> {
+    use futures::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| ToolError::execution_with_source("Failed to read response", e))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_SIZE {
+            // ここで stream を drop し、これ以上のボディを受信しない。
+            return Err(response_too_large_error());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
+}
+
+/// 画像バイトを base64 データ URL に展開する。展開後のサイズにも同じ 5MB 上限を適用する。
+fn encode_image_data_url(mime: &str, bytes: &[u8]) -> Result<String, ToolError> {
+    let base64_content = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let data_url = format!("data:{mime};base64,{base64_content}");
+    if data_url.len() > MAX_RESPONSE_SIZE {
+        return Err(response_too_large_error());
+    }
+    Ok(data_url)
+}
+
+/// 上限超過の共通エラー。URL やトークン値は一切含めない。
+fn response_too_large_error() -> ToolError {
+    ToolError::ExecutionError("Response too large (exceeds 5MB limit)".to_string())
+}
+
 /// IPv4 アドレスが SSRF 保護のために拒否すべき範囲かどうかを判定する（純粋関数）。
 fn ipv4_is_forbidden(ip: &Ipv4Addr) -> bool {
     let octets = ip.octets();
@@ -187,6 +224,18 @@ fn result_title(display_url: &str, content_type: &str) -> String {
     format!("{} ({})", display_url, content_type)
 }
 
+/// webfetch の権限リクエストを生成する。
+///
+/// `patterns` にはトークン（userinfo / クエリ）を落とした `redacted_url`
+/// のみを渡す。生 URL を渡すと許可プロンプトや権限リクエストの
+/// シリアライズ値（記録・監査ログ）に api_key 等が露出するため。
+/// 実際の HTTP リクエスト生成には元の `parsed_url` をそのまま使う。
+fn webfetch_permission_request(url: &Url) -> crate::PermissionRequest {
+    crate::PermissionRequest::new("webfetch")
+        .with_pattern(redacted_url(url))
+        .always_allow()
+}
+
 /// URL のスキームと IP リテラルを検証する（DNS 問い合わせを行わない）。
 fn validate_url_literal(url: &Url) -> Result<(), ToolError> {
     match url.scheme() {
@@ -311,12 +360,11 @@ impl Tool for WebFetchTool {
         // 実際の接続は fetch_with_retry 内で再検証した IP に固定する。
         let _ = validate_url_target(&parsed_url).await?;
 
-        ctx.ask_permission(
-            crate::PermissionRequest::new("webfetch")
-                .with_pattern(&url)
-                .always_allow(),
-        )
-        .await?;
+        // 権限リクエストには redacted URL（スキーム・ホスト・パスのみ）を渡す。
+        // 生 URL のトークンがプロンプト／監査記録に露出しないようにする。
+        // 実際の接続は fetch_with_retry が元の parsed_url を使うため影響しない。
+        ctx.ask_permission(webfetch_permission_request(&parsed_url))
+            .await?;
 
         let timeout_secs = input
             .timeout
@@ -349,30 +397,9 @@ impl Tool for WebFetchTool {
             .unwrap_or("")
             .to_string();
 
-        let content_length = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok());
-
-        if let Some(len) = content_length {
-            if len > MAX_RESPONSE_SIZE {
-                return Err(ToolError::ExecutionError(
-                    "Response too large (exceeds 5MB limit)".to_string(),
-                ));
-            }
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ToolError::execution_with_source("Failed to read response", e))?;
-
-        if bytes.len() > MAX_RESPONSE_SIZE {
-            return Err(ToolError::ExecutionError(
-                "Response too large (exceeds 5MB limit)".to_string(),
-            ));
-        }
+        // Content-Length は参考値にすぎない（欠落・虚偽があり得る）ため、
+        // ヘッダ値での早期リジェクトは行わず、実バイトの累計で上限を強制する。
+        let bytes = read_body_limited(response).await?;
 
         let mime = content_type
             .split(';')
@@ -388,9 +415,7 @@ impl Tool for WebFetchTool {
             && mime != "image/vnd.fastbidsheet";
 
         if is_image {
-            let base64_content =
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-            let data_url = format!("data:{};base64,{}", mime, base64_content);
+            let data_url = encode_image_data_url(&mime, &bytes)?;
             let output = format!(
                 "Image fetched successfully.\n\n<attachment type=\"image\" mimeType=\"{}\" url=\"{}\" size=\"{}\" data=\"{}\" />",
                 mime, display_url, bytes.len(), data_url
@@ -872,5 +897,121 @@ mod tests {
         assert!(!title.contains("api_key"), "query key leaked into title");
         // スキーム・ホスト・パスは保持され、userinfo / クエリのみ除去される。
         assert_eq!(display, "https://api.example.com/v1/resource");
+    }
+
+    /// 回帰テスト（R4 medium）: 権限リクエストのシリアライズ値に
+    /// userinfo / クエリのトークンが露出しないこと。
+    /// 許可プロンプトの表示や権限リクエストの記録・監査に api_key 等が残らない。
+    #[test]
+    fn permission_request_serialization_never_leaks_token() {
+        let token = "tok_super_secret_9f8e7d";
+        let url = Url::parse(&format!(
+            "https://api-user:{token}@api.example.com/v1/resource?api_key={token}&page=2"
+        ))
+        .expect("parse url with token");
+
+        // 本番の execute() と同じヘルパーを使って権限リクエストを生成する。
+        let request = webfetch_permission_request(&url);
+        let serialized = serde_json::to_string(&request).expect("serialize permission request");
+
+        assert!(
+            !serialized.contains(token),
+            "serialized permission request leaked token: {serialized}"
+        );
+        assert!(
+            !serialized.contains("api_key"),
+            "serialized permission request leaked query key: {serialized}"
+        );
+        assert!(
+            !serialized.contains("api-user"),
+            "serialized permission request leaked userinfo: {serialized}"
+        );
+        // pattern は redacted URL（スキーム・ホスト・パスのみ）であること。
+        assert_eq!(
+            request.patterns,
+            vec!["https://api.example.com/v1/resource".to_string()]
+        );
+        assert!(
+            serialized.contains("https://api.example.com/v1/resource"),
+            "redacted url must be present in serialized request: {serialized}"
+        );
+        // 元のトークン込み URL がどのフィールドにも入っていないこと。
+        let raw = url.to_string();
+        assert!(!serialized.contains(&raw), "raw url leaked: {serialized}");
+    }
+
+    /// 回帰テスト（R2 medium）: Content-Length なしの chunked レスポンスが
+    /// 5MB を超えた場合、ストリーム累計で即エラーになり残りが破棄されること。
+    #[tokio::test]
+    async fn chunked_response_without_content_length_over_limit_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let total = MAX_RESPONSE_SIZE + CHUNK_SIZE;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 512];
+            let _ = socket.read(&mut request).await.expect("read request");
+            // 意図的に Content-Length を付けず、chunked で送信する。
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let payload = vec![b'z'; CHUNK_SIZE];
+            let mut sent = 0;
+            while sent < total {
+                let n = payload.len().min(total - sent);
+                let header = format!("{n:X}\r\n");
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&payload[..n]).await;
+                let _ = socket.write_all(b"\r\n").await;
+                sent += n;
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let client = pinned_client("no-such-host.invalid", IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("build pinned client");
+        let response = client
+            .get(format!("http://no-such-host.invalid:{port}/"))
+            .send()
+            .await
+            .expect("request must use the pinned IP");
+        assert!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .is_none(),
+            "test response must not carry Content-Length"
+        );
+
+        let error = read_body_limited(response)
+            .await
+            .expect_err("oversized chunked body must be rejected");
+        assert!(matches!(error, ToolError::ExecutionError(_)));
+
+        server.await.expect("server task");
+    }
+
+    /// 画像の base64 展開も元バイトと同じ 5MB 上限内に収まること。
+    #[test]
+    fn image_base64_expansion_is_capped_by_same_limit() {
+        let small = vec![b'x'; MAX_RESPONSE_SIZE / 2];
+        let url = encode_image_data_url("image/png", &small).expect("small image");
+        assert!(url.starts_with("data:image/png;base64,"));
+        assert!(url.len() <= MAX_RESPONSE_SIZE);
+
+        // 生バイトが 5MB 以下でも base64 展開で 5MB を超えれば拒否する。
+        let too_big = vec![b'x'; MAX_RESPONSE_SIZE];
+        let error = encode_image_data_url("image/png", &too_big)
+            .expect_err("base64 expansion beyond 5MB must be rejected");
+        assert!(matches!(error, ToolError::ExecutionError(_)));
     }
 }

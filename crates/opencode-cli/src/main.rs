@@ -629,9 +629,12 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|cwd| config_for(cwd).ok())
         .and_then(|config| config.log_level);
     // 非 TUI は print=true のため log_dir は init_tracing 側で早期 return され不使用。
+    // TUI のファイルログは cwd 直下に置かず、init_tracing のユーザー専用既定
+    // ディレクトリ (XDG_STATE_HOME / $HOME/.local/state 配下) を使うため None を渡す。
+    // cwd は上の config 読み込み用に維持する。
     // 第 2 戻り値 (WorkerGuard) を main のローカルとして保持し、終了時にフラッシュさせる。
     let (_log_path, _log_guard) =
-        opencode_util::init_tracing(startup_log_level.as_deref(), cwd, !is_tui);
+        opencode_util::init_tracing(startup_log_level.as_deref(), None, !is_tui);
 
     match cli.command {
         Some(Commands::Tui {
