@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T14:37:20+09:00"
+  at: "2026-11-19T15:09:27+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2129 件
+  テスト総数 594 → 2142 件
 
 ### Changed
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-outdated` を必須ツールとして導入し、月次監査を実施
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
-- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.14% を計測
+- `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 48.25% を計測
   （前回 37.63% から計測揺らぎの範囲で微減）
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
@@ -368,6 +368,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `session`: revert 経路のデータ損失を修正（checkout 失敗の種別判定、ls-tree 再確認、
   worktree 外パスの除外、unrevert の restore 失敗伝播。swarm-coding R1-R6、
   R4 の ParentDir/remove_file 指摘を R5 で修正）(H-26/H-27)
+- `provider` / `tool` / `server`: Responses SSE の生バイト化、エラープレビューの
+  UTF-8 境界丸め、write の存在判定、find_files の type フィルタ（swarm-coding
+  R1-R6、R4 の成功パスアロケ指摘を R5 で修正）(M-56/M-57/M-58/M-59)
 
 ## [0.1.0]
 

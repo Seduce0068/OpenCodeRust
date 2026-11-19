@@ -262,20 +262,10 @@ status: current
     固定化される。eventstream は長さ付きフレームで 1 チャンク収まり保証が無い。
     空 TextDelta プレースホルダも残存（confirmed）。
   - 対応: フレーム長/CRC を読むバイト単位 stateful デコーダ、完全フレーム単位で JSON パース。
-- [ ] **[M-56]** Responses API ストリームが SSE フレーム組立前に per-chunk lossy デコード
-  - `provider/responses.rs:1440-1447,1486-1488`。SseLineBuffer は 16 アダプタへ展開済みだが
-    本経路は未移行。生バイト保持へ切り替え、完全行確定後にデコード（confirmed）。
-- [ ] **[M-57]** OpenAI 互換エラーボディ要約がバイト単位スライスで panic
-  - `provider/openai.rs:761-774`。`body.len() > 500` に対し `&body[..500]` のため、
-    500 バイト目がマルチバイト文字途中だと char boundary panic。M-53 の修正は tool 側のみ。
-    `body.get(..500)` または境界丸めへ（confirmed）。
-- [ ] **[M-58]** write ツールが空ファイルの存在を見失い file_time_assert をスキップ
-  - `tool/write.rs:101-106,142-149`。`exists = !old_content.is_empty()` のため既存の空ファイルを
-    新規作成扱いし、並行編集の stale 検出が効かず上書きしうる。イベントも "add" と誤る。
-    `try_exists` で存在判定を分離（confirmed）。
-- [ ] **[M-59]** /find/file の type クエリが受理されるだけでフィルタに未使用
-  - `server/routes.rs:3777-3829`。FindFilesQuery.file_type はパースされるが find_files が
-    参照せず name.contains のみ。type=file/directory が効かない。find_files テスト 0 件。
+- [ ] **[M-67]** edit/tool.rs の空ファイル存在判定（write.rs と同種）
+  - `tool/edit/tool.rs:135` も `exists = !content.is_empty()` のため空ファイル編集時に
+    file_time_assert をスキップしイベントも "add" になる。write.rs は M-58 で
+    `try_exists` へ修正済み。multiedit.rs は問題なし（2026-11-19 発見）。
 - [ ] **[M-60]** create_worktree が既存ブランチにも -b を付け常に失敗
   - `server/worktree.rs:131-146`。branch_exists=true で
     `git worktree add -b <branch> ...` を
@@ -307,6 +297,8 @@ status: current
 
 ## 完了
 
+- [x] **[M-56〜M-59]** SSE/境界/存在判定/type フィルタを修正
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[H-26/H-27]** revert 経路のデータ損失を修正（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-11 一部]** 全 16 アダプタの SSE 行バッファ化（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-34 一部]** renovate.json を追加（2026-11-19、親が直接実施）
@@ -506,6 +498,15 @@ status: current
 
 ## メモ
 
+- M-56〜59 R4 の low/info 指摘（2026-11-19、記録のみ）:
+  - responses.rs の reqwest 経路で `flush()` 未呼び出し（改行なし末尾行は旧実装も
+    実質未処理のため機能回帰ではない）、CRLF が LF へ正規化（フレーム解析は等価）。
+  - find_files の broken symlink が list_files と分類不一致、不正 type は後方互換のため
+    未指定扱い（`limit` の serde エラーとは方針差）。
+  - write.rs の `try_exists` が Err を `unwrap_or(false)` で丸め、権限エラー時に
+    既存ファイルを新規扱いする経路が残存。
+  - custom fetch 経路（`CustomFetchChunkStream<Item=Result<String,_>>`）は生バイトを
+    保持できず UTF-8 分断問題が残存（型変更が必要な別タスク）。
 - H-26 R4 の low 指摘（2026-11-19、記録のみ）: `checkout_failure_is_missing_path`
   の分類関数単体テストのみで、`revert_with_ls_tree` を通した「他理由失敗時に
   ls-tree/削除を行わない」フローは未固定。checkout 実行を注入する fixture で
