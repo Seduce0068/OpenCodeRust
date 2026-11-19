@@ -117,8 +117,10 @@ status: current
 - [ ] **[M-34 残り]** 依存更新検知の Renovate 委譲とスクリプトゲート
   - 2026-11-19 対応済み: ci.yml に all-features と unsafe lint ゲートを追加（`extra_gates`
     / `clippy_args`、ローカルで両方 green、共通ワークフロー README で入力仕様確認）。
-    残存: cargo outdated は時間依存で time-bomb になるため CI に入れない方針。
-    依存更新検知は Renovate（renovate.json 追加＋GitHub App 有効化が別判断）へ委譲。
+    2026-11-19 追加済み: `renovate.json`（$schema + config:recommended の最小構成）を
+    配置。cargo outdated は時間依存で time-bomb になるため CI には入れない方針で、
+    依存更新検知は Renovate へ委譲。**GitHub App / self-hosted の有効化は外部サービス
+    操作のためユーザー判断として未実施**（設定ファイルだけでは動作しない）。
     `scripts/opencode_llm_mcp.rs` は workspace member 外で `--locked` 再現性の観点から
     ゲート化を見送り（恒久対策は member 化）。脆弱性監査は `audit: true` で既にゲート済み。
 - [ ] **[M-37 残り]** 共通 canonicalize ヘルパの async 化
@@ -219,6 +221,7 @@ status: current
 
 ## 完了
 
+- [x] **[M-34 一部]** renovate.json を追加（2026-11-19、親が直接実施）
 - [x] **[L-04 一部]** TUI ログをファイル出力へ切替（2026-11-19、swarm-coding R1-R6）
 - [x] **[M-16 一部]** BashArity を tool 内へ移動し依存を解消
   （2026-11-19、swarm-coding R1-R6）
