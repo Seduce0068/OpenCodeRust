@@ -41,58 +41,82 @@ fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists() || run_git(&["rev-parse", "--git-dir"], path).is_ok()
 }
 
-pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-    if !is_git_repo(repo_path) {
-        return Err(WorktreeError::NotGitRepo);
+/// 現在の worktree レコードを結果へ push する共通処理。
+///
+/// detached worktree は `branch` 行を持たないため、branch が無い場合は
+/// 従来の末尾フォールバックと同じく `"HEAD"` を採用する。path が無い
+/// （推定開始前）レコードは無視する。
+fn push_worktree(
+    worktrees: &mut Vec<WorktreeInfo>,
+    path: &Option<String>,
+    branch: &Option<String>,
+    head: &Option<String>,
+) {
+    if let Some(path) = path {
+        worktrees.push(WorktreeInfo {
+            path: path.clone(),
+            branch: branch.clone().unwrap_or_else(|| "HEAD".to_string()),
+            head: head.clone().unwrap_or_default(),
+        });
     }
+}
 
-    let output = run_git(&["worktree", "list", "--porcelain"], repo_path)?;
-
+/// `git worktree list --porcelain` の出力をパースする。
+///
+/// 各レコードは空行で区切られ、`worktree <path>` 行で始まる。detached
+/// worktree には `branch` 行の代わりに `detached` 行が出るため、明示的に
+/// 解釈して branch を `"HEAD"` とする。レコードは branch の有無に関わらず
+/// 次の `worktree` 行（または入力末尾）で必ず push され、並び順に依存しない。
+fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
     let mut worktrees = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
     let mut current_head: Option<String> = None;
 
     for line in output.lines() {
-        if line.starts_with("worktree ") {
-            if let (Some(path), Some(branch), Some(head)) =
-                (&current_path, &current_branch, &current_head)
-            {
-                worktrees.push(WorktreeInfo {
-                    path: path.clone(),
-                    branch: branch.clone(),
-                    head: head.clone(),
-                });
-            }
-            current_path = Some(line["worktree ".len()..].to_string());
+        if let Some(path) = line.strip_prefix("worktree ") {
+            // 前のレコードを flush。branch が無くても（detached でも）push する。
+            push_worktree(
+                &mut worktrees,
+                &current_path,
+                &current_branch,
+                &current_head,
+            );
+            current_path = Some(path.to_string());
             current_branch = None;
             current_head = None;
-        } else if line.starts_with("HEAD ") {
-            current_head = Some(line["HEAD ".len()..].to_string());
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            current_head = Some(head.to_string());
         } else if let Some(branch_full) = line.strip_prefix("branch ") {
             let branch = branch_full
                 .strip_prefix("refs/heads/")
                 .unwrap_or(branch_full);
             current_branch = Some(branch.to_string());
+        } else if line == "detached" {
+            // git は detached worktree に branch 行を出さないため、
+            // 従来の末尾フォールバックと同じ "HEAD" を設定する。
+            current_branch = Some("HEAD".to_string());
         }
     }
 
-    if let (Some(path), Some(branch), Some(head)) = (&current_path, &current_branch, &current_head)
-    {
-        worktrees.push(WorktreeInfo {
-            path: path.clone(),
-            branch: branch.clone(),
-            head: head.clone(),
-        });
-    } else if let (Some(path), Some(head)) = (&current_path, &current_head) {
-        worktrees.push(WorktreeInfo {
-            path: path.clone(),
-            branch: "HEAD".to_string(),
-            head: head.clone(),
-        });
+    // 末尾のレコードを flush（ルート worktree 等）。
+    push_worktree(
+        &mut worktrees,
+        &current_path,
+        &current_branch,
+        &current_head,
+    );
+
+    worktrees
+}
+
+pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+    if !is_git_repo(repo_path) {
+        return Err(WorktreeError::NotGitRepo);
     }
 
-    Ok(worktrees)
+    let output = run_git(&["worktree", "list", "--porcelain"], repo_path)?;
+    Ok(parse_worktree_list(&output))
 }
 
 /// 指定した名前のローカルブランチが厳密に存在するかを判定する。
@@ -337,5 +361,67 @@ mod tests {
         assert_eq!(checked_out, "feature-existing");
 
         cleanup(&repo, target.as_str());
+    }
+
+    /// 回帰テスト: attached -> detached -> attached の並びで、
+    /// 中間にある detached worktree が黙って除外されないこと。
+    /// 修正前は中間の detached レコードが落とされ len == 2 となっていた。
+    #[test]
+    fn parse_worktree_list_keeps_detached_in_the_middle() {
+        let porcelain = "\
+worktree /repo/main
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /repo/detached
+HEAD 2222222222222222222222222222222222222222
+detached
+
+worktree /repo/feature
+HEAD 3333333333333333333333333333333333333333
+branch refs/heads/feature
+";
+
+        let trees = parse_worktree_list(porcelain);
+
+        assert_eq!(trees.len(), 3);
+        assert_eq!(trees[0].path, "/repo/main");
+        assert_eq!(trees[0].branch, "main");
+        assert_eq!(trees[0].head, "1111111111111111111111111111111111111111");
+        assert_eq!(trees[1].path, "/repo/detached");
+        assert_eq!(trees[1].branch, "HEAD");
+        assert_eq!(trees[1].head, "2222222222222222222222222222222222222222");
+        assert_eq!(trees[2].path, "/repo/feature");
+        assert_eq!(trees[2].branch, "feature");
+        assert_eq!(trees[2].head, "3333333333333333333333333333333333333333");
+    }
+
+    /// 並び順非依存の確認: detached が先頭と末尾にあっても全レコードが得られること。
+    #[test]
+    fn parse_worktree_list_keeps_detached_at_boundaries() {
+        let porcelain = "\
+worktree /repo/detached-first
+HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+detached
+
+worktree /repo/main
+HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+branch refs/heads/main
+
+worktree /repo/detached-last
+HEAD cccccccccccccccccccccccccccccccccccccccc
+detached
+";
+
+        let trees = parse_worktree_list(porcelain);
+
+        assert_eq!(trees.len(), 3);
+        assert_eq!(trees[0].path, "/repo/detached-first");
+        assert_eq!(trees[0].branch, "HEAD");
+        assert_eq!(trees[1].path, "/repo/main");
+        assert_eq!(trees[1].branch, "main");
+        assert_eq!(trees[2].path, "/repo/detached-last");
+        assert_eq!(trees[2].branch, "HEAD");
+        assert_eq!(trees[2].head, "cccccccccccccccccccccccccccccccccccccccc");
     }
 }

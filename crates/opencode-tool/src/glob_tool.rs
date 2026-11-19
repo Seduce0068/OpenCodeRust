@@ -100,11 +100,24 @@ impl Tool for GlobTool {
             tokio::task::spawn_blocking(move || {
                 let mut files_with_mtime: Vec<(String, SystemTime)> = Vec::new();
 
+                // 外部ディレクトリの権限チェックは検索ルート base_dir に対して
+                // 走査前に一度だけ行われる。シンボリックリンクを辿ると、
+                // プロジェクト内のリンクが外部を指す場合にそのチェックを
+                // すり抜けて外部のファイル名を返してしまうため、辿らない。
+                // follow_links(false) は symlink cycle による無限走査も
+                // 構造的に防ぐ（リンクを一切 traverse しないため）。
                 for entry in WalkDir::new(&base_dir_buf)
-                    .follow_links(true)
+                    .follow_links(false)
                     .into_iter()
                     .filter_map(|e| e.ok())
                 {
+                    // follow_links(false) でも WalkDir はリンク自身をエントリとして
+                    // 返す。リンク先が外部ファイルのとき path.is_file() は true に
+                    // なるため、結果に含めないようリンクを明示的に除外する。
+                    if entry.file_type().is_symlink() {
+                        continue;
+                    }
+
                     let path = entry.path();
                     if !path.is_file() {
                         continue;
@@ -247,6 +260,74 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 検索ルート内の symlink がプロジェクト外を指しても、外部のファイル名を
+    /// 返してはならない（external_directory 権限のすり抜け回帰テスト）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_does_not_follow_external_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let outside =
+            std::env::temp_dir().join(format!("opencode-glob-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leaked.rs"), "fn leaked() {}").unwrap();
+
+        // 外部ディレクトリを指す symlink と、外部ファイルを直接指す symlink。
+        symlink(&outside, dir.join("outside_link")).unwrap();
+        symlink(outside.join("leaked.rs"), dir.join("leaked_link.rs")).unwrap();
+
+        for pattern in ["*.rs", "**/*.rs"] {
+            let result = GlobTool::new()
+                .execute(
+                    serde_json::json!({
+                        "pattern": pattern,
+                        "path": dir.to_string_lossy()
+                    }),
+                    context(&dir),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.metadata["count"], 0, "pattern: {pattern}");
+            assert!(!result.output.contains("leaked"), "pattern: {pattern}");
+            assert!(
+                !result.output.contains("outside_link"),
+                "pattern: {pattern}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// 自分自身を指す symlink（cycle）があっても走査が完了することを確認する。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_cyclic_symlink_does_not_hang() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.rs"), "fn a() {}").unwrap();
+        symlink(".", dir.join("self_link")).unwrap();
+
+        let result = GlobTool::new()
+            .execute(
+                serde_json::json!({
+                    "pattern": "*.rs",
+                    "path": dir.to_string_lossy()
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["count"], 1);
+        assert!(result.output.contains("a.rs"));
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
