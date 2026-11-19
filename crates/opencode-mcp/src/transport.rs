@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -15,6 +16,66 @@ const MAX_HEADER_LINES: usize = 64;
 /// 1 ヘッダ行の最大長（改行を除く）。ヘッダ値にトークンが含まれても
 /// エラー本文には出さないため、値そのものはログに残さない。
 const MAX_HEADER_LINE_BYTES: usize = 8192;
+/// HTTP レスポンス本文の累積バイト上限（stdio と同じ 10 MiB）。
+const MAX_HTTP_BODY_SIZE: usize = MAX_FRAME_SIZE;
+/// SSE の 1 イベント（`data:` ペイロード）のバイト上限（10 MiB 相当）。
+const MAX_SSE_EVENT_SIZE: usize = MAX_FRAME_SIZE;
+/// レスポンス受信用 bounded mpsc キューの容量。
+/// これを超える詰まりは「切断」として扱い、キューを無限に伸ばさない。
+const RESPONSE_QUEUE_CAPACITY: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Shared helpers (HTTP / SSE)
+// ---------------------------------------------------------------------------
+
+/// `reqwest::Response::bytes_stream()` で本文を読み、累積バイト数が `limit` を
+/// 超えた時点で打ち切って `ProtocolError` を返す。
+///
+/// `resp.text()` と違い途中でサイズを検証できるため、巨大な本文をメモリに
+/// 展開しない。読み取った本文値はエラー本文に一切含めない。
+async fn read_body_capped(
+    resp: reqwest::Response,
+    limit: usize,
+    label: &'static str,
+) -> Result<String, McpClientError> {
+    use futures::StreamExt;
+
+    let mut stream = resp.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| McpClientError::TransportError(format!("Failed to read {label}: {e}")))?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(McpClientError::ProtocolError(format!(
+                "{label} exceeds size limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body)
+        .map_err(|_| McpClientError::ProtocolError(format!("{label} is not valid UTF-8")))
+}
+
+/// SSE の `data:` ペイロードが上限内か検証する。値そのものはエラーに出さない。
+fn validate_sse_event_size(data: &str) -> Result<(), McpClientError> {
+    if data.len() > MAX_SSE_EVENT_SIZE {
+        return Err(McpClientError::ProtocolError(
+            "SSE event exceeds size limit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// bounded キューへ 1 メッセージを入れる。キューが一杯（=受信側が追いついて
+/// いない）または閉じている場合は切断扱いの `TransportError` を返し、
+/// バッファを無限に伸ばさない。
+fn enqueue_response(
+    tx: &tokio::sync::mpsc::Sender<JsonRpcMessage>,
+    message: JsonRpcMessage,
+) -> Result<(), McpClientError> {
+    tx.try_send(message)
+        .map_err(|_| McpClientError::TransportError("Response queue is full or closed".to_string()))
+}
 
 // ---------------------------------------------------------------------------
 // Transport trait
@@ -268,13 +329,14 @@ pub struct HttpTransport {
     headers: HashMap<String, String>,
     client: reqwest::Client,
     /// Buffer for responses received via streaming that haven't been consumed yet.
-    response_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
-    response_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+    /// Bounded so a slow/stuck consumer cannot grow the queue without limit.
+    response_rx: Mutex<tokio::sync::mpsc::Receiver<JsonRpcMessage>>,
+    response_tx: tokio::sync::mpsc::Sender<JsonRpcMessage>,
 }
 
 impl HttpTransport {
     pub fn new(url: String, headers: Option<HashMap<String, String>>) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(RESPONSE_QUEUE_CAPACITY);
         Self {
             url,
             headers: headers.unwrap_or_default(),
@@ -333,9 +395,7 @@ impl McpTransport for HttpTransport {
 
         if content_type.contains("text/event-stream") {
             // Server chose to stream the response via SSE inside the POST response.
-            let text = resp.text().await.map_err(|e| {
-                McpClientError::TransportError(format!("Failed to read SSE body: {}", e))
-            })?;
+            let text = read_body_capped(resp, MAX_HTTP_BODY_SIZE, "SSE body").await?;
             for line in text.lines() {
                 let line = line.trim();
                 if let Some(data) = line.strip_prefix("data:") {
@@ -343,21 +403,20 @@ impl McpTransport for HttpTransport {
                     if data.is_empty() || data == "[DONE]" {
                         continue;
                     }
+                    validate_sse_event_size(data)?;
                     if let Ok(message) = JsonRpcMessage::parse_json_str(data) {
-                        let _ = self.response_tx.send(message);
+                        enqueue_response(&self.response_tx, message)?;
                     }
                 }
             }
         } else {
             // Plain JSON response.
-            let text = resp.text().await.map_err(|e| {
-                McpClientError::TransportError(format!("Failed to read response body: {}", e))
-            })?;
+            let text = read_body_capped(resp, MAX_HTTP_BODY_SIZE, "response body").await?;
             if !text.is_empty() {
                 let message = JsonRpcMessage::parse_json_str(&text).map_err(|e| {
                     McpClientError::ProtocolError(format!("Failed to parse response: {}", e))
                 })?;
-                let _ = self.response_tx.send(message);
+                enqueue_response(&self.response_tx, message)?;
             }
         }
 
@@ -403,21 +462,27 @@ pub struct SseTransport {
     url: String,
     headers: HashMap<String, String>,
     client: reqwest::Client,
-    response_rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
-    response_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+    response_rx: Mutex<tokio::sync::mpsc::Receiver<JsonRpcMessage>>,
+    response_tx: tokio::sync::mpsc::Sender<JsonRpcMessage>,
+    /// バックグラウンド SSE リスナが検出した上限超過 등의理由（本文は含まない）。
+    violation: Arc<Mutex<Option<String>>>,
+    /// 違反検出時に待機中の `receive()` を起こすための通知。
+    violation_notify: Arc<tokio::sync::Notify>,
     /// Handle to the background SSE listener task so we can abort on close.
     sse_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SseTransport {
     pub fn new(url: String, headers: Option<HashMap<String, String>>) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(RESPONSE_QUEUE_CAPACITY);
         Self {
             url,
             headers: headers.unwrap_or_default(),
             client: reqwest::Client::new(),
             response_rx: Mutex::new(rx),
             response_tx: tx,
+            violation: Arc::new(Mutex::new(None)),
+            violation_notify: Arc::new(tokio::sync::Notify::new()),
             sse_task: Mutex::new(None),
         }
     }
@@ -438,21 +503,37 @@ impl SseTransport {
         })?;
 
         let tx = self.response_tx.clone();
+        let violation = Arc::clone(&self.violation);
+        let notify = Arc::clone(&self.violation_notify);
 
         let handle = tokio::spawn(async move {
             while let Some(event) = es.next().await {
                 match event {
                     Ok(Event::Message(msg)) => {
-                        let data = msg.data.trim().to_string();
+                        let data = msg.data.trim();
                         if data.is_empty() || data == "[DONE]" {
                             continue;
                         }
-                        match JsonRpcMessage::parse_json_str(&data) {
-                            Ok(msg) => {
-                                if tx.send(msg).is_err() {
+                        if validate_sse_event_size(data).is_err() {
+                            // 上限超過: 本文は残さず理由だけ記録して切断する。
+                            *violation.lock().await =
+                                Some("SSE event exceeds size limit".to_string());
+                            notify.notify_one();
+                            break;
+                        }
+                        match JsonRpcMessage::parse_json_str(data) {
+                            Ok(msg) => match tx.try_send(msg) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    // bounded キューが一杯なら無限に溜めず切断する。
+                                    *violation.lock().await =
+                                        Some("Response queue is full".to_string());
+                                    notify.notify_one();
                                     break;
                                 }
-                            }
+                                // 受信側が閉じられた: これ以上配信先がない。
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                            },
                             Err(e) => {
                                 tracing::warn!("SSE: failed to parse message: {}", e);
                             }
@@ -463,10 +544,26 @@ impl SseTransport {
                     }
                     Err(e) => {
                         tracing::error!("SSE error: {}", e);
+                        // エラー本文（トークン等を含む可能性がある）は残さず、
+                        // 理由だけ記録して待機中の receive() を必ず起こす。
+                        *violation.lock().await = Some("SSE stream error".to_string());
+                        notify.notify_one();
                         break;
                     }
                 }
             }
+            // ここに到達した時点で SSE ストリームはもうイベントを配信しない
+            // （SSE エラー / TrySendError::Closed / 正常なストリーム終了）。
+            // どの break 経路でも violation を設定し notify_one() を呼んで
+            // receive() が rx.recv() で永久にハングしないようにする。
+            // 上限超過・キュー詰まり・エラーで既に理由がある場合は上書きしない。
+            {
+                let mut guard = violation.lock().await;
+                if guard.is_none() {
+                    *guard = Some("SSE stream closed".to_string());
+                }
+            }
+            notify.notify_one();
         });
 
         let mut task = self.sse_task.lock().await;
@@ -527,10 +624,26 @@ impl McpTransport for SseTransport {
     }
 
     async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+        // バックグラウンドリスナが上限超過/キュー詰まりを検出済みなら、
+        // バッファに残っていても切断扱いのエラーを返す。
+        if let Some(reason) = self.violation.lock().await.as_ref() {
+            return Err(McpClientError::ProtocolError(reason.clone()));
+        }
+
         let mut rx = self.response_rx.lock().await;
-        match rx.recv().await {
-            Some(msg) => Ok(Some(msg)),
-            None => Ok(None),
+        tokio::select! {
+            result = rx.recv() => {
+                match self.violation.lock().await.as_ref() {
+                    Some(reason) => Err(McpClientError::ProtocolError(reason.clone())),
+                    None => Ok(result),
+                }
+            }
+            _ = self.violation_notify.notified() => {
+                match self.violation.lock().await.as_ref() {
+                    Some(reason) => Err(McpClientError::ProtocolError(reason.clone())),
+                    None => Ok(None),
+                }
+            }
         }
     }
 
@@ -637,5 +750,250 @@ mod stdio_framing_tests {
             "unexpected error: {error}"
         );
         let _ = transport.close().await;
+    }
+}
+
+#[cfg(test)]
+mod http_sse_limit_tests {
+    //! HTTP / SSE トランスポートのサイズ上限と bounded キューの回帰テスト。
+    //! 新規依存なしのループバック HTTP モック（127.0.0.1 のみ、外部送信なし）を使う。
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Once;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn ensure_no_proxy() {
+        static SET_NO_PROXY: Once = Once::new();
+        SET_NO_PROXY.call_once(|| {
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        });
+    }
+
+    /// 1 接続だけ捌く最小のループバック HTTP モック。
+    /// サイズ超過でクライアントが早期切断してもスレッドを失敗させないため、
+    /// レスポンスの書き込みエラーは無視する。
+    fn serve_once(content_type: &'static str, body: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+        let addr = listener.local_addr().expect("loopback addr must succeed");
+        let url = format!("http://{addr}/mcp");
+        let handle = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("mock listener must be nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            panic!("mock timed out waiting for a connection");
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("mock accept failed: {err}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("mock read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("mock write timeout");
+
+            // リクエスト（ヘッダ + Content-Length 分のボディ）を読み捨てる。
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("mock must read request");
+                assert!(read > 0, "unexpected EOF while reading request");
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(position) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let read = stream
+                    .read(&mut chunk)
+                    .expect("mock must read request body");
+                assert!(read > 0, "unexpected EOF while reading request body");
+                buf.extend_from_slice(&chunk[..read]);
+            }
+
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response_headers.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn ordinary_http_response_is_still_buffered_and_received() {
+        ensure_no_proxy();
+        let body = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        let (url, handle) = serve_once("application/json", body.to_string());
+
+        let transport = HttpTransport::new(url, None);
+        transport
+            .send(&JsonRpcRequest::new(7, "ping"))
+            .await
+            .expect("send must succeed");
+        let message = transport
+            .receive()
+            .await
+            .expect("receive must succeed")
+            .expect("message must be buffered");
+        match message {
+            JsonRpcMessage::Response(response) => assert_eq!(response.id, 7),
+            other => panic!("expected response, got {other:?}"),
+        }
+        handle.join().expect("mock thread must not panic");
+    }
+
+    #[tokio::test]
+    async fn oversized_http_response_body_is_rejected_without_echoing_body() {
+        ensure_no_proxy();
+        let marker = "SECRET_BODY_MARKER_DO_NOT_LEAK";
+        // 有効な JSON に上限を超える padding を入れる。
+        let padding = format!("{marker}{}", "x".repeat(MAX_HTTP_BODY_SIZE));
+        let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"pad\":\"{padding}\"}}}}");
+        assert!(body.len() > MAX_HTTP_BODY_SIZE);
+        let (url, handle) = serve_once("application/json", body);
+
+        let transport = HttpTransport::new(url, None);
+        let error = transport
+            .send(&JsonRpcRequest::new(1, "ping"))
+            .await
+            .expect_err("oversized body must be rejected");
+
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains(marker),
+            "error must not echo the response body: {rendered}"
+        );
+        handle.join().expect("mock thread must not panic");
+    }
+
+    #[test]
+    fn oversized_sse_event_is_rejected_without_echoing_data() {
+        let data = "s".repeat(MAX_SSE_EVENT_SIZE + 1);
+        let error = validate_sse_event_size(&data).expect_err("must reject");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        assert!(!error.to_string().contains(data.as_str()));
+        validate_sse_event_size("{}").expect("normal event must pass");
+    }
+
+    #[test]
+    fn enqueue_response_rejects_when_bounded_queue_is_full() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<JsonRpcMessage>(RESPONSE_QUEUE_CAPACITY);
+        for id in 0..RESPONSE_QUEUE_CAPACITY as u64 {
+            let message = JsonRpcMessage::parse_json_str(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"
+            ))
+            .expect("parse fixture");
+            enqueue_response(&tx, message).expect("queue must accept up to capacity");
+        }
+        let extra = JsonRpcMessage::parse_json_str(r#"{"jsonrpc":"2.0","id":999,"result":{}}"#)
+            .expect("parse fixture");
+        let error = enqueue_response(&tx, extra).expect_err("full queue must reject");
+        assert!(
+            matches!(&error, McpClientError::TransportError(_)),
+            "unexpected error: {error}"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "buffered messages must remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn consecutive_sse_events_disconnect_when_bounded_queue_fills() {
+        ensure_no_proxy();
+        // キュー容量を確実に超える数のイベントを連続で送出する。
+        let mut sse_body = String::new();
+        for id in 0..(RESPONSE_QUEUE_CAPACITY + 8) {
+            sse_body.push_str(&format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}\n\n"
+            ));
+        }
+        let (url, handle) = serve_once("text/event-stream", sse_body);
+
+        let transport = SseTransport::new(url, None);
+        transport.connect().await.expect("connect must succeed");
+
+        // リスナがキュー詰まりを検出するまで待つ（タイムアウト付き）。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if transport.violation.lock().await.is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("SSE listener did not detect bounded queue overflow");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let error = transport
+            .receive()
+            .await
+            .expect_err("overflow must surface as a transport error");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("jsonrpc") && !rendered.contains('{'),
+            "error must not echo event data: {rendered}"
+        );
+        transport.close().await.expect("close");
+        handle.join().expect("mock thread must not panic");
+    }
+
+    /// R4 指摘 2: SSE がエラー（ここではストリーム終端由来の StreamEnded）を
+    /// 出したとき、バックグラウンドリスナが violation を設定して receive() を
+    /// 起こすため、receive() がエラーを返さず永久にハングしないことを検証する。
+    #[tokio::test]
+    async fn sse_error_is_surfaced_by_receive_without_hanging() {
+        ensure_no_proxy();
+        // 空の SSE ボディ: EventSource は Open の後に StreamEnded を Err として流す。
+        let (url, handle) = serve_once("text/event-stream", String::new());
+
+        let transport = SseTransport::new(url, None);
+        transport.connect().await.expect("connect must succeed");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), transport.receive()).await;
+        let error = outcome
+            .expect("receive must not hang after an SSE error")
+            .expect_err("SSE error must surface as an error");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        // エラー本文を借用していないこと（JSON-RPC の断片が混ざらないこと）も確認。
+        let rendered = error.to_string();
+        assert!(!rendered.contains("jsonrpc") && !rendered.contains('{'));
+
+        transport.close().await.expect("close");
+        handle.join().expect("mock thread must not panic");
     }
 }

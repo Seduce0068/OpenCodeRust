@@ -881,7 +881,18 @@ impl SessionManager {
     }
 
     /// Set summary.
-    pub fn set_summary(&mut self, session_id: &str, summary: SessionSummary) -> Option<Session> {
+    ///
+    /// R4(high): `diffs: None` は直列化時に省略され、永続化側の `diffs: Vec<_>`
+    /// (serde(default) なし) の復元が "missing field `diffs`" で失敗するため、
+    /// 直接呼び出し経路でも空配列へ正規化してから保持する。
+    pub fn set_summary(
+        &mut self,
+        session_id: &str,
+        mut summary: SessionSummary,
+    ) -> Option<Session> {
+        if summary.diffs.is_none() {
+            summary.diffs = Some(Vec::new());
+        }
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
             session.set_summary(summary);
@@ -1131,6 +1142,42 @@ mod tests {
 
         manager.delete(&session.id);
         assert_eq!(manager.count(), 0);
+    }
+
+    /// R4(high) 回帰: SessionManager::set_summary を直接呼ぶ経路でも
+    /// diffs=None が Some(空配列) へ正規化され、永続化用の直列化で
+    /// `diffs` フィールドが省略されないことを検証する。
+    #[test]
+    fn test_set_summary_normalizes_none_diffs() {
+        let mut manager = SessionManager::new();
+        let session = manager.create("project-1", "/path/to/project");
+        let session_id = session.id.clone();
+
+        let updated = manager
+            .set_summary(
+                &session_id,
+                SessionSummary {
+                    additions: 4,
+                    deletions: 2,
+                    files: 1,
+                    diffs: None,
+                },
+            )
+            .expect("session should be updated");
+
+        let summary = updated.summary.as_ref().expect("summary should be set");
+        assert_eq!(summary.additions, 4);
+        assert_eq!(summary.deletions, 2);
+        assert_eq!(summary.files, 1);
+        assert!(summary.diffs.as_ref().is_some_and(Vec::is_empty));
+
+        // 直列化結果に diffs が含まれること（永続化側の復元が成功する条件）。
+        let value = serde_json::to_value(&updated).expect("session should serialize");
+        assert_eq!(
+            value["summary"]["diffs"],
+            serde_json::json!([]),
+            "diffs must be present after serialization"
+        );
     }
 
     #[test]

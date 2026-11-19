@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout, Duration};
 
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
@@ -54,6 +54,69 @@ impl Default for BashTool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// stdout / stderr を固定サイズのチャンクで読み、1 行を丸ごと確保しない。
+/// 累計が MAX_OUTPUT_BYTES を超えた時点で truncated を立て、以降のバイトは
+/// 破棄する（子プロセスをブロックさせないため EOF まで読み切る）。
+/// 改行なしの巨大出力でも行バッファは MAX_OUTPUT_BYTES を超えて伸びない。
+///
+/// 上限は**ストリーム単位**で適用される。呼び出し側は stdout と stderr に
+/// それぞれ別の `output` / `truncated` を渡すため、各ストリームが最大
+/// MAX_OUTPUT_BYTES を持ち、結合後の出力は最大 2 * MAX_OUTPUT_BYTES になる。
+/// これは「合計 50KB」ではなく「各ストリーム 50KB」という設計方針である。
+async fn read_limited_lines<R: AsyncRead + Unpin>(
+    mut reader: R,
+    output: &mut String,
+    truncated: &mut bool,
+) -> std::io::Result<()> {
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            if !pending.is_empty() {
+                push_limited_line(&mut pending, output, truncated);
+            }
+            return Ok(());
+        }
+        for &byte in &buf[..n] {
+            if byte == b'\n' {
+                push_limited_line(&mut pending, output, truncated);
+            } else if pending.len() < MAX_OUTPUT_BYTES {
+                pending.push(byte);
+            } else {
+                // 1 行が MAX_OUTPUT_BYTES を超えても行バッファを伸ばさない。
+                *truncated = true;
+            }
+        }
+    }
+}
+
+/// 1 行分のバイトを出力に追加する。上限を超える場合は追加せず truncated を立てる。
+///
+/// 上限判定は元バイト列の長さ (`pending.len()`) ではなく `from_utf8_lossy`
+/// 変換後のバイト長で行う。不正 UTF-8 は 1 バイトが U+FFFD（3 バイト）へ
+/// 展開されるため、元バイト長で判定すると変換後に MAX_OUTPUT_BYTES を
+/// 大幅に超えてしまう（例: 17,067 バイト → 51,201 バイト）。
+/// 終端改行の 1 バイトも予算に含め、加算後の合計が上限を**厳密に超える**
+/// 場合のみ拒否する。これにより、改行を含めてちょうど上限の行は
+/// 丸ごと残り、1 バイトでも多ければ切り捨てられる。
+fn push_limited_line(pending: &mut Vec<u8>, output: &mut String, truncated: &mut bool) {
+    let rendered = String::from_utf8_lossy(pending.as_slice());
+    let projected = output
+        .len()
+        .saturating_add(rendered.len())
+        .saturating_add(1); // 終端改行
+    if projected > MAX_OUTPUT_BYTES {
+        *truncated = true;
+        pending.clear();
+        return;
+    }
+    output.push_str(&rendered);
+    output.push('\n');
+    pending.clear();
 }
 
 #[async_trait]
@@ -220,64 +283,50 @@ impl Tool for BashTool {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
-
-        let mut output = String::new();
-        let mut truncated = false;
+        let mut stdout_output = String::new();
+        let mut stderr_output = String::new();
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
 
         let abort_token = ctx.abort.clone();
 
         let result = timeout(Duration::from_millis(timeout_ms), async {
-            loop {
-                tokio::select! {
-                    _ = abort_token.cancelled() => {
-                        #[cfg(unix)]
-                        {
-                            if let Some(pid) = child_pid {
-                                kill_process_tree(pid).await;
-                            }
-                        }
-                        let _ = child.kill().await;
-                        return Err(ToolError::Cancelled);
-                    }
-                    line = stdout_reader.next_line() => {
-                        match line {
-                            Ok(Some(l)) => {
-                                if output.len() + l.len() + 1 > MAX_OUTPUT_BYTES {
-                                    truncated = true;
-                                } else {
-                                    output.push_str(&l);
-                                    output.push('\n');
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                output.push_str(&format!("Error reading stdout: {}\n", e));
-                            }
+            tokio::select! {
+                _ = abort_token.cancelled() => {
+                    #[cfg(unix)]
+                    {
+                        if let Some(pid) = child_pid {
+                            kill_process_tree(pid).await;
                         }
                     }
-                    line = stderr_reader.next_line() => {
-                        match line {
-                            Ok(Some(l)) => {
-                                if output.len() + l.len() + 1 > MAX_OUTPUT_BYTES {
-                                    truncated = true;
-                                } else {
-                                    output.push_str(&l);
-                                    output.push('\n');
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                output.push_str(&format!("Error reading stderr: {}\n", e));
-                            }
-                        }
-                    }
+                    let _ = child.kill().await;
+                    return Err(ToolError::Cancelled);
                 }
+                // 両ストリームを同時にドレインする。片方だけを読むと子プロセスが
+                // もう片方のパイプへの書き込みでブロックしデッドロックする。
+                // MAX_OUTPUT_BYTES はストリーム単位の上限: stdout / stderr が
+                // それぞれ最大 50KB を持ち、合計は最大 100KB になる（共有
+                // カウンタではなく per-stream 予算を採用する方針）。
+                _ = async {
+                    let (stdout_result, stderr_result) = tokio::join!(
+                        read_limited_lines(stdout, &mut stdout_output, &mut stdout_truncated),
+                        read_limited_lines(stderr, &mut stderr_output, &mut stderr_truncated),
+                    );
+                    if let Err(e) = stdout_result {
+                        stdout_output.push_str(&format!("Error reading stdout: {e}\n"));
+                    }
+                    if let Err(e) = stderr_result {
+                        stderr_output.push_str(&format!("Error reading stderr: {e}\n"));
+                    }
+                } => {}
             }
             Ok::<_, ToolError>(())
         })
         .await;
+
+        let mut output = stdout_output;
+        output.push_str(&stderr_output);
+        let truncated = stdout_truncated || stderr_truncated;
 
         match result {
             Ok(Ok(())) => {}
@@ -1289,5 +1338,128 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    // --- R2 medium: 行長制限付き出力読取（改行なし巨大出力で OOM しない） ---
+
+    #[tokio::test]
+    async fn newline_free_oversized_output_is_truncated_and_drained() {
+        // 旧実装は BufReader::lines() が 1MB の行を丸ごと String に確保して
+        // から上限判定を行っていた。行バッファが上限を超えて伸びないことを検証する。
+        let data = vec![b'a'; 1024 * 1024];
+        let mut reader = &data[..];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        read_limited_lines(&mut reader, &mut output, &mut truncated)
+            .await
+            .expect("read must succeed");
+
+        assert!(truncated, "1MB output must be detected as truncated");
+        assert!(output.len() <= MAX_OUTPUT_BYTES, "output must stay bounded");
+        assert!(reader.is_empty(), "must drain to EOF to avoid child block");
+    }
+
+    #[tokio::test]
+    async fn read_limited_lines_preserves_normal_lines() {
+        let data = b"hello\nworld\nlast";
+        let mut reader = &data[..];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        read_limited_lines(&mut reader, &mut output, &mut truncated)
+            .await
+            .expect("read must succeed");
+
+        assert_eq!(output, "hello\nworld\nlast\n");
+        assert!(!truncated);
+    }
+
+    // --- R4 指摘 2: lossy 展開と境界値（51,200 / 51,201 バイト） ---
+
+    #[test]
+    fn push_limited_line_keeps_line_exactly_at_the_limit() {
+        // 本文 51,199 バイト + 終端改行 1 バイト = ちょうど 51,200 バイト。
+        // 上限ぴったりの行は丸ごと残り、truncated は立たない。
+        let mut pending = vec![b'a'; MAX_OUTPUT_BYTES - 1];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        push_limited_line(&mut pending, &mut output, &mut truncated);
+
+        assert!(!truncated, "exact-limit line must not be discarded");
+        assert_eq!(output.len(), MAX_OUTPUT_BYTES);
+        let mut expected = vec![b'a'; MAX_OUTPUT_BYTES - 1];
+        expected.push(b'\n');
+        assert_eq!(output.as_bytes(), expected.as_slice());
+    }
+
+    #[test]
+    fn push_limited_line_discards_line_one_byte_over_the_limit() {
+        // 本文 51,200 バイト + 改行 = 51,201 バイト → 上限超過で丸ごと破棄。
+        let mut pending = vec![b'a'; MAX_OUTPUT_BYTES];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        push_limited_line(&mut pending, &mut output, &mut truncated);
+
+        assert!(truncated, "one-byte-over-limit line must be rejected");
+        assert!(output.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn push_limited_line_counts_lossy_expansion_toward_the_limit() {
+        // 不正 UTF-8 1 バイトは U+FFFD（3 バイト）に展開される。
+        // 17,066 * 3 = 51,198（+改行 = 51,199）→ 保持。
+        let mut pending = vec![0xFFu8; MAX_OUTPUT_BYTES / 3];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        push_limited_line(&mut pending, &mut output, &mut truncated);
+
+        assert!(!truncated);
+        assert_eq!(output.len(), MAX_OUTPUT_BYTES - 1);
+        assert!(output.chars().all(|c| c == '\u{FFFD}' || c == '\n'));
+
+        // 17,067 * 3 = 51,201 バイト → 元バイト長は 17,067 でも
+        // 変換後は上限超過。旧実装はここを見逃して 51KB を超えていた。
+        let mut pending = vec![0xFFu8; MAX_OUTPUT_BYTES / 3 + 1];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        push_limited_line(&mut pending, &mut output, &mut truncated);
+
+        assert!(
+            truncated,
+            "lossy expansion must be counted: 17067 invalid bytes render to 51201 bytes"
+        );
+        assert!(
+            output.is_empty(),
+            "output must not exceed the cap after U+FFFD expansion"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_output_never_exceeds_limit_after_lossy_expansion() {
+        // 1MB の不正バイトをストリームから読む。pending は生バイトで
+        // MAX_OUTPUT_BYTES までしか伸びないが、そのまま変換すると 3 倍の
+        // 153,600 バイトになる。変換後長で判定し、出力を 50KB 以下に保つ。
+        let data = vec![0xFFu8; 1024 * 1024];
+        let mut reader = &data[..];
+        let mut output = String::new();
+        let mut truncated = false;
+
+        read_limited_lines(&mut reader, &mut output, &mut truncated)
+            .await
+            .expect("read must succeed");
+
+        assert!(truncated);
+        assert!(
+            output.len() <= MAX_OUTPUT_BYTES,
+            "lossy expansion must stay bounded: {} bytes",
+            output.len()
+        );
+        assert!(reader.is_empty(), "must drain to EOF");
     }
 }
