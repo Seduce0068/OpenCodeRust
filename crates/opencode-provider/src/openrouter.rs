@@ -133,25 +133,45 @@ impl OpenRouterProvider {
         }
     }
 
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
+    /// リクエストヘッダを組み立てる。
+    ///
+    /// config / env 由来の値に改行等の不正なヘッダ文字が含まれる場合、
+    /// panic せず `ProviderError` として明示的に伝播する。エラー文言にはヘッダ名
+    /// のみを含め、API キー等の元の値は一切露出させない。
+    /// HTTP の obs-text (0x80-0xFF) として有効な非 ASCII 値は従来どおり許可する。
+    fn build_headers(&self) -> Result<reqwest::header::HeaderMap, ProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
+
+        // InvalidHeaderValue の Display は値を含まないが、念のためメッセージ側でも
+        // 元の値を参照せずヘッダ名だけを渡す（secret 漏洩リスクの回避）。
+        // from_str は改行等の制御文字を拒否する一方、obs-text の非 ASCII は許可するため、
+        // 追加の to_str() 検証は行わず変更前の互換性を維持する。
+        let header_value = |name: &str, value: &str| {
+            value.parse::<reqwest::header::HeaderValue>().map_err(|e| {
+                ProviderError::api_error_with_source(format!("invalid {name} header value"), e)
+            })
+        };
+
         headers.insert(
             "Authorization",
-            format!("Bearer {}", self.config.api_key).parse().unwrap(),
+            header_value("Authorization", &format!("Bearer {}", self.config.api_key))?,
         );
-        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            "Content-Type",
+            header_value("Content-Type", "application/json")?,
+        );
 
         let site_url = self
             .config
             .site_url
             .as_deref()
             .unwrap_or("https://opencode.ai/");
-        headers.insert("HTTP-Referer", site_url.parse().unwrap());
+        headers.insert("HTTP-Referer", header_value("HTTP-Referer", site_url)?);
 
         let site_name = self.config.site_name.as_deref().unwrap_or("opencode");
-        headers.insert("X-Title", site_name.parse().unwrap());
+        headers.insert("X-Title", header_value("X-Title", site_name)?);
 
-        headers
+        Ok(headers)
     }
 }
 
@@ -183,7 +203,7 @@ impl Provider for OpenRouterProvider {
         let response = self
             .client
             .post(url)
-            .headers(self.build_headers())
+            .headers(self.build_headers()?)
             .json(&request)
             .send()
             .await
@@ -214,7 +234,7 @@ impl Provider for OpenRouterProvider {
         let response = self
             .client
             .post(url)
-            .headers(self.build_headers())
+            .headers(self.build_headers()?)
             .header("Accept", "text/event-stream")
             .json(&stream_request)
             .send()
@@ -449,7 +469,9 @@ mod tests {
 
     #[test]
     fn build_headers_are_openrouter_specific_with_dummy_values() {
-        let default_headers = provider().build_headers();
+        let default_headers = provider()
+            .build_headers()
+            .expect("valid config should build headers");
         assert_eq!(
             header_value(&default_headers, "authorization"),
             "Bearer dummy-openrouter-key-for-tests"
@@ -464,12 +486,123 @@ mod tests {
         );
         assert_eq!(header_value(&default_headers, "x-title"), "opencode");
 
-        let custom_headers = configured_provider().build_headers();
+        let custom_headers = configured_provider()
+            .build_headers()
+            .expect("valid config should build headers");
         assert_eq!(
             header_value(&custom_headers, "http-referer"),
             "https://dummy-site.invalid/"
         );
         assert_eq!(header_value(&custom_headers, "x-title"), "dummy-site-name");
+    }
+
+    /// config / env 由来の不正値で panic せずエラーになること。
+    /// 3 ヘッダすべて（api_key / site_url / site_name）を改行・CR 等の制御文字で検証する。
+    #[test]
+    fn build_headers_rejects_invalid_values_without_panic() {
+        let invalid_values = ["bad\nvalue", "bad\rvalue"];
+
+        for invalid in invalid_values {
+            // Authorization (api_key)
+            let provider = OpenRouterProvider::with_config(OpenRouterConfig {
+                api_key: invalid.to_string(),
+                base_url: None,
+                site_url: None,
+                site_name: None,
+            });
+            assert!(
+                provider.build_headers().is_err(),
+                "invalid api_key must be an error, not a panic"
+            );
+
+            // HTTP-Referer (site_url)
+            let provider = OpenRouterProvider::with_config(OpenRouterConfig {
+                api_key: "dummy-key".to_string(),
+                base_url: None,
+                site_url: Some(invalid.to_string()),
+                site_name: None,
+            });
+            assert!(
+                provider.build_headers().is_err(),
+                "invalid site_url must be an error, not a panic"
+            );
+
+            // X-Title (site_name)
+            let provider = OpenRouterProvider::with_config(OpenRouterConfig {
+                api_key: "dummy-key".to_string(),
+                base_url: None,
+                site_url: None,
+                site_name: Some(invalid.to_string()),
+            });
+            assert!(
+                provider.build_headers().is_err(),
+                "invalid site_name must be an error, not a panic"
+            );
+        }
+    }
+
+    /// HTTP の obs-text (0x80-0xFF) として有効な非 ASCII 値は、変更前どおり
+    /// 拒否されず元のバイト列が保持されること。
+    /// to_str() は obs-text を拒否するため、ここでは as_bytes() で検証する。
+    #[test]
+    fn build_headers_accepts_non_ascii_values() {
+        let provider = OpenRouterProvider::with_config(OpenRouterConfig {
+            api_key: "日本語キー".to_string(),
+            base_url: None,
+            site_url: Some("https://日本語.example.invalid/".to_string()),
+            site_name: Some("日本語サイト".to_string()),
+        });
+
+        let headers = provider
+            .build_headers()
+            .expect("obs-text header values should be accepted");
+
+        assert_eq!(
+            headers
+                .get("authorization")
+                .expect("authorization should be present")
+                .as_bytes(),
+            "Bearer 日本語キー".as_bytes()
+        );
+        assert_eq!(
+            headers
+                .get("http-referer")
+                .expect("http-referer should be present")
+                .as_bytes(),
+            "https://日本語.example.invalid/".as_bytes()
+        );
+        assert_eq!(
+            headers
+                .get("x-title")
+                .expect("x-title should be present")
+                .as_bytes(),
+            "日本語サイト".as_bytes()
+        );
+    }
+
+    /// エラー文言にヘッダ名は含むが、元の値（API キー等）は含まないこと。
+    #[test]
+    fn build_headers_error_does_not_leak_header_value() {
+        let secret = "super-secret-openrouter-value";
+        let provider = OpenRouterProvider::with_config(OpenRouterConfig {
+            api_key: format!("{secret}\n"),
+            base_url: None,
+            site_url: None,
+            site_name: None,
+        });
+
+        let error = provider
+            .build_headers()
+            .expect_err("header value with newline must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Authorization"),
+            "error should identify the header name: {message}"
+        );
+        assert!(
+            !message.contains(secret),
+            "error must not leak the raw header value"
+        );
     }
 
     #[test]
