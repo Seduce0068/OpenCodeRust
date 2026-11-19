@@ -160,16 +160,6 @@ status: current
     O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
-- [ ] **[L-16]** retry_queued_prompts に上限・バックオフがなく永続失敗時に無限リトライ
-  - `server/routes.rs:2243-2247,2284-2289`。DB 破損等で 1 秒間隔が終了条件なしに回り
-    エラーログとタスク生成が際限なく増える。H-10/H-11 とは別の失敗時終端化欠落。
-- [ ] **[L-18]** GitWatcher の BranchChanged / CommitMade が一切発行されない
-  - `core/git_watcher.rs:6-15,31-36`。受け取った Event を _event として無視し常に
-    IndexChanged を send。バリアント削除 or HEAD/refs 変更の実検出。
-- [ ] **[L-19]** llm::stream がキャンセル/受信側切断を次のイベント到達まで検知できない
-  - `session/llm.rs:962-995`。abort と tx.send 失敗を stream.next() 後のループ先頭でしか
-    見ないためアイドル中は上流 HTTP ストリームと spawn タスクが生存。select! で
-    abort.cancelled() / rx.closed() を競合させる（上流停止効果は speculative）。
 
 ### 優先度: 高（残タスク調査で追加）
 
@@ -240,6 +230,8 @@ status: current
 
 ## 完了
 
+- [x] **[L-16/L-18/L-19]** キュー終端化・GitWatcher 整理・LLM 切断検知
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[L-10〜L-17 一部]** 入力検証・デッドコード・CORS 等を修正
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-61/62/63/65/66]** TodoManager・SQLite・FileWatcher を修正
@@ -447,6 +439,16 @@ status: current
 
 ## メモ
 
+- L-16/18/19 R4 の残存（2026-11-19、記録のみ）:
+  - リトライ上限到達時にキュー項目が pending/processing のまま残り、再起動時の
+    reset_processing/resume まで同一セッションの後続キューがブロックされうる
+    （retry_queued_prompts は session_id しか持たず queue_id を mark できない）。
+  - `chat_stream(request).await` の確立中は abort/closed と競合していない（転送ループ
+    の select! はアイドル中をカバー）。上流 HTTP の実停止効果は provider の Drop に
+    依存し speculative。
+  - attempt 伝播チェーンの統合テストが無い（算術テストのみ）。InputRepository を
+    差し替えて連続失敗させ、上限で打ち切り・成功でリセットを検証する別タスク。
+  - GitEvent::IndexChanged の doc を「`.git` 配下の任意の変更」へ修正済み。
 - L-10〜17 R4 の残存（2026-11-19、記録のみ）:
   - `truncation.rs:16` に同種の `floor_char_boundary` が既に存在。grep_tool.rs と
     read.rs にもローカル実装を置いたため 3 重複。共通化は別タスク候補。
