@@ -10,9 +10,15 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+  # advisory DB の更新はリポジトリへの push を伴わないため、
+  # 定期実行でも cargo audit を走らせる（毎週月曜 00:00 UTC）。
+  schedule:
+    - cron: '0 0 * * 1'
 
+# schedule と push が同じ master ref で衝突し定期 audit がキャンセルされないよう、
+# イベント種別を group に含めて分離する。
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -36,7 +42,14 @@ jobs:
       # clippy は all-features 用に独立で再実行する。clippy_args は既定 feature の
       # 標準 clippy ゲートへ渡す入力なので、ここでは重複させず -D warnings を
       # 直接指定する（共通ワークフロー側の変更は不要・競合なし）。
+      # unsafe 対策は二層で担保する。workspace lint の unsafe_code = "deny" は
+      # unsafe の使用そのものをコンパイル時に拒否するのに対し、
+      # clippy::undocumented_unsafe_blocks は #[allow(unsafe_code)] で例外を
+      # 認めた FFI 境界等でも SAFETY コメントの欠落を検出する補完ゲートであり、
+      # 既定 feature の clippy_args と同じく all-features 側にも明示付与する。
+      # さらにリリースプロファイル（最適化有効）のビルドもゲートに含める。
       extra_gates: |
         cargo check --workspace --all-features --all-targets --locked
         cargo test --workspace --all-features --all-targets --locked
-        cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+        cargo clippy --workspace --all-features --all-targets --locked -- -D warnings -D clippy::undocumented_unsafe_blocks
+        cargo build --workspace --release --locked
