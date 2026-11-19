@@ -184,10 +184,14 @@ status: current
     TUI（Tui / Attach / サブコマンドなし）起動時のみログをファイルへ出力し
     stdout 描画干渉を解消。WorkerGuard は main のローカル束縛で保持し終了時
     フラッシュを保証（R4 の static 保持では終了時フラッシュされない指摘を修正）。
-  - 残存: prompt/stream ハンドラの開始・完了・切断ログ、/log の extra 平坦化、
-    load_config 二重化（いずれもユーザー可視の実害なし）。rolling 未使用は
-    ファイルログを本運用する段階で検討。二重初期化は .init() が panic する
-    ため呼び出しは 1 箇所に限定（doc 明記済み）。
+  - 2026-11-19 一部対応: load_config の 11 呼び出しを cwd キーの `OnceLock` キャッシュ
+    経由へ集約（同一 cwd の再パースを排除、`--dir`/PROJECT/ACP の cwd 切替は维持、
+    エラー伝播と .ok() の握り潰しは不変）。
+  - 残存: prompt/stream ハンドラの開始・完了・切断ログ、/log の extra 平坦化
+    （いずれもユーザー可視の実害なし）。rolling 未使用はファイルログを本運用する
+    段階で検討。二重初期化は .init() が panic するため呼び出しは 1 箇所に限定。
+    設定ファイルのプロセス中変更・env 変更は cwd スナップショット化で反映されない
+    （意図した意味論変化。--config / 設定書き込み経路は現状存在しない）。
 - [ ] **[L-14 残り]** スナップショット全件 clone の実害計測（現状維持）
   - list_messages の後方互換 pagination は対応済み。2026-11-19 調査で「Arc による
     メッセージ COW」という前提は誤りと判明: メッセージは所有 `Vec<SessionMessage>` で、
@@ -264,6 +268,7 @@ status: current
 
 ## 完了
 
+- [x] **[L-04 一部]** load_config を cwd キャッシュへ集約（2026-11-19、swarm-coding R2）
 - [x] **[M-03 一部]** orphan クレート opencode-pty を削除（2026-11-19、親が直接実施）
 - [x] **[H-03 一部]** npm spec 厳密化と import 検証（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-13 一部]** 501 終点のポーリング除去（2026-11-19、swarm-coding R2）
@@ -481,6 +486,18 @@ status: current
 
 ## メモ
 
+- 2026-11-19 discovery 新規候補（swarm51、未着手。要 triage）:
+  - **high**: `session/prompt.rs:3077,3298,3367` と `summary.rs:343,496` の
+    タイトル/要約バイトスライス `&s[..97]` / `&s[..500]` が UTF-8 境界を検証せず
+    panic（system.rs:144-155 の `char_indices` 方式へ統一すべき）。
+  - **high**: `tool/apply_patch.rs:759-847` が Context/Remove 行のテキストを検証せず
+    位置指定で適用。stale patch が黙ってファイルを破壊（M-28/29/54 は別箇所）。
+  - **medium**: openrouter.rs:136-155 の HeaderValue::from_str().unwrap()、
+    multiedit の逐次書き込み部分適用、glob/grep の follow_links(true) が
+    external_directory 権限をすり抜ける、worktree.rs:56-93 の detached HEAD 除外、
+    PermissionBroker/QuestionBroker の pending 残留と reply の false success。
+  - **low**: PTY cursor -2 以下の全リプレイ、SseLineBuffer 無上限、
+    edit の replace_all 型丸め、read の metadata エラー丸め、limit 上限なし。
 - M-55 R4 の残存（2026-11-19、記録のみ）: 完全な eventstream フレームデコーダ
   （preamble length / prelude CRC / message CRC）は未実装で、既知 7 キーの JSON テキスト
   検索ヒューリスティックを維持。未知イベント（modelStreamErrorException 等）が

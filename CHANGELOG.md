@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T19:39:40+09:00"
+  at: "2026-11-19T19:57:03+09:00"
 ---
 
 # Changelog
@@ -401,6 +401,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   R1-R6、R4 の Windows/エンコード/名検証指摘を R5 で修正）(H-03 一部)
 - `workspace`: 参照 0 の orphan クレート `opencode-pty` を member 外し・削除
   （server の PtyManager は現状維持）(M-03 一部)
+- `cli`: load_config の 11 回の再パースを cwd キーのキャッシュへ集約（L-04 一部）
 
 ## [0.1.0]
 
