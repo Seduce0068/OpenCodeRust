@@ -331,16 +331,8 @@ status: current
   — — `main.rs:2512-2517` / R1-ST06 / 中
 - [ ] **tui --fork --session が実際にはフォークせずベースセッションへ接続**
   — — `main.rs:999-1003` / R1-ST07 / 中
-- [ ] **Bash が ctx.extra[\"env\"] と shell.env フックの環境変数名を無検証で注入**
-  — — `bash.rs:122-159` / R1-IV04 / 中
-- [ ] **WebFetch がレスポンス全体をバッファした後にサイズ上限を判定**
-  — — `webfetch.rs:306-329` / R1-IV05 / 中
-- [ ] **WebSearch の numResults/contextMaxCharacters に上限なし**
-  — — `websearch.rs:28-35,183-185` / R1-IV06 / 中
 - [ ] **プラグイン host/builtin スクリプトが予測可能な共有キャッシュへ symlink 追従で書き込まれる**
   — — `loader.rs:68-74,164-178` / R1-IV08 / 中
-- [ ] **bash タイムアウト/abort 時の kill_process_tree が直系子のみ kill**
-  — — `bash.rs:26-43,231-292` / R1-IV09 / 中
 - [ ] **HTTP 5xx を含む全完了リクエストが INFO で記録されアラートが機能しない**
   — — `server.rs:1091-1110` / R1-OB04 / 中
 - [ ] **生成 request_id がレスポンスへ返されず相関ログ照合が不能**
@@ -349,8 +341,6 @@ status: current
   — — `logging.rs:39,100-107` / R1-OB06 / 中
 - [ ] **認証失敗ログに送信元 IP が含まれず発生元を特定できない**
   — `server.rs:1116-1192` / R1-OB07 / 中
-- [ ] **all-features の clippy に undocumented_unsafe_blocks が付与されない**
-  — `ci.yml:31-42` / R1-OB09 / 中
 - [ ] **LLM 再試行時に StreamProcessor の蓄積状態がリセットされない**
   — `llm.rs:324-407` / R1-E04 / 中
 - [ ] **subsessions メタデータのデシリアライズ失敗が次の保存で削除される**
@@ -365,21 +355,17 @@ status: current
   — `snapshot.rs:57-71` / R1-E09 / 中
 - [ ] **compaction が要約メッセージを先に永続化し LLM 失敗時に残す**
   — `compaction.rs:466-471,659-666` / R1-E10 / 中
-- [ ] **cargo audit がイベント駆動のみでスケジュール実行されない**
-  — `ci.yml:7-12` / R1-DP01 / 中
 - [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
   — `renovate.json:3-5` / R1-DP02 / 中
-- [ ] **MSRV / Rust ツールチェーンが宣言・固定されていない**
-  — `Cargo.toml:36-40` / R1-DP03 / 中
 - [ ] **reqwest 既定 feature で rustls と native-tls が二重搭載**
   — `Cargo.toml:85`, `Cargo.lock:3493-3538` / R1-DP04 / 中
-- [ ] **リリースビルドが CI ゲートに含まれていない**
-  — `ci.yml:39-42` / R1-DP05 / 中
 - [ ] **SQLite DB のバックアップ・復旧 Runbook が存在しない**
   — `docs/opencode-storage.md:9-41` / R1-DP06 / 中
 
 ## 完了
 
+- [x] **[Bash/Web/CI 8 件]** env 検証・上限・audit/TSRV/release ゲート
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[Slash クリック・ADR 整合]** ポップアップ選択と 6 文書の追随
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[中優先 6 件]** TUI 操作・RPC バージョン・local-llm 上限
@@ -635,6 +621,11 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（Bash/Web/CI 8 件の修正時、記録のみ）: process group kill が
+  外部 `kill` バイナリ依存で、最小コンテナ等で失敗すると無音フォールバックする
+  （nix 等の syscall ラッパ導入は設計判断）。schedule 実行の失敗通知運用は
+  docs/security-audit.md が scope 外で未対応。MSRV 1.97 は依存マニフェストの
+  要求値から確定したが、cargo +1.97 check の実検証は未実施（現行 1.100 で green）。
 - 2026-11-20 R4 残存（中優先 6 件の修正時、記録のみ）: SlashCommandPopup の
   クリック対応は次イテレーションで対応済み。書記素境界は std のみの実用近似で
   UAX #29 の完全規則（GB9c 等）に非対応。
