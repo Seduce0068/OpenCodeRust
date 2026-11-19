@@ -277,18 +277,11 @@ impl PluginLoader {
 
         // Write/update package.json
         let pkg_json = npm_dir.join("package.json");
-        let mut deps = serde_json::Map::new();
 
-        // Read existing deps if present
-        if pkg_json.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pkg_json) {
-                if let Ok(existing) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(obj) = existing.get("dependencies").and_then(|d| d.as_object()) {
-                        deps = obj.clone();
-                    }
-                }
-            }
-        }
+        // Reuse cached deps only after re-validating every entry. The cache is
+        // writable between runs, so a poisoned package.json must not smuggle
+        // dist-tags, ranges, `file:` specs or malformed names into this install.
+        let mut deps = read_validated_deps(&pkg_json);
 
         // Add new packages
         for spec in specs {
@@ -427,6 +420,68 @@ fn parse_npm_spec(spec: &str) -> Result<(&str, &str), PluginLoaderError> {
     }
 
     Ok((name, version))
+}
+
+/// Re-validate one cached `(name, version)` dependency using the same grammar
+/// as `parse_npm_spec`.
+///
+/// Cached dependencies are stored as separate name/version fields, so we rebuild
+/// the `name@version` spec and require `parse_npm_spec` to both accept it and
+/// return exactly the original pair. This reuses the npm-name and fixed-version
+/// checks instead of duplicating them, and prevents tampered names from parsing
+/// into a different (but valid) dependency.
+fn is_valid_cached_dependency(name: &str, version: &str) -> bool {
+    let spec = format!("{name}@{version}");
+    match parse_npm_spec(&spec) {
+        Ok((parsed_name, parsed_version)) => parsed_name == name && parsed_version == version,
+        Err(_) => false,
+    }
+}
+
+/// Read the cached `dependencies` map, dropping any entry that is not a pinned,
+/// well-formed npm spec.
+///
+/// The cache is attacker-writable between runs, so every entry is re-validated
+/// through `parse_npm_spec` before it is carried into the next install. Invalid
+/// entries are skipped rather than fatal: one poisoned record cannot brick
+/// startup, and it is never written back to `package.json` or handed to the
+/// installer.
+fn read_validated_deps(pkg_json: &Path) -> Map<String, Value> {
+    let mut deps = Map::new();
+    if !pkg_json.exists() {
+        return deps;
+    }
+    let Ok(content) = std::fs::read_to_string(pkg_json) else {
+        return deps;
+    };
+    let Ok(existing) = serde_json::from_str::<Value>(&content) else {
+        return deps;
+    };
+    let Some(obj) = existing.get("dependencies").and_then(|d| d.as_object()) else {
+        return deps;
+    };
+
+    for (name, value) in obj {
+        let Some(version) = value.as_str() else {
+            // Object forms such as npm aliases (`"pkg": "npm:other@1"`) and
+            // non-string values are not pinned versions we can vouch for.
+            tracing::warn!(
+                dependency = name.as_str(),
+                "dropping cached dependency without a string version"
+            );
+            continue;
+        };
+        if is_valid_cached_dependency(name, version) {
+            deps.insert(name.clone(), value.clone());
+        } else {
+            tracing::warn!(
+                dependency = name.as_str(),
+                version,
+                "dropping invalid cached dependency (not a pinned npm spec)"
+            );
+        }
+    }
+    deps
 }
 
 fn hook_io_from_context(context: &HookContext) -> (Value, Value) {
@@ -820,5 +875,99 @@ mod tests {
         assert_eq!(normalize_hook_key("tool_id"), "toolID");
         assert_eq!(normalize_hook_key("max_tokens"), "maxTokens");
         assert_eq!(normalize_hook_key("custom"), "custom");
+    }
+
+    /// テスト専用の一意な一時ディレクトリを作成する（外部クレートに依存しない）。
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "opencode-plugin-{label}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作成できる");
+        dir
+    }
+
+    #[test]
+    fn cached_dependencies_are_revalidated_before_reuse() {
+        let dir = unique_temp_dir("cache-deps");
+        let pkg_json = dir.join("package.json");
+        let fixture = serde_json::json!({
+            "name": "opencode-plugins",
+            "private": true,
+            "dependencies": {
+                // 正常な固定バージョンはそのまま保持される
+                "good-pkg": "1.2.3",
+                "@scope/good": "0.0.13",
+                "foo-bar_baz.qux": "1.2.3-beta.1+build.5",
+                // 不正・非固定・非文字列エントリはすべて排除される
+                "evil-latest": "latest",
+                "evil-caret": "^1.0.0",
+                "evil-tilde": "~1.2.3",
+                "evil-wildcard": "*",
+                "evil-range": ">=1.0.0",
+                "evil-file": "file:///tmp/evil.tgz",
+                "BadName": "1.0.0",
+                "@Scope/pkg": "1.0.0",
+                "evil-alias": { "npm": "other@latest" },
+                "evil-number": 42
+            }
+        });
+        std::fs::write(&pkg_json, serde_json::to_string_pretty(&fixture).unwrap())
+            .expect("package.json フィクスチャを書ける");
+
+        let deps = read_validated_deps(&pkg_json);
+
+        assert_eq!(deps.get("good-pkg"), Some(&serde_json::json!("1.2.3")));
+        assert_eq!(deps.get("@scope/good"), Some(&serde_json::json!("0.0.13")));
+        assert_eq!(
+            deps.get("foo-bar_baz.qux"),
+            Some(&serde_json::json!("1.2.3-beta.1+build.5"))
+        );
+
+        for name in [
+            "evil-latest",
+            "evil-caret",
+            "evil-tilde",
+            "evil-wildcard",
+            "evil-range",
+            "evil-file",
+            "BadName",
+            "@Scope/pkg",
+            "evil-alias",
+            "evil-number",
+        ] {
+            assert!(!deps.contains_key(name), "不正エントリが残った: {name}");
+        }
+        assert_eq!(deps.len(), 3, "正常な 3 エントリのみ残るべき");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_or_malformed_cache_yields_no_deps() {
+        let dir = unique_temp_dir("cache-missing");
+        let pkg_json = dir.join("package.json");
+        assert!(
+            read_validated_deps(&pkg_json).is_empty(),
+            "存在しないキャッシュ"
+        );
+
+        std::fs::write(&pkg_json, "not valid json").unwrap();
+        assert!(read_validated_deps(&pkg_json).is_empty(), "不正な JSON");
+
+        std::fs::write(&pkg_json, r#"{"name":"no-deps"}"#).unwrap();
+        assert!(
+            read_validated_deps(&pkg_json).is_empty(),
+            "dependencies 欠落"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

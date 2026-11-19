@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use opencode_plugin::{HookContext, HookEvent};
+use opencode_plugin::{HookContext, HookEvent, HookOutput};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionInfo {
@@ -113,18 +113,24 @@ impl PermissionEngine {
             hook_ctx = hook_ctx.with_data("call_id", serde_json::json!(call_id));
         }
 
-        let mut status = "ask".to_string();
         let hook_outputs = opencode_plugin::trigger_collect(hook_ctx).await;
-        for output in hook_outputs {
-            let Some(payload) = output.payload.as_ref() else {
-                continue;
-            };
-            if let Some(next_status) = extract_permission_status(payload) {
-                status = next_status;
-            }
-        }
+        self.decide_hook_status(info, hook_outputs)
+    }
 
-        match status.as_str() {
+    /// `permission.ask` hook の結果を適用して承否を決定する。
+    ///
+    /// `ask()` が収集した hook 出力を受け取る。テストからはプロセスグローバルな
+    /// PluginSystem を汚さずに同じ決定経路を直接検証できる。
+    /// `is_approved` による事前判定と pending 登録のフローは変更しない。
+    fn decide_hook_status(
+        &mut self,
+        info: PermissionInfo,
+        hook_outputs: Vec<HookOutput>,
+    ) -> Result<(), PermissionError> {
+        let session_id = info.session_id.clone();
+        let permission_id = info.id.clone();
+
+        match aggregate_permission_status(&hook_outputs) {
             "allow" => return Ok(()),
             "deny" => {
                 return Err(PermissionError::Rejected {
@@ -137,7 +143,7 @@ impl PermissionEngine {
         }
 
         self.pending
-            .entry(session_id.clone())
+            .entry(session_id)
             .or_default()
             .insert(permission_id, PendingPermission { info });
 
@@ -210,6 +216,39 @@ fn extract_permission_status(payload: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// 複数の `permission.ask` hook 結果を順序に依存せず集約する。
+///
+/// - 1 つでも `deny` を返した hook があれば `deny`（最優先・他を上書きしない）。
+/// - `deny` が無く、明示的に `allow` を返した hook があれば `allow`。
+/// - それ以外は既定の `ask` を維持し、通常の pending / 承認フローへ進める。
+///
+/// 以前は hook 出力を順に `status` へ代入していたため（最後勝ち）、
+/// `deny` の後に `allow` が来ると権限承認を強制できた。ここでは各出力を
+/// フラグへ畳み込むため、hook の登録順・優先度に結果が左右されない。
+fn aggregate_permission_status(outputs: &[HookOutput]) -> &'static str {
+    let mut has_allow = false;
+    let mut has_deny = false;
+
+    for output in outputs {
+        let Some(payload) = output.payload.as_ref() else {
+            continue;
+        };
+        match extract_permission_status(payload).as_deref() {
+            Some("deny") => has_deny = true,
+            Some("allow") => has_allow = true,
+            _ => {}
+        }
+    }
+
+    if has_deny {
+        "deny"
+    } else if has_allow {
+        "allow"
+    } else {
+        "ask"
+    }
+}
+
 fn wildcard_match(text: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -280,5 +319,120 @@ mod tests {
         assert!(wildcard_match("foo/bar/baz", "*/baz"));
         assert!(wildcard_match("foo/bar/baz", "*bar*"));
         assert!(!wildcard_match("foo", "bar"));
+    }
+
+    fn hook_output(status: &str) -> HookOutput {
+        HookOutput::with_payload(serde_json::json!({ "status": status }))
+    }
+
+    fn hook_info(id: &str) -> PermissionInfo {
+        PermissionInfo {
+            id: id.to_string(),
+            permission_type: "bash".to_string(),
+            pattern: Some(Pattern::Single("ls".to_string())),
+            session_id: "ses_hook".to_string(),
+            message_id: "msg_hook".to_string(),
+            call_id: Some("call_hook".to_string()),
+            message: "Execute ls command".to_string(),
+            metadata: HashMap::new(),
+            time: TimeInfo { created: 0 },
+        }
+    }
+
+    // 複数 hook: deny→allow / allow→deny は共に deny（順序非依存）。
+    #[test]
+    fn test_hook_status_deny_wins_regardless_of_order() {
+        assert_eq!(
+            aggregate_permission_status(&[hook_output("deny"), hook_output("allow")]),
+            "deny"
+        );
+        assert_eq!(
+            aggregate_permission_status(&[hook_output("allow"), hook_output("deny")]),
+            "deny"
+        );
+        assert_eq!(
+            aggregate_permission_status(&[
+                hook_output("ask"),
+                hook_output("deny"),
+                hook_output("allow"),
+            ]),
+            "deny"
+        );
+        assert_eq!(
+            aggregate_permission_status(&[
+                hook_output("allow"),
+                hook_output("ask"),
+                hook_output("deny"),
+            ]),
+            "deny"
+        );
+    }
+
+    // 複数 hook: ask→allow は明示 allow が存在し deny が無いため allow。
+    #[test]
+    fn test_hook_status_ask_then_allow_is_allow() {
+        assert_eq!(
+            aggregate_permission_status(&[hook_output("ask"), hook_output("allow")]),
+            "allow"
+        );
+        assert_eq!(
+            aggregate_permission_status(&[hook_output("allow")]),
+            "allow"
+        );
+    }
+
+    // deny 単体、および入れ子 payload でも deny が優先されることを確認。
+    #[test]
+    fn test_hook_status_deny_only_and_nested_payload() {
+        assert_eq!(aggregate_permission_status(&[hook_output("deny")]), "deny");
+        let nested = HookOutput::with_payload(serde_json::json!({
+            "output": { "status": "deny" }
+        }));
+        assert_eq!(
+            aggregate_permission_status(&[nested, hook_output("allow")]),
+            "deny"
+        );
+    }
+
+    // hook が無い／既定 ask のみの場合は "ask" を維持する。
+    #[test]
+    fn test_hook_status_default_ask_is_preserved() {
+        assert_eq!(aggregate_permission_status(&[]), "ask");
+        assert_eq!(aggregate_permission_status(&[hook_output("ask")]), "ask");
+        let payload_less = HookOutput::default();
+        assert_eq!(aggregate_permission_status(&[payload_less]), "ask");
+    }
+
+    // 決定経路そのもの: deny は Rejected を返し pending を作らない。
+    #[test]
+    fn test_decide_hook_status_deny_rejects_without_pending() {
+        let mut engine = PermissionEngine::new();
+        let result = engine.decide_hook_status(
+            hook_info("per_deny"),
+            vec![hook_output("deny"), hook_output("allow")],
+        );
+        assert!(matches!(result, Err(PermissionError::Rejected { .. })));
+        assert!(engine.list().is_empty());
+    }
+
+    // 決定経路そのもの: allow は pending を作らず Ok を返す。
+    #[test]
+    fn test_decide_hook_status_allow_skips_pending() {
+        let mut engine = PermissionEngine::new();
+        let result = engine.decide_hook_status(
+            hook_info("per_allow"),
+            vec![hook_output("ask"), hook_output("allow")],
+        );
+        assert!(result.is_ok());
+        assert!(engine.list().is_empty());
+    }
+
+    // 決定経路そのもの: ask は従前どおり pending へ積む。
+    #[test]
+    fn test_decide_hook_status_ask_queues_pending() {
+        let mut engine = PermissionEngine::new();
+        let result = engine.decide_hook_status(hook_info("per_ask"), vec![hook_output("ask")]);
+        assert!(result.is_ok());
+        assert_eq!(engine.list().len(), 1);
     }
 }
