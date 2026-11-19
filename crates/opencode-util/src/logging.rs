@@ -368,14 +368,24 @@ fn build_filter(level: Option<&str>) -> EnvFilter {
     }
 }
 
-pub fn init_tracing(level: Option<&str>, log_dir: Option<PathBuf>, print: bool) -> Option<PathBuf> {
+/// `print = false` 経路では `WorkerGuard` を返す。呼び出し側は `main` の
+/// ローカル束縛として保持し、スコープ終了時に drop させて末尾ログをフラッシュする。
+/// 二重初期化は `.init()` がパニックするため、呼び出しは 1 箇所に限定する。
+pub fn init_tracing(
+    level: Option<&str>,
+    log_dir: Option<PathBuf>,
+    print: bool,
+) -> (
+    Option<PathBuf>,
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+) {
     if print {
         let filter = build_filter(level);
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer())
             .init();
-        return None;
+        return (None, None);
     }
 
     let log_dir = log_dir.unwrap_or_else(|| PathBuf::from("."));
@@ -394,15 +404,16 @@ pub fn init_tracing(level: Option<&str>, log_dir: Option<PathBuf>, print: bool) 
         .ok();
 
     if let Some(file) = file {
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file);
         let filter = build_filter(level);
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().with_writer(non_blocking))
             .init();
+        return (Some(log_path), Some(guard));
     }
 
-    Some(log_path)
+    (Some(log_path), None)
 }
 
 #[cfg(test)]

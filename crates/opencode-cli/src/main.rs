@@ -578,16 +578,26 @@ enum GithubCommands {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // L-04: `config.logLevel` を tracing の EnvFilter へ反映する。
-    // `print = true` は既存 `fmt::init()` と同じ stdout 出力を維持し、
-    // `log_dir = None` は print 時の早期 return で不使用なため渡さない。
-    let startup_log_level = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| load_config(&cwd).ok())
-        .and_then(|config| config.log_level);
-    let _ = opencode_util::init_tracing(startup_log_level.as_deref(), None, true);
-
     let cli = Cli::parse();
+
+    // L-04: TUI は stdout 上で alternate screen を開始するため、tracing の
+    // stdout 出力が描画を汚す。Cli::parse() 後にコマンド種別を判定し、
+    // TUI セッションのみ print=false（ファイルへ）、それ以外は従来どおり
+    // print=true で tracing を初期化する。
+    // `Attach` とサブコマンドなし（既定の TUI 起動）も `run_tui` を通るため TUI 扱い。
+    let is_tui = matches!(
+        &cli.command,
+        Some(Commands::Tui { .. }) | Some(Commands::Attach { .. }) | None
+    );
+    let cwd = std::env::current_dir().ok();
+    let startup_log_level = cwd
+        .as_ref()
+        .and_then(|cwd| load_config(cwd).ok())
+        .and_then(|config| config.log_level);
+    // 非 TUI は print=true のため log_dir は init_tracing 側で早期 return され不使用。
+    // 第 2 戻り値 (WorkerGuard) を main のローカルとして保持し、終了時にフラッシュさせる。
+    let (_log_path, _log_guard) =
+        opencode_util::init_tracing(startup_log_level.as_deref(), cwd, !is_tui);
 
     match cli.command {
         Some(Commands::Tui {
