@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[認証/設定 3 件]** attach パスワード・CLI fail-open・well-known 再注入
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[設定/CI/ドキュメント 3 件]** PTY 追随・NO_AUTH fail-open・all-features
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery high 3 件]** deny 最優先・OAuth 0600・deps 再検証
@@ -500,6 +502,11 @@ status: current
 
 ## メモ
 
+- 2026-11-19 R4 残存（認証/設定 3 件、記録のみ）: `parse_no_auth` が CLI と server に
+  複製（共有化は公開 API 追加の判断が必要）、wellknown の `is_safe_env_key` が
+  BASH_ENV / NODE_OPTIONS / HTTP_PROXY 等を許容（許可リスト方式の検討課題）、
+  `redact_token` が先頭 4 文字と長さを info ログへ出力（生成トークンは 43 文字で
+  実害限定的）。TUI の実起動を伴う end-to-end 警告テストも未追加。
 - 2026-11-19 R4 残存（設定/CI/ドキュメント 3 件、記録のみ）: CLI main.rs:1939 が
   `is_ok()` 判定で fail-open（server と挙動矛盾。認証強制自体は server 側が行うため
   バイパスは起きず誤通知のみ）、起動時警告が CLI と server で二重、
