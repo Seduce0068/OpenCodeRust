@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use walkdir::WalkDir;
 
+use crate::tool::parse_usize_arg;
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
@@ -32,27 +33,44 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
-/// Parse an optional non-negative integer argument into `usize`.
+/// Convert a `fs::metadata` failure into a `ToolError`.
 ///
-/// Missing/`null` keeps `default`. Any other JSON type — including a
-/// negative number such as `-1` — is rejected rather than silently coerced
-/// to `1`. `usize::try_from` also guards the u64 -> usize narrowing on
-/// targets where `usize` is smaller than `u64`.
-fn parse_usize_arg(
-    args: &serde_json::Value,
-    key: &str,
-    default: usize,
-) -> Result<usize, ToolError> {
-    let value = &args[key];
-    if value.is_null() {
-        return Ok(default);
+/// Only [`std::io::ErrorKind::NotFound`] keeps the historical "File not found"
+/// response (with best-effort spelling suggestions). Every other I/O error —
+/// notably `PermissionDenied` — becomes an `ExecutionWithSource` error that
+/// preserves the original `io::Error` as its source, so an access failure is
+/// never misreported as a missing file.
+async fn map_metadata_error(err: std::io::Error, path: &Path) -> ToolError {
+    if err.kind() != std::io::ErrorKind::NotFound {
+        return ToolError::execution_with_source(
+            format!("Failed to access {}: {}", path.display(), err),
+            err,
+        );
     }
-    let n = value.as_u64().ok_or_else(|| {
-        ToolError::InvalidArguments(format!("{} must be a non-negative integer", key))
-    })?;
-    usize::try_from(n).map_err(|_| {
-        ToolError::InvalidArguments(format!("{} is out of range for this platform", key))
-    })
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // 候補パスの列挙は tokio::fs::read_dir に変更し、同期 read_dir で
+    // tokio ワーカーをブロックしないようにする。
+    let mut suggestions: Vec<String> = Vec::new();
+    if let Ok(mut entries) = fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let target = base.to_lowercase();
+            if name.contains(&target) || target.contains(&name) {
+                suggestions.push(entry.path().to_string_lossy().to_string());
+                if suggestions.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+
+    ToolError::with_suggestions(format!("File not found: {}", path.display()), &suggestions)
 }
 
 pub struct ReadTool {
@@ -170,32 +188,11 @@ impl Tool for ReadTool {
             .to_string_lossy()
             .to_string();
 
-        let metadata = fs::metadata(&path).await.map_err(|_e| {
-            let dir = path.parent().unwrap_or(Path::new("."));
-            let base = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                let suggestions: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        let name = e.file_name().to_string_lossy().to_lowercase();
-                        let target = base.to_lowercase();
-                        name.contains(&target) || target.contains(&name)
-                    })
-                    .take(3)
-                    .map(|e| e.path().to_string_lossy().to_string())
-                    .collect();
-                ToolError::with_suggestions(
-                    format!("File not found: {}", path.display()),
-                    &suggestions,
-                )
-            } else {
-                ToolError::FileNotFound(format!("File not found: {}", path.display()))
-            }
-        })?;
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            // エラーを破棄せず、NotFound とそれ以外（権限不足等）を区別して返す。
+            Err(err) => return Err(map_metadata_error(err, &path).await),
+        };
 
         if metadata.is_dir() {
             ctx.do_file_time_read(path_str.clone()).await?;
@@ -322,12 +319,23 @@ async fn read_directory(
     let mut entries: Vec<String> = tokio::task::spawn_blocking(move || {
         let mut entries: Vec<String> = Vec::new();
 
+        // 外部ディレクトリの権限チェックは走査対象のディレクトリに対して一度だけ
+        // 行われる。シンボリックリンクを辿ると、ディレクトリ内のリンクが外部を
+        // 指す場合にそのチェックをすり抜けて外部のエントリ名を返してしまうため、
+        // 辿らない。follow_links(false) は symlink cycle も構造的に防ぐ。
         for entry in WalkDir::new(&path_buf)
             .max_depth(1)
-            .follow_links(true)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
         {
+            // follow_links(false) でも WalkDir はリンク自身をエントリとして返す。
+            // リンク先が外部のとき path.is_file() / File::open はリンク先を辿るため、
+            // 外部の内容や名前を返さないようリンクを明示的に除外する。
+            if entry.file_type().is_symlink() {
+                continue;
+            }
+
             if entry.path() == path_buf.as_path() {
                 continue;
             }
@@ -802,5 +810,65 @@ mod tests {
                 "unexpectedly accepted {bad}"
             );
         }
+    }
+
+    /// ディレクトリ読み取り時に内部の symlink が外部のファイル／ディレクトリを
+    /// 指しても、そのエントリ名を返してはならない（権限すり抜け回帰テスト）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_directory_does_not_follow_external_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("opencode-read-test-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("opencode-read-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP_SECRET").unwrap();
+        std::fs::write(dir.join("normal.txt"), "normal").unwrap();
+
+        symlink(&outside, dir.join("outside_link")).unwrap();
+        symlink(outside.join("secret.txt"), dir.join("secret_link.txt")).unwrap();
+
+        let result = read_directory(&dir, 1, 100, "test".to_string())
+            .await
+            .unwrap();
+
+        // 通常ファイルはそのまま返るが、外部を指す symlink の名前は漏れない。
+        assert!(result.output.contains("normal.txt"));
+        assert!(!result.output.contains("outside_link"));
+        assert!(!result.output.contains("secret_link.txt"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// 権限不足（EACCES 等）は「File not found」に丸められず、
+    /// 元の I/O エラーを source として保持すること（回帰テスト）。
+    #[tokio::test]
+    async fn metadata_permission_error_is_not_file_not_found() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let mapped = map_metadata_error(err, Path::new("/some/locked/file.txt")).await;
+
+        assert!(
+            !matches!(&mapped, ToolError::FileNotFound(_)),
+            "PermissionDenied は FileNotFound に丸められないこと: {mapped}"
+        );
+        assert!(
+            matches!(&mapped, ToolError::ExecutionWithSource { .. }),
+            "元の I/O エラーを source として保持すること: {mapped}"
+        );
+    }
+
+    /// NotFound は従来どおり FileNotFound（候補付き）として報告されること。
+    #[tokio::test]
+    async fn metadata_not_found_still_reports_file_not_found() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let mapped = map_metadata_error(err, Path::new("/some/missing-file.txt")).await;
+
+        assert!(
+            matches!(&mapped, ToolError::FileNotFound(_)),
+            "NotFound は従来どおり FileNotFound であること: {mapped}"
+        );
     }
 }

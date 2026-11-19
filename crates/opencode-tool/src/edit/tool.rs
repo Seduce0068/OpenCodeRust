@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::replacers::CompositeReplacer;
+use crate::tool::parse_bool_arg;
 use crate::{with_file_lock, Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[cfg(feature = "lsp")]
@@ -81,7 +82,7 @@ impl Tool for EditTool {
             .ok_or_else(|| ToolError::InvalidArguments("new_string is required".into()))?
             .to_string();
 
-        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+        let replace_all = parse_bool_arg(&args, "replace_all", false)?;
 
         let base_dir = if ctx.directory.is_empty() {
             &self.directory
@@ -678,6 +679,115 @@ mod tests {
         );
         assert_eq!(assert_calls.load(Ordering::SeqCst), 0);
         assert!(events.lock().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_bool_arg_keeps_omitted_and_null_defaults() {
+        let omitted = serde_json::json!({});
+        assert!(!parse_bool_arg(&omitted, "replace_all", false).unwrap());
+
+        let nulls = serde_json::json!({ "replace_all": null });
+        assert!(!parse_bool_arg(&nulls, "replace_all", false).unwrap());
+
+        let explicit = serde_json::json!({ "replace_all": true });
+        assert!(parse_bool_arg(&explicit, "replace_all", false).unwrap());
+    }
+
+    #[test]
+    fn parse_bool_arg_rejects_invalid_types() {
+        for bad in [
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let args = serde_json::json!({ "replace_all": bad });
+            assert!(
+                matches!(
+                    parse_bool_arg(&args, "replace_all", false),
+                    Err(ToolError::InvalidArguments(_))
+                ),
+                "unexpectedly accepted {bad}"
+            );
+        }
+    }
+
+    /// 不正型の `replace_all` は丸められず InvalidArguments になること。
+    /// 旧実装では `"yes"` / `1` が `false` に丸められ、全置換の意図が
+    /// 先頭 1 件だけの置換に退化していた（回帰テスト）。
+    #[tokio::test]
+    async fn execute_rejects_non_boolean_replace_all() {
+        let dir = temp_dir();
+        let file = dir.join("target.txt");
+        std::fs::write(&file, "foo foo").unwrap();
+
+        for bad in [serde_json::json!("yes"), serde_json::json!(1)] {
+            let error = EditTool::new()
+                .execute(
+                    serde_json::json!({
+                        "file_path": file.to_string_lossy(),
+                        "old_string": "foo",
+                        "new_string": "bar",
+                        "replace_all": bad,
+                    }),
+                    context(&dir),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(&error, ToolError::InvalidArguments(_)),
+                "unexpectedly accepted {bad}: {error}"
+            );
+        }
+
+        // 引数検証はファイル操作より前に行われるため、内容は変更されない。
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "foo foo");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 正当な boolean / null が過剰に拒否されず従来どおり動くことの確認。
+    #[tokio::test]
+    async fn execute_replace_all_bool_and_null_defaults() {
+        let dir = temp_dir();
+        let file = dir.join("target.txt");
+
+        // replace_all: true は全件置換。
+        std::fs::write(&file, "foo foo").unwrap();
+        EditTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "foo",
+                    "new_string": "bar",
+                    "replace_all": true,
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar bar");
+
+        // null は既定値 false として受け入れられる。複数一致は一意化エラーに
+        // なるため、単一一致のケースで「拒否されないこと」を確認する。
+        // （false の既定値そのものは parse_bool_arg の単体テストで固定。）
+        std::fs::write(&file, "foo only").unwrap();
+        EditTool::new()
+            .execute(
+                serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "foo",
+                    "new_string": "bar",
+                    "replace_all": null,
+                }),
+                context(&dir),
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar only");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

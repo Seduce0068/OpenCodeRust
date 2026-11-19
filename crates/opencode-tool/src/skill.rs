@@ -157,10 +157,18 @@ fn scan_skill_root(root: &Path) -> Vec<SkillInfo> {
         return Vec::new();
     }
 
+    // 外部スキルディレクトリの権限チェックは走査ルート root に対して行われる。
+    // シンボリックリンクを辿ると、ルート内のリンクが外部の SKILL.md を指す場合に
+    // そのチェックをすり抜けて外部のスキル定義を読み出してしまうため、辿らない。
+    // follow_links(false) は symlink cycle も構造的に防ぐ。
     let mut skill_files: Vec<PathBuf> = WalkDir::new(root)
-        .follow_links(true)
+        .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
+        // follow_links(false) でも WalkDir はリンク自身をエントリとして返す。
+        // fs::read_to_string / path.is_file() はリンク先を辿るため、外部の
+        // SKILL.md を読み込まないようリンクを明示的に除外する。
+        .filter(|entry| !entry.file_type().is_symlink())
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
@@ -503,5 +511,49 @@ custom content
         let tool = SkillTool;
         assert_eq!(tool.id(), "skill");
         assert_eq!(tool.parameters()["type"], "object");
+    }
+
+    /// スキル走査ルート内の symlink が外部の SKILL.md や外部ディレクトリを
+    /// 指しても、その内容を読み込んでしまってはならない
+    /// （権限すり抜け回帰テスト）。
+    #[cfg(unix)]
+    #[test]
+    fn scan_skill_root_does_not_follow_external_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("skills");
+        fs::create_dir_all(&root).unwrap();
+
+        // 正規のローカルスキル。
+        let local = root.join("local/SKILL.md");
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        fs::write(&local, "---\nname: local\ndescription: d\n---\nbody\n").unwrap();
+
+        // ルート外（兄弟ディレクトリ）に外部の SKILL.md を用意する。
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let external = outside.join("SKILL.md");
+        fs::write(
+            &external,
+            "---\nname: leaked\ndescription: d\n---\nTOP_SECRET\n",
+        )
+        .unwrap();
+
+        // 外部ファイルへの直接 symlink と、外部ディレクトリへの symlink。
+        let link_dir = root.join("linked");
+        fs::create_dir_all(&link_dir).unwrap();
+        symlink(&external, link_dir.join("SKILL.md")).unwrap();
+        symlink(&outside, root.join("outside_link")).unwrap();
+
+        let skills = scan_skill_root(&root);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+
+        // ローカルスキルのみが検出され、外部の "leaked" は漏れない。
+        assert_eq!(names, vec!["local"]);
+        assert!(!names.contains(&"leaked"));
+
+        let contents: Vec<&str> = skills.iter().map(|s| s.content.as_str()).collect();
+        assert!(contents.iter().all(|c| !c.contains("TOP_SECRET")));
     }
 }

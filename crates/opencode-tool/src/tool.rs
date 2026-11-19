@@ -40,6 +40,50 @@ where
     f().await
 }
 
+/// Parse an optional boolean argument. A missing or `null` value keeps
+/// `default`; any other JSON type is rejected instead of being silently
+/// coerced to `false`.
+///
+/// Shared by tools that accept `replace_all`-style flags (grep, edit).
+/// Rejecting invalid types prevents a value such as `"yes"` or `1` from
+/// collapsing to `false` and silently changing the tool's behaviour.
+pub(crate) fn parse_bool_arg(
+    args: &serde_json::Value,
+    key: &str,
+    default: bool,
+) -> Result<bool, ToolError> {
+    let value = &args[key];
+    if value.is_null() {
+        return Ok(default);
+    }
+    value
+        .as_bool()
+        .ok_or_else(|| ToolError::InvalidArguments(format!("{} must be a boolean", key)))
+}
+
+/// Parse an optional non-negative integer argument into `usize`.
+///
+/// Missing/`null` keeps `default`. Any other JSON type — including a
+/// negative number such as `-1` — is rejected rather than silently coerced
+/// to `1`. `usize::try_from` also guards the u64 -> usize narrowing on
+/// targets where `usize` is smaller than `u64`.
+pub(crate) fn parse_usize_arg(
+    args: &serde_json::Value,
+    key: &str,
+    default: usize,
+) -> Result<usize, ToolError> {
+    let value = &args[key];
+    if value.is_null() {
+        return Ok(default);
+    }
+    let n = value.as_u64().ok_or_else(|| {
+        ToolError::InvalidArguments(format!("{} must be a non-negative integer", key))
+    })?;
+    usize::try_from(n).map_err(|_| {
+        ToolError::InvalidArguments(format!("{} is out of range for this platform", key))
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionDef {
     pub question: String,
