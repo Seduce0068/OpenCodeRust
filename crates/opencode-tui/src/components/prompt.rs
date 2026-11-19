@@ -418,7 +418,7 @@ impl Prompt {
                     self.mode = PromptMode::Normal;
                     return false;
                 }
-                if let Some(prev) = prev_char_boundary(&self.input, self.cursor_position) {
+                if let Some(prev) = prev_grapheme_boundary(&self.input, self.cursor_position) {
                     self.input.replace_range(prev..self.cursor_position, "");
                     self.cursor_position = prev;
                     self.reset_history_cursor();
@@ -426,19 +426,19 @@ impl Prompt {
                 }
             }
             KeyCode::Delete => {
-                if let Some(next) = next_char_boundary(&self.input, self.cursor_position) {
+                if let Some(next) = next_grapheme_boundary(&self.input, self.cursor_position) {
                     self.input.replace_range(self.cursor_position..next, "");
                     self.reset_history_cursor();
                     self.recompute_suggestions();
                 }
             }
             KeyCode::Left => {
-                if let Some(prev) = prev_char_boundary(&self.input, self.cursor_position) {
+                if let Some(prev) = prev_grapheme_boundary(&self.input, self.cursor_position) {
                     self.cursor_position = prev;
                 }
             }
             KeyCode::Right => {
-                if let Some(next) = next_char_boundary(&self.input, self.cursor_position) {
+                if let Some(next) = next_grapheme_boundary(&self.input, self.cursor_position) {
                     self.cursor_position = next;
                 }
             }
@@ -1270,25 +1270,126 @@ fn spinner_mode_from_env() -> SpinnerMode {
     }
 }
 
-fn prev_char_boundary(input: &str, cursor_position: usize) -> Option<usize> {
+/// UAX #29 の Grapheme_Extend 相当を std だけで近似した判定。
+///
+/// `unicode-segmentation` は workspace の直接依存ではないため追加せず、
+/// 一般的な結合記号・異体字セレクタ・スキントーン等を「直前の書記素に
+/// 吸着する」文字として扱う。完全な_grapheme cluster_規則ではなく、
+/// プロンプトのカーソル移動・削除が結合文字列を壊さないことを目的とする。
+fn is_grapheme_extend(ch: char) -> bool {
+    matches!(ch,
+        '\u{0300}'..='\u{036F}'
+        | '\u{0483}'..='\u{0489}'
+        | '\u{0591}'..='\u{05BD}'
+        | '\u{05BF}'
+        | '\u{05C1}'..='\u{05C2}'
+        | '\u{05C4}'..='\u{05C5}'
+        | '\u{05C7}'
+        | '\u{0610}'..='\u{061A}'
+        | '\u{064B}'..='\u{065F}'
+        | '\u{0670}'
+        | '\u{06D6}'..='\u{06DC}'
+        | '\u{06DF}'..='\u{06E4}'
+        | '\u{06E7}'..='\u{06E8}'
+        | '\u{06EA}'..='\u{06ED}'
+        | '\u{0711}'
+        | '\u{0730}'..='\u{074A}'
+        | '\u{07A6}'..='\u{07B0}'
+        | '\u{07EB}'..='\u{07F3}'
+        | '\u{0816}'..='\u{0819}'
+        | '\u{081B}'..='\u{0823}'
+        | '\u{0825}'..='\u{0827}'
+        | '\u{0829}'..='\u{082D}'
+        | '\u{0859}'..='\u{085B}'
+        | '\u{08D3}'..='\u{0903}'
+        | '\u{093A}'..='\u{094F}'
+        | '\u{0951}'..='\u{0957}'
+        | '\u{0962}'..='\u{0963}'
+        | '\u{0981}'
+        | '\u{09BC}'
+        | '\u{09C1}'..='\u{09CD}'
+        | '\u{0BCD}'
+        | '\u{0E31}'
+        | '\u{0E34}'..='\u{0E3A}'
+        | '\u{0E47}'..='\u{0E4E}'
+        | '\u{0F71}'..='\u{0F84}'
+        | '\u{0F86}'..='\u{0F87}'
+        | '\u{0F8D}'..='\u{0FBC}'
+        | '\u{1160}'..='\u{11FF}'
+        | '\u{135D}'..='\u{135F}'
+        | '\u{17B4}'..='\u{17B5}'
+        | '\u{17B7}'..='\u{17BD}'
+        | '\u{17C6}'
+        | '\u{17C9}'..='\u{17D3}'
+        | '\u{17DD}'
+        | '\u{1AB0}'..='\u{1AFF}'
+        | '\u{1DC0}'..='\u{1DFF}'
+        | '\u{200C}'
+        | '\u{20D0}'..='\u{20FF}'
+        | '\u{302A}'..='\u{302F}'
+        | '\u{3099}'..='\u{309A}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FE20}'..='\u{FE2F}'
+        | '\u{1F3FB}'..='\u{1F3FF}'
+        | '\u{E0020}'..='\u{E007F}'
+        | '\u{E0100}'..='\u{E01EF}'
+        | '\u{FF9E}'..='\u{FF9F}'
+    )
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    matches!(ch, '\u{1F1E6}'..='\u{1F1FF}')
+}
+
+/// 入力中の書記素クラスタ境界（バイトオフセット）を列挙する。
+/// 0 と `input.len()` は常に境界に含まれる。
+fn grapheme_boundaries(input: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut previous: Option<char> = None;
+    // 直前の地域指標がペアの 1 文字目かどうか（国旗は 2 文字で 1 クラスタ）。
+    let mut regional_pair_lead = false;
+
+    for (index, ch) in input.char_indices() {
+        // ZWJ は自身と直後の文字を同じクラスタに結合する（家族絵文字等）。
+        let continues = previous.is_some_and(|prev| {
+            ch == '\u{200D}'
+                || prev == '\u{200D}'
+                || is_grapheme_extend(ch)
+                || (prev == '\r' && ch == '\n')
+                || (is_regional_indicator(ch) && regional_pair_lead)
+        });
+        if !continues {
+            boundaries.push(index);
+        }
+
+        regional_pair_lead = if is_regional_indicator(ch) {
+            !regional_pair_lead
+        } else {
+            false
+        };
+        previous = Some(ch);
+    }
+    boundaries.push(input.len());
+    boundaries
+}
+
+fn prev_grapheme_boundary(input: &str, cursor_position: usize) -> Option<usize> {
     if cursor_position == 0 || cursor_position > input.len() {
         return None;
     }
-    input[..cursor_position]
-        .char_indices()
+    grapheme_boundaries(input)
+        .into_iter()
+        .take_while(|&boundary| boundary < cursor_position)
         .last()
-        .map(|(idx, _)| idx)
 }
 
-fn next_char_boundary(input: &str, cursor_position: usize) -> Option<usize> {
+fn next_grapheme_boundary(input: &str, cursor_position: usize) -> Option<usize> {
     if cursor_position >= input.len() {
         return None;
     }
-    let suffix = &input[cursor_position..];
-    suffix
-        .chars()
-        .next()
-        .map(|ch| cursor_position + ch.len_utf8())
+    grapheme_boundaries(input)
+        .into_iter()
+        .find(|&boundary| boundary > cursor_position)
 }
 
 fn prompt_state_dir() -> PathBuf {
@@ -1482,6 +1583,64 @@ mod tests {
             prompt.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
             assert_eq!(prompt.get_input(), "");
         });
+    }
+
+    #[test]
+    fn grapheme_backspace_keeps_combining_sequence_intact() {
+        with_isolated_prompt(|mut prompt| {
+            prompt.set_input("e\u{301}x".to_string());
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+            assert_eq!(prompt.get_input(), "e\u{301}");
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+            assert_eq!(prompt.get_input(), "");
+        });
+    }
+
+    #[test]
+    fn grapheme_cursor_skips_zwj_emoji_as_one_unit() {
+        with_isolated_prompt(|mut prompt| {
+            let emoji = "👨‍👩‍👧‍👦";
+            prompt.set_input(format!("A{emoji}B"));
+            let after_a = 1;
+            let after_emoji = 1 + emoji.len();
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
+            prompt.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
+            assert_eq!(prompt.cursor_position(), after_a);
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
+            assert_eq!(prompt.cursor_position(), after_emoji);
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+            assert_eq!(prompt.cursor_position(), after_a);
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+            assert_eq!(prompt.get_input(), format!("{emoji}B"));
+        });
+    }
+
+    #[test]
+    fn grapheme_delete_removes_emoji_with_modifier_and_variation_selector() {
+        with_isolated_prompt(|mut prompt| {
+            prompt.set_input("👍🏽\u{FE0F}X".to_string());
+
+            prompt.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
+            prompt.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
+            assert_eq!(prompt.get_input(), "X");
+        });
+    }
+
+    #[test]
+    fn grapheme_boundaries_group_extend_zwj_and_regional_indicators() {
+        assert_eq!(grapheme_boundaries("a\u{301}b"), vec![0, 3, 4]);
+
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(grapheme_boundaries(family), vec![0, family.len()]);
+
+        let flag = "🇯🇵X";
+        assert_eq!(grapheme_boundaries(flag), vec![0, 8, 9]);
     }
 
     #[test]

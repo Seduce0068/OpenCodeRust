@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct SubagentInfo {
     pub id: String,
@@ -26,6 +28,7 @@ pub struct SubagentDialog {
     pub subagent: Option<SubagentInfo>,
     pub open: bool,
     pub scroll_offset: u16,
+    click_map: DialogClickMap,
 }
 
 impl SubagentDialog {
@@ -34,6 +37,7 @@ impl SubagentDialog {
             subagent: None,
             open: false,
             scroll_offset: 0,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -50,6 +54,12 @@ impl SubagentDialog {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Return `true` when the click landed on the dialog frame, so the app
+    /// keeps the dialog open.
+    pub fn handle_click(&self, col: u16, row: u16) -> bool {
+        self.click_map.contains(col, row)
     }
 
     pub fn scroll_up(&mut self) {
@@ -77,6 +87,7 @@ impl SubagentDialog {
         let height = area.height.saturating_sub(4).min(20);
         let width = area.width.saturating_sub(4).min(80);
         let popup_area = super::centered_rect(width, height, area);
+        self.click_map.set_area(popup_area);
 
         let title = format!(" Subagent: {} [{}] ", subagent.name, subagent.category);
 

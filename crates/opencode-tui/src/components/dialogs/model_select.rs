@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct Model {
     pub id: String,
@@ -22,6 +24,7 @@ pub struct ModelSelectDialog {
     query: String,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl ModelSelectDialog {
@@ -99,6 +102,7 @@ impl ModelSelectDialog {
             query: String::new(),
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -155,6 +159,15 @@ impl ModelSelectDialog {
             .and_then(|&idx| self.models.get(idx))
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     fn filter(&mut self) {
         let query_lower = self.query.to_lowercase();
         self.filtered = self
@@ -184,6 +197,7 @@ impl ModelSelectDialog {
         let dialog_width = 50;
         let dialog_height = (self.filtered.len() + 4).min(15) as u16;
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
+        self.click_map.set_area(dialog_area);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -252,7 +266,10 @@ impl ModelSelectDialog {
             height: inner_area.height.saturating_sub(2),
         };
 
-        frame.render_stateful_widget(list, list_area, &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, list_area, &mut state);
+        self.click_map
+            .set_list(list_area, state.offset(), self.filtered.len());
     }
 }
 
@@ -827,5 +844,29 @@ mod tests {
         assert!(text.contains("GPT-4o"), "fourth default model");
         assert!(text.contains("anthropic"), "provider of first model");
         assert!(text.contains("openai"), "provider of fourth model");
+    }
+
+    #[test]
+    fn click_selects_list_item_and_leaves_backdrop_unconsumed() {
+        let mut dialog = ModelSelectDialog::new();
+        dialog.open();
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = render_to_string(80, 24, |frame| dialog.render(frame, area, &theme));
+
+        // 80x24 では 10 件のリストが row 8 から始まる（枠と検索行を除く）。
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(
+            dialog.handle_click(17, 9),
+            "click inside dialog is consumed"
+        );
+        assert_eq!(dialog.state.selected(), Some(1));
+        assert!(
+            dialog.handle_click(17, 8),
+            "click inside dialog is consumed"
+        );
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert!(!dialog.handle_click(0, 0), "backdrop click is not consumed");
+        assert_eq!(dialog.state.selected(), Some(0));
     }
 }

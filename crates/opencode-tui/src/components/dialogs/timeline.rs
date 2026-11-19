@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct TimelineEntry {
     pub message_id: String,
@@ -20,6 +22,7 @@ pub struct TimelineDialog {
     entries: Vec<TimelineEntry>,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl TimelineDialog {
@@ -28,6 +31,7 @@ impl TimelineDialog {
             entries: Vec::new(),
             state: ListState::default(),
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -73,6 +77,15 @@ impl TimelineDialog {
         self.selected_entry().map(|e| e.message_id.as_str())
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
@@ -80,6 +93,7 @@ impl TimelineDialog {
         let dialog_width = 70u16.min(area.width.saturating_sub(4));
         let dialog_height = 20u16.min(area.height.saturating_sub(4));
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
         let block = Block::default()
             .title(Span::styled(
@@ -94,6 +108,7 @@ impl TimelineDialog {
         let inner = super::dialog_inner(block.inner(dialog_area));
         frame.render_widget(block, dialog_area);
         if self.entries.is_empty() {
+            self.click_map.set_list(inner, 0, 0);
             let empty = ratatui::widgets::Paragraph::new("No messages in timeline")
                 .style(Style::default().fg(theme.text_muted));
             frame.render_widget(empty, inner);
@@ -126,7 +141,10 @@ impl TimelineDialog {
                 .bg(theme.background_element)
                 .add_modifier(Modifier::BOLD),
         );
-        frame.render_stateful_widget(list, inner, &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, inner, &mut state);
+        self.click_map
+            .set_list(inner, state.offset(), self.entries.len());
     }
 }
 

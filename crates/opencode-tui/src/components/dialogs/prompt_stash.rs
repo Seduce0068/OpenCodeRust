@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct StashItem {
     pub input: String,
@@ -20,6 +22,7 @@ pub struct PromptStashDialog {
     query: String,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl PromptStashDialog {
@@ -32,6 +35,7 @@ impl PromptStashDialog {
             query: String::new(),
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -97,6 +101,15 @@ impl PromptStashDialog {
         Some(index)
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     fn filter(&mut self) {
         let query = self.query.to_ascii_lowercase();
         self.filtered = self
@@ -119,6 +132,7 @@ impl PromptStashDialog {
         }
 
         let dialog_area = centered_rect(84, 20, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -172,6 +186,7 @@ impl PromptStashDialog {
             })
             .collect::<Vec<_>>();
 
+        let mut state = self.state;
         frame.render_stateful_widget(
             List::new(items).highlight_style(
                 Style::default()
@@ -179,8 +194,10 @@ impl PromptStashDialog {
                     .add_modifier(Modifier::BOLD),
             ),
             layout[1],
-            &mut self.state.clone(),
+            &mut state,
         );
+        self.click_map
+            .set_list(layout[1], state.offset(), self.filtered.len());
 
         frame.render_widget(
             Paragraph::new("Enter load  d delete  Esc close")

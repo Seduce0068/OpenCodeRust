@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct Provider {
     pub id: String,
@@ -29,6 +31,7 @@ pub struct ProviderDialog {
     pub selected_provider: Option<Provider>,
     pub api_key_input: String,
     pub input_mode: bool,
+    click_map: DialogClickMap,
 }
 
 impl ProviderDialog {
@@ -40,6 +43,7 @@ impl ProviderDialog {
             selected_provider: None,
             api_key_input: String::new(),
             input_mode: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -80,6 +84,17 @@ impl ProviderDialog {
         self.state.selected().and_then(|i| self.providers.get(i))
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if !self.input_mode {
+            if let Some(index) = self.click_map.item_at(col, row) {
+                self.state.select(Some(index));
+            }
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
@@ -88,6 +103,7 @@ impl ProviderDialog {
         let height = 15u16;
         let width = 50u16;
         let popup_area = super::centered_rect(width, height, area);
+        self.click_map.set_area(popup_area);
         let block = Block::default()
             .title(" Connect Provider ")
             .borders(Borders::ALL)
@@ -95,6 +111,7 @@ impl ProviderDialog {
         let content_area = super::dialog_inner(block.inner(popup_area));
 
         if self.input_mode {
+            self.click_map.set_list(content_area, 0, 0);
             let content = vec![
                 Line::from(Span::styled(
                     "Connect Provider",
@@ -171,6 +188,8 @@ impl ProviderDialog {
             let list = List::new(items).highlight_style(Style::default().fg(theme.primary));
 
             frame.render_widget(list, content_area);
+            self.click_map
+                .set_list(content_area, 0, self.providers.len());
         }
     }
 }

@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 pub struct SessionExportDialog {
     open: bool,
     session_id: Option<String>,
@@ -15,6 +17,7 @@ pub struct SessionExportDialog {
     pub include_thinking: bool,
     pub include_tool_details: bool,
     pub include_metadata: bool,
+    click_map: DialogClickMap,
 }
 
 impl SessionExportDialog {
@@ -26,6 +29,7 @@ impl SessionExportDialog {
             include_thinking: false,
             include_tool_details: true,
             include_metadata: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -43,6 +47,12 @@ impl SessionExportDialog {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Return `true` when the click landed on the dialog frame, so the app
+    /// keeps the dialog open.
+    pub fn handle_click(&self, col: u16, row: u16) -> bool {
+        self.click_map.contains(col, row)
     }
 
     pub fn handle_input(&mut self, c: char) {
@@ -72,6 +82,7 @@ impl SessionExportDialog {
         }
 
         let dialog_area = centered_rect(80, 14, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct Agent {
     pub name: String,
@@ -19,6 +21,7 @@ pub struct AgentSelectDialog {
     agents: Vec<Agent>,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl AgentSelectDialog {
@@ -63,6 +66,7 @@ impl AgentSelectDialog {
             agents,
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -107,6 +111,15 @@ impl AgentSelectDialog {
         self.state.selected().and_then(|i| self.agents.get(i))
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
@@ -115,6 +128,7 @@ impl AgentSelectDialog {
         let dialog_width = 45;
         let dialog_height = (self.agents.len() + 2).min(12) as u16;
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
+        self.click_map.set_area(dialog_area);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -154,7 +168,10 @@ impl AgentSelectDialog {
             .collect();
 
         let list = List::new(items);
-        frame.render_stateful_widget(list, inner_area, &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, inner_area, &mut state);
+        self.click_map
+            .set_list(inner_area, state.offset(), self.agents.len());
     }
 }
 

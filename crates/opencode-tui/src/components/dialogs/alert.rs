@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 pub enum AlertType {
     Info,
     Success,
@@ -20,6 +22,7 @@ pub struct AlertDialog {
     message: String,
     alert_type: AlertType,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl AlertDialog {
@@ -29,6 +32,7 @@ impl AlertDialog {
             message: message.to_string(),
             alert_type,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -68,6 +72,12 @@ impl AlertDialog {
         &self.message
     }
 
+    /// Return `true` when the click landed on the dialog frame, so the app
+    /// keeps the dialog open.
+    pub fn handle_click(&self, col: u16, row: u16) -> bool {
+        self.click_map.contains(col, row)
+    }
+
     fn get_color(&self, theme: &Theme) -> ratatui::style::Color {
         match self.alert_type {
             AlertType::Info => theme.info,
@@ -99,6 +109,7 @@ impl AlertDialog {
         let dialog_height = (line_count + 6).min(16) as u16;
 
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
+        self.click_map.set_area(dialog_area);
 
         frame.render_widget(Clear, dialog_area);
 

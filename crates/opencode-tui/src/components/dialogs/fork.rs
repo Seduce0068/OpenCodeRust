@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct ForkEntry {
     pub message_id: String,
@@ -21,6 +23,7 @@ pub struct ForkDialog {
     state: ListState,
     session_id: Option<String>,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl ForkDialog {
@@ -30,6 +33,7 @@ impl ForkDialog {
             state: ListState::default(),
             session_id: None,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -80,6 +84,15 @@ impl ForkDialog {
         self.selected_entry().map(|e| e.message_id.as_str())
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
@@ -87,6 +100,7 @@ impl ForkDialog {
         let dialog_width = 70u16.min(area.width.saturating_sub(4));
         let dialog_height = 20u16.min(area.height.saturating_sub(4));
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
         let block = Block::default()
             .title(Span::styled(
@@ -101,6 +115,7 @@ impl ForkDialog {
         let inner = super::dialog_inner(block.inner(dialog_area));
         frame.render_widget(block, dialog_area);
         if self.entries.is_empty() {
+            self.click_map.set_list(inner, 0, 0);
             let empty = ratatui::widgets::Paragraph::new("No messages to fork from")
                 .style(Style::default().fg(theme.text_muted));
             frame.render_widget(empty, inner);
@@ -152,7 +167,10 @@ impl ForkDialog {
                 .bg(theme.background_element)
                 .add_modifier(Modifier::BOLD),
         );
-        frame.render_stateful_widget(list, list_area, &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, list_area, &mut state);
+        self.click_map
+            .set_list(list_area, state.offset(), self.entries.len());
     }
 }
 

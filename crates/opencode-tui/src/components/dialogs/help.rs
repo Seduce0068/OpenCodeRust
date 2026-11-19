@@ -8,13 +8,19 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 pub struct HelpDialog {
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl HelpDialog {
     pub fn new() -> Self {
-        Self { open: false }
+        Self {
+            open: false,
+            click_map: DialogClickMap::default(),
+        }
     }
 
     pub fn open(&mut self) {
@@ -29,6 +35,12 @@ impl HelpDialog {
         self.open
     }
 
+    /// Return `true` when the click landed on the dialog frame, so the app
+    /// keeps the dialog open.
+    pub fn handle_click(&self, col: u16, row: u16) -> bool {
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
@@ -36,6 +48,7 @@ impl HelpDialog {
 
         // キー割当の説明行を 2 行追加したため、80x24 でも末尾が見えるよう 20 -> 22 に拡大。
         let dialog_area = centered_rect(74, 22, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

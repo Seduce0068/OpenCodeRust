@@ -63,6 +63,12 @@ fn should_insert_paste_into_prompt(
     !(permission_open || question_open || dialog_open)
 }
 
+/// モーダルの単文字ショートカットは Ctrl/Alt が付いていないときだけ発動する。
+/// これにより Ctrl+A などのアプリ共通キーバインドをモーダルが横取りしない。
+fn is_plain_shortcut(key: KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// A question request received from the server.
 ///
 /// Multi-question requests are asked sequentially; answers are accumulated
@@ -371,17 +377,22 @@ impl App {
                 // Handle inline permission prompt before dialogs
                 if self.permission_prompt.is_open {
                     match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => {
+                        KeyCode::Enter => {
                             if let Some(request) = self.permission_prompt.approve() {
                                 self.reply_permission(&request.id, "once");
                             }
                         }
-                        KeyCode::Char('n') => {
+                        KeyCode::Char('y') if is_plain_shortcut(*key) => {
+                            if let Some(request) = self.permission_prompt.approve() {
+                                self.reply_permission(&request.id, "once");
+                            }
+                        }
+                        KeyCode::Char('n') if is_plain_shortcut(*key) => {
                             if let Some(request) = self.permission_prompt.deny() {
                                 self.reply_permission(&request.id, "reject");
                             }
                         }
-                        KeyCode::Char('a') => {
+                        KeyCode::Char('a') if is_plain_shortcut(*key) => {
                             if let Some(request) = self.permission_prompt.approve_always() {
                                 self.reply_permission(&request.id, "always");
                             }
@@ -401,7 +412,9 @@ impl App {
                     match key.code {
                         KeyCode::Up => self.question_prompt.move_up(),
                         KeyCode::Down => self.question_prompt.move_down(),
-                        KeyCode::Char(' ') => self.question_prompt.toggle_selected(),
+                        KeyCode::Char(' ') if is_plain_shortcut(*key) => {
+                            self.question_prompt.toggle_selected();
+                        }
                         KeyCode::Enter => {
                             if let Some(answer) = self.question_prompt.confirm() {
                                 self.submit_question_answer(answer);
@@ -410,7 +423,9 @@ impl App {
                         KeyCode::Esc => {
                             self.reject_active_question();
                         }
-                        KeyCode::Char(c) => self.question_prompt.type_char(c),
+                        KeyCode::Char(c) if is_plain_shortcut(*key) => {
+                            self.question_prompt.type_char(c);
+                        }
                         KeyCode::Backspace => self.question_prompt.backspace(),
                         _ => {}
                     }
@@ -1091,6 +1106,73 @@ impl App {
         }
     }
 
+    /// Left-click hit testing for general dialogs.
+    ///
+    /// Returns `true` when the click was inside the topmost dialog frame (and
+    /// updates its selection when an item was hit). Returns `false` only for
+    /// clicks on the backdrop, which the caller closes via `close_top_dialog`.
+    /// Permission/question prompts keep their own `handle_click` path and are
+    /// handled before this function in `handle_event`.
+    fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        if self.alert_dialog.is_open() {
+            return self.alert_dialog.handle_click(col, row);
+        }
+        if self.help_dialog.is_open() {
+            return self.help_dialog.handle_click(col, row);
+        }
+        if self.status_dialog.is_open() {
+            return self.status_dialog.handle_click(col, row);
+        }
+        if self.session_rename_dialog.is_open() {
+            return self.session_rename_dialog.handle_click(col, row);
+        }
+        if self.session_export_dialog.is_open() {
+            return self.session_export_dialog.handle_click(col, row);
+        }
+        if self.prompt_stash_dialog.is_open() {
+            return self.prompt_stash_dialog.handle_click(col, row);
+        }
+        if self.skill_list_dialog.is_open() {
+            return self.skill_list_dialog.handle_click(col, row);
+        }
+        // Slash popup has no click map in scope: keep the previous close-on-click
+        // behaviour for it rather than swallowing every click while it is open.
+        if self.command_palette.is_open() {
+            return self.command_palette.handle_click(col, row);
+        }
+        if self.model_select.is_open() {
+            return self.model_select.handle_click(col, row);
+        }
+        if self.agent_select.is_open() {
+            return self.agent_select.handle_click(col, row);
+        }
+        if self.session_list_dialog.is_open() {
+            return self.session_list_dialog.handle_click(col, row);
+        }
+        if self.theme_list_dialog.is_open() {
+            return self.theme_list_dialog.handle_click(col, row);
+        }
+        if self.mcp_dialog.is_open() {
+            return self.mcp_dialog.handle_click(col, row);
+        }
+        if self.timeline_dialog.is_open() {
+            return self.timeline_dialog.handle_click(col, row);
+        }
+        if self.fork_dialog.is_open() {
+            return self.fork_dialog.handle_click(col, row);
+        }
+        if self.provider_dialog.is_open() {
+            return self.provider_dialog.handle_click(col, row);
+        }
+        if self.subagent_dialog.is_open() {
+            return self.subagent_dialog.handle_click(col, row);
+        }
+        if self.tag_dialog.is_open() {
+            return self.tag_dialog.handle_click(col, row);
+        }
+        false
+    }
+
     fn handle_dialog_mouse(
         &mut self,
         mouse_event: &crossterm::event::MouseEvent,
@@ -1113,7 +1195,15 @@ impl App {
                 Ok(true)
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                self.event_caused_change = self.close_top_dialog();
+                let col = mouse_event.column;
+                let row = mouse_event.row;
+                if self.handle_dialog_click(col, row) {
+                    // ダイアログ枠内（項目命中時は選択済み）。閉じない。
+                    self.event_caused_change = true;
+                } else {
+                    // 背景クリックのみ最上位ダイアログを閉じる。
+                    self.event_caused_change = self.close_top_dialog();
+                }
                 Ok(true)
             }
             MouseEventKind::Moved
@@ -1131,6 +1221,11 @@ impl App {
     }
 
     fn handle_dialog_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        // 修飾付きの非文字キー（Alt+Enter / Alt+Up 等）はアプリ共通キーバインドへ委譲する。
+        // Ctrl+C はダイアログ側で意図的に消費するため例外とする。
+        if !is_plain_shortcut(key) && !matches!(key.code, KeyCode::Char(_)) {
+            return Ok(false);
+        }
         if self.alert_dialog.is_open() {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
@@ -1267,7 +1362,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('d') if is_plain_shortcut(key) => {
                     if let Some(index) = self.prompt_stash_dialog.selected_index() {
                         if self.prompt.remove_stash(index) {
                             let entries = self
@@ -1554,10 +1649,10 @@ impl App {
                 KeyCode::Esc => self.mcp_dialog.close(),
                 KeyCode::Up => self.mcp_dialog.move_up(),
                 KeyCode::Down => self.mcp_dialog.move_down(),
-                KeyCode::Char('r') => {
+                KeyCode::Char('r') if is_plain_shortcut(key) => {
                     let _ = self.refresh_mcp_dialog();
                 }
-                KeyCode::Char('a') => {
+                KeyCode::Char('a') if is_plain_shortcut(key) => {
                     if let Some(item) = self.mcp_dialog.selected_item() {
                         if let Some(client) = self.context.get_api_client() {
                             match client.start_mcp_auth(&item.name) {
@@ -1581,7 +1676,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('x') => {
+                KeyCode::Char('x') if is_plain_shortcut(key) => {
                     if let Some(item) = self.mcp_dialog.selected_item() {
                         if let Some(client) = self.context.get_api_client() {
                             if let Err(err) = client.remove_mcp_auth(&item.name) {
@@ -1711,7 +1806,9 @@ impl App {
                 KeyCode::Esc => self.tag_dialog.close(),
                 KeyCode::Up => self.tag_dialog.move_up(),
                 KeyCode::Down => self.tag_dialog.move_down(),
-                KeyCode::Char(' ') => self.tag_dialog.toggle_selection(),
+                KeyCode::Char(' ') if is_plain_shortcut(key) => {
+                    self.tag_dialog.toggle_selection();
+                }
                 KeyCode::Enter => self.tag_dialog.close(),
                 _ => {}
             }
@@ -4329,6 +4426,31 @@ fn default_export_filename(title: &str, session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_single_char_shortcuts_ignore_ctrl_and_alt() {
+        assert!(is_plain_shortcut(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::empty()
+        )));
+        // SHIFT は許容（crossterm は大文字を SHIFT 付きで報告する）。
+        assert!(is_plain_shortcut(KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_plain_shortcut(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_plain_shortcut(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_plain_shortcut(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
+    }
 
     #[test]
     fn parse_question_asked_reads_server_payload() {

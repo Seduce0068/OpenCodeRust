@@ -10,6 +10,8 @@ use crate::command::{fuzzy_match, CommandAction};
 use crate::context::MessageDensity;
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct Command {
     pub action: CommandAction,
@@ -24,6 +26,7 @@ pub struct CommandPalette {
     query: String,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl CommandPalette {
@@ -227,6 +230,7 @@ impl CommandPalette {
             query: String::new(),
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -280,6 +284,15 @@ impl CommandPalette {
 
     pub fn selected_action(&self) -> Option<CommandAction> {
         self.selected_command().map(|cmd| cmd.action.clone())
+    }
+
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
     }
 
     pub fn sync_visibility_labels(
@@ -381,6 +394,7 @@ impl CommandPalette {
         let dialog_height = (self.filtered.len() + 4).min(20) as u16;
 
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
+        self.click_map.set_area(dialog_area);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -459,7 +473,10 @@ impl CommandPalette {
             height: inner_area.height.saturating_sub(2),
         };
 
-        frame.render_stateful_widget(list, list_area, &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, list_area, &mut state);
+        self.click_map
+            .set_list(list_area, state.offset(), self.filtered.len());
     }
 }
 

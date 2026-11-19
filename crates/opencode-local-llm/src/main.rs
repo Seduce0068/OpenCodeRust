@@ -14,6 +14,18 @@ use tokio::time::timeout;
 /// ollama サブプロセスの既定タイムアウト（秒）。
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 
+/// サブプロセス出力・MCP レスポンスの 1 テキストあたりの最大バイト数（16 MiB）。
+///
+/// 暴走モデルや入れ替えられた ollama バイナリが際限なく出力しても
+/// メモリを食い潰さないための上限。
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// model 名の最大長（文字数）。
+const MAX_MODEL_NAME_CHARS: usize = 256;
+
+/// 上限超過時に出力へ付与する、利用者に可視な切り詰めマーカー。
+const TRUNCATION_MARKER: &str = "\n... [truncated: output exceeded 16 MiB limit]\n";
+
 /// サブプロセスのタイムアウトを環境変数で上書きできるようにする。
 ///
 /// `OPENCODE_LOCAL_LLM_TIMEOUT_SECS` に正の整数を設定した場合のみ使用し、
@@ -27,15 +39,115 @@ fn command_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS))
 }
 
-/// パイプを EOF まで読み切る（パイプが無い場合は何もしない）。
+/// 上限を超えない範囲だけ `buf` に蓄積してパイプを読み切る。
+///
+/// 上限到達後も子プロセスがパイプへの書き込みでブロックしてデッドロックするのを
+/// 防ぐため、残りのバイトは小さな一時バッファで読み捨てる（メモリ使用量は
+/// `limit` に抑制される）。蓄積データには [`TRUNCATION_MARKER`] を付与し、
+/// 切り詰めが発生したかどうかを返す。
+async fn read_pipe_limited<R: AsyncRead + Unpin>(
+    pipe: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<bool> {
+    let Some(pipe) = pipe.as_mut() else {
+        return Ok(false);
+    };
+
+    let mut chunk = [0u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        if buf.len() < limit {
+            let room = limit - buf.len();
+            let keep = read.min(room);
+            buf.extend_from_slice(&chunk[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+        // 上限超過後のバイトは蓄積せず読み捨てる（子プロセスのブロック防止）。
+    }
+    if truncated {
+        buf.extend_from_slice(TRUNCATION_MARKER.as_bytes());
+    }
+    Ok(truncated)
+}
+
+/// パイプを既定上限（[`MAX_OUTPUT_BYTES`]）付きで読み切る。
 async fn read_pipe<R: AsyncRead + Unpin>(
     pipe: &mut Option<R>,
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    if let Some(pipe) = pipe.as_mut() {
-        pipe.read_to_end(buf).await?;
-    }
+    read_pipe_limited(pipe, buf, MAX_OUTPUT_BYTES).await?;
     Ok(())
+}
+
+/// 文字列を最大 `limit` バイトに切り詰め、超過分をマーカーで置き換える。
+///
+/// MCP レスポンスへ巨大テキストが流入しないための最終ゲート。
+/// UTF-8 の文字境界を尊重し、境界上で `limit` 以下まで切り下げる。
+fn truncate_utf8(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + TRUNCATION_MARKER.len());
+    out.push_str(&text[..end]);
+    out.push_str(TRUNCATION_MARKER);
+    out
+}
+
+/// ollama の model 名として安全な文字列かどうかを検証する。
+///
+/// `-` で始まる値が ollama CLI のオプションとして解釈されるのを防ぐため、
+/// 先頭は英数字、それ以降は英数字と `:` `-` `_` `.` `/` のみを許可する。
+/// 実在の `q4_K_M` のような大文字の量子化タグや `library/llama3` のような
+/// 名前空間付き名も受け付ける。
+fn is_valid_model_name(model: &str) -> bool {
+    if model.is_empty() || model.chars().count() > MAX_MODEL_NAME_CHARS {
+        return false;
+    }
+    let mut chars = model.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.' | '/'))
+}
+
+/// `tools/call` の失敗を JSON-RPC エラーへ変換するための型。
+#[derive(Debug)]
+struct ToolCallError {
+    code: i32,
+    message: String,
+}
+
+impl ToolCallError {
+    /// 不正な引数（JSON-RPC: Invalid params / -32602）。
+    fn invalid_arguments(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            code: -32602,
+            message: format!("InvalidArguments: {}", message),
+        }
+    }
+
+    /// その他の内部エラー（JSON-RPC: Internal error / -32603）。
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self {
+            code: -32603,
+            message: error.to_string(),
+        }
+    }
 }
 
 /// 子プロセスをタイムアウト付きで実行し、結果を返す。
@@ -298,8 +410,8 @@ async fn handle_request(
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
             let result = match tool_name {
-                "local_llm_query" => call_local_llm(arguments).await?,
-                "local_llm_list_models" => list_local_models().await?,
+                "local_llm_query" => call_local_llm(arguments).await,
+                "local_llm_list_models" => list_local_models().await,
                 _ => {
                     return Ok(error_response(
                         id,
@@ -307,6 +419,13 @@ async fn handle_request(
                         &format!("Unknown tool: {}", tool_name),
                     ))
                 }
+            };
+            // ツール失敗でサーバ全体が終了しないよう JSON-RPC エラーへ変換する。
+            // 併せて MCP レスポンス本文にも上限を適用し、巨大テキストが
+            // クライアントのコンテキストへ流入しないようにする。
+            let result = match result {
+                Ok(text) => truncate_utf8(&text, MAX_OUTPUT_BYTES),
+                Err(err) => return Ok(error_response(id, err.code, &err.message)),
             };
 
             Ok(JsonRpcResponse {
@@ -340,45 +459,65 @@ fn error_response(id: Option<Value>, code: i32, message: &str) -> JsonRpcRespons
     }
 }
 
-async fn call_local_llm(args: Value) -> Result<String, Box<dyn std::error::Error>> {
+async fn call_local_llm(args: Value) -> Result<String, ToolCallError> {
     let model = args
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or("model required")?;
+        .ok_or_else(|| ToolCallError::invalid_arguments("model required"))?;
+    if !is_valid_model_name(model) {
+        return Err(ToolCallError::invalid_arguments(format!(
+            "invalid model name: {:?}",
+            model
+        )));
+    }
     let prompt = args
         .get("prompt")
         .and_then(|v| v.as_str())
-        .ok_or("prompt required")?;
+        .ok_or_else(|| ToolCallError::invalid_arguments("prompt required"))?;
     let system = args.get("system").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut cmd = Command::new("ollama");
-    cmd.args(["run", model]);
+    // ollama CLI（cobra）のオプション終端記号。モデル名を検証済みでも、
+    // 位置引数がオプションとして解釈されないよう二重に防御する。
+    cmd.args(["run", "--", model]);
     if !system.is_empty() {
         cmd.env("OLLAMA_SYSTEM", system);
     }
     cmd.arg(prompt);
 
-    let output = output_with_timeout(cmd, command_timeout()).await?;
+    let output = output_with_timeout(cmd, command_timeout())
+        .await
+        .map_err(ToolCallError::internal)?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(truncate_utf8(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            MAX_OUTPUT_BYTES,
+        ))
     } else {
-        Err(format!("ollama error: {}", String::from_utf8_lossy(&output.stderr)).into())
+        Err(ToolCallError::internal(format!(
+            "ollama error: {}",
+            truncate_utf8(&String::from_utf8_lossy(&output.stderr), MAX_OUTPUT_BYTES)
+        )))
     }
 }
 
-async fn list_local_models() -> Result<String, Box<dyn std::error::Error>> {
+async fn list_local_models() -> Result<String, ToolCallError> {
     let mut cmd = Command::new("ollama");
     cmd.args(["list"]);
 
-    let output = output_with_timeout(cmd, command_timeout()).await?;
+    let output = output_with_timeout(cmd, command_timeout())
+        .await
+        .map_err(ToolCallError::internal)?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(truncate_utf8(
+            &String::from_utf8_lossy(&output.stdout),
+            MAX_OUTPUT_BYTES,
+        ))
     } else {
-        Err(format!(
+        Err(ToolCallError::internal(format!(
             "ollama list error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into())
+            truncate_utf8(&String::from_utf8_lossy(&output.stderr), MAX_OUTPUT_BYTES)
+        )))
     }
 }
 
@@ -454,5 +593,116 @@ mod tests {
             .expect("large output should complete without blocking on the pipe");
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 200000);
+    }
+
+    #[test]
+    fn model_name_grammar_accepts_real_world_names() {
+        for name in [
+            "gemma4:4b",
+            "llama3.2",
+            "qwen2.5:14b-instruct-q4_K_M",
+            "library/llama3",
+            "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF",
+        ] {
+            assert!(is_valid_model_name(name), "should accept: {}", name);
+        }
+    }
+
+    #[test]
+    fn model_name_grammar_rejects_unsafe_names() {
+        for name in [
+            "",
+            "-v",
+            "--verbose",
+            "model name",
+            "model;rm",
+            "model\nfoo",
+            ".hidden",
+            "/etc/passwd",
+        ] {
+            assert!(!is_valid_model_name(name), "should reject: {:?}", name);
+        }
+        let too_long = "a".repeat(MAX_MODEL_NAME_CHARS + 1);
+        assert!(!is_valid_model_name(too_long.as_str()));
+    }
+
+    #[tokio::test]
+    async fn call_local_llm_rejects_invalid_model_without_spawning_ollama() {
+        let args = json!({ "model": "--verbose", "prompt": "hi" });
+        let err = call_local_llm(args)
+            .await
+            .expect_err("leading '-' model must be rejected before spawning");
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("InvalidArguments"));
+        assert!(err.message.contains("--verbose"));
+    }
+
+    #[tokio::test]
+    async fn handle_request_returns_invalid_arguments_for_bad_model() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(42)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "local_llm_query",
+                "arguments": { "model": "-h", "prompt": "hi" }
+            })),
+        };
+        let mut initialized = true;
+        let response = handle_request(request, &mut initialized)
+            .await
+            .expect("handler should return a JSON-RPC response, not terminate the server");
+        let value = serde_json::to_value(response).expect("serialize");
+        assert_eq!(value["error"]["code"], -32602);
+        assert!(value["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("InvalidArguments"));
+        assert!(value.get("result").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_pipe_limited_caps_huge_output_and_appends_marker() {
+        // 256 KiB を 1 KiB の上限で読ませ、上限を超えて蓄積されないことを検証。
+        let data = vec![b'x'; 256 * 1024];
+        let mut pipe: Option<&[u8]> = Some(data.as_slice());
+        let mut buf = Vec::new();
+        let truncated = read_pipe_limited(&mut pipe, &mut buf, 1024)
+            .await
+            .expect("read should succeed");
+        assert!(truncated);
+        assert_eq!(buf.len(), 1024 + TRUNCATION_MARKER.len());
+        assert!(buf.ends_with(TRUNCATION_MARKER.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn read_pipe_limited_keeps_all_bytes_when_under_limit() {
+        let data = vec![b'a'; 512];
+        let expected = data.clone();
+        let mut pipe: Option<&[u8]> = Some(data.as_slice());
+        let mut buf = Vec::new();
+        let truncated = read_pipe_limited(&mut pipe, &mut buf, 1024)
+            .await
+            .expect("read should succeed");
+        assert!(!truncated);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn truncate_utf8_limits_oversized_mcp_text() {
+        let text = "a".repeat(2048);
+        let out = truncate_utf8(&text, 1024);
+        assert!(out.ends_with(TRUNCATION_MARKER));
+        assert_eq!(out.len(), 1024 + TRUNCATION_MARKER.len());
+        assert_eq!(truncate_utf8("short", 1024), "short");
+    }
+
+    #[test]
+    fn truncate_utf8_keeps_utf8_char_boundaries() {
+        let text = "あ".repeat(100); // 1 文字 3 バイト
+        let out = truncate_utf8(&text, 10);
+        let marker_start = out.len() - TRUNCATION_MARKER.len();
+        assert!(std::str::from_utf8(&out.as_bytes()[..marker_start]).is_ok());
+        assert!(out.ends_with(TRUNCATION_MARKER));
     }
 }

@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+use super::DialogClickMap;
+
 #[derive(Clone, Debug)]
 pub struct McpItem {
     pub name: String,
@@ -21,6 +23,7 @@ pub struct McpDialog {
     items: Vec<McpItem>,
     state: ListState,
     open: bool,
+    click_map: DialogClickMap,
 }
 
 impl McpDialog {
@@ -31,6 +34,7 @@ impl McpDialog {
             items: Vec::new(),
             state,
             open: false,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -81,12 +85,22 @@ impl McpDialog {
             .cloned()
     }
 
+    /// Select the item under the pointer. Returns `true` when the click landed
+    /// on the dialog frame (so the app must not close it).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
         }
 
         let dialog_area = centered_rect(86, 20, area);
+        self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -154,7 +168,15 @@ impl McpDialog {
                 .bg(theme.background_element)
                 .add_modifier(Modifier::BOLD),
         );
-        frame.render_stateful_widget(list, layout[0], &mut self.state.clone());
+        let mut state = self.state;
+        frame.render_stateful_widget(list, layout[0], &mut state);
+        // 空のときはプレースホルダ行が 1 つあるだけなので選択不可能にする。
+        let count = if self.items.is_empty() {
+            0
+        } else {
+            self.items.len()
+        };
+        self.click_map.set_list(layout[0], state.offset(), count);
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
