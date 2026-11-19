@@ -791,8 +791,6 @@ impl App {
                 }
                 if self.last_aux_sync.elapsed() >= Duration::from_secs(5) {
                     self.refresh_session_list_dialog();
-                    let _ = self.refresh_skill_list_dialog();
-                    let _ = self.refresh_lsp_status();
                     let _ = self.refresh_mcp_dialog();
                     self.last_aux_sync = Instant::now();
                     tick_changed = true;
@@ -2810,6 +2808,9 @@ impl App {
     }
 
     fn refresh_status_dialog(&mut self) {
+        // LSP 一覧は 501 終点（常に空配列）のため、ステータス表示を開く時だけ同期する。
+        // これにより 5 秒ごとの Tick 同期を廃止しても表示内容は変わらない。
+        let _ = self.refresh_lsp_status();
         let formatters = self
             .context
             .get_api_client()
