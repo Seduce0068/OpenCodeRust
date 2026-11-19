@@ -79,10 +79,12 @@ status: current
     `pub use` 化 → server.rs を明示 From へ（H-10 の非アトミック書き出しと
     同一箇所、同時対応が効率的）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
-  - 2026-11-19 調査: 推奨は **opencode-pty を member 外し＋削除、server 版 PtyManager は
-    現状維持**。2 つの PtyManager は API 非互換（sync spawn + `mpsc<String>` vs async
-    CRUD + `broadcast<Vec<u8>>` + replay）で直接置換不可。配線は約 500 行の実移管で
-    wire 契約・M-43 回収の回帰リスクあり。opencode-pty は外部参照 0 の orphan。
+  - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
+    外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
+    現状維持で /pty 契約・M-43 挙動に影響なし。自己テスト 1 件消失で総数 2214→2213。
+  - 2026-11-19 調査: 2 つの PtyManager は API 非互換（sync spawn + `mpsc<String>` vs
+    async CRUD + `broadcast<Vec<u8>>` + replay）で直接置換不可。配線は約 500 行の
+    実移管で wire 契約・M-43 回収の回帰リスクあり（見積りは speculative）。
   - 前提を訂正: util は CLI が実使用（L-04 で配線済み）で「無依存」は stale。
     watcher は core の GitWatcher と config.watcher に機能分散（別 ADR 判断）。
     local-llm は外部 MCP 起動想定（登録有無は未確認）、codemode は ADR-0006 維持。
@@ -262,6 +264,7 @@ status: current
 
 ## 完了
 
+- [x] **[M-03 一部]** orphan クレート opencode-pty を削除（2026-11-19、親が直接実施）
 - [x] **[H-03 一部]** npm spec 厳密化と import 検証（2026-11-19、swarm-coding R1-R6）
 - [x] **[H-13 一部]** 501 終点のポーリング除去（2026-11-19、swarm-coding R2）
 - [x] **[M-55]** Bedrock ストリームの行バッファ化（2026-11-19、swarm-coding R1-R6）
