@@ -178,15 +178,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **ADR-0005 の stale pending entry 既知制約は解消済みで記述が古い**
-  — `adr-0005:93-95`, `server.rs:62-70` / ADR5-STALE
-- [ ] **ADR-0001 の許可ヘッダーが 3 種記載で実装は 5 種**
-  — `adr-0001:48-51`, `server.rs:1175-1192` / ADR1-CORS-HEADERS
-- [ ] **ADR-0002 の permission reply ルートが stale（実際は /permission/{id}/reply）**
-  — `adr-0002:41-42` / ADR2-REPLY-PATH
-- [ ] **ADR-0001 の実装参照（関数名・行番号）が stale** — `adr-0001:55-59,70` / ADR1-REFS
-- [ ] **ADR-0004 の単一 writer 制約が process 単位で実装は ServerState 単位**
-  — `adr-0004:79-100` / ADR4-SCOPE
 - [ ] **SSE リスナースレッドが App 終了を検知せずデタッチ残存** — `app.rs:3850,3945-4056` / TUI-08
 - [ ] **長いセッションで scroll_offset が u16 に丸められる** — `session.rs:884` / TUI-09
 - [ ] **極小ターミナル時に screen_lines スナップショットが古いまま残る** — `app.rs:3377-3379` / TUI-10
@@ -317,8 +308,6 @@ status: current
   — `local-llm/main.rs:168-198` / LLM-SERIAL
 - [ ] **ADR-0002 の always が永続化されず毎回プロンプトが出る**
   — `adr-0002:66`, `routes.rs:2012-2020` / ADR2-ALWAYS
-- [ ] **ADR-0001 の CORS ポート完全一致決定が実装と不一致（任意ポート許可）**
-  — `adr-0001:37-46`, `server.rs:1065-1071` / ADR1-CORS-PORT
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
@@ -391,6 +380,8 @@ status: current
 
 ## 完了
 
+- [x] **[Slash クリック・ADR 整合]** ポップアップ選択と 6 文書の追随
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[中優先 6 件]** TUI 操作・RPC バージョン・local-llm 上限
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[ストリーム構造化エラー]** Retry-After 到達とエンベロープ堅牢化
@@ -644,9 +635,9 @@ status: current
 
 ## メモ
 
-- 2026-11-20 R4 残存（中優先 6 件の修正時、記録のみ）: SlashCommandPopup は
-  click_map 未対応で左クリックが close 動作のまま（components/ 直下で scope 外）。
-  書記素境界は std のみの実用近似で UAX #29 の完全規則（GB9c 等）に非対応。
+- 2026-11-20 R4 残存（中優先 6 件の修正時、記録のみ）: SlashCommandPopup の
+  クリック対応は次イテレーションで対応済み。書記素境界は std のみの実用近似で
+  UAX #29 の完全規則（GB9c 等）に非対応。
   plugin protocolVersion は欠落時既定値 1 を許容（互換維持）。local-llm の
   ollama CLI が cobra の `--` を解釈する前提は外部確認していない。
   local-llm の直列リクエスト処理・CM-HOST-TIMEOUT は未対応。
