@@ -2360,7 +2360,6 @@ name = "opencode-permission"
 version = "0.1.0"
 dependencies = [
  "dirs",
- "lazy_static",
  "opencode-plugin",
  "serde",
  "serde_json",
@@ -2509,10 +2508,10 @@ dependencies = [
  "dirs",
  "futures",
  "glob",
+ "lazy_static",
  "lsp-types",
  "opencode-config",
  "opencode-lsp",
- "opencode-permission",
  "opencode-plugin",
  "regex",
  "reqwest",
