@@ -9,7 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-opencode-core = { path = "../opencode-core" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

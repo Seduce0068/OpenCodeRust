@@ -3,18 +3,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use opencode_core::bus::{Bus, BusEventDef};
-
-// ============================================================================
-// Bus event definitions (matches TS SessionStatus.Event)
-// ============================================================================
-
-/// Event published when a session's run status changes.
-pub static SESSION_STATUS_EVENT: BusEventDef = BusEventDef::new("session.status");
-
-/// Deprecated event published when a session becomes idle.
-pub static SESSION_IDLE_EVENT: BusEventDef = BusEventDef::new("session.idle");
-
 // ============================================================================
 // Status types (matches TS SessionStatus.Info union type)
 // ============================================================================
@@ -42,22 +30,12 @@ pub enum SessionStatusInfo {
 
 pub struct SessionStatusManager {
     state: Arc<RwLock<HashMap<String, SessionStatusInfo>>>,
-    bus: Option<Arc<Bus>>,
 }
 
 impl SessionStatusManager {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(HashMap::new())),
-            bus: None,
-        }
-    }
-
-    /// Create a status manager with bus event publishing.
-    pub fn with_bus(bus: Arc<Bus>) -> Self {
-        Self {
-            state: Arc::new(RwLock::new(HashMap::new())),
-            bus: Some(bus),
         }
     }
 
@@ -75,28 +53,12 @@ impl SessionStatusManager {
         state.clone()
     }
 
-    /// Set the status for a session and publish bus events.
+    /// Set the status for a session.
     /// Matches TS `SessionStatus.set(sessionID, status)`.
     pub async fn set(&self, session_id: &str, status: SessionStatusInfo) {
-        // Publish status event
-        if let Some(ref bus) = self.bus {
-            let event_data = serde_json::json!({
-                "sessionID": session_id,
-                "status": status,
-            });
-            bus.publish(&SESSION_STATUS_EVENT, event_data).await;
-        }
-
         let mut state = self.state.write().await;
         match &status {
             SessionStatusInfo::Idle => {
-                // Publish deprecated idle event
-                if let Some(ref bus) = self.bus {
-                    let idle_data = serde_json::json!({
-                        "sessionID": session_id,
-                    });
-                    bus.publish(&SESSION_IDLE_EVENT, idle_data).await;
-                }
                 state.remove(session_id);
             }
             _ => {
@@ -209,14 +171,6 @@ mod tests {
         assert!(list.contains_key("ses_2"));
     }
 
-    #[tokio::test]
-    async fn test_with_bus() {
-        let bus = Arc::new(Bus::new());
-        let mgr = SessionStatusManager::with_bus(bus);
-        mgr.set_busy("ses_123").await;
-        assert!(mgr.is_busy("ses_123").await);
-    }
-
     #[test]
     fn status_serde_tag_roundtrip() {
         for status in [
@@ -239,24 +193,5 @@ mod tests {
         let mgr = SessionStatusManager::default();
         assert!(mgr.list().await.is_empty());
         assert!(!mgr.is_busy("ses_123").await);
-    }
-
-    #[tokio::test]
-    async fn idle_publishes_deprecated_event() {
-        let bus = Arc::new(Bus::new());
-        let mut rx = bus.subscribe_channel();
-        let mgr = SessionStatusManager::with_bus(bus);
-
-        mgr.set_busy("ses_123").await;
-        mgr.set_idle("ses_123").await;
-
-        let mut idle_seen = false;
-        while let Ok(event) = rx.try_recv() {
-            if event.event_type == SESSION_IDLE_EVENT.event_type {
-                idle_seen = true;
-                assert_eq!(event.properties["sessionID"], "ses_123");
-            }
-        }
-        assert!(idle_seen);
     }
 }

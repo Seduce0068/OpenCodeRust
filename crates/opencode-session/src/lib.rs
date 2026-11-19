@@ -42,6 +42,9 @@ pub use message_v2::*;
 pub use prompt::*;
 pub use retry::*;
 pub use revert::*;
+// Bus 削除で session モジュール由来の glob re-export が未使用と判定されるが、
+// 公開 API の互換維持のため残す（ambiguous_glob_reexports と同じ方針）。
+#[allow(unused_imports)]
 pub use session::*;
 pub use status::*;
 pub use summary::*;

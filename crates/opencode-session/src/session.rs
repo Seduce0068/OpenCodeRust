@@ -1,31 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use uuid::Uuid;
 
-use opencode_core::bus::{Bus, BusEventDef};
 use opencode_plugin::{HookContext, HookEvent};
 
 use crate::{MessagePart, MessageRole, SessionMessage};
-
-// ============================================================================
-// Bus Event Definitions (matches TS Session.Event)
-// ============================================================================
-
-pub static SESSION_CREATED_EVENT: BusEventDef = BusEventDef::new("session.created");
-pub static SESSION_UPDATED_EVENT: BusEventDef = BusEventDef::new("session.updated");
-pub static SESSION_DELETED_EVENT: BusEventDef = BusEventDef::new("session.deleted");
-pub static SESSION_DIFF_EVENT: BusEventDef = BusEventDef::new("session.diff");
-pub static SESSION_ERROR_EVENT: BusEventDef = BusEventDef::new("session.error");
-
-// Message-level events (matches TS MessageV2.Event)
-pub static MESSAGE_UPDATED_EVENT: BusEventDef = BusEventDef::new("message.updated");
-pub static MESSAGE_REMOVED_EVENT: BusEventDef = BusEventDef::new("message.removed");
-pub static PART_UPDATED_EVENT: BusEventDef = BusEventDef::new("message.part.updated");
-pub static PART_REMOVED_EVENT: BusEventDef = BusEventDef::new("message.part.removed");
-pub static PART_DELTA_EVENT: BusEventDef = BusEventDef::new("message.part.delta");
-pub static COMMAND_EXECUTED_EVENT: BusEventDef = BusEventDef::new("command.executed");
 
 // ============================================================================
 // Session Info Schema
@@ -742,7 +722,6 @@ pub struct SessionRow {
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     events: Vec<SessionEvent>,
-    bus: Option<Arc<Bus>>,
 }
 
 impl SessionManager {
@@ -750,71 +729,7 @@ impl SessionManager {
         Self {
             sessions: HashMap::new(),
             events: Vec::new(),
-            bus: None,
         }
-    }
-
-    /// Create a new SessionManager with a Bus for event publishing
-    pub fn with_bus(bus: Arc<Bus>) -> Self {
-        Self {
-            sessions: HashMap::new(),
-            events: Vec::new(),
-            bus: Some(bus),
-        }
-    }
-
-    /// Publish an event to the Bus (fire-and-forget from sync context)
-    fn publish_event(&self, def: &'static BusEventDef, properties: serde_json::Value) {
-        if let Some(ref bus) = self.bus {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let bus = bus.clone();
-                handle.spawn(async move {
-                    bus.publish(def, properties).await;
-                });
-            }
-        }
-    }
-
-    /// Publish a session info event (Created/Updated/Deleted)
-    fn publish_session_event(&self, def: &'static BusEventDef, session: &Session) {
-        if let Ok(json) = serde_json::to_value(session) {
-            self.publish_event(def, serde_json::json!({ "info": json }));
-        }
-    }
-
-    /// Publish a message event
-    fn publish_message_event(&self, def: &'static BusEventDef, msg: &SessionMessage) {
-        if let Ok(json) = serde_json::to_value(msg) {
-            self.publish_event(def, serde_json::json!({ "info": json }));
-        }
-    }
-
-    /// Publish a part event
-    fn publish_part_event(&self, def: &'static BusEventDef, part: &MessagePart) {
-        if let Ok(json) = serde_json::to_value(part) {
-            self.publish_event(def, serde_json::json!({ "part": json }));
-        }
-    }
-
-    /// Publish a part delta event (streaming text updates)
-    pub fn publish_part_delta(
-        &self,
-        session_id: &str,
-        message_id: &str,
-        part_id: &str,
-        field: &str,
-        delta: &str,
-    ) {
-        self.publish_event(
-            &PART_DELTA_EVENT,
-            serde_json::json!({
-                "sessionID": session_id,
-                "messageID": message_id,
-                "partID": part_id,
-                "field": field,
-                "delta": delta,
-            }),
-        );
     }
 
     /// Create a new session
@@ -828,9 +743,6 @@ impl SessionManager {
         self.events.push(SessionEvent::Created {
             info: session.clone(),
         });
-
-        // Publish to Bus
-        self.publish_session_event(&SESSION_CREATED_EVENT, &session);
 
         // Plugin hook: session.start — notify plugins of new session
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -855,7 +767,6 @@ impl SessionManager {
         self.events.push(SessionEvent::Created {
             info: child.clone(),
         });
-        self.publish_session_event(&SESSION_CREATED_EVENT, &child);
         Some(child)
     }
 
@@ -884,11 +795,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Created {
             info: forked.clone(),
         });
-        self.publish_session_event(&SESSION_CREATED_EVENT, &forked);
         Some(forked)
     }
 
-    /// Set share info and publish session.updated.
+    /// Set share info.
     pub fn share(&mut self, session_id: &str, url: impl Into<String>) -> Option<Session> {
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
@@ -898,11 +808,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Clear share info and publish session.updated.
+    /// Clear share info.
     pub fn unshare(&mut self, session_id: &str) -> Option<Session> {
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
@@ -912,11 +821,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Set archived time and publish session.updated.
+    /// Set archived time.
     pub fn set_archived(&mut self, session_id: &str, time: Option<i64>) -> Option<Session> {
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
@@ -926,11 +834,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Set permission rules and publish session.updated.
+    /// Set permission rules.
     pub fn set_permission(
         &mut self,
         session_id: &str,
@@ -944,11 +851,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Set revert info and publish session.updated.
+    /// Set revert info.
     pub fn set_revert(&mut self, session_id: &str, revert: SessionRevert) -> Option<Session> {
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
@@ -958,11 +864,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Clear revert info and publish session.updated.
+    /// Clear revert info.
     pub fn clear_revert(&mut self, session_id: &str) -> Option<Session> {
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
@@ -972,11 +877,10 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Set summary and publish session.updated.
+    /// Set summary.
     pub fn set_summary(&mut self, session_id: &str, summary: SessionSummary) -> Option<Session> {
         let updated = {
             let session = self.sessions.get_mut(session_id)?;
@@ -986,27 +890,17 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &updated);
         Some(updated)
     }
 
-    /// Publish command.executed event.
+    /// Retained for API compatibility; events are now emitted by the server.
     pub fn publish_command_executed(
         &self,
-        command_name: &str,
-        session_id: &str,
-        arguments: Vec<String>,
-        message_id: &str,
+        _command_name: &str,
+        _session_id: &str,
+        _arguments: Vec<String>,
+        _message_id: &str,
     ) {
-        self.publish_event(
-            &COMMAND_EXECUTED_EVENT,
-            serde_json::json!({
-                "name": command_name,
-                "sessionID": session_id,
-                "arguments": arguments,
-                "messageID": message_id,
-            }),
-        );
     }
 
     /// Get a session by ID
@@ -1072,9 +966,6 @@ impl SessionManager {
             info: session.clone(),
         });
 
-        // Publish to Bus
-        self.publish_session_event(&SESSION_DELETED_EVENT, &session);
-
         // Plugin hook: session.end — notify plugins of session deletion
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let session_id = session.id.clone();
@@ -1096,7 +987,6 @@ impl SessionManager {
         self.events.push(SessionEvent::Updated {
             info: session.clone(),
         });
-        self.publish_session_event(&SESSION_UPDATED_EVENT, &session);
     }
 
     /// Get events (and clear them)
@@ -1110,32 +1000,23 @@ impl SessionManager {
     }
 
     // ========================================================================
-    // Message/Part Operations with Bus Publishing
+    // Message/Part Operations
     // ========================================================================
 
-    /// Update a message in a session and publish Bus event
+    /// Update a message in a session
     pub fn update_message(&mut self, session_id: &str, msg: SessionMessage) -> Option<()> {
         let session = self.sessions.get_mut(session_id)?;
-        session.update_message(msg.clone());
-        self.publish_message_event(&MESSAGE_UPDATED_EVENT, &msg);
+        session.update_message(msg);
         Some(())
     }
 
-    /// Remove a message from a session and publish Bus event
+    /// Remove a message from a session
     pub fn remove_message(&mut self, session_id: &str, message_id: &str) -> Option<SessionMessage> {
         let session = self.sessions.get_mut(session_id)?;
-        let msg = session.remove_message(message_id)?;
-        self.publish_event(
-            &MESSAGE_REMOVED_EVENT,
-            serde_json::json!({
-                "sessionID": session_id,
-                "messageID": message_id,
-            }),
-        );
-        Some(msg)
+        session.remove_message(message_id)
     }
 
-    /// Update a part in a message and publish Bus event
+    /// Update a part in a message
     pub fn update_part(
         &mut self,
         session_id: &str,
@@ -1143,12 +1024,11 @@ impl SessionManager {
         part: MessagePart,
     ) -> Option<()> {
         let session = self.sessions.get_mut(session_id)?;
-        session.update_part(message_id, part.clone());
-        self.publish_part_event(&PART_UPDATED_EVENT, &part);
+        session.update_part(message_id, part);
         Some(())
     }
 
-    /// Remove a part from a message and publish Bus event
+    /// Remove a part from a message
     pub fn remove_part(
         &mut self,
         session_id: &str,
@@ -1156,51 +1036,13 @@ impl SessionManager {
         part_id: &str,
     ) -> Option<MessagePart> {
         let session = self.sessions.get_mut(session_id)?;
-        let part = session.remove_part(message_id, part_id)?;
-        self.publish_event(
-            &PART_REMOVED_EVENT,
-            serde_json::json!({
-                "sessionID": session_id,
-                "messageID": message_id,
-                "partID": part_id,
-            }),
-        );
-        Some(part)
-    }
-
-    /// Publish a session error event
-    pub fn publish_error(&self, session_id: Option<&str>, error: serde_json::Value) {
-        let mut props = serde_json::json!({ "error": error });
-        if let Some(sid) = session_id {
-            props["sessionID"] = serde_json::Value::String(sid.to_string());
-        }
-        self.publish_event(&SESSION_ERROR_EVENT, props);
-    }
-
-    /// Publish a session diff event
-    pub fn publish_diff(&self, session_id: &str, diffs: &[FileDiff]) {
-        if let Ok(diff_json) = serde_json::to_value(diffs) {
-            self.publish_event(
-                &SESSION_DIFF_EVENT,
-                serde_json::json!({
-                    "sessionID": session_id,
-                    "diff": diff_json,
-                }),
-            );
-        }
+        session.remove_part(message_id, part_id)
     }
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl SessionManager {
-    /// Set the Bus for event publishing (can be called after construction)
-    pub fn set_bus(&mut self, bus: Arc<Bus>) {
-        self.bus = Some(bus);
     }
 }
 
@@ -1239,8 +1081,6 @@ impl std::error::Error for BusyError {}
 mod tests {
     use super::*;
     use crate::MessageUsage;
-    use std::sync::Arc;
-    use tokio::time::{timeout, Duration};
 
     #[test]
     fn test_session_creation() {
@@ -1469,62 +1309,5 @@ mod tests {
         let diffs = session.diff();
         assert_eq!(diffs.len(), 2);
         assert_eq!(diffs[0].path, "src/main.rs");
-    }
-
-    #[tokio::test]
-    async fn session_share_publishes_updated_event() {
-        let bus = Arc::new(Bus::new());
-        let mut manager = SessionManager::with_bus(bus.clone());
-        let session = manager.create("project-1", "/path");
-        let mut rx = bus.subscribe_channel();
-
-        let updated = manager
-            .share(&session.id, "https://share.opencode.ai/test")
-            .expect("session should exist");
-        assert_eq!(
-            updated.share.as_ref().map(|share| share.url.as_str()),
-            Some("https://share.opencode.ai/test")
-        );
-
-        let event = timeout(Duration::from_secs(1), async {
-            loop {
-                let event = rx.recv().await.expect("event channel closed");
-                if event.event_type == SESSION_UPDATED_EVENT.event_type {
-                    break event;
-                }
-            }
-        })
-        .await
-        .expect("event timeout");
-        assert_eq!(event.event_type, SESSION_UPDATED_EVENT.event_type);
-        assert_eq!(event.properties["info"]["id"], session.id);
-        assert_eq!(
-            event.properties["info"]["share"]["url"],
-            "https://share.opencode.ai/test"
-        );
-    }
-
-    #[tokio::test]
-    async fn command_executed_event_is_published() {
-        let bus = Arc::new(Bus::new());
-        let manager = SessionManager::with_bus(bus.clone());
-        let mut rx = bus.subscribe_channel();
-
-        manager.publish_command_executed(
-            "review",
-            "session-1",
-            vec!["--fast".to_string()],
-            "message-1",
-        );
-
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("event timeout")
-            .expect("event channel closed");
-        assert_eq!(event.event_type, COMMAND_EXECUTED_EVENT.event_type);
-        assert_eq!(event.properties["name"], "review");
-        assert_eq!(event.properties["sessionID"], "session-1");
-        assert_eq!(event.properties["arguments"][0], "--fast");
-        assert_eq!(event.properties["messageID"], "message-1");
     }
 }

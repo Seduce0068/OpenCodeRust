@@ -20,10 +20,7 @@ pub mod protocol;
 pub mod tool;
 pub mod transport;
 
-pub use client::{
-    McpClient, McpClientError, McpClientRegistry, McpServerConfig, McpStatus,
-    MCP_TOOLS_CHANGED_EVENT,
-};
+pub use client::{McpClient, McpClientError, McpClientRegistry, McpServerConfig, McpStatus};
 pub use discovery::{
     discover_endpoints, AuthorizationServerMetadata, DiscoveryError, OAuthEndpoints,
     ProtectedResourceMetadata, RegisteredClient,

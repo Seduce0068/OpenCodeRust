@@ -2527,7 +2527,6 @@ impl SessionPrompt {
             worktree,
             Some(provider),
             Some(model_id),
-            None,
         )
         .await?;
 

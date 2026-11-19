@@ -2300,10 +2300,8 @@ dependencies = [
  "rand 0.10.3",
  "regex",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2347,7 +2345,6 @@ dependencies = [
  "dirs",
  "futures",
  "oauth2",
- "opencode-core",
  "reqwest",
  "reqwest-eventsource",
  "serde",

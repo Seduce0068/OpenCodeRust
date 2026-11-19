@@ -1,5 +1,4 @@
 use chrono::Utc;
-use opencode_core::bus::{Bus, BusEventDef};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -168,12 +167,9 @@ pub struct McpClient {
     execution_timeout_ms: u64,
     status: RwLock<McpStatus>,
     oauth_manager: RwLock<Option<Arc<McpOAuthManager>>>,
-    bus: Option<Arc<Bus>>,
     /// Set to true when a `notifications/tools/list_changed` is received.
     tools_changed: std::sync::atomic::AtomicBool,
 }
-
-pub static MCP_TOOLS_CHANGED_EVENT: BusEventDef = BusEventDef::new("mcp.tools.changed");
 
 impl McpClient {
     pub fn new(server_name: String, tool_registry: Arc<McpToolRegistry>) -> Self {
@@ -190,7 +186,6 @@ impl McpClient {
             execution_timeout_ms: DEFAULT_EXECUTION_MS,
             status: RwLock::new(McpStatus::Disabled),
             oauth_manager: RwLock::new(None),
-            bus: None,
             tools_changed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -210,11 +205,6 @@ impl McpClient {
     /// Sets the MCP protocol revision to negotiate during `initialize`.
     pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
         self.protocol_version = version.into();
-        self
-    }
-
-    pub fn with_bus(mut self, bus: Arc<Bus>) -> Self {
-        self.bus = Some(bus);
         self
     }
 
@@ -681,13 +671,6 @@ impl McpClient {
     pub async fn refresh_tools_if_needed(&self) -> Result<(), McpClientError> {
         if self.tools_changed.swap(false, Ordering::SeqCst) {
             self.load_tools().await?;
-            if let Some(bus) = &self.bus {
-                bus.publish(
-                    &MCP_TOOLS_CHANGED_EVENT,
-                    serde_json::json!({ "server": self.server_name }),
-                )
-                .await;
-            }
         }
         Ok(())
     }
@@ -812,7 +795,6 @@ impl McpClient {
 pub struct McpClientRegistry {
     clients: RwLock<HashMap<String, Arc<McpClient>>>,
     tool_registry: Arc<McpToolRegistry>,
-    bus: Option<Arc<Bus>>,
     /// Per-server status, including servers that failed to connect or are
     /// disabled.  Entries here may not have a corresponding client.
     statuses: RwLock<HashMap<String, McpStatus>>,
@@ -827,17 +809,11 @@ impl McpClientRegistry {
         Self {
             clients: RwLock::new(HashMap::new()),
             tool_registry: Arc::new(McpToolRegistry::new()),
-            bus: None,
             statuses: RwLock::new(HashMap::new()),
             connection_configs: RwLock::new(HashMap::new()),
             logs: RwLock::new(HashMap::new()),
             oauth_manager: RwLock::new(None),
         }
-    }
-
-    pub fn with_bus(mut self, bus: Arc<Bus>) -> Self {
-        self.bus = Some(bus);
-        self
     }
 
     // -- Status helpers ------------------------------------------------------
@@ -892,9 +868,6 @@ impl McpClientRegistry {
         if let Some(protocol) = config.protocol.as_ref() {
             client_impl = client_impl.with_protocol_version(protocol.clone());
         }
-        if let Some(bus) = &self.bus {
-            client_impl = client_impl.with_bus(bus.clone());
-        }
         let client = Arc::new(client_impl);
 
         match client.connect_stdio(config).await {
@@ -946,9 +919,6 @@ impl McpClientRegistry {
         if let Some(manager) = self.oauth_manager.read().await.as_ref() {
             client_impl = client_impl.with_oauth_manager(manager.clone()).await;
         }
-        if let Some(bus) = &self.bus {
-            client_impl = client_impl.with_bus(bus.clone());
-        }
         let client = Arc::new(client_impl);
 
         match client.connect_http(url, headers).await {
@@ -993,9 +963,6 @@ impl McpClientRegistry {
         }
         if let Some(manager) = self.oauth_manager.read().await.as_ref() {
             client_impl = client_impl.with_oauth_manager(manager.clone()).await;
-        }
-        if let Some(bus) = &self.bus {
-            client_impl = client_impl.with_bus(bus.clone());
         }
         let client = Arc::new(client_impl);
 
@@ -1110,7 +1077,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::VecDeque;
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{sleep, Duration};
 
     struct MockTransport {
         messages: Mutex<VecDeque<(Duration, Option<JsonRpcMessage>)>>,
@@ -1197,12 +1164,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_tools_if_needed_publishes_bus_event_and_reloads_tools() {
-        let bus = Arc::new(Bus::new());
-        let mut rx = bus.subscribe_channel();
+    async fn refresh_tools_if_needed_reloads_tools() {
         let tool_registry = Arc::new(McpToolRegistry::new());
-        let client =
-            McpClient::new("server-a".to_string(), tool_registry.clone()).with_bus(bus.clone());
+        let client = McpClient::new("server-a".to_string(), tool_registry.clone());
 
         tool_registry
             .register(crate::tool::McpTool::new(
@@ -1243,13 +1207,6 @@ mod tests {
             .refresh_tools_if_needed()
             .await
             .expect("tools should refresh successfully");
-
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("event should arrive")
-            .expect("event channel should be open");
-        assert_eq!(event.event_type, MCP_TOOLS_CHANGED_EVENT.event_type);
-        assert_eq!(event.properties["server"], "server-a");
 
         let tools = tool_registry.list_for_server("server-a").await;
         assert_eq!(tools.len(), 1);
