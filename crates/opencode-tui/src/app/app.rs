@@ -1135,8 +1135,9 @@ impl App {
         if self.skill_list_dialog.is_open() {
             return self.skill_list_dialog.handle_click(col, row);
         }
-        // Slash popup has no click map in scope: keep the previous close-on-click
-        // behaviour for it rather than swallowing every click while it is open.
+        if self.slash_popup.is_open() {
+            return self.slash_popup.handle_click(col, row);
+        }
         if self.command_palette.is_open() {
             return self.command_palette.handle_click(col, row);
         }

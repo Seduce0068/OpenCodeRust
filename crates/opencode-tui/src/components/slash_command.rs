@@ -9,6 +9,8 @@ use ratatui::{
 use crate::command::{CommandAction, CommandRegistry};
 use crate::theme::Theme;
 
+use super::dialogs::DialogClickMap;
+
 pub struct SlashCommandPopup {
     pub registry: CommandRegistry,
     pub query: String,
@@ -16,6 +18,8 @@ pub struct SlashCommandPopup {
     pub state: ListState,
     pub open: bool,
     pub selected_action: Option<CommandAction>,
+    /// 描画ジオメトリを記録し、クリック位置を項目インデックスへ変換する。
+    click_map: DialogClickMap,
 }
 
 impl SlashCommandPopup {
@@ -27,6 +31,7 @@ impl SlashCommandPopup {
             state: ListState::default(),
             open: false,
             selected_action: None,
+            click_map: DialogClickMap::default(),
         }
     }
 
@@ -42,6 +47,9 @@ impl SlashCommandPopup {
         self.open = false;
         self.query.clear();
         self.filtered.clear();
+        // Drop the previous frame geometry so a stale map cannot swallow a click
+        // before the next render records a fresh one.
+        self.click_map.clear();
     }
 
     pub fn is_open(&self) -> bool {
@@ -114,8 +122,20 @@ impl SlashCommandPopup {
         }
     }
 
+    /// ポインタ下の項目を選択する。ダイアログ枠内のクリックを消費し、
+    /// 背景クリックは `false` を返して呼び出し側の close 処理へ委譲する。
+    pub fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(index) = self.click_map.item_at(col, row) {
+            self.state.select(Some(index));
+        }
+        self.click_map.contains(col, row)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open || self.filtered.is_empty() {
+            // 非表示／候補なしのときは前フレームのジオメトリを破棄し、
+            // 見えないポップアップが背景クリックを飲み込まないようにする。
+            self.click_map.clear();
             return;
         }
 
@@ -164,14 +184,19 @@ impl SlashCommandPopup {
             })
             .collect();
 
+        let block = Block::default()
+            .title(query_line)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border));
+        let list_area = block.inner(popup_area);
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(query_line)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.border)),
-            )
+            .block(block)
             .highlight_style(Style::default().fg(theme.primary));
+
+        self.click_map.set_area(popup_area);
+        // The popup renders its list without stateful scrolling, so the visible
+        // offset is always zero.
+        self.click_map.set_list(list_area, 0, self.filtered.len());
 
         frame.render_widget(list, popup_area);
     }
@@ -186,6 +211,7 @@ impl Default for SlashCommandPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     /// Stable (sorted) view of the built-in suggested command names.
     fn suggested_names() -> Vec<String> {
@@ -406,5 +432,79 @@ mod tests {
             popup.move_up();
         }
         assert_eq!(popup.state.selected(), Some(0));
+    }
+
+    // --- mouse hit testing ---
+
+    /// Reproduce the frame rectangle computed by `SlashCommandPopup::render`.
+    fn rendered_frame(area: Rect, filtered_len: usize) -> Rect {
+        let width = 50.min(area.width.saturating_sub(4));
+        let height = (10.min(filtered_len) as u16).saturating_add(2);
+        let x = area.x + (area.width - width) / 2;
+        let y = area.y.saturating_sub(height + 1);
+        Rect::new(x.max(1), y.max(1), width, height)
+    }
+
+    fn render_open_popup(popup: &SlashCommandPopup, area: Rect) {
+        let theme = Theme::default();
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal
+            .draw(|frame| popup.render(frame, area, &theme))
+            .expect("draw should succeed");
+    }
+
+    #[test]
+    fn click_on_rendered_item_selects_it_and_consumes_click() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let area = Rect::new(0, 0, 80, 24);
+        render_open_popup(&popup, area);
+
+        let frame = rendered_frame(area, popup.filtered.len());
+        let item_col = frame.x + 1;
+        let item_row = frame.y + 1 + 2;
+        assert!(popup.handle_click(item_col, item_row));
+        assert_eq!(popup.state.selected(), Some(2));
+        assert!(popup.is_open());
+        assert!(popup.selected_action.is_none());
+    }
+
+    #[test]
+    fn click_on_popup_border_is_consumed_without_changing_selection() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let area = Rect::new(0, 0, 80, 24);
+        render_open_popup(&popup, area);
+
+        let frame = rendered_frame(area, popup.filtered.len());
+        assert!(popup.handle_click(frame.x, frame.y));
+        assert_eq!(popup.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn click_outside_rendered_popup_is_not_consumed() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let area = Rect::new(0, 0, 80, 24);
+        render_open_popup(&popup, area);
+
+        let frame = rendered_frame(area, popup.filtered.len());
+        assert!(!popup.handle_click(frame.x.saturating_sub(1), frame.y + 2));
+        assert_eq!(popup.state.selected(), Some(0));
+        assert!(popup.is_open());
+    }
+
+    #[test]
+    fn close_discards_recorded_click_geometry() {
+        let mut popup = SlashCommandPopup::new();
+        popup.open();
+        let area = Rect::new(0, 0, 80, 24);
+        render_open_popup(&popup, area);
+        let frame = rendered_frame(area, popup.filtered.len());
+
+        popup.close();
+
+        assert!(!popup.handle_click(frame.x + 1, frame.y + 1));
     }
 }

@@ -78,12 +78,14 @@ cannot block later items.
 
 #### Single-writer operational constraint
 
-Run one server process against a given SQLite database. The conditional claim
-prevents duplicate claims and overlapping queue items, but session snapshots
-are held in process memory and synchronized as whole-session state. Multiple
-server processes sharing the database can therefore overwrite each other's
-session snapshots. The startup reset of `processing` rows also assumes there
-is no other live server process using that database.
+One SQLite database must be owned by exactly one storage-backed `ServerState`,
+which in turn means one server process. The conditional claim prevents
+duplicate claims and overlapping queue items, but session snapshots are held in
+process memory and synchronized as whole-session state. A second
+storage-backed `ServerState`, even within the same process, keeps its own
+in-memory snapshots, so two states sharing the database can overwrite each
+other's session snapshots. The startup reset of `processing` rows also assumes
+there is no other live storage-backed `ServerState` using that database.
 
 ### Consequences
 
@@ -96,8 +98,10 @@ is no other live server process using that database.
   to recreate or reuse the session message.
 - Provider failures are not automatically retried; operators can inspect
   `failed` rows and explicitly re-enqueue work.
-- Multiple active server processes per database are unsupported until session
-  state is moved to coordinated, transactional storage.
+- One SQLite database supports exactly one storage-backed `ServerState` (one
+  server process). Multiple active server processes or states sharing a
+  database are unsupported until session state is moved to coordinated,
+  transactional storage.
 
 ### Verification
 
