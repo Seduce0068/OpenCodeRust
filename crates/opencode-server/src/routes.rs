@@ -3219,8 +3219,9 @@ async fn start_mcp_auth(Path(name): Path<String>) -> Result<Json<serde_json::Val
 #[derive(Debug, Deserialize)]
 pub struct McpAuthCallbackRequest {
     pub code: String,
-    /// CSRF state returned by the authorization server. Optional for
-    /// compatibility with callers that only forward the code.
+    /// CSRF state returned by the authorization server. Required: a missing
+    /// value is rejected with 400 rather than falling back to the stored state,
+    /// which would make the state comparison vacuous.
     #[serde(default)]
     pub state: Option<String>,
 }
@@ -3229,10 +3230,16 @@ async fn mcp_auth_callback(
     Path(name): Path<String>,
     Json(req): Json<McpAuthCallbackRequest>,
 ) -> Result<Json<McpStatusInfo>> {
+    // The caller must echo back the state it received. Without this check,
+    // handle_callback would compare the stored state against itself and a
+    // code-only callback could complete the authorization flow.
+    let state = req.state.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("mcp oauth callback requires the state parameter".to_string())
+    })?;
     let manager = get_mcp_oauth_manager();
     ensure_mcp_server_registered(manager, &name).await?;
     let server_info = manager
-        .handle_callback(&name, &req.code, req.state.as_deref())
+        .handle_callback(&name, &req.code, Some(state))
         .await
         .map_err(mcp_error_to_api_error)?;
 
@@ -5439,6 +5446,32 @@ mod mcp_loaded_config_tests {
             }
             McpRuntimeConfig::Local(_) => panic!("expected remote config"),
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_callback_tests {
+    use super::*;
+
+    /// state を省略した callback は 400 を返す。保存済み state をフォールバックに
+    /// すると比較が自明になり CSRF 検証が無効化されるため、ハンドラで必ず拒否する。
+    #[tokio::test]
+    async fn callback_without_state_returns_bad_request() {
+        let result = mcp_auth_callback(
+            Path("remote".to_string()),
+            Json(McpAuthCallbackRequest {
+                code: "dummy-code".to_string(),
+                state: None,
+            }),
+        )
+        .await;
+
+        let error = result.expect_err("missing state must be rejected before any exchange");
+        assert!(
+            matches!(&error, ApiError::BadRequest(message) if message.contains("state")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }
 

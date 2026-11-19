@@ -121,13 +121,14 @@ pub(crate) async fn migrate_pool(pool: &SqlitePool) -> Result<(), DatabaseError>
     Ok(())
 }
 
-/// すべてのプール生成経路が共有する接続設定。
+/// すべてのプール生成経路（`Database::new` / `Database::in_memory` / `Storage::new`）が
+/// 共有する接続設定。
 ///
 /// SQLite は `PRAGMA foreign_keys` が既定で OFF のため、`schema.rs` の
 /// `ON DELETE CASCADE`（6 件）が何も発動しない。`after_connect` はプールが
 /// 新規接続を確立するたびに呼ばれるので、ここで有効化すれば
 /// 通常クエリにも `begin()` 由来のトランザクションにも同じ設定が適用される。
-fn sqlite_pool_options(max_connections: u32) -> SqlitePoolOptions {
+pub(crate) fn sqlite_pool_options(max_connections: u32) -> SqlitePoolOptions {
     SqlitePoolOptions::new()
         .max_connections(max_connections)
         .after_connect(|conn, _meta| {

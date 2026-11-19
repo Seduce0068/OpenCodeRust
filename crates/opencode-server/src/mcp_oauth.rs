@@ -531,17 +531,16 @@ impl McpOAuthManager {
                 .ok_or_else(|| McpOAuthError::OAuthFailed("No pending OAuth flow".to_string()))?;
         }
 
-        // Exchange the authorization code for tokens. This validates the CSRF
-        // state and persists the access/refresh tokens.
+        // The caller must echo back the CSRF state. Falling back to the stored
+        // state would make finish_auth's comparison vacuous, so reject a
+        // missing value before any discovery or token exchange happens.
+        let state = returned_state.ok_or_else(|| {
+            McpOAuthError::OAuthFailed("OAuth callback requires the state parameter".to_string())
+        })?;
         let oauth_client = self.oauth_client_for(server_name).await?;
-        let expected_state = opencode_mcp::auth::get_oauth_state(server_name).await;
-        let state = returned_state
-            .map(str::to_string)
-            .or(expected_state)
-            .ok_or_else(|| McpOAuthError::OAuthFailed("No pending OAuth state".to_string()))?;
 
         oauth_client
-            .finish_auth(code, &state)
+            .finish_auth(code, state)
             .await
             .map_err(|e| McpOAuthError::OAuthFailed(e.to_string()))?;
 
@@ -1504,6 +1503,44 @@ mod tests {
             .expect_err("callback without a started flow must fail");
         assert!(
             matches!(&error, McpOAuthError::OAuthFailed(message) if message == "No pending OAuth flow"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_callback_requires_returned_state() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+        // Seed a pending flow so the missing state is the only failure.
+        {
+            let mut states = manager.oauth_states.write().await;
+            states.insert(
+                "remote".to_string(),
+                McpOAuthState {
+                    server_name: "remote".to_string(),
+                    authorization_url: "https://idp.example.com/authorize".to_string(),
+                    client_id: None,
+                    status: McpOAuthStatus::Pending,
+                },
+            );
+        }
+
+        let error = manager
+            .handle_callback("remote", "dummy-code", None)
+            .await
+            .expect_err("a callback without state must be rejected");
+        assert!(
+            matches!(&error, McpOAuthError::OAuthFailed(message) if message.contains("state")),
             "unexpected error: {error}"
         );
     }
