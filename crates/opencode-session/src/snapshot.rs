@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 #[derive(Debug, Clone)]
@@ -25,6 +25,21 @@ impl Snapshot {
     }
 
     pub fn revert(directory: &Path, patches: Vec<SnapshotPatch>) -> Result<()> {
+        Self::revert_with_ls_tree(directory, patches, git_output)
+    }
+
+    /// Same as [`Snapshot::revert`], but allows the `ls-tree` probe to be supplied by callers.
+    ///
+    /// Keeping the probe injectable lets tests exercise the fail-closed branch without
+    /// depending on git internals failing in a particular way.
+    fn revert_with_ls_tree<F>(
+        directory: &Path,
+        patches: Vec<SnapshotPatch>,
+        ls_tree: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Path, &Path, &[&str]) -> Result<Output>,
+    {
         let git_dir = ensure_snapshot_repo(directory)?;
         let mut seen = HashSet::new();
 
@@ -32,33 +47,59 @@ impl Snapshot {
             for file in patch.files {
                 let file_path = PathBuf::from(&file);
                 let relative = relative_to_worktree(directory, &file_path);
-                if relative.is_empty() || !seen.insert(relative.clone()) {
+                if relative.is_empty()
+                    || !is_worktree_relative(&relative)
+                    || !seen.insert(relative.clone())
+                {
                     continue;
                 }
 
-                let checkout = git_output(
+                let checkout = git_output_allow_failure(
                     directory,
                     &git_dir,
                     &["checkout", &patch.hash, "--", &relative],
-                );
-                if checkout.is_err() {
-                    // If file does not exist in snapshot, delete it locally.
-                    let exists_in_tree = git_output(
-                        directory,
-                        &git_dir,
-                        &["ls-tree", &patch.hash, "--", &relative],
-                    )
-                    .ok()
-                    .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
-                    .unwrap_or(false);
+                )?;
+                if checkout.status.success() {
+                    continue;
+                }
 
-                    if !exists_in_tree {
-                        let absolute = if file_path.is_absolute() {
-                            file_path
-                        } else {
-                            directory.join(&relative)
-                        };
-                        let _ = fs::remove_file(absolute);
+                // Only a "pathspec is not in the tree" failure is eligible for deletion.
+                // Other checkout failures (permission, lock, conflict, ...) must not
+                // be mistaken for an absent path.
+                if !checkout_failure_is_missing_path(&checkout) {
+                    continue;
+                }
+
+                // Confirm absence with ls-tree. If the probe itself fails, bail out
+                // instead of deleting: we can no longer prove the file is absent.
+                let tree_output = ls_tree(
+                    directory,
+                    &git_dir,
+                    &["ls-tree", &patch.hash, "--", &relative],
+                )?;
+                let exists_in_tree = !String::from_utf8_lossy(&tree_output.stdout)
+                    .trim()
+                    .is_empty();
+                if exists_in_tree {
+                    continue;
+                }
+
+                let absolute = if file_path.is_absolute() {
+                    file_path
+                } else {
+                    directory.join(&relative)
+                };
+                match fs::remove_file(&absolute) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Already gone; the desired end state is satisfied.
+                    }
+                    Err(err) => {
+                        anyhow::bail!(
+                            "failed to delete file absent from snapshot: {}: {}",
+                            absolute.display(),
+                            err
+                        );
                     }
                 }
             }
@@ -227,15 +268,7 @@ fn ensure_snapshot_repo(directory: &Path) -> Result<PathBuf> {
 }
 
 fn git_output(directory: &Path, git_dir: &Path, args: &[&str]) -> Result<Output> {
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir)
-        .arg("--work-tree")
-        .arg(directory)
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .with_context(|| format!("failed to run git command: git {}", args.join(" ")))?;
+    let output = git_output_allow_failure(directory, git_dir, args)?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -246,6 +279,35 @@ fn git_output(directory: &Path, git_dir: &Path, args: &[&str]) -> Result<Output>
     }
 
     Ok(output)
+}
+
+/// Run a git command and return its raw output, including a non-zero exit status.
+///
+/// Only a failure to spawn the process is reported as an error. Callers decide
+/// how to interpret the status and stderr, which is required to classify a
+/// failed `git checkout` safely.
+fn git_output_allow_failure(directory: &Path, git_dir: &Path, args: &[&str]) -> Result<Output> {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(directory)
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .with_context(|| format!("failed to run git command: git {}", args.join(" ")))
+}
+
+/// Whether a failed `git checkout` means the pathspec is absent from the tree.
+///
+/// Git reports this as `pathspec '<path>' did not match any file(s) known to git`.
+/// The second, looser check covers git versions/variants with slightly different
+/// wording. An unrecognised failure is deliberately treated as "not absent", so
+/// no file is deleted on that basis.
+fn checkout_failure_is_missing_path(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("did not match any file(s) known to git")
+        || (stderr.contains("pathspec") && stderr.contains("did not match"))
 }
 
 fn git_add_all(directory: &Path, git_dir: &Path) -> Result<()> {
@@ -275,10 +337,27 @@ fn relative_to_worktree(worktree: &Path, input: &Path) -> String {
     }
 }
 
+/// Whether a worktree-relative path stays inside the worktree.
+///
+/// `SnapshotPatch.files` is publicly constructible, so callers can supply
+/// paths such as `"../outside.txt"`. Those must be excluded before any git
+/// operation or deletion is attempted.
+fn is_worktree_relative(relative: &str) -> bool {
+    Path::new(relative)
+        .components()
+        .all(|component| match component {
+            Component::ParentDir | Component::RootDir => false,
+            #[cfg(windows)]
+            Component::Prefix(_) => false,
+            _ => true,
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Snapshot;
+    use super::{checkout_failure_is_missing_path, git_output, Snapshot, SnapshotPatch};
     use std::fs;
+    use std::process::Output;
     use tempfile::tempdir;
 
     fn is_hex_40(s: &str) -> bool {
@@ -322,6 +401,142 @@ mod tests {
         assert!(
             diffs.iter().any(|d| d.path == "diff_full.txt"),
             "expected file change in diff_full"
+        );
+    }
+
+    #[test]
+    fn revert_deletes_file_absent_from_snapshot() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        let tracked = root.join("tracked.txt");
+        fs::write(&tracked, "keep\n").expect("write tracked file");
+        let hash = Snapshot::track(root).expect("track snapshot");
+
+        // Created after the snapshot, so it is provably absent from the tree.
+        let extra = root.join("extra.txt");
+        fs::write(&extra, "delete me\n").expect("write extra file");
+        assert!(extra.exists());
+
+        Snapshot::revert(
+            root,
+            vec![SnapshotPatch {
+                hash,
+                files: vec![extra.to_string_lossy().to_string()],
+            }],
+        )
+        .expect("revert");
+
+        assert!(!extra.exists(), "file absent from snapshot must be deleted");
+        assert!(tracked.exists(), "unrelated tracked file must survive");
+    }
+
+    #[test]
+    fn revert_keeps_file_present_in_snapshot() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        let file = root.join("present.txt");
+        fs::write(&file, "original\n").expect("write file");
+        let hash = Snapshot::track(root).expect("track snapshot");
+
+        fs::write(&file, "modified\n").expect("modify file");
+
+        Snapshot::revert(
+            root,
+            vec![SnapshotPatch {
+                hash,
+                files: vec![file.to_string_lossy().to_string()],
+            }],
+        )
+        .expect("revert");
+
+        assert_eq!(
+            fs::read_to_string(&file).expect("read file"),
+            "original\n",
+            "file present in snapshot must be restored, not deleted"
+        );
+    }
+
+    #[test]
+    fn checkout_failure_is_missing_path_only_for_pathspec_errors() {
+        // Classify stderr directly: relying on how a particular git version
+        // reports a directory/file conflict is environment-dependent.
+        // Build a real Output via a failing process, then override only stderr.
+        let mut pathspec = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("run git for Output fixture");
+        pathspec.stdout = Vec::new();
+        pathspec.stderr = b"error: pathspec 'x' did not match any file(s) known to git\n".to_vec();
+        assert!(checkout_failure_is_missing_path(&pathspec));
+
+        let mut conflict: Output = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("run git for Output fixture");
+        conflict.stdout = Vec::new();
+        conflict.stderr =
+            b"error: Your local changes to 'x' would be overwritten by checkout\n".to_vec();
+        assert!(!checkout_failure_is_missing_path(&conflict));
+    }
+
+    #[test]
+    fn revert_fails_closed_when_ls_tree_fails() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        let tracked = root.join("tracked.txt");
+        fs::write(&tracked, "keep\n").expect("write tracked file");
+        let hash = Snapshot::track(root).expect("track snapshot");
+
+        let extra = root.join("extra.txt");
+        fs::write(&extra, "must survive\n").expect("write extra file");
+
+        let result = Snapshot::revert_with_ls_tree(
+            root,
+            vec![SnapshotPatch {
+                hash,
+                files: vec![extra.to_string_lossy().to_string()],
+            }],
+            |directory, git_dir, args| {
+                if args.first() == Some(&"ls-tree") {
+                    anyhow::bail!("forced ls-tree failure");
+                }
+                git_output(directory, git_dir, args)
+            },
+        );
+
+        assert!(result.is_err(), "ls-tree failure must be returned as Err");
+        assert!(
+            extra.exists(),
+            "file must not be deleted when ls-tree fails"
+        );
+    }
+
+    #[test]
+    fn revert_does_not_delete_outside_worktree_via_parent_dir() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("worktree");
+        fs::create_dir(&root).expect("create worktree");
+        let tracked = root.join("tracked.txt");
+        fs::write(&tracked, "keep\n").expect("write tracked file");
+        let hash = Snapshot::track(&root).expect("track snapshot");
+
+        // Publicly constructible patches may contain a traversal path. The file
+        // lives outside the worktree and must never become a deletion target.
+        let outside = temp.path().join("outside.txt");
+        fs::write(&outside, "must survive\n").expect("write outside file");
+
+        Snapshot::revert(
+            &root,
+            vec![SnapshotPatch {
+                hash,
+                files: vec!["../outside.txt".to_string()],
+            }],
+        )
+        .expect("revert");
+
+        assert!(
+            outside.exists(),
+            "file outside worktree must not be deleted"
         );
     }
 }
