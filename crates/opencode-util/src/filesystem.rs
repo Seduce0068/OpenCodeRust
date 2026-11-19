@@ -109,10 +109,19 @@ impl Filesystem {
 
             for entry in WalkDir::new(&current)
                 .max_depth(1)
-                .follow_links(true)
+                .follow_links(false)
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
+                // 外部ディレクトリの権限チェックなしで検索ルートを走査するため、
+                // シンボリックリンクを辿ると外部のファイル名を返してしまう。
+                // follow_links(false) はリンクを traverse しないが、リンク自身は
+                // エントリとして返る。path.is_file() はリンク先を辿るため、
+                // リンク自身を明示的に除外する。symlink cycle も構造的に防ぐ。
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
+
                 let path = entry.path();
                 if path.is_file() {
                     if let Ok(rel) = path.strip_prefix(&current) {
@@ -142,6 +151,15 @@ impl Filesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos))
+    }
 
     #[tokio::test]
     async fn test_exists() {
@@ -159,5 +177,49 @@ mod tests {
     async fn test_find_up() {
         let results = Filesystem::find_up("Cargo.toml", ".", None).await;
         assert!(!results.is_empty());
+    }
+
+    /// 通常ファイルの glob マッチが従来どおり機能すること。
+    #[tokio::test]
+    async fn glob_up_matches_regular_files() {
+        let dir = unique_temp_dir("opencode-util-glob");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.join("b.txt"), "text").unwrap();
+
+        let result = Filesystem::glob_up("*.rs", dir.as_path(), Some(dir.as_path())).await;
+        assert_eq!(result, vec![dir.join("a.rs")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 検索ルート内の symlink が外部のファイル／ディレクトリを指しても、
+    /// 外部のファイル名を返してはならない（権限すり抜け回帰テスト）。
+    /// 同一ディレクトリ内の正当な symlink も非追跡となるのは、前回の
+    /// glob/read/ls ツールと同じトレードオフである。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_up_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_temp_dir("opencode-util-glob");
+        let outside = unique_temp_dir("opencode-util-outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leaked.rs"), "fn leaked() {}").unwrap();
+        std::fs::write(dir.join("normal.rs"), "fn normal() {}").unwrap();
+
+        symlink(&outside, dir.join("outside_link")).unwrap();
+        symlink(outside.join("leaked.rs"), dir.join("leaked_link.rs")).unwrap();
+        symlink(dir.join("normal.rs"), dir.join("local_link.rs")).unwrap();
+
+        // path.is_file() はリンク先を辿るため、follow_links(false) だけでは
+        // leaked_link.rs / local_link.rs が結果に残る。リンク自身を除外する
+        // ことで、外部への漏洩と重複をともに防ぐ。
+        let result = Filesystem::glob_up("*.rs", dir.as_path(), Some(dir.as_path())).await;
+        assert_eq!(result, vec![dir.join("normal.rs")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 }

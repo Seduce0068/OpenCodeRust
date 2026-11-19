@@ -156,6 +156,22 @@ fn session_routes() -> Router<Arc<ServerState>> {
         .route("/{id}/diff", get(get_session_diff))
 }
 
+/// クライアントが指定できる `limit` クエリのサーバ側上限。
+///
+/// 極端な値（例: `?limit=18446744073709551615`）が巨大リポジトリの全走査や
+/// 全メッセージのシリアライズを誘発するのを防ぐ安全上限。超過時はこの値へ
+/// クランプする方針を採り、レスポンスの wire format は変更しない。
+const MAX_LIMIT: usize = 5000;
+
+/// クエリの `limit` を [`MAX_LIMIT`] 以下へクランプする純粋ヘルパ。
+///
+/// - `None` はそのまま `None`（未指定時の既存意味論を維持）
+/// - `Some(v)` は `v.min(MAX_LIMIT)`（上限ちょうどは不変、上限超のみクランプ）
+/// - `Some(0)` はそのまま `Some(0)`（`limit=0` の既存意味論を維持）
+fn clamp_limit(limit: Option<usize>) -> Option<usize> {
+    limit.map(|v| v.min(MAX_LIMIT))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListSessionsQuery {
     pub directory: Option<String>,
@@ -278,7 +294,7 @@ async fn list_sessions(
         roots: query.roots.unwrap_or(false),
         start: query.start,
         search: query.search,
-        limit: query.limit,
+        limit: clamp_limit(query.limit),
     };
     let manager = state.sessions.lock().await;
     let sessions = manager.list_filtered(filter);
@@ -1128,8 +1144,9 @@ async fn list_messages(
     // offset/limit が指定されたときだけ skip/take を適用する。
     // 未指定時は従来どおり全件を返し、wire format を維持する。
     // limit=0 は take(0)、範囲外 offset は skip(len 超) により空結果になる。
+    // limit は MAX_LIMIT 以下へクランプする（未指定・上限以下は既存挙動を維持）。
     let messages = session.messages.iter();
-    let infos: Vec<MessageInfo> = match (query.offset, query.limit) {
+    let infos: Vec<MessageInfo> = match (query.offset, clamp_limit(query.limit)) {
         (Some(offset), Some(limit)) => messages
             .skip(offset)
             .take(limit)
@@ -3940,7 +3957,7 @@ fn collect_find_files(
 
 async fn find_files(Query(query): Query<FindFilesQuery>) -> Result<Json<Vec<String>>> {
     let base_path = project_root()?;
-    let limit = query.limit.unwrap_or(100);
+    let limit = clamp_limit(query.limit).unwrap_or(100);
     let name_query = query.query;
     let file_type = parse_find_file_type(query.file_type.as_deref());
 
@@ -6169,6 +6186,43 @@ mod message_info_wire_format_tests {
 }
 
 #[cfg(test)]
+mod limit_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_limit_stays_none() {
+        // 未指定は None のまま（各ハンドラの「全件/デフォルト」意味論を維持）。
+        assert_eq!(clamp_limit(None), None);
+    }
+
+    #[test]
+    fn limit_below_max_is_unchanged() {
+        assert_eq!(clamp_limit(Some(1)), Some(1));
+        assert_eq!(clamp_limit(Some(3)), Some(3));
+        assert_eq!(clamp_limit(Some(MAX_LIMIT - 1)), Some(MAX_LIMIT - 1));
+    }
+
+    #[test]
+    fn limit_at_max_is_unchanged() {
+        // 上限ちょうどは境界値としてそのまま通す。
+        assert_eq!(clamp_limit(Some(MAX_LIMIT)), Some(MAX_LIMIT));
+    }
+
+    #[test]
+    fn limit_above_max_is_clamped() {
+        assert_eq!(clamp_limit(Some(MAX_LIMIT + 1)), Some(MAX_LIMIT));
+        // 攻撃ベクトル（usize::MAX = 18446744073709551615 on 64-bit）。
+        assert_eq!(clamp_limit(Some(usize::MAX)), Some(MAX_LIMIT));
+    }
+
+    #[test]
+    fn limit_zero_is_preserved() {
+        // limit=0 の既存意味論（空結果）を維持する。
+        assert_eq!(clamp_limit(Some(0)), Some(0));
+    }
+}
+
+#[cfg(test)]
 mod list_messages_pagination_tests {
     use super::*;
 
@@ -6271,6 +6325,16 @@ mod list_messages_pagination_tests {
         let (state, session_id) = state_with_messages(3).await;
         let ids = list_ids(&state, &session_id, Some(0), None).await;
         assert!(ids.is_empty(), "limit=0 は空結果");
+    }
+
+    #[tokio::test]
+    async fn huge_limit_is_clamped_and_keeps_wire_compat() {
+        // 上限超の limit はクランプされ、実データ件数（ここでは 5 件）に
+        // 対して未指定時と同じ全件結果になる（レスポンス型・順序は不変）。
+        let (state, session_id) = state_with_messages(5).await;
+        let expected = list_ids(&state, &session_id, None, None).await;
+        let ids = list_ids(&state, &session_id, Some(usize::MAX), None).await;
+        assert_eq!(ids, expected, "上限超 limit はクランプされ全件取得と同等");
     }
 
     // --- Query エクストラクタのデシリアライズ経路（実 HTTP サーバは起動しない） ---
