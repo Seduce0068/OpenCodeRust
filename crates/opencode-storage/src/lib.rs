@@ -21,7 +21,7 @@ pub use repository::{
 pub use schema::*;
 
 use anyhow::Result;
-use sqlx::{sqlite::SqlitePool, Pool, Sqlite};
+use sqlx::{Pool, Sqlite};
 
 pub struct Storage {
     pool: Pool<Sqlite>,
@@ -29,7 +29,12 @@ pub struct Storage {
 
 impl Storage {
     pub async fn new(db_path: &str) -> Result<Self> {
-        let pool = SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
+        // Database と同じ pool options を使い、全接続で PRAGMA foreign_keys = ON を適用する。
+        // 直接 SqlitePool::connect すると FK が OFF のプールになり ON DELETE CASCADE が
+        // 発動しないため、必ず database::sqlite_pool_options 経由で生成する。
+        let pool = crate::database::sqlite_pool_options(5)
+            .connect(&format!("sqlite:{}", db_path))
+            .await?;
         Ok(Self { pool })
     }
 
@@ -183,6 +188,69 @@ mod tests {
         );
 
         drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn storage_pool_enables_foreign_keys() {
+        let path = temp_db_path();
+        std::fs::write(&path, b"").expect("create temp db file");
+        let path_str = path.to_string_lossy().into_owned();
+        let storage = Storage::new(&path_str)
+            .await
+            .expect("storage connects to temp db");
+
+        // Storage::new は database::sqlite_pool_options 経由でプールを生成するため、
+        // Database 経路と同じく接続ごとに foreign_keys が ON になる。
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&storage.pool)
+            .await
+            .expect("foreign_keys pragma readable");
+        assert_eq!(enabled, 1, "Storage pool must have foreign_keys ON");
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn storage_session_delete_cascades_to_children() {
+        let path = temp_db_path();
+        std::fs::write(&path, b"").expect("create temp db file");
+        let path_str = path.to_string_lossy().into_owned();
+        let storage = Storage::new(&path_str)
+            .await
+            .expect("storage connects to temp db");
+        storage.migrate().await.expect("migration succeeds");
+
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('storage-fk-session', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(&storage.pool)
+        .await
+        .expect("session row exists");
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, created_at) VALUES ('storage-fk-message', 'storage-fk-session', 'user', 1)",
+        )
+        .execute(&storage.pool)
+        .await
+        .expect("message row exists");
+
+        // SessionRepository::delete と同じ DELETE を Storage プール上で実行する。
+        sqlx::query("DELETE FROM sessions WHERE id = 'storage-fk-session'")
+            .execute(&storage.pool)
+            .await
+            .expect("delete session");
+
+        // FK が OFF だと子行が残るため、cascade の発動を直接検証する。
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id = ?")
+                .bind("storage-fk-session")
+                .fetch_one(&storage.pool)
+                .await
+                .expect("count messages");
+        assert_eq!(remaining, 0, "message must cascade-delete via Storage pool");
+
+        drop(storage);
         let _ = std::fs::remove_file(&path);
     }
 }
