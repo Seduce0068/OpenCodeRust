@@ -190,7 +190,7 @@ status: current
     で別タスク。他 10 件は意味論未確定／型不一致／既存経路との競合。
     `Config.enterprise` は loader の managed config（OS 固定ディレクトリ）と
     無関係、`experimental.mcp_timeout` は実効の `McpConfig::timeout` と別経路。
-    follow-up: MAPPING.md:168 の loader.rs 参照を 538-548 → 629-637 へ更新。
+    2026-11-19 対応済み: MAPPING.md:168 の loader.rs 参照を 538-548 → 629-637 へ更新。
   - `Config.keybinds` が TUI の `KeybindRegistry::new()` へ渡されずハードコード固定。
     `snapshot` / `autoupdate` / `enterprise` / `experimental` と
     `ExperimentalConfig` の **6 サブフィールド**

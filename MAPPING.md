@@ -165,7 +165,7 @@ Runtime Proof: `schema.rs` の
 `parses_timezone_and_discards_unmapped_upstream_keys` により、上記 6 キーを
 含む JSON が parse 成功し、`timezone` のみ保持されて他は破棄されることを
 確認済み。loader は未知キー名のみ warn し、値はログに出さない
-(`crates/opencode-config/src/loader.rs:538-548`)。
+(`crates/opencode-config/src/loader.rs:629-637`)。
 
 ### 未配線の設定フィールド (2026-11-18)
 
