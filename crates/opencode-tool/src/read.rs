@@ -32,6 +32,29 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
+/// Parse an optional non-negative integer argument into `usize`.
+///
+/// Missing/`null` keeps `default`. Any other JSON type — including a
+/// negative number such as `-1` — is rejected rather than silently coerced
+/// to `1`. `usize::try_from` also guards the u64 -> usize narrowing on
+/// targets where `usize` is smaller than `u64`.
+fn parse_usize_arg(
+    args: &serde_json::Value,
+    key: &str,
+    default: usize,
+) -> Result<usize, ToolError> {
+    let value = &args[key];
+    if value.is_null() {
+        return Ok(default);
+    }
+    let n = value.as_u64().ok_or_else(|| {
+        ToolError::InvalidArguments(format!("{} must be a non-negative integer", key))
+    })?;
+    usize::try_from(n).map_err(|_| {
+        ToolError::InvalidArguments(format!("{} is out of range for this platform", key))
+    })
+}
+
 pub struct ReadTool {
     directory: PathBuf,
 }
@@ -75,11 +98,11 @@ impl Tool for ReadTool {
                     "description": "The absolute path to the file or directory to read"
                 },
                 "offset": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "The line number to start reading from (1-indexed)"
                 },
                 "limit": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "The maximum number of lines to read (defaults to 2000)"
                 }
             },
@@ -97,9 +120,9 @@ impl Tool for ReadTool {
             .ok_or_else(|| ToolError::InvalidArguments("file_path is required".into()))?
             .to_string();
 
-        let offset: usize = args["offset"].as_u64().unwrap_or(1) as usize;
+        let offset: usize = parse_usize_arg(&args, "offset", 1)?;
 
-        let limit: usize = args["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+        let limit: usize = parse_usize_arg(&args, "limit", DEFAULT_READ_LIMIT)?;
 
         if offset < 1 {
             return Err(ToolError::InvalidArguments("offset must be >= 1".into()));
@@ -333,7 +356,7 @@ async fn read_directory(
         .take(limit)
         .map(|s| s.as_str())
         .collect();
-    let truncated = start + sliced.len() < entries.len();
+    let truncated = start.saturating_add(sliced.len()) < entries.len();
 
     let output = format!(
         "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n{}{}\n</entries>",
@@ -344,7 +367,7 @@ async fn read_directory(
                 "\n(Showing {} of {} entries. Use 'offset' parameter to read beyond entry {})",
                 sliced.len(),
                 entries.len(),
-                offset + sliced.len()
+                offset.saturating_add(sliced.len())
             )
         } else {
             format!("\n({} entries)", entries.len())
@@ -397,7 +420,10 @@ async fn read_file_content(
     let mut bytes = 0;
     let mut truncated_by_bytes = false;
 
-    for i in start..std::cmp::min(lines.len(), start + limit) {
+    // `limit` can be u64::MAX (== usize::MAX on 64-bit targets); a plain
+    // `start + limit` would overflow in debug builds. Saturating is correct
+    // because the loop bound is clamped by `lines.len()` anyway.
+    for i in start..std::cmp::min(lines.len(), start.saturating_add(limit)) {
         let line = if lines[i].len() > MAX_LINE_LENGTH {
             let end = floor_char_boundary(lines[i], MAX_LINE_LENGTH);
             format!("{}...", &lines[i][..end])
@@ -422,7 +448,7 @@ async fn read_file_content(
         .collect::<Vec<_>>()
         .join("\n");
     let total_lines = lines.len();
-    let last_read_line = offset + result_lines.len() - 1;
+    let last_read_line = offset.saturating_add(result_lines.len()).saturating_sub(1);
     let has_more_lines = total_lines > last_read_line;
     let truncated = has_more_lines || truncated_by_bytes;
 
@@ -574,11 +600,23 @@ async fn find_instruction_file(dir: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn context(directory: &Path) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_string_lossy().to_string(),
+        )
+    }
+
     #[test]
     fn identity_and_schema() {
         let tool = ReadTool::new();
         assert_eq!(tool.id(), "read");
         assert_eq!(tool.parameters()["required"][0], "file_path");
+        // The schema must advertise integers: the parser accepts only u64
+        // literals, so `type: number` would mislead clients into sending 2000.0.
+        assert_eq!(tool.parameters()["properties"]["offset"]["type"], "integer");
+        assert_eq!(tool.parameters()["properties"]["limit"]["type"], "integer");
     }
 
     #[test]
@@ -637,6 +675,30 @@ mod tests {
         assert!(!result.output.contains("beyond line 0"));
     }
 
+    #[tokio::test]
+    async fn read_file_content_with_max_limit_does_not_overflow() {
+        // Regression: offset >= 2 with limit = usize::MAX overflowed the old
+        // `start + limit` in debug builds. Saturating must clamp it to the
+        // actual line count instead.
+        let content = b"first\nsecond\nthird";
+        let result = read_file_content(
+            std::path::Path::new("/tmp/test.txt"),
+            "/tmp/test.txt",
+            content,
+            2,
+            usize::MAX,
+            "test".to_string(),
+            "/tmp",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.output.contains("2: second"));
+        assert!(result.output.contains("3: third"));
+        assert!(!result.output.contains("1: first"));
+        assert!(result.output.contains("End of file - total 3 lines"));
+    }
+
     #[test]
     fn floor_char_boundary_respects_multibyte_boundaries() {
         // 'あ' is 3 bytes; place it so byte offset 2000 lands on its middle byte.
@@ -676,5 +738,69 @@ mod tests {
     fn with_directory_sets_base() {
         let tool = ReadTool::with_directory("/tmp");
         assert_eq!(tool.directory, PathBuf::from("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_negative_offset() {
+        // Regression: `as_u64().unwrap_or(1)` turned `offset: -1` into `1`.
+        let error = ReadTool::with_directory("/tmp")
+            .execute(
+                serde_json::json!({ "file_path": "a.txt", "offset": -1 }),
+                context(Path::new("/tmp")),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_numeric_limit() {
+        let error = ReadTool::with_directory("/tmp")
+            .execute(
+                serde_json::json!({ "file_path": "a.txt", "limit": "10" }),
+                context(Path::new("/tmp")),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn parse_usize_arg_keeps_omitted_and_null_defaults() {
+        let args = serde_json::json!({});
+        assert_eq!(parse_usize_arg(&args, "offset", 1).unwrap(), 1);
+        assert_eq!(
+            parse_usize_arg(&args, "limit", DEFAULT_READ_LIMIT).unwrap(),
+            DEFAULT_READ_LIMIT
+        );
+
+        let nulls = serde_json::json!({ "offset": null, "limit": null });
+        assert_eq!(parse_usize_arg(&nulls, "offset", 1).unwrap(), 1);
+        assert_eq!(
+            parse_usize_arg(&nulls, "limit", DEFAULT_READ_LIMIT).unwrap(),
+            DEFAULT_READ_LIMIT
+        );
+    }
+
+    #[test]
+    fn parse_usize_arg_rejects_invalid_types() {
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("10"),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            let args = serde_json::json!({ "offset": bad });
+            assert!(
+                matches!(
+                    parse_usize_arg(&args, "offset", 1),
+                    Err(ToolError::InvalidArguments(_))
+                ),
+                "unexpectedly accepted {bad}"
+            );
+        }
     }
 }

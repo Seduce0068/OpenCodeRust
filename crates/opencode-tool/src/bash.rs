@@ -10,6 +10,19 @@ use opencode_plugin::{HookContext, HookEvent};
 const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1000;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
+/// Parse an optional non-negative `u64` argument. A missing or `null` value
+/// keeps `default`; a negative number or any other JSON type is rejected
+/// instead of being silently replaced by the default.
+fn parse_u64_arg(args: &serde_json::Value, key: &str, default: u64) -> Result<u64, ToolError> {
+    let value = &args[key];
+    if value.is_null() {
+        return Ok(default);
+    }
+    value.as_u64().ok_or_else(|| {
+        ToolError::InvalidArguments(format!("{} must be a non-negative integer", key))
+    })
+}
+
 #[cfg(unix)]
 async fn kill_process_tree(pid: u32) {
     let _ = tokio::process::Command::new("pkill")
@@ -62,7 +75,7 @@ impl Tool for BashTool {
                     "description": "The command to execute"
                 },
                 "timeout": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Optional timeout in milliseconds"
                 },
                 "workdir": {
@@ -88,7 +101,7 @@ impl Tool for BashTool {
             .ok_or_else(|| ToolError::InvalidArguments("command is required".into()))?
             .to_string();
 
-        let timeout_ms: u64 = args["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
+        let timeout_ms: u64 = parse_u64_arg(&args, "timeout", DEFAULT_TIMEOUT_MS)?;
 
         let workdir: String = args["workdir"]
             .as_str()
@@ -742,12 +755,25 @@ fn process_command_node(node: tree_sitter::Node, source: &[u8], result: &mut Par
 mod tests {
     use super::*;
 
+    fn context(directory: &str) -> ToolContext {
+        ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            directory.to_owned(),
+        )
+    }
+
     #[test]
     fn identity_and_schema() {
         let tool = BashTool;
         assert_eq!(tool.id(), "bash");
         assert_eq!(tool.parameters()["required"][0], "command");
         assert_eq!(tool.parameters()["required"][1], "description");
+        // The parser accepts only u64 literals, so advertise integers.
+        assert_eq!(
+            tool.parameters()["properties"]["timeout"]["type"],
+            "integer"
+        );
     }
 
     #[test]
@@ -955,5 +981,40 @@ mod tests {
             BashArity::prefix(&tokens(&["docker", "compose"])),
             tokens(&["docker", "compose"])
         );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_negative_timeout() {
+        // Regression: `as_u64().unwrap_or(DEFAULT_TIMEOUT_MS)` accepted -1.
+        let error = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "echo hi",
+                    "description": "echo hi",
+                    "timeout": -1,
+                }),
+                context("/tmp"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_numeric_timeout() {
+        let error = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "echo hi",
+                    "description": "echo hi",
+                    "timeout": "1000",
+                }),
+                context("/tmp"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
     }
 }
