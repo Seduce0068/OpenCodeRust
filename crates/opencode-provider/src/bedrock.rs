@@ -1,7 +1,9 @@
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::VecDeque;
 
 use crate::{
     ChatRequest, ChatResponse, Choice, Content, Message, ModelInfo, Provider, ProviderError, Role,
@@ -401,15 +403,43 @@ impl Provider for BedrockProvider {
             return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
         }
 
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk_result| match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    parse_bedrock_stream(&text)
+        // 生バイトを保持し、完全な JSON オブジェクトが揃ってからデコードする。
+        // AWS eventstream は改行区切りではないため SseLineBuffer ではフレーム境界を
+        // 取り出せず、既存実装と同様に JSON テキストを手掛かりに境界を決定する。
+        // チャンク境界で UTF-8 文字や JSON トークンが分断されても、完全に揃うまで
+        // UTF-8 デコードを行わないため U+FFFD に固定化されない。
+        let stream = stream::try_unfold(
+            (
+                response.bytes_stream(),
+                BedrockJsonBuffer::new(),
+                VecDeque::<StreamEvent>::new(),
+                false,
+            ),
+            |(mut chunks, mut buffer, mut pending, mut exhausted)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Ok(Some((event, (chunks, buffer, pending, exhausted))));
+                    }
+
+                    if exhausted {
+                        return Ok(None);
+                    }
+
+                    match chunks.next().await {
+                        Some(Ok(bytes)) => {
+                            push_bedrock_values(buffer.push(bytes.as_ref()), &mut pending);
+                        }
+                        Some(Err(err)) => {
+                            return Err(ProviderError::StreamError(err.to_string()));
+                        }
+                        None => {
+                            exhausted = true;
+                            push_bedrock_values(buffer.flush(), &mut pending);
+                        }
+                    }
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -510,27 +540,155 @@ fn convert_bedrock_response(response: BedrockConverseResponse) -> ChatResponse {
     }
 }
 
-fn parse_bedrock_stream(text: &str) -> Result<StreamEvent, ProviderError> {
-    if text.contains("\"contentBlockDelta\"") {
-        if let Some(start) = text.find("\"text\":") {
-            let rest = &text[start + 8..];
-            if let Some(end) = rest.find("\"") {
-                let text_content = &rest[..end];
-                if let Ok(decoded) =
-                    serde_json::from_str::<String>(&format!("\"{}\"", text_content))
-                {
-                    return Ok(StreamEvent::TextDelta(decoded));
+/// Bedrock ConverseStream のトップレベルイベント名（JSON キー）。
+///
+/// eventstream のバイナリフレーム間に挟まった JSON を取り出すための手掛かりとして
+/// 使う。完全なフレーム長/CRC デコーダは別タスク（TODO: M-55 の返済方針を参照）。
+const BEDROCK_EVENT_KEYS: [&[u8]; 7] = [
+    b"\"messageStart\"",
+    b"\"contentBlockStart\"",
+    b"\"contentBlockDelta\"",
+    b"\"contentBlockStop\"",
+    b"\"messageDelta\"",
+    b"\"messageStop\"",
+    b"\"metadata\"",
+];
+
+/// `bytes_stream()` の生バイトを保持し、完全な JSON オブジェクトが揃うまで
+/// UTF-8 デコードを遅延するバッファ。
+///
+/// `SseLineBuffer` は改行で確定するため、改行を含まない eventstream バイナリ
+/// フレームには使えない。ここでは既存実装と同じく JSON テキストを手掛かりに
+/// オブジェクト境界を決定するが、境界判定はすべてバイト単位で行い、完全な
+/// オブジェクトが揃って初めて `str` 化するため途中分割でも文字化けしない。
+#[derive(Debug, Default)]
+struct BedrockJsonBuffer {
+    bytes: Vec<u8>,
+}
+
+impl BedrockJsonBuffer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 生バイトを追加し、新たに確定した JSON オブジェクトを返す。
+    fn push(&mut self, chunk: &[u8]) -> Vec<Value> {
+        self.bytes.extend_from_slice(chunk);
+        self.drain_complete_objects()
+    }
+
+    /// ストリーム終端で未確定の尾部を破棄し、確定済みオブジェクトだけを返す。
+    fn flush(&mut self) -> Vec<Value> {
+        let values = self.drain_complete_objects();
+        self.bytes.clear();
+        values
+    }
+
+    fn drain_complete_objects(&mut self) -> Vec<Value> {
+        let mut values = Vec::new();
+        while let Some((start, end)) = Self::next_object_range(&self.bytes) {
+            let object = self.bytes[start..end].to_vec();
+            // 不正 JSON でも必ず範囲を消費し、ループが止まらないようにする。
+            self.bytes.drain(..end);
+            if let Ok(text) = std::str::from_utf8(&object) {
+                if let Ok(value) = serde_json::from_str::<Value>(text) {
+                    values.push(value);
                 }
-                return Ok(StreamEvent::TextDelta(text_content.to_string()));
             }
         }
+        values
     }
 
-    if text.contains("\"messageStop\"") {
-        return Ok(StreamEvent::Done);
+    /// 既知のイベントキーを手掛かりに、完全な JSON オブジェクトの範囲を返す。
+    fn next_object_range(bytes: &[u8]) -> Option<(usize, usize)> {
+        let key_pos = BEDROCK_EVENT_KEYS
+            .iter()
+            .filter_map(|key| find_subslice(bytes, key))
+            .min()?;
+        // イベントキーの直前に置かれたトップレベルの `{` を開始位置とする。
+        let start = bytes[..key_pos].iter().rposition(|&byte| byte == b'{')?;
+        let end = object_end(bytes, start)?;
+        Some((start, end))
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// `start` の `{` に対応する `}` の直後を返す。
+///
+/// 文字列とエスケープを考慮するため、テキスト中の `{` / `}` や改行、
+/// マルチバイト文字の途中バイトで誤って境界を判定しない。
+fn object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 完全にデコードされた Bedrock イベント JSON を `StreamEvent` へ変換する。
+///
+/// テキストデルタと `messageStop` のみを扱い、それ以外のイベント
+/// （messageStart / contentBlockStop / metadata / toolUse デルタ等）は `None`
+/// を返して呼び出し側がスキップする。空の `TextDelta` プレースホルダは出さない。
+fn parse_bedrock_stream(value: &Value) -> Option<StreamEvent> {
+    if let Some(delta) = value.get("contentBlockDelta") {
+        if let Some(text) = delta
+            .get("delta")
+            .and_then(|inner| inner.get("text"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(StreamEvent::TextDelta(text.to_string()));
+        }
+        return None;
     }
 
-    Ok(StreamEvent::TextDelta(String::new()))
+    if value.get("messageStop").is_some() {
+        return Some(StreamEvent::Done);
+    }
+
+    None
+}
+
+/// 確定した JSON オブジェクト列を、発行可能なイベントだけキューへ積む。
+fn push_bedrock_values(values: Vec<Value>, pending: &mut VecDeque<StreamEvent>) {
+    for value in values {
+        if let Some(event) = parse_bedrock_stream(&value) {
+            pending.push_back(event);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -576,5 +734,97 @@ mod tests {
                 .collect::<String>(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// eventstream のフレームヘッダ相当のバイトを間に挟み、「こんにちは」の
+    /// 先頭バイト直後で分割しても U+FFFD にならず全イベントが届くこと。
+    #[test]
+    fn bedrock_buffer_reassembles_split_utf8_and_multiple_events() {
+        let first =
+            r#"{"contentBlockDelta":{"delta":{"text":"こんにちは"},"contentBlockIndex":0}}"#;
+        let second = r#"{"contentBlockDelta":{"delta":{"text":"world"},"contentBlockIndex":0}}"#;
+        let stop = r#"{"messageStop":{"stopReason":"end_turn"}}"#;
+
+        // 改行も JSON 特殊文字も含まないバイナリヘッダを模す。
+        let frame_header = [0x00u8, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x0d, 0x12, 0x34];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&frame_header);
+        payload.extend_from_slice(first.as_bytes());
+        payload.extend_from_slice(&frame_header);
+        payload.extend_from_slice(second.as_bytes());
+        payload.extend_from_slice(&frame_header);
+        payload.extend_from_slice(stop.as_bytes());
+
+        let needle = "こんにちは".as_bytes();
+        let split = payload
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("text should be present")
+            + 1;
+        assert!(split < payload.len());
+
+        let mut buffer = BedrockJsonBuffer::new();
+        let mut pending = VecDeque::new();
+
+        // 途中のチャンクではオブジェクトが確定していないためイベントを出さない。
+        push_bedrock_values(buffer.push(&payload[..split]), &mut pending);
+        assert!(pending.is_empty());
+
+        push_bedrock_values(buffer.push(&payload[split..]), &mut pending);
+        push_bedrock_values(buffer.flush(), &mut pending);
+
+        let events: Vec<StreamEvent> = pending.into_iter().collect();
+        assert_eq!(events.len(), 3, "複数フレームを全て順序どおり返す");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "こんにちは"));
+        assert!(matches!(&events[1], StreamEvent::TextDelta(text) if text == "world"));
+        assert!(matches!(&events[2], StreamEvent::Done));
+    }
+
+    /// 1 チャンクに複数イベントが入っていても、文字列内の `{` / `}` / エスケープ
+    /// を誤って境界とみなさず、非イベントはスキップされること。
+    #[test]
+    fn bedrock_buffer_emits_all_events_in_single_chunk() {
+        let payload = concat!(
+            r#"{"messageStart":{"role":"assistant"}}"#,
+            r#"{"contentBlockDelta":{"delta":{"text":"a\"b{c}"},"contentBlockIndex":0}}"#,
+            r#"{"metadata":{"usage":{"inputTokens":1,"outputTokens":2}}}"#,
+            r#"{"messageStop":{"stopReason":"end_turn"}}"#,
+        );
+
+        let mut buffer = BedrockJsonBuffer::new();
+        let mut pending = VecDeque::new();
+        push_bedrock_values(buffer.push(payload.as_bytes()), &mut pending);
+
+        let events: Vec<StreamEvent> = pending.into_iter().collect();
+        assert_eq!(events.len(), 2, "非イベント値はスキップする");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "a\"b{c}"));
+        assert!(matches!(&events[1], StreamEvent::Done));
+    }
+
+    /// 短い／不正なチャンクで panic せず、空 TextDelta プレースホルダも出ないこと。
+    #[test]
+    fn bedrock_buffer_skips_partial_and_non_event_chunks_without_panic() {
+        let mut buffer = BedrockJsonBuffer::new();
+        let mut pending = VecDeque::new();
+
+        // 旧実装の `"text":` +8 固定オフセットは短いチャンクで境界外 panic しうかった。
+        assert!(buffer.push(b"{\"contentBlockDelta\"").is_empty());
+        assert!(buffer.push(b":{").is_empty());
+        push_bedrock_values(buffer.push(br#""delta":{"text":"ok"}}}"#), &mut pending);
+        assert_eq!(pending.len(), 1);
+
+        push_bedrock_values(buffer.flush(), &mut pending);
+        let events: Vec<StreamEvent> = pending.into_iter().collect();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "ok"));
+
+        assert!(parse_bedrock_stream(&serde_json::json!({
+            "metadata": {"usage": {"inputTokens": 1}}
+        }))
+        .is_none());
+        assert!(parse_bedrock_stream(&serde_json::json!({
+            "contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}, "contentBlockIndex": 1}
+        }))
+        .is_none());
     }
 }
