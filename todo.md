@@ -97,10 +97,11 @@ status: current
     実使用し orphan rule で storage への直接移管は不可（newtype＋From/Into 案は未検証）。
     未対応は charter と逆の permission→plugin、tool→permission/plugin、session→
     provider/tool/mcp/lsp の依存方向（ADR 改訂またはトレイト注入反転）
-- [ ] **[M-17]** 内部実装モジュールの pub 露出（7 モジュール縮小済み）
-  - 外部フルパス参照ゼロの 7 モジュールを pub(crate) 化済み（ファサード公開維持）。
-    残存 14 モジュールは外部参照ありで維持。さらに縮小するには dead_code 解消＋
-    ファサード再エクスポート整理（他ファイル変更）が必要
+- [x] **[M-17 一部]** transform / registry を pub(crate) 化
+  （2026-11-19、swarm-coding R1-R6）
+  - 外部フルパス参照ゼロの 7 モジュールに加え transform / registry を縮小。
+    残存は bootstrap / skill（ファサードへ未再エクスポートの型あり）と provider
+    実装 12 モジュール（意図的な公開 API、意図は speculative）。
 - [ ] **[M-34 残り]** 依存更新検知の Renovate 委譲とスクリプトゲート
   - 2026-11-19 対応済み: ci.yml に all-features と unsafe lint ゲートを追加（`extra_gates`
     / `clippy_args`、ローカルで両方 green、共通ワークフロー README で入力仕様確認）。
@@ -113,11 +114,11 @@ status: current
     get_file_status の git subprocess を tokio::process 化。
   - 残存: list_files、current_project_info の git subprocess、共通 canonicalize
     ヘルパ async 化、tool 側 glob/read の WalkDir。性能改善の実測は未実施。
-- [ ] **[M-38]** ストリーミング応答のタスク寿命（切断検知は対応済み）
-  - `tx.closed()` の協調 break を実装済み。JoinHandle 保持は再調査（2026-11-18、
-    stream-handle-worker）で「tokio の破棄はデタッチ、協調 break で十分、AbortHandle は
-    部分永続化の回帰＋循环的参照リスク」のため見送り。残る実ギャップは初期
-    `chat_stream()` 確立中の切断検知と provider 側の上流キャンセル（routes.rs 外・未検証）
+- [x] **[M-38 一部]** /stream の初期切断検知を追加（2026-11-19、swarm-coding R1-R6）
+  - chat_stream().await を tx.closed() と biased select! で競合、切断時に future を
+    ドロップし永続化してから早期リターン（R4 の永続化回帰指摘を R5 で修正）。
+    残存: provider 側の上流キャンセル（CancellationToken 追加は 25 実装以上波及で
+    高リスク）、/prompt の fire-and-forget 契約上の切断検知不可（明示 abort のみ）。
 
 ### 優先度: 低
 
@@ -127,10 +128,15 @@ status: current
     未対応: prompt/stream ハンドラの開始・完了・切断ログ、/log の extra 平坦化、
     WorkerGuard 早期ドロップ、rolling 未使用、load_config 二重化、
     TUI の stdout ログ（いずれも他クレート変更・API 変更・契約変更を伴う）。
-- [ ] **[L-14 残り]** Arc copy-on-write の見直し
-  - list_messages の後方互換 pagination（limit/offset）は 2026-11-19 に対応済み。
-    未指定時は従来どおり全件（wire format 不変）、TUI 変更不要。
-    残るはメッセージ保持の Arc copy-on-write。実害は未計測。
+- [ ] **[L-14 残り]** スナップショット全件 clone の実害計測（現状維持）
+  - list_messages の後方互換 pagination は対応済み。2026-11-19 調査で「Arc による
+    メッセージ COW」という前提は誤りと判明: メッセージは所有 `Vec<SessionMessage>` で、
+    実態は Arc<dyn Fn(&Session)> の update_hook 経由で Session 全体を deep clone
+    （1 エミットあたり最大 3 回、TextDelta は 50ms スロットル）。
+    Arc::make_mut はスナップショット側が Arc を保持する限り deep clone するため
+    O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
+    推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
+    問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
 
 ### 優先度: 高（残タスク調査で追加）
 

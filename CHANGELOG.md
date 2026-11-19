@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-19T09:16:06+09:00"
+  at: "2026-11-19T09:48:13+09:00"
 ---
 
 # Changelog
@@ -342,6 +342,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `core` / `session` / `mcp`: 未配線の core Bus と全 publish 配線を削除
   （Server `broadcast<String>` を単一イベント源とし SSE 契約は不変、
   swarm-coding R1-R6、R4 findings 0 件）(M-20)
+- `server` / `provider` / `tool`: /stream の初期切断検知を追加（切断時future drop＋
+  永続化）、transform/registry を pub(crate) 化（swarm-coding R1-R6、
+  R4 の永続化回帰指摘を R5 で修正）(M-38/M-17)
 
 ## [0.1.0]
 
