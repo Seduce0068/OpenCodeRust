@@ -160,6 +160,41 @@ status: current
     O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
+- [ ] **[L-10]** grep ツールの不正 glob が黙って無視され検索範囲が広がる
+  - `tool/grep_tool.rs:132-134`。`glob::Pattern::new(g).ok()` が parse 失敗を None
+    （フィルタなし）へ変換。glob_tool は InvalidArguments を返しており非対称。
+- [ ] **[L-11]** provider/retry.rs の sleep/delay/定数が本番配線ゼロの重複実装
+  - `provider/retry.rs:8-11,28-43,58-103`。IsRetryable のみ再エクスポートされ、
+    sleep/delay/RETRY_* は参照 0。session/retry.rs を単一情報源へ縮小候補
+    （pub API のため外部利用確認が必要、M-49 の別ヘルパとは別）。
+- [ ] **[L-12]** parse_anthropic_sse が本番未使用のレガシーラッパー
+  - `stream.rs:385-393`。呼び出しはテストのみで anthropic.rs は AnthropicSseParser を
+    直接使用。tool_use id が空文字列になる誤挙動を含むラッパーが pub API として残存。
+    削除 or pub(crate) 化 or #[deprecated]。
+- [ ] **[L-13]** ls ツールが serde 解析失敗を既定値にフォールバック
+  - `tool/ls.rs:97-102`。`unwrap_or(LsInput{path:None,...})` のため型違反でも path="." で
+    実行され意図しない permission プロンプト。他ツールと入力検証方針が不整合。
+- [ ] **[L-14b]** read/bash/grep の数値・真偽引数が型違反/負値を黙って既定値へ丸める
+  - `tool/read.rs:100-105`, `bash.rs:91`, `grep_tool.rs:94-96`。
+    as_u64().unwrap_or /
+    as_bool().unwrap_or のため offset=-1 が 1 に丸まる等。InvalidArguments を返すか
+    型付き Input 構造体へ寄せる。
+- [ ] **[L-15]** delete_message が存在しない message_id でも 200 deleted:true
+  - `server/routes.rs:1151-1163,1273-1277`。remove_message の戻り値を破棄。delete_part は
+    NotFound を返しており同一 API 内で契約が不一致。
+- [ ] **[L-16]** retry_queued_prompts に上限・バックオフがなく永続失敗時に無限リトライ
+  - `server/routes.rs:2243-2247,2284-2289`。DB 破損等で 1 秒間隔が終了条件なしに回り
+    エラーログとタスク生成が際限なく増える。H-10/H-11 とは別の失敗時終端化欠落。
+- [ ] **[L-17]** CORS localhost 許可が明示的ポートを要求
+  - `server/server.rs:940-943,1047-1062`。is_localhost が port.is_some() を要求するため
+    ブラウザがポート省略する既定ポート（`http://localhost`）の Origin が拒否されうる。
+- [ ] **[L-18]** GitWatcher の BranchChanged / CommitMade が一切発行されない
+  - `core/git_watcher.rs:6-15,31-36`。受け取った Event を _event として無視し常に
+    IndexChanged を send。バリアント削除 or HEAD/refs 変更の実検出。
+- [ ] **[L-19]** llm::stream がキャンセル/受信側切断を次のイベント到達まで検知できない
+  - `session/llm.rs:962-995`。abort と tx.send 失敗を stream.next() 後のループ先頭でしか
+    見ないためアイドル中は上流 HTTP ストリームと spawn タスクが生存。select! で
+    abort.cancelled() / rx.closed() を競合させる（上流停止効果は speculative）。
 
 ### 優先度: 高（残タスク調査で追加）
 
@@ -181,6 +216,19 @@ status: current
     text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
+
+- [ ] **[H-26]** Snapshot::revert が checkout 失敗を「ファイル不在」と誤判定して削除
+  - `session/snapshot.rs:39-63`。git checkout の失敗（権限・不正ハッシュ・一時障害）を
+    すべて「スナップショットに存在しない」とみなし、ls-tree 失敗まで `unwrap_or(false)`
+    で丸めて `fs::remove_file` を呼ぶ。rollback 対象の作業ツリーが不可逆に失われうる。
+    revert 経路のテストは 0 件（confirmed / 2026-11-19 swarm-todo-discovery）
+  - 対応: checkout エラーを種別判定し、ls-tree が成功して「確実に tree 内に無い」場合
+    のみ削除。ls-tree 失敗時は Err を返す。削除/非削除/失敗の 3 分岐テスト。
+- [ ] **[H-27]** unrevert が Snapshot::restore の失敗を無視して成功を返す
+  - `session/revert.rs:148-157`。`let _ = Snapshot::restore(...)` で失敗を捨てた後
+    `clear_revert()` と `Ok(Some(session))` を返すため、ファイルは元に戻っていないのに
+    スナップショット参照が失われ再試行手段もない。unrevert のテストは 0 件（confirmed）
+  - 対応: restore 結果を伝播、失敗時は clear_revert せずエラーを返す。成否双方のテスト。
 
 ### 優先度: 中（残タスク調査で追加）
 
@@ -220,6 +268,55 @@ status: current
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
+
+- [ ] **[M-55]** Bedrock ストリームが AWS eventstream バイナリを per-chunk lossy デコード
+  - `provider/bedrock.rs:404-412,513-533`。各 chunk を個別に from_utf8_lossy してから
+    parse_bedrock_stream へ渡すため、UTF-8/JSON トークンが境界で切れると U+FFFD に
+    固定化される。eventstream は長さ付きフレームで 1 チャンク収まり保証が無い。
+    空 TextDelta プレースホルダも残存（confirmed）。
+  - 対応: フレーム長/CRC を読むバイト単位 stateful デコーダ、完全フレーム単位で JSON パース。
+- [ ] **[M-56]** Responses API ストリームが SSE フレーム組立前に per-chunk lossy デコード
+  - `provider/responses.rs:1440-1447,1486-1488`。SseLineBuffer は 16 アダプタへ展開済みだが
+    本経路は未移行。生バイト保持へ切り替え、完全行確定後にデコード（confirmed）。
+- [ ] **[M-57]** OpenAI 互換エラーボディ要約がバイト単位スライスで panic
+  - `provider/openai.rs:761-774`。`body.len() > 500` に対し `&body[..500]` のため、
+    500 バイト目がマルチバイト文字途中だと char boundary panic。M-53 の修正は tool 側のみ。
+    `body.get(..500)` または境界丸めへ（confirmed）。
+- [ ] **[M-58]** write ツールが空ファイルの存在を見失い file_time_assert をスキップ
+  - `tool/write.rs:101-106,142-149`。`exists = !old_content.is_empty()` のため既存の空ファイルを
+    新規作成扱いし、並行編集の stale 検出が効かず上書きしうる。イベントも "add" と誤る。
+    `try_exists` で存在判定を分離（confirmed）。
+- [ ] **[M-59]** /find/file の type クエリが受理されるだけでフィルタに未使用
+  - `server/routes.rs:3777-3829`。FindFilesQuery.file_type はパースされるが find_files が
+    参照せず name.contains のみ。type=file/directory が効かない。find_files テスト 0 件。
+- [ ] **[M-60]** create_worktree が既存ブランチにも -b を付け常に失敗
+  - `server/worktree.rs:131-146`。branch_exists=true で
+    `git worktree add -b <branch> ...` を
+    実行し同名ブランチで失敗。既存ブランチなら -b を外す分岐へ（confirmed）。
+- [ ] **[M-61]** TodoManager のメモリ index と DB todo_id が remove 後に不一致
+  - `session/todo.rs:49-56,198-219,133-161,168-191`。remove(0) 後も DB は
+    id_1/id_2 のまま、
+    set_status(0) は id_0 を B の内容で upsert し重複。安定 ID へ変更 or 再採番（confirmed、
+    本番 with_database 未配線のため配線時に顕在化）。
+- [ ] **[M-62]** TodoManager が RwLock write guard を DB I/O の .await をまたいで保持
+  - `session/todo.rs:134-155,169-190,199-214`。DB 遅延中に get() 含む全 readers がブロック。
+    update() は DB 後にロック取得で順序も不一致。DB 操作をロック外へ（confirmed）。
+- [ ] **[M-63]** FileWatcher が 2 回目以降に既存 watcher をドロップ
+  - `watcher/lib.rs:76-84,127-201`。単一 `RwLock<Option<Watcher>>` を上書きし 1 つ目の監視が
+    止まるが watched_paths に残る。2 回目以降 NonRecursive、unwatch も実解除しない。
+    crate 未配線（M-03）のため実害は限定的（confirmed）。
+- [ ] **[M-64]** RevertManager::cleanup が part_id 不一致でメッセージ全体を失う
+  - `session/revert.rs:171-205`。target_msg は見つかるが part.id 不一致だと preserve に
+    追加されずメッセージ丸ごと削除。不一致時は target を保持（confirmed）。
+- [ ] **[M-65]** SQLite の foreign_keys PRAGMA 未設定で ON DELETE CASCADE が無効
+  - `storage/schema.rs:72,112-113 等` の 6 FK に対し `storage/database.rs:130-147` に
+    after_connect / PRAGMA が無い。parts / session_shares / permissions は CRUD 皆無。
+    `PRAGMA foreign_keys = ON` ＋ cascade 統合テスト（medium-high、speculative 実害）。
+- [ ] **[M-66]** MessageRepository が不正 role/壊れた JSON を黙って捨てる
+  - `storage/repository.rs:408-436,419-422,470-473,516-542`。
+    filter_map で未知 role を消し、
+    parts パース失敗を空化。この結果を replace_for_session へ渡すと読み取り時に失われた
+    行が物理削除されうる（medium、speculative 壊れた行の生成経路）。
 
 ## 完了
 
