@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[discovery low 3 件]** util symlink・SSE 上限・limit クランプ
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery low 4 件]** read/ls/skill symlink・replace_all・metadata・PTY cursor
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery medium 3 件]** Broker pending 修正・detached worktree・symlink
@@ -499,10 +501,12 @@ status: current
   - **medium**: openrouter.rs の unwrap、glob/grep の symlink 権限すり抜け、
     worktree.rs の detached HEAD 除外、PermissionBroker/QuestionBroker の pending
     残留と false success は対応済み。残存は multiedit の逐次書き込み部分適用のみ。
-  - **low**: PTY cursor -2 以下、edit の replace_all 型丸め、read の metadata エラー丸め
-    は対応済み。残存は SseLineBuffer 無上限、limit 上限なし、
-    `opencode-util/src/filesystem.rs:112` の follow_links(true)、
-    `parse_bool_arg` / `parse_usize_arg` を `crate::tool` へ共通化済み（DRY 解消）。
+  - **low**: すべて対応済み（PTY cursor、replace_all、metadata エラー、
+    util の follow_links、SseLineBuffer の 16 MiB 上限、limit クランプ 5000、
+    `parse_bool_arg` / `parse_usize_arg` の `crate::tool` 共通化）。
+    R4 残存: 16 MiB 超の単一チャンクは extend_from_slice 前に一時確保される、
+    上限ドロップ境界でマルチバイトが分断され lossy になる（いずれも病理的ケースで
+    実害未計測）。`SessionFilter.limit` は list_filtered へ適用済み。
   - 2026-11-19 対応済み: `*** Update File:` と `@@` hunk のパース、`*** Move To:` の
     全文置換（Add-only hunk を Move に転用しない）を実装。宣言行数との突き合わせで
     カウント検証を強化（R4 の指摘を R5 で修正）。
