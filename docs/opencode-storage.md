@@ -40,6 +40,96 @@ tags: [storage, sqlite, persistence, crate]
 See [ADR-0004](adr/adr-0004-durable-session-input-queue.md) for queue
 recovery semantics and the single-server-per-database constraint.
 
+## Backup and recovery runbook
+
+The SQLite database (by default
+`${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db`) is the durable
+source of truth for sessions, messages, todos, and the session-input queue.
+Back it up with SQLite's online facilities only; never copy a live `.db`
+file with `cp`.
+
+### Prerequisites
+
+- Determine the active database path from the server configuration before
+  taking a backup.
+- One database must be owned by exactly one storage-backed `ServerState`
+  (one server process). See
+  [ADR-0004](adr/adr-0004-durable-session-input-queue.md). Stop or isolate
+  any second server before restoring; its in-memory session snapshots can
+  otherwise overwrite the restored state.
+- Store backups outside the database directory, on a separate filesystem
+  or host.
+
+### Online backup
+
+Both SQLite online methods produce a consistent snapshot without stopping
+the writer.
+
+```bash
+# VACUUM INTO: writes a compact, self-contained file; target must not exist
+sqlite3 /path/to/opencode.db \
+  "VACUUM INTO '/var/backups/opencode/opencode-20261120.db';"
+
+# .backup: SQLite online backup API; overwrites the target file
+sqlite3 /path/to/opencode.db \
+  ".backup '/var/backups/opencode/opencode-20261120.db'"
+```
+
+`VACUUM INTO` fails if the destination already exists, so use a unique
+timestamped name. For `.backup`, write to a staging path and rename the
+file atomically after the command succeeds.
+
+### WAL and -shm sidecars
+
+The storage crate does not set `journal_mode` explicitly; it uses the sqlx
+default unless the database has been switched to WAL. If
+`PRAGMA journal_mode` returns `wal`, the database has `-wal` and `-shm`
+sidecars.
+
+- Both online methods above include committed WAL content in the backup,
+  so the backup file needs no `-wal`/`-shm` pair of its own.
+- Do not back up the `.db` file alone with `cp` while WAL is active:
+  committed transactions may still live only in `-wal`.
+- Never delete `-wal`/`-shm` from a live database directory. Stop the
+  server cleanly first so SQLite checkpoints and removes the sidecars.
+- For a cold copy, either stop the server and copy after a clean checkpoint,
+  or restore `.db`, `-wal`, and `-shm` together.
+
+### Restore
+
+1. Stop the storage-backed server process to preserve the single-writer
+   constraint from ADR-0004.
+2. Move the current database aside for rollback, then place the backup at
+   the configured database path.
+
+### Post-restore integrity verification
+
+Verify the restored file before restarting the server:
+
+```bash
+sqlite3 /path/to/opencode.db "PRAGMA integrity_check;"
+sqlite3 /path/to/opencode.db "PRAGMA user_version;"
+```
+
+`integrity_check` must return `ok`. `user_version` records the applied
+schema level; this codebase writes `SCHEMA_VERSION = 2`
+(`crates/opencode-storage/src/database.rs`). A lower value means the
+storage layer applies migrations at startup. A higher value means the
+backup came from a newer binary and must not be used.
+
+Restart the server afterwards. At storage-backed startup, stale
+`processing` queue rows are reset to `pending`, so interrupted work
+resumes (ADR-0004).
+
+### Frequency and destination example
+
+- Run an online backup hourly, plus one immediately before a schema
+  migration or binary upgrade.
+- Write to `/var/backups/opencode/` on a separate filesystem, and copy the
+  daily snapshot to off-host storage.
+- Keep 24 hourly and 30 daily snapshots, and test a restore quarterly.
+- Never overwrite the most recent known-good backup.
+
 ## Validation
 
 ```bash

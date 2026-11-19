@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-20T07:25:08+09:00"
+  at: "2026-11-20T08:07:45+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2491 件（all-features は 2490 件）
+  テスト総数 594 → 2508 件（all-features は 2507 件）
 
 ### Changed
 
@@ -43,7 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-machete` を導入し、未使用依存 66 件を削除 (検出ゼロ)
 - 検証を `cargo test --workspace --all-targets` に統一
 - `cargo-nextest` / `cargo-tarpaulin` を導入し、カバレッジ 49.19% を計測
-  （前回 37.63% から計測揺らぎの範囲で微減）
+  （前回 37.63% から 49.19% へ向上、+11.56pt の大幅増）。「計測揺らぎ」の
+  説明は直近の 49.20% → 49.19% → 49.19% の横ばいなど、ADR-0008 の該当
+  箇所に限定する
 - リリースビルド・`cargo audit`・`cargo outdated` を再検証 (脆弱性 0、
   依存は最新、`version` = `OpenCode 0.1.0`)
 - 全 feature で check / clippy / test (899 passed) が成功。`cargo nextest
@@ -453,6 +455,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tui` / `docs`: SlashCommandPopup のクリックと ADR の実装整合（swarm-coding R1-R6）
 - `tool` / `ci`: Bash の env 検証とプロセスグループ kill、WebSearch 上限、
   audit 定期実行・MSRV・release/unsafe ゲート（swarm-coding R1-R6）
+- `server` / `session` / `agent` / `docs`: 観測性と整合性の強化、バックアップ Runbook
+  （swarm-coding R1-R6）
 
 ## [0.1.0]
 

@@ -231,6 +231,13 @@ impl CompactionEngine {
             .map(|input| input.saturating_sub(reserved))
             .unwrap_or_else(|| limits.context.saturating_sub(limits.max_output));
 
+        // A zero usable window makes `count >= usable` true for every input,
+        // including an empty conversation. Treat it as "unknown/disabled"
+        // instead of signalling a permanent overflow.
+        if usable == 0 {
+            return false;
+        }
+
         count >= usable
     }
 
@@ -1345,6 +1352,50 @@ mod tests {
             max_output: 8192,
         };
         assert!(!engine.is_overflow(&usage, &limits));
+    }
+
+    /// max_input が予約分以下で usable が 0 になる場合、常に true と
+    /// ならずオーバーフロー判定が無効化されること。
+    #[test]
+    fn test_is_overflow_zero_usable_max_input_is_disabled() {
+        let engine = CompactionEngine::default();
+        let usage = TokenUsage::new(200_000, 100_000);
+        let limits = ModelLimits {
+            context: 128_000,
+            max_input: Some(0),
+            max_output: 4_096,
+        };
+        assert!(!engine.is_overflow(&usage, &limits));
+
+        // 予約分（COMPACTION_BUFFER.min(max_output) == 4_096）と同じ
+        // max_input も usable == 0 になる。
+        let limits_at_reserved = ModelLimits {
+            context: 128_000,
+            max_input: Some(4_096),
+            max_output: 4_096,
+        };
+        assert!(!engine.is_overflow(&usage, &limits_at_reserved));
+    }
+
+    /// context <= max_output で usable が 0 になる場合も無効化されること。
+    #[test]
+    fn test_is_overflow_zero_usable_context_is_disabled() {
+        let engine = CompactionEngine::default();
+        let usage = TokenUsage::new(10_000, 1_000);
+        let limits = ModelLimits {
+            context: 4_096,
+            max_input: None,
+            max_output: 4_096,
+        };
+        assert!(!engine.is_overflow(&usage, &limits));
+
+        // 1 トークンでも availability があれば従来どおり判定する。
+        let limits_with_room = ModelLimits {
+            context: 4_097,
+            max_input: None,
+            max_output: 4_096,
+        };
+        assert!(engine.is_overflow(&usage, &limits_with_room));
     }
 
     #[test]

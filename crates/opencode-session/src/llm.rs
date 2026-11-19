@@ -411,10 +411,14 @@ pub struct StreamProcessor {
     session_id: String,
     /// Assistant message ID.
     _assistant_message_id: String,
-    /// Accumulated cost.
+    /// Accumulated cost finalized across completed attempts.
     cost: f64,
-    /// Latest token usage.
+    /// Latest token usage finalized at the end of an attempt.
     tokens: Option<MessageUsage>,
+    /// Cost produced by the current attempt only. Discarded when it is retried.
+    attempt_cost: f64,
+    /// Usage produced by the current attempt only. Discarded when it is retried.
+    attempt_tokens: Option<MessageUsage>,
     /// Finish reason from the last step.
     finish_reason: Option<String>,
     /// Error from the stream, if any.
@@ -455,6 +459,8 @@ impl StreamProcessor {
             _assistant_message_id: assistant_message_id,
             cost: 0.0,
             tokens: None,
+            attempt_cost: 0.0,
+            attempt_tokens: None,
             finish_reason: None,
             error: None,
             completed_tool_parts: Vec::new(),
@@ -463,6 +469,43 @@ impl StreamProcessor {
             compaction_engine: CompactionEngine::new(CompactionConfig::default()),
             model_limits: None,
         }
+    }
+
+    /// Clear every piece of state that belongs to a single streaming attempt.
+    ///
+    /// A retry must start from a clean slate: tool calls, patches, doom-loop
+    /// records, plugin events, blocking decisions and partial usage from the
+    /// failed attempt would otherwise leak into the next one (double-counted
+    /// cost, stale `Running` tool parts, spurious blocks and duplicate patches).
+    /// `cost` / `tokens` are intentionally not cleared here — they are only
+    /// finalized when an attempt ends (see [`Self::finalize_attempt_usage`]).
+    fn reset_attempt_state(&mut self) {
+        self.reasoning_map.clear();
+        self.tool_calls.clear();
+        self.current_text = None;
+        self.snapshot = None;
+        self.blocked = false;
+        self.needs_compaction = false;
+        self.error = None;
+        self.finish_reason = None;
+        self.completed_tool_parts.clear();
+        self.pending_patches.clear();
+        self.pending_events.clear();
+        self.attempt_cost = 0.0;
+        self.attempt_tokens = None;
+    }
+
+    /// Finalize the usage produced by the attempt that just ended.
+    ///
+    /// Only the final attempt of a `process()` call contributes to the
+    /// processor's cumulative cost and token snapshot; attempts that are
+    /// retried are discarded by [`Self::reset_attempt_state`].
+    fn finalize_attempt_usage(&mut self) {
+        self.cost += self.attempt_cost;
+        if let Some(tokens) = self.attempt_tokens.take() {
+            self.tokens = Some(tokens);
+        }
+        self.attempt_cost = 0.0;
     }
 
     /// Get the accumulated cost.
@@ -544,7 +587,9 @@ impl StreamProcessor {
         stream_input: StreamInput,
         provider: Arc<dyn Provider>,
     ) -> ProcessResult {
-        self.needs_compaction = false;
+        // A new `process()` call starts a fresh attempt chain; nothing from a
+        // previous invocation may be carried into it.
+        self.reset_attempt_state();
         self.model_limits = Some(resolve_model_limits(&stream_input, provider.as_ref()));
 
         let max_attempts = stream_input.retries.unwrap_or(DEFAULT_MAX_RETRIES);
@@ -614,6 +659,9 @@ impl StreamProcessor {
                                 .await
                                 .is_ok()
                             {
+                                // Retry begins: drop all state produced by the
+                                // failed attempt before the next `process_stream`.
+                                self.reset_attempt_state();
                                 continue;
                             }
 
@@ -636,6 +684,10 @@ impl StreamProcessor {
             }
 
             // After stream ends (success or non-retryable error):
+            // Finalize this attempt's usage. Retried attempts never reach this
+            // point, so their partial cost is discarded instead of accumulating.
+            self.finalize_attempt_usage();
+
             // Flush any pending snapshot that wasn't closed by a FinishStep event.
             // This mirrors TS processor.ts lines 379-392 where, after the stream
             // loop exits (e.g. due to error or abort), any remaining snapshot is
@@ -943,10 +995,13 @@ impl StreamProcessor {
                         &input.model.provider_id,
                     );
 
-                    self.cost += step_cost;
+                    // Accumulate into attempt-local scratch fields. They are
+                    // committed only when this attempt ends (or discarded on
+                    // retry), preventing double counting across retries.
+                    self.attempt_cost += step_cost;
                     let mut usage_with_cost = step_usage.clone();
                     usage_with_cost.total_cost = step_cost;
-                    self.tokens = Some(usage_with_cost.clone());
+                    self.attempt_tokens = Some(usage_with_cost.clone());
                     self.finish_reason = finish_reason;
 
                     // Check compaction using model-specific context limits.
@@ -2725,5 +2780,189 @@ mod tests {
             !rendered.contains(secret),
             "raw payload must not leak into the normalized error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2: retry 時の attempt 単位状態リセット / cost・tokens の確定
+    // -----------------------------------------------------------------------
+
+    /// attempt ごとに異なるストリームを再生する provider。
+    struct ScriptedProvider {
+        scripts: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        fn id(&self) -> &str {
+            "openai"
+        }
+
+        fn name(&self) -> &str {
+            "Scripted"
+        }
+
+        fn models(&self) -> Vec<opencode_provider::ModelInfo> {
+            vec![]
+        }
+
+        fn get_model(&self, _id: &str) -> Option<&opencode_provider::ModelInfo> {
+            None
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<opencode_provider::ChatResponse, ProviderError> {
+            Err(ProviderError::InvalidRequest("unused".to_string()))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<opencode_provider::StreamResult, ProviderError> {
+            let events = self
+                .scripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(
+                events.into_iter().map(Ok::<StreamEvent, ProviderError>),
+            )))
+        }
+    }
+
+    fn retryable_stream_error() -> String {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after-ms".to_string(), "1".to_string());
+        encode_stream_error(&ProviderError::api_error_with_headers(
+            429,
+            "rate limited",
+            Some(headers),
+            None,
+        ))
+    }
+
+    /// 失敗 attempt のツール呼び出し・blocking・cost が次の attempt へ
+    /// 持ち越されず、cost / tokens が最終 attempt のみで確定すること。
+    #[tokio::test]
+    async fn test_retry_discards_failed_attempt_state_and_finalizes_usage_once() {
+        let first_attempt = vec![
+            StreamEvent::StartStep,
+            StreamEvent::ToolCallStart {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+            },
+            StreamEvent::ToolError {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                input: None,
+                error: "permission denied: transient".to_string(),
+                kind: Some(StreamToolErrorKind::PermissionDenied),
+            },
+            StreamEvent::FinishStep {
+                finish_reason: Some("tool-error".to_string()),
+                usage: StreamUsage {
+                    prompt_tokens: 1_000,
+                    completion_tokens: 100,
+                    ..Default::default()
+                },
+                provider_metadata: None,
+            },
+            StreamEvent::Error(retryable_stream_error()),
+        ];
+        let second_usage = StreamUsage {
+            prompt_tokens: 2_000,
+            completion_tokens: 200,
+            ..Default::default()
+        };
+        let second_attempt = vec![
+            StreamEvent::FinishStep {
+                finish_reason: Some("stop".to_string()),
+                usage: second_usage.clone(),
+                provider_metadata: None,
+            },
+            StreamEvent::Done,
+        ];
+
+        let provider = Arc::new(ScriptedProvider {
+            scripts: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                first_attempt,
+                second_attempt,
+            ])),
+        });
+        let mut input = make_stream_input();
+        input.retries = Some(1);
+        let mut processor =
+            StreamProcessor::new("ses_test".to_string(), "msg_assistant".to_string());
+
+        assert_eq!(
+            processor.process(input, provider).await,
+            ProcessResult::Continue
+        );
+
+        let expected_usage = usage_from_stream(&second_usage, None, "openai");
+        let expected_cost = compute_cost(&expected_usage, None, "openai");
+        assert!(
+            (processor.cost() - expected_cost).abs() < 1e-9,
+            "only the final attempt may contribute cost"
+        );
+        assert_eq!(processor.tokens().map(|u| u.input_tokens), Some(2_000));
+        assert_eq!(processor.finish_reason(), Some("stop"));
+        assert!(processor.error().is_none());
+        assert!(
+            !processor.blocked,
+            "blocking from a retried attempt must be cleared"
+        );
+        assert!(processor.tool_calls.is_empty());
+        assert!(processor.completed_tool_parts.is_empty());
+        assert!(processor.pending_patches.is_empty());
+        assert!(processor.pending_events.is_empty());
+    }
+
+    /// ヘルパ単体でも attempt 一時状態が消え、確定済み cost は保持されること。
+    #[test]
+    fn test_reset_attempt_state_preserves_finalized_cost() {
+        let mut processor =
+            StreamProcessor::new("ses_test".to_string(), "msg_assistant".to_string());
+        processor.cost = 0.25;
+        processor.attempt_cost = 0.75;
+        processor.attempt_tokens = Some(MessageUsage {
+            input_tokens: 10,
+            ..Default::default()
+        });
+        processor.blocked = true;
+        processor.tool_calls.insert(
+            "call-1".to_string(),
+            ToolCallState {
+                part_id: "prt-1".to_string(),
+                tool_name: "read".to_string(),
+                _call_id: "call-1".to_string(),
+                raw_input: String::new(),
+                parsed_input: serde_json::json!({}),
+                state: ToolState::Pending {
+                    input: serde_json::json!({}),
+                    raw: String::new(),
+                },
+            },
+        );
+        processor.pending_patches.push(SnapshotPatch {
+            hash: "h".to_string(),
+            files: vec![],
+        });
+
+        processor.reset_attempt_state();
+
+        assert_eq!(processor.cost, 0.25);
+        assert_eq!(processor.attempt_cost, 0.0);
+        assert!(processor.attempt_tokens.is_none());
+        assert!(!processor.blocked);
+        assert!(processor.tool_calls.is_empty());
+        assert!(processor.pending_patches.is_empty());
     }
 }
