@@ -74,11 +74,13 @@ status: current
     残存 `ExecutionError` 17 箇所は下位エラーが無い固定文字列／StatusCode／別バリアント。
     未対応: StreamError(e.to_string()) と InvalidArguments(e.to_string())（serde_json）。
     新バリアントは _enum 非 non_exhaustive_ のため下流列挙には破壊的変更になりうる
-- [ ] **[M-05]** Todo 状態の未配線（要確認、配線には他クレート変更が必須）
-  - 事実確認済み（2026-11-18、todo-wire-worker）: 本番 update 0 件、todo_update/todo_get
-    None。配線には ①session/prompt.rs へコールバック注入 API、②server.rs へ TodoManager
-    保持、③routes.rs で broadcast、④TUI の forward_server_event マッピングが必要。
-    tool.rs 単独の global static 案は M-21 方針に反するため却下済み
+- [x] **[M-05]** Todo 状態を最小配線（2026-11-19、swarm-coding R1-R6）
+  - SessionPrompt に with_todo_manager / with_todo_hooks を追加し ToolContext へ
+    with_todo_update / with_todo_get を注入（false success を解消）。server 側で
+    state.todo_manager と todo.updated broadcast を配線、TUI はイベント受信と
+    /event 再接続時の GET /session/{id}/todo 再同期を追加。
+  - 残存: DB 永続化（with_database）、CLI 実コマンド、TodoStatus 3 重定義の統合、
+    SessionPrompt::new のデフォルトコールバック None（本番経路は注入済み）。
 - [ ] **[M-11 残り]** 他アダプタの HTTP テストと OAuth フロー
   - 2026-11-19 対応済み: Anthropic chat_stream の SSE 行分割／UTF-8 境界を実 HTTP
     モック（std::net、新規依存なし）で検証。行バッファを `Vec<u8>` 化し完全行確定後に
@@ -97,10 +99,16 @@ status: current
     複数バージョン併存リスクの精査は不要と判断。
   - version/edition/authors/license の workspace 継承は 7 クレートとも完了済み
 - [ ] **[M-16]** 依存方向の逆転（sqlx 未使用 derive は削除済み）
+  - 2026-11-19 調査（swarm-coding R2）: 推奨は **charter/ADR 改訂主軸**。
+    逆依存はすべて DAG 内で循環は無く（AGENTS.md のハードルールは充足）、
+    session は実質 composition root として provider/tool/mcp/lsp/plugin を直接
+    参照するのは設計上説明可能。大規模なトレイト注入反転（90 参照超、
+    plugin グローバル singleton の注入化が前提）はコスト対効果で見送り。
+    例外として `opencode_permission::BashArity`（permission 自身が使わない純粋関数、
+    tool の 3 呼び出しのみ）と `opencode_lsp::detect_language` は中和クレートへ
+    移動が低コスト（任意・低優先）。
   - 未使用の `SessionID` の sqlx::Type derive は削除済み。`SessionStatus` は storage が
     実使用し orphan rule で storage への直接移管は不可（newtype＋From/Into 案は未検証）。
-    未対応は charter と逆の permission→plugin、tool→permission/plugin、session→
-    provider/tool/mcp/lsp の依存方向（ADR 改訂またはトレイト注入反転）
 - [x] **[M-17 一部]** transform / registry を pub(crate) 化
   （2026-11-19、swarm-coding R1-R6）
   - 外部フルパス参照ゼロの 7 モジュールに加え transform / registry を縮小。
@@ -152,11 +160,16 @@ status: current
     残るは upstream checkout で 126 パスを直接照合し欠落を洗い出すこと、
     `session_id_from_path()` の /api/session 対応（server.rs follow-up）、
     および互換方針の ADR 化。upstream 側のパス情報はローカル間接引用のみで speculative。
-- [ ] **[P-02]** `/experimental/generate` の契約が upstream と完全に不一致
-  - Rust は `{prompt?, context?}` → `{operation, status, message, ...}` の placeholder
-    (`routes.rs:4423,4440,4462`)。upstream は `/api/experimental/generate/text` /
-    `/image` / `/decisions` に実 handler（`packages/server/src/handlers/generate.ts:20-63`）と
-    契約（`packages/protocol/src/groups/generate.ts:25-73`）あり。M-06 の具体化。
+- [ ] **[P-02]** `/experimental/generate` の契約が upstream と完全に不一致（現状維持）
+  - 2026-11-19 調査（swarm-coding R2）: 推奨は**現状維持（501）＋定義の再設定**。
+    Rust 側は既に 501 の not_implemented を返し、旧 placeholder レスポンスは
+    wire に出ていない（todo.md の記述は古い）。upstream 想定の
+    `/api/experimental/generate/{text,image,decisions}` は未登録で 404 になる。
+    upstream 契約の一次情報はローカルに無く（間接引用のみ）、full parity は
+    5〜10 ファイル・300〜800 行超の speculative 見積り。
+    再定義: 「実装」ではなく「サブパス 404 を契約として明記し 501 方針を維持」。
+    follow-up: routes.rs の行番号を 4557-4659 へ更新、MAPPING.md に 404/501 の
+    区別を追記。実 handler 実装は upstream checkout 取得後の別タスク。
     text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
@@ -387,6 +400,11 @@ status: current
 
 ## メモ
 
+- M-05 の R4 誤検知（2026-11-19、親が grep で confirmed）: R4 は
+  「TodoWriteTool の session_id 引数が他セッションの TODO を上書きできる」と
+  指摘したが、tool/todo.rs:178 の `ctx.do_todo_update(new_todos)` は session_id を
+  取らず ToolContext.session_id（正しいセッション）がコールバックへ渡る。
+  input.session_id は ask_permission のみに使用。却下。
 - M-05 調査結果（2026-11-19、swarm-coding R2）: 推奨は**最小配線を入れる**
   （現状維持は不可）。todowrite が成功を返すのに ToolContext の
   with_todo_update/with_todo_get が本番未注入で状態が消え、todoread は常に空、
