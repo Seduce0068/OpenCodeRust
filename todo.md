@@ -402,6 +402,8 @@ status: current
 
 ## 完了
 
+- [x] **[ストリーム構造化エラー]** Retry-After 到達とエンベロープ堅牢化
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[provider 残存 3 件]** OAuth 期限配線・ヘッダ保持・共通サニタイズ
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[新観点 high 8 件]** 構造化エラー・TUI 入力・ReDoS・Retry-After
@@ -651,11 +653,15 @@ status: current
 
 ## メモ
 
-- 2026-11-20 R4 残存（provider 残存 3 件の修正時、記録のみ）: ストリーミング経路
-  （session/src/llm.rs:965-971）が chat_stream の ProviderError を e.to_string() で
-  文字列化し、error_from_anyhow の downcast が失敗して Retry-After が届かない
-  （large scope のため未対応）。get_oauth_token は本番コール元が無く実質
-  デッドコード（起動時の bootstrap 検知は機能）。refresh 自動更新は未実装。
+- 2026-11-20 R4 残存（ストリーム構造化エラーの修正時、記録のみ）:
+  encode_stream_error の Other バリアントが ApiError(String) へ平坦化され、
+  status_code とバリアント種別が失われる（現状は非リトライで結果一致だが、
+  将来 source 由来を retryable へ拡張するとストリーム経路だけ乖離する）。
+  型定義が opencode-provider crate にあるため enum 拡張ではなく JSON
+  エンベロープ方式を採用（下位互換維持）。
+- 2026-11-20 R4 残存（provider 残存 3 件の修正時、記録のみ）: ストリーミング経路の
+  Retry-After 未到達は次イテレーションで対応済み。get_oauth_token は本番コール元が
+  無く実質デッドコード（起動時の bootstrap 検知は機能）。refresh 自動更新は未実装。
 - 2026-11-20 R4 残存（新観点 high 8 件の修正時、記録のみ）: ADR1-TOKEN は
   トークン配布経路の再定義が必要で仕様変更のため未実施。OAuth 期限検知ヘルパが
   本番リクエストパスへ未配線（expires 単位は epoch ms と仮定で未確認、
