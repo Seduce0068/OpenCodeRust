@@ -2,9 +2,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 pub const MODELS_DEV_URL: &str = "https://models.dev";
+
+/// 取得失敗を短時間だけキャッシュする TTL（外部 API への連打を防ぐ）。
+pub const DEFAULT_MODELS_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// 失敗キャッシュが有効かどうかを判定する純粋ヘルパ。
+pub fn failure_cache_is_active(last_failure: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+    last_failure
+        .and_then(|at| now.checked_duration_since(at))
+        .is_some_and(|elapsed| elapsed < ttl)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCost {
@@ -101,6 +112,9 @@ pub type ModelsData = HashMap<String, ProviderInfo>;
 pub struct ModelsRegistry {
     data: Arc<RwLock<Option<ModelsData>>>,
     cache_path: PathBuf,
+    /// 直近の取得失敗時刻。TTL 内は再取得をスキップする。
+    last_failure: Arc<RwLock<Option<Instant>>>,
+    failure_ttl: Duration,
 }
 
 impl ModelsRegistry {
@@ -108,7 +122,33 @@ impl ModelsRegistry {
         Self {
             data: Arc::new(RwLock::new(None)),
             cache_path,
+            last_failure: Arc::new(RwLock::new(None)),
+            failure_ttl: DEFAULT_MODELS_FAILURE_CACHE_TTL,
         }
+    }
+
+    /// 失敗キャッシュの TTL を差し替える（テスト・チューニング用）。
+    pub fn with_failure_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.failure_ttl = ttl;
+        self
+    }
+
+    /// 失敗キャッシュが有効かどうか。
+    pub(crate) async fn failure_cache_active(&self) -> bool {
+        let last_failure = self.last_failure.read().await;
+        failure_cache_is_active(*last_failure, Instant::now(), self.failure_ttl)
+    }
+
+    /// 取得失敗を記録し、TTL の間は再取得を抑制する。
+    pub(crate) async fn mark_fetch_failed(&self) {
+        let mut last_failure = self.last_failure.write().await;
+        *last_failure = Some(Instant::now());
+    }
+
+    /// 失敗キャッシュを明示的に解除する（`refresh` や成功時に呼ぶ）。
+    pub(crate) async fn clear_failure_cache(&self) {
+        let mut last_failure = self.last_failure.write().await;
+        *last_failure = None;
     }
 
     pub async fn get(&self) -> ModelsData {
@@ -134,6 +174,11 @@ impl ModelsRegistry {
     }
 
     async fn fetch(&self) -> ModelsData {
+        if self.failure_cache_active().await {
+            tracing::debug!("models.dev fetch skipped: failure cache is active");
+            return HashMap::new();
+        }
+
         let url = format!("{}/api.json", MODELS_DEV_URL);
 
         match reqwest::Client::new()
@@ -149,6 +194,7 @@ impl ModelsRegistry {
                         let _ = tokio::fs::write(&self.cache_path, &text).await;
                         let mut data = self.data.write().await;
                         *data = Some(parsed.clone());
+                        self.clear_failure_cache().await;
                         return parsed;
                     }
                 }
@@ -156,10 +202,13 @@ impl ModelsRegistry {
             _ => {}
         }
 
+        self.mark_fetch_failed().await;
         HashMap::new()
     }
 
     pub async fn refresh(&self) {
+        // 明示的な更新要求は失敗キャッシュを無視して再取得する。
+        self.clear_failure_cache().await;
         self.fetch().await;
     }
 
@@ -405,5 +454,42 @@ mod tests {
         assert!(over.cache_read.is_none());
         assert!(over.cache_write.is_none());
         assert!(over.context_over_200k.is_none());
+    }
+
+    #[test]
+    fn failure_cache_is_active_within_ttl_only() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(30);
+        let recent = now.checked_sub(Duration::from_secs(5)).unwrap();
+        let old = now.checked_sub(Duration::from_secs(31)).unwrap();
+
+        assert!(failure_cache_is_active(Some(recent), now, ttl));
+        assert!(!failure_cache_is_active(Some(old), now, ttl));
+        assert!(!failure_cache_is_active(None, now, ttl));
+        assert_eq!(DEFAULT_MODELS_FAILURE_CACHE_TTL, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn failure_cache_blocks_refetch_until_cleared() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-models-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("models.json");
+        let registry =
+            ModelsRegistry::new(cache_path).with_failure_cache_ttl(Duration::from_secs(60));
+
+        assert!(!registry.failure_cache_active().await);
+        registry.mark_fetch_failed().await;
+        assert!(registry.failure_cache_active().await);
+
+        // キャッシュファイルも存在しないため、再取得をスキップしなければ
+        // 外部 HTTP に触れずに空の ModelsData が返る。
+        assert!(registry.get().await.is_empty());
+        assert!(registry.get_provider("anthropic").await.is_none());
+
+        registry.clear_failure_cache().await;
+        assert!(!registry.failure_cache_active().await);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

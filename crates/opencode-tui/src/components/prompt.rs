@@ -498,6 +498,16 @@ impl Prompt {
         &self.input
     }
 
+    /// 未送信の入力があるか。送信済みの履歴は含まない。
+    pub fn has_input(&self) -> bool {
+        !self.input.is_empty()
+    }
+
+    /// 現在の入力トークンに対して補完候補が存在するか。
+    pub fn has_completion_candidates(&self) -> bool {
+        !self.suggestions.is_empty()
+    }
+
     pub fn cursor_position(&self) -> usize {
         self.cursor_position
     }
@@ -1383,7 +1393,7 @@ mod tests {
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     fn with_isolated_prompt<T>(f: impl FnOnce(Prompt) -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state_dir =
             std::env::temp_dir().join(format!("opencode-tui-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir).expect("create state dir");
@@ -1471,6 +1481,28 @@ mod tests {
             prompt.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
             prompt.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
             assert_eq!(prompt.get_input(), "");
+        });
+    }
+
+    #[test]
+    fn has_input_tracks_only_unsent_text() {
+        with_isolated_prompt(|mut prompt| {
+            assert!(!prompt.has_input());
+            prompt.set_input("draft".to_string());
+            assert!(prompt.has_input());
+            let _ = prompt.take_input();
+            assert!(!prompt.has_input());
+        });
+    }
+
+    #[test]
+    fn has_completion_candidates_tracks_suggestion_state() {
+        with_isolated_prompt(|mut prompt| {
+            assert!(!prompt.has_completion_candidates());
+            prompt.set_input("@b".to_string());
+            assert!(prompt.has_completion_candidates());
+            prompt.set_input(String::new());
+            assert!(!prompt.has_completion_candidates());
         });
     }
 }

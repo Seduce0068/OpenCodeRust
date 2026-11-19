@@ -289,7 +289,7 @@ impl OpenAIProvider {
         ];
 
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             config,
             models,
             legacy_only,
@@ -742,7 +742,14 @@ impl OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         let body = response.text().await.map_err(|e| {
@@ -922,7 +929,14 @@ impl OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         let stream = stream::try_unfold(
@@ -1104,7 +1118,7 @@ where
 ///
 /// 500 バイト目が UTF-8 マルチバイト文字の途中に一致しても文字境界まで
 /// 丸めて切り詰める。`&body[..500]` は境界でない場合に panic するため使わない。
-fn error_body_preview(body: &str, max_bytes: usize) -> String {
+pub(crate) fn error_body_preview(body: &str, max_bytes: usize) -> String {
     if body.len() <= max_bytes {
         return body.to_string();
     }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use opencode_provider::{
-    parse_api_call_error, parse_stream_error, Content, ContentPart, ImageUrl,
+    parse_api_call_error_with_headers, parse_stream_error, Content, ContentPart, ImageUrl,
     Message as ProviderMessage, ParsedAPICallError, ParsedStreamError, ProviderError, Role,
     ToolResult as ProviderToolResult, ToolUse,
 };
@@ -640,7 +640,10 @@ pub fn error_from_anyhow(e: anyhow::Error, provider_id: &str) -> MessageError {
 
     // 5. Try to downcast to ProviderError for structured handling.
     if let Some(provider_err) = e.downcast_ref::<ProviderError>() {
-        let parsed = parse_api_call_error(provider_id, provider_err);
+        // 構造化保持されたレスポンスヘッダを取り出し、session 側の retry へ流す。
+        // 本文は parse 側で 500 バイト preview に制限される。
+        let response_headers = provider_err.response_headers().cloned();
+        let parsed = parse_api_call_error_with_headers(provider_id, provider_err, response_headers);
         return match parsed {
             ParsedAPICallError::ContextOverflow {
                 message,
@@ -1170,6 +1173,58 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(serde_json::to_value(part).unwrap()["type"], "text");
+    }
+
+    #[test]
+    fn error_from_anyhow_propagates_structured_headers_and_body() {
+        let mut headers = HashMap::new();
+        headers.insert("retry-after".to_string(), "2".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+        let body = "{\"error\":\"rate_limited\"}".to_string();
+        let provider_error = ProviderError::api_error_with_headers(
+            429,
+            "rate limited",
+            Some(headers.clone()),
+            Some(body.clone()),
+        );
+
+        let error = error_from_anyhow(anyhow::Error::new(provider_error), "openai");
+        match &error {
+            MessageError::ApiError {
+                status_code,
+                is_retryable,
+                response_headers,
+                response_body,
+                ..
+            } => {
+                assert_eq!(*status_code, Some(429));
+                assert!(*is_retryable);
+                assert_eq!(response_headers.as_ref(), Some(&headers));
+                assert_eq!(response_body.as_deref(), Some(body.as_str()));
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+
+        // Retry-After が session retry の delay へ反映されること。
+        let api_info = crate::retry::ApiErrorInfo {
+            message: "rate limited".to_string(),
+            is_retryable: true,
+            response_headers: Some(headers),
+            response_body: None,
+        };
+        assert_eq!(crate::retry::delay(1, Some(&api_info)), 2_000);
+
+        // 無関係ヘッダだけなら 30 秒を超えないこと（Finding 6）。
+        let mut unrelated = HashMap::new();
+        unrelated.insert("x-request-id".to_string(), "req-1".to_string());
+        let api_info = crate::retry::ApiErrorInfo {
+            response_headers: Some(unrelated),
+            ..api_info
+        };
+        assert_eq!(
+            crate::retry::delay(u32::MAX, Some(&api_info)),
+            crate::retry::RETRY_MAX_DELAY_NO_HEADERS
+        );
     }
 
     #[test]

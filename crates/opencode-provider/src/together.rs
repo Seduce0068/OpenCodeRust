@@ -19,7 +19,7 @@ pub struct TogetherProvider {
 impl TogetherProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             api_key: api_key.into(),
             models: vec![
                 ModelInfo {
@@ -111,7 +111,14 @@ impl Provider for TogetherProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         response
@@ -138,7 +145,14 @@ impl Provider for TogetherProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         // チャンク境界で SSE 行や UTF-8 文字が分断されても取りこぼさないよう、

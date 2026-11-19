@@ -19,7 +19,7 @@ pub struct CohereProvider {
 impl CohereProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::provider::default_http_client().unwrap_or_else(|_| Client::new()),
             api_key: api_key.into(),
             models: vec![
                 ModelInfo {
@@ -100,7 +100,14 @@ impl Provider for CohereProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         response
@@ -127,7 +134,14 @@ impl Provider for CohereProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
+            return Err(ProviderError::api_error_from_status(
+                status.as_u16(),
+                format!(
+                    "{}: {}",
+                    status,
+                    crate::openai::error_body_preview(&body, 500)
+                ),
+            ));
         }
 
         // bytes_stream のチャンク境界をまたぐ SSE 行を SseLineBuffer で組み立てる。
@@ -370,5 +384,46 @@ mod tests {
 
         assert!(models.is_empty());
         assert_eq!(provider.models().len(), 4);
+    }
+
+    /// 回帰テスト: 500 応答を平坦化せず構造化ステータスとして保持し、
+    /// リトライ可と判定されることを固定する。
+    #[test]
+    fn http_500_response_is_retryable_and_body_is_previewed() {
+        use crate::retry::IsRetryable;
+
+        // chat / chat_stream と同一の構築経由（共通ヘルパ + 本文プレビュー）。
+        let status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        let body = "Internal Server Error";
+        let error = ProviderError::api_error_from_status(
+            status.as_u16(),
+            format!(
+                "{}: {}",
+                status,
+                crate::openai::error_body_preview(body, 500)
+            ),
+        );
+        assert_eq!(error.status_code(), Some(500));
+        assert!(
+            error.is_retryable().is_some(),
+            "500 レスポンスはリトライ可能でなければならない: {error:?}"
+        );
+
+        // 本文全体をエラーへ埋め込まないことの回帰防止。
+        let long_body = "x".repeat(1000);
+        let long_error = ProviderError::api_error_from_status(
+            status.as_u16(),
+            format!(
+                "{}: {}",
+                status,
+                crate::openai::error_body_preview(&long_body, 500)
+            ),
+        );
+        let message = long_error.to_string();
+        assert!(message.contains("..."), "長い本文は省略されるべき");
+        assert!(
+            !message.contains(long_body.as_str()),
+            "本文全体をエラーへ露出してはならない"
+        );
     }
 }

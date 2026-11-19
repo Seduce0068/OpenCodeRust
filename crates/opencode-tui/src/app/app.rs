@@ -41,6 +41,28 @@ use crate::ui::{Clipboard, Selection};
 const TICK_RATE_MS: u64 = 16;
 const MAX_EVENTS_PER_FRAME: usize = 256;
 
+/// 無修飾 `q` で終了してよいか。未送信入力がある、またはプロンプトが
+/// テキスト入力を捕捉している場合は `q` を文字として扱う。
+fn should_exit_on_unmodified_q(prompt_has_input: bool, prompt_captures_text: bool) -> bool {
+    !(prompt_has_input || prompt_captures_text)
+}
+
+/// Tab / BackTab を補完へ委譲すべきか。候補があるか未送信入力があれば
+/// エージェント切替より補完を優先する。
+fn should_delegate_navigation_key_to_prompt(has_input: bool, has_candidates: bool) -> bool {
+    has_input || has_candidates
+}
+
+/// Paste をプロンプトへ挿入してよいか。permission → question → dialog の
+/// 順に入力を占有する層があれば挿入しない。
+fn should_insert_paste_into_prompt(
+    permission_open: bool,
+    question_open: bool,
+    dialog_open: bool,
+) -> bool {
+    !(permission_open || question_open || dialog_open)
+}
+
 /// A question request received from the server.
 ///
 /// Multi-question requests are asked sequentially; answers are accumulated
@@ -455,7 +477,15 @@ impl App {
                     return Ok(());
                 }
 
-                if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+                // 未送信入力がある／シェルモード中は 'q' を終了キーとして扱わず、
+                // 文字としてプロンプトへ渡す（入力の誤消去を防ぐ）。
+                if key.code == KeyCode::Char('q')
+                    && key.modifiers.is_empty()
+                    && should_exit_on_unmodified_q(
+                        self.prompt.has_input(),
+                        self.prompt_captures_text(),
+                    )
+                {
                     self.state = AppState::Exiting;
                     return Ok(());
                 }
@@ -536,11 +566,27 @@ impl App {
                     return Ok(());
                 }
                 if self.matches_keybind("agent_cycle", *key) {
-                    self.cycle_agent(1);
+                    if should_delegate_navigation_key_to_prompt(
+                        self.prompt.has_input(),
+                        self.prompt.has_completion_candidates(),
+                    ) {
+                        // 入力中／補完候補あり: Tab は補完として扱う（agent 切替は行わない）。
+                        self.prompt.handle_key(*key);
+                    } else {
+                        self.cycle_agent(1);
+                    }
                     return Ok(());
                 }
                 if self.matches_keybind("agent_cycle_reverse", *key) {
-                    self.cycle_agent(-1);
+                    if should_delegate_navigation_key_to_prompt(
+                        self.prompt.has_input(),
+                        self.prompt.has_completion_candidates(),
+                    ) {
+                        // 入力中／補完候補あり: BackTab は前の補完候補へ戻す。
+                        self.prompt.handle_key(*key);
+                    } else {
+                        self.cycle_agent(-1);
+                    }
                     return Ok(());
                 }
                 if self.matches_keybind("variant_cycle", *key) {
@@ -707,7 +753,15 @@ impl App {
                 }
             }
             Event::Paste(text) if !text.is_empty() => {
-                self.prompt.insert_text(text);
+                // Key と同じく permission → question → dialog の順で入力の
+                // 所有者を確認し、モーダル表示中はプロンプトへ挿入しない。
+                if should_insert_paste_into_prompt(
+                    self.permission_prompt.is_open,
+                    self.question_prompt.is_open,
+                    self.has_open_dialog_layer(),
+                ) {
+                    self.prompt.insert_text(text);
+                }
             }
             Event::Custom(event) => match event {
                 CustomEvent::StateChanged(StateChange::SessionUpdated(session_id)) => {
@@ -806,6 +860,11 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// プロンプトが現在テキスト入力を捕捉しているか（未送信入力またはシェルモード）。
+    fn prompt_captures_text(&self) -> bool {
+        self.prompt.has_input() || self.prompt.is_shell_mode()
     }
 
     fn has_open_dialog_layer(&self) -> bool {
@@ -3842,6 +3901,61 @@ fn resync_todos_from_server(context: &Arc<AppContext>) {
     }
 }
 
+/// SSE 初回再接続待機（従来の 400ms を維持）。
+const SSE_INITIAL_RETRY_MS: u64 = 400;
+/// 指数バックオフの上限。
+const SSE_MAX_RETRY_MS: u64 = 30_000;
+/// 上限までのシフト数（400ms * 2^7 = 51.2s で 30s へ丸められる）。
+const SSE_MAX_BACKOFF_SHIFT: u32 = 8;
+/// 同時再接続を分散するためのジッタ上限。
+const SSE_JITTER_MAX_MS: u64 = 250;
+/// ストリーム読み出しのタイムアウト。reqwest は本文読込を含むリクエスト全体へ適用する。
+const SSE_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// これ以上生存したストリームは健全とみなし、バックオフをリセットする。
+const SSE_HEALTHY_STREAM_MIN: Duration = Duration::from_secs(10);
+
+fn sse_backoff_base_ms(attempt: u32) -> u64 {
+    let shift = attempt.min(SSE_MAX_BACKOFF_SHIFT);
+    let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    SSE_INITIAL_RETRY_MS
+        .saturating_mul(factor)
+        .min(SSE_MAX_RETRY_MS)
+}
+
+fn sse_retry_delay(attempt: u32, jitter_ms: u64) -> Duration {
+    let jitter = jitter_ms % (SSE_JITTER_MAX_MS + 1);
+    Duration::from_millis(sse_backoff_base_ms(attempt).saturating_add(jitter))
+}
+
+/// 依存追加なしの軽量ジッタ源。同時起動したクライアントの再接続を分散する。
+fn sse_jitter_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % (SSE_JITTER_MAX_MS + 1)
+}
+
+/// HTTP エラー／接続エラー後の試行回数と待機時間。
+fn sse_delay_after_failure(previous_attempt: u32, jitter_ms: u64) -> (u32, Duration) {
+    let attempt = previous_attempt.saturating_add(1);
+    (attempt, sse_retry_delay(attempt, jitter_ms))
+}
+
+/// EOF / エラー / タイムアウトを問わず、ストリーム終了後は必ず待機する。
+/// 十分長く生存したストリームのみ試行回数をリセットする。
+fn sse_delay_after_stream_end(
+    stream_lifetime: Duration,
+    previous_attempt: u32,
+    jitter_ms: u64,
+) -> (u32, Duration) {
+    if stream_lifetime >= SSE_HEALTHY_STREAM_MIN {
+        (0, sse_retry_delay(0, jitter_ms))
+    } else {
+        sse_delay_after_failure(previous_attempt, jitter_ms)
+    }
+}
+
 fn spawn_server_event_listener(
     event_tx: Sender<Event>,
     base_url: String,
@@ -3871,17 +3985,34 @@ fn spawn_server_event_listener(
         let event_url = format!("{}/event", base_url.trim_end_matches('/'));
         // 起動時にもサーバ側の状態で上書きし、過去の更新の取りこぼしを回復する。
         resync_todos_from_server(&context);
+        let mut retry_attempt: u32 = 0;
         loop {
             match client
                 .get(&event_url)
                 .header(reqwest::header::ACCEPT, "text/event-stream")
+                .timeout(SSE_READ_TIMEOUT)
                 .send()
             {
                 Ok(response) if response.status().is_success() => {
                     // 再接続中に届いた todo.updated を取りこぼす場合があるため、
                     // ストリームの消費前に GET で再同期する。
                     resync_todos_from_server(&context);
+                    let stream_started = Instant::now();
                     consume_server_event_stream(response, &event_tx, &context);
+                    // EOF / ストリーム終了も失敗として扱い、即再接続しない。
+                    let (attempt, delay) = sse_delay_after_stream_end(
+                        stream_started.elapsed(),
+                        retry_attempt,
+                        sse_jitter_ms(),
+                    );
+                    retry_attempt = attempt;
+                    tracing::debug!(
+                        url = %event_url,
+                        attempt,
+                        ?delay,
+                        "server event stream ended; backing off"
+                    );
+                    thread::sleep(delay);
                 }
                 Ok(response) => {
                     tracing::debug!(
@@ -3889,7 +4020,9 @@ fn spawn_server_event_listener(
                         status = %response.status(),
                         "server event stream subscription rejected"
                     );
-                    thread::sleep(Duration::from_millis(400));
+                    let (attempt, delay) = sse_delay_after_failure(retry_attempt, sse_jitter_ms());
+                    retry_attempt = attempt;
+                    thread::sleep(delay);
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -3897,13 +4030,17 @@ fn spawn_server_event_listener(
                         %err,
                         "server event stream disconnected"
                     );
-                    thread::sleep(Duration::from_millis(400));
+                    let (attempt, delay) = sse_delay_after_failure(retry_attempt, sse_jitter_ms());
+                    retry_attempt = attempt;
+                    thread::sleep(delay);
                 }
             }
         }
     });
 }
 
+/// SSE ストリームを消費する。この関数が戻ることはすなわち EOF / 読込エラー /
+/// タイムアウトによるストリーム終了を意味し、呼び出し側はバックオフ待機を行う。
 fn consume_server_event_stream(
     response: reqwest::blocking::Response,
     event_tx: &Sender<Event>,
@@ -4407,6 +4544,77 @@ mod tests {
         assert!(
             std::env::var("OPENCODE_TUI_AUTH_TOKEN").is_err(),
             "even a blank auth token env value must be removed"
+        );
+    }
+
+    #[test]
+    fn unmodified_q_does_not_exit_while_typing() {
+        // 未送信入力がある／入力を捕捉中は 'q' を文字として扱う。
+        assert!(!should_exit_on_unmodified_q(true, true));
+        assert!(!should_exit_on_unmodified_q(true, false));
+        assert!(!should_exit_on_unmodified_q(false, true));
+        // 入力が空でフォーカスもプロンプト外のときだけ終了する。
+        assert!(should_exit_on_unmodified_q(false, false));
+    }
+
+    #[test]
+    fn tab_navigation_is_delegated_to_prompt_while_typing() {
+        // 入力非空 or 補完候補あり → エージェント切替ではなく補完へ委譲。
+        assert!(should_delegate_navigation_key_to_prompt(true, false));
+        assert!(should_delegate_navigation_key_to_prompt(false, true));
+        assert!(should_delegate_navigation_key_to_prompt(true, true));
+        // 入力がなく候補もない場合のみ agent 切替を許可する。
+        assert!(!should_delegate_navigation_key_to_prompt(false, false));
+    }
+
+    #[test]
+    fn paste_respects_permission_question_and_dialog_layers() {
+        // permission → question → dialog の順で、1 つでも開いていれば挿入しない。
+        assert!(!should_insert_paste_into_prompt(true, false, false));
+        assert!(!should_insert_paste_into_prompt(false, true, false));
+        assert!(!should_insert_paste_into_prompt(false, false, true));
+        assert!(!should_insert_paste_into_prompt(true, true, true));
+        assert!(should_insert_paste_into_prompt(false, false, false));
+    }
+
+    #[test]
+    fn eof_stream_end_backs_off_before_reconnecting() {
+        // EOF で直ちに再接続せず、初回待機（400ms）以上を必ず挟む。
+        let (attempt, delay) = sse_delay_after_stream_end(Duration::from_millis(1), 0, 0);
+        assert_eq!(attempt, 1);
+        assert!(delay >= Duration::from_millis(SSE_INITIAL_RETRY_MS));
+
+        // 短いストリームが続くと指数バックオフで待機が伸びる。
+        let (attempt2, delay2) = sse_delay_after_stream_end(Duration::from_millis(1), attempt, 0);
+        assert_eq!(attempt2, 2);
+        assert!(delay2 >= delay);
+
+        // 十分長く生存したストリームは試行回数をリセットするが、待機は残す。
+        let (reset, healthy_delay) =
+            sse_delay_after_stream_end(SSE_HEALTHY_STREAM_MIN, attempt2, 0);
+        assert_eq!(reset, 0);
+        assert_eq!(healthy_delay, Duration::from_millis(SSE_INITIAL_RETRY_MS));
+    }
+
+    #[test]
+    fn sse_backoff_grows_exponentially_and_is_capped() {
+        assert_eq!(sse_backoff_base_ms(0), SSE_INITIAL_RETRY_MS);
+        assert_eq!(sse_backoff_base_ms(1), SSE_INITIAL_RETRY_MS * 2);
+        assert_eq!(sse_backoff_base_ms(2), SSE_INITIAL_RETRY_MS * 4);
+        assert!(sse_backoff_base_ms(3) > sse_backoff_base_ms(2));
+        assert_eq!(sse_backoff_base_ms(u32::MAX), SSE_MAX_RETRY_MS);
+    }
+
+    #[test]
+    fn sse_retry_delay_adds_bounded_jitter() {
+        let base = sse_backoff_base_ms(3);
+        let no_jitter = sse_retry_delay(3, 0);
+        let with_jitter = sse_retry_delay(3, u64::MAX);
+        assert_eq!(no_jitter, Duration::from_millis(base));
+        assert!(with_jitter >= no_jitter);
+        assert!(
+            with_jitter <= Duration::from_millis(base + SSE_JITTER_MAX_MS),
+            "jitter must stay within the bounded range"
         );
     }
 }

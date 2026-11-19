@@ -259,6 +259,47 @@ pub enum AuthError {
 
     #[error("API key not set for provider: {0}")]
     ApiKeyNotSet(String),
+
+    #[error("OAuth token expired for provider: {provider_id}")]
+    OAuthTokenExpired { provider_id: String },
+}
+
+/// OAuth トークンの期限に対して余裕を持たせる既定値（60 秒）。
+pub const DEFAULT_OAUTH_EXPIRY_SKEW_MS: i64 = 60_000;
+
+/// OAuth 資格情報の期限（epoch milliseconds）を取り出す。
+pub fn oauth_expires_at_ms(auth: &AuthInfo) -> Option<i64> {
+    match auth {
+        AuthInfo::OAuth { expires, .. } => *expires,
+        _ => None,
+    }
+}
+
+/// 期限が切れている、または `skew_ms` 以内に切れるかを判定する純粋ヘルパ。
+pub fn is_oauth_expired(auth: &AuthInfo, now_ms: i64, skew_ms: i64) -> bool {
+    match oauth_expires_at_ms(auth) {
+        // 現在時刻への skew 加算でオーバーフローしないよう saturating_add を使う。
+        Some(expires_ms) => now_ms.saturating_add(skew_ms.max(0)) >= expires_ms,
+        None => false,
+    }
+}
+
+/// 期限切れ（または skew ウィンドウ内）なら `AuthError` を返す純粋ヘルパ。
+///
+/// refresh による自動更新は外部 HTTP を伴うため本次では行わず、期限検知のみを提供する。
+pub fn ensure_oauth_not_expired(
+    provider_id: &str,
+    auth: &AuthInfo,
+    now_ms: i64,
+    skew_ms: i64,
+) -> Result<(), AuthError> {
+    if is_oauth_expired(auth, now_ms, skew_ms) {
+        Err(AuthError::OAuthTokenExpired {
+            provider_id: provider_id.to_string(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 pub fn get_env_key(provider_id: &str) -> Option<String> {
@@ -411,5 +452,68 @@ mod tests {
         assert!(manager.last_persist_error().await.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn oauth_with_expiry(expires: Option<i64>) -> AuthInfo {
+        AuthInfo::OAuth {
+            access: "access-token".to_string(),
+            refresh: "refresh-token".to_string(),
+            expires,
+            account_id: None,
+            enterprise_url: None,
+        }
+    }
+
+    #[test]
+    fn oauth_expiry_detection_respects_skew() {
+        let auth = oauth_with_expiry(Some(10_000));
+        assert_eq!(oauth_expires_at_ms(&auth), Some(10_000));
+        assert!(!is_oauth_expired(&auth, 8_000, 1_000));
+        assert!(is_oauth_expired(&auth, 9_000, 1_000));
+        assert!(is_oauth_expired(&auth, 10_000, 0));
+        assert!(is_oauth_expired(&auth, 11_000, 0));
+    }
+
+    #[test]
+    fn oauth_without_expiry_is_not_treated_as_expired() {
+        let auth = oauth_with_expiry(None);
+        assert_eq!(oauth_expires_at_ms(&auth), None);
+        assert!(!is_oauth_expired(
+            &auth,
+            i64::MAX,
+            DEFAULT_OAUTH_EXPIRY_SKEW_MS
+        ));
+        assert!(
+            ensure_oauth_not_expired("openai", &auth, i64::MAX, DEFAULT_OAUTH_EXPIRY_SKEW_MS)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ensure_oauth_not_expired_returns_auth_error_before_expiry() {
+        let auth = oauth_with_expiry(Some(10_000));
+        assert!(ensure_oauth_not_expired("openai", &auth, 8_000, 1_000).is_ok());
+
+        let error = ensure_oauth_not_expired("openai", &auth, 9_500, 1_000)
+            .expect_err("token inside skew window must be rejected");
+        assert!(matches!(error, AuthError::OAuthTokenExpired { .. }));
+        let message = error.to_string();
+        assert!(message.contains("openai"));
+        assert!(!message.contains("access-token"), "token must not leak");
+        assert!(!message.contains("refresh-token"), "token must not leak");
+    }
+
+    #[test]
+    fn non_oauth_auth_is_ignored_by_expiry_helper() {
+        let auth = AuthInfo::Api {
+            key: "key".to_string(),
+        };
+        assert_eq!(oauth_expires_at_ms(&auth), None);
+        assert!(!is_oauth_expired(
+            &auth,
+            i64::MAX,
+            DEFAULT_OAUTH_EXPIRY_SKEW_MS
+        ));
+        assert!(ensure_oauth_not_expired("openai", &auth, i64::MAX, 0).is_ok());
     }
 }

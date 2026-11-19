@@ -40,6 +40,18 @@ const MAX_CALL_DEPTH: usize = 64;
 /// stack from parser-accepted, deeply nested syntax.
 const MAX_EVAL_DEPTH: usize = 64;
 
+/// Maximum byte length of a RegExp pattern accepted by the interpreter.
+const MAX_REGEX_PATTERN_LENGTH: usize = 8 * 1024;
+
+/// Maximum byte length of a string matched by a RegExp. Bounds the work done
+/// even by linear-time patterns and complements `REGEX_BACKTRACK_LIMIT`.
+const MAX_REGEX_INPUT_LENGTH: usize = 256 * 1024;
+
+/// Backtracking budget for fancy-regex's VM. Without this, a pattern such as
+/// `/^(a+)+$/` can backtrack exponentially (ReDoS). 1M attempts are plenty for
+/// ordinary patterns while still failing in milliseconds.
+const REGEX_BACKTRACK_LIMIT: usize = 1_000_000;
+
 /// Classification of an interpreter runtime error, mirroring the upstream
 /// diagnostic kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4622,9 +4634,11 @@ impl<'a> Interpreter<'a> {
                 match re {
                     Some(re) => {
                         let re = re.borrow();
-                        let index = match re.regex.find(&text) {
+                        let text = regex_input(&text, span)?;
+                        let index = match re.regex.find(text) {
                             Ok(Some(m)) => m.start() as f64,
-                            _ => -1.0,
+                            Ok(None) => -1.0,
+                            Err(err) => return Err(regex_execution_error(&err, span)),
                         };
                         Ok(Value::Number(index))
                     }
@@ -4657,15 +4671,16 @@ impl<'a> Interpreter<'a> {
                     });
                 };
 
+                let input = regex_input(&text, span)?;
                 let global = re.borrow().global;
                 if global {
                     // Global: return array of all matches (no index/input props)
                     let re = re.borrow();
                     let mut matches = Vec::new();
-                    for m in re.regex.find_iter(&text) {
+                    for m in re.regex.find_iter(input) {
                         match m {
                             Ok(m) => matches.push(Value::String(m.as_str().to_string())),
-                            Err(_) => break,
+                            Err(err) => return Err(regex_execution_error(&err, span)),
                         }
                     }
                     if matches.is_empty() {
@@ -4674,7 +4689,7 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::array(matches))
                 } else {
                     let re = re.borrow();
-                    Ok(match re.regex.captures(&text) {
+                    Ok(match re.regex.captures(input) {
                         Ok(Some(caps)) => {
                             let m = caps.get(0).unwrap();
                             let mut obj = indexmap::IndexMap::new();
@@ -4723,7 +4738,8 @@ impl<'a> Interpreter<'a> {
                             }
                             Value::Object(Rc::new(RefCell::new(obj)))
                         }
-                        _ => Value::Null,
+                        Ok(None) => Value::Null,
+                        Err(err) => return Err(regex_execution_error(&err, span)),
                     })
                 }
             }
@@ -4744,9 +4760,13 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 let re = re.borrow();
+                let input = regex_input(&text, span)?;
                 let mut results = Vec::new();
-                for caps in re.regex.captures_iter(&text) {
-                    let Ok(caps) = caps else { break };
+                for caps in re.regex.captures_iter(input) {
+                    let caps = match caps {
+                        Ok(caps) => caps,
+                        Err(err) => return Err(regex_execution_error(&err, span)),
+                    };
                     let m = caps.get(0).unwrap();
                     let mut obj = indexmap::IndexMap::new();
                     obj.insert("0".to_string(), Value::String(m.as_str().to_string()));
@@ -4876,12 +4896,13 @@ impl<'a> Interpreter<'a> {
                     _ => return Ok(Value::Boolean(false)),
                 };
                 let text = to_js_string(&argument(0));
+                let input = regex_input(&text, span)?;
                 let mut re = re.borrow_mut();
                 let result = if re.global || re.sticky {
                     // Global/sticky flag: start scanning at last_index.
                     // JS clamps a negative lastIndex to 0 for scanning.
                     let start = re.last_index.max(0) as usize;
-                    match re.regex.captures_from_pos(&text, start) {
+                    match re.regex.captures_from_pos(input, start) {
                         Ok(Some(caps)) => {
                             let m = caps.get(0).unwrap();
                             if re.sticky && m.start() != start {
@@ -4892,13 +4913,17 @@ impl<'a> Interpreter<'a> {
                                 true
                             }
                         }
-                        _ => {
+                        Ok(None) => {
                             re.last_index = 0;
                             false
                         }
+                        Err(err) => return Err(regex_execution_error(&err, span)),
                     }
                 } else {
-                    re.regex.is_match(&text).unwrap_or(false)
+                    match re.regex.is_match(input) {
+                        Ok(matched) => matched,
+                        Err(err) => return Err(regex_execution_error(&err, span)),
+                    }
                 };
                 Ok(Value::Boolean(result))
             }
@@ -4908,6 +4933,7 @@ impl<'a> Interpreter<'a> {
                     _ => return Ok(Value::Null),
                 };
                 let text = to_js_string(&argument(0));
+                let input = regex_input(&text, span)?;
                 let mut re = re.borrow_mut();
                 let sticky = re.sticky;
                 let global = re.global;
@@ -4916,7 +4942,7 @@ impl<'a> Interpreter<'a> {
                 // Determine the search start and whether we require an exact anchor.
                 let caps = if global || sticky {
                     // For sticky, the match must start exactly at last_index.
-                    match re.regex.captures_from_pos(&text, start) {
+                    match re.regex.captures_from_pos(input, start) {
                         Ok(Some(caps)) => {
                             if sticky && caps.get(0).map(|m| m.start()) != Some(start) {
                                 re.last_index = 0;
@@ -4925,13 +4951,17 @@ impl<'a> Interpreter<'a> {
                                 Some(caps)
                             }
                         }
-                        _ => {
+                        Ok(None) => {
                             re.last_index = 0;
                             None
                         }
+                        Err(err) => return Err(regex_execution_error(&err, span)),
                     }
                 } else {
-                    re.regex.captures(&text).ok().flatten()
+                    match re.regex.captures(input) {
+                        Ok(caps) => caps,
+                        Err(err) => return Err(regex_execution_error(&err, span)),
+                    }
                 };
 
                 match caps {
@@ -6309,9 +6339,52 @@ fn construct_url_search_params(arguments: &[Value], _span: Span) -> Result<Value
     ))))
 }
 
+/// Reject inputs that are too large to match safely. Called immediately before
+/// every fancy-regex execution site so RegExp literals, `RegExp` constructor
+/// results and string-method arguments all share the same bound.
+fn regex_input(text: &str, span: Span) -> Result<&str, RuntimeError> {
+    if text.len() > MAX_REGEX_INPUT_LENGTH {
+        return Err(RuntimeError::new(
+            RuntimeErrorKind::RangeError,
+            format!("Regular expression input exceeds {MAX_REGEX_INPUT_LENGTH} bytes."),
+            span,
+        ));
+    }
+    Ok(text)
+}
+
+/// Convert a fancy-regex runtime error (notably `BacktrackLimitExceeded` and
+/// `StackOverflow`) into an interpreter `RuntimeError` instead of silently
+/// treating the match as "no match".
+fn regex_execution_error(error: &fancy_regex::Error, span: Span) -> RuntimeError {
+    match error {
+        fancy_regex::Error::RuntimeError(
+            fancy_regex::RuntimeError::BacktrackLimitExceeded
+            | fancy_regex::RuntimeError::StackOverflow,
+        ) => RuntimeError::new(
+            RuntimeErrorKind::RangeError,
+            "Regular expression exceeded its backtracking limit.",
+            span,
+        ),
+        other => RuntimeError::new(
+            RuntimeErrorKind::ExecutionFailure,
+            format!("Regular expression execution failed: {other}"),
+            span,
+        ),
+    }
+}
+
 fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeError> {
     let pattern = arguments.first().map(to_js_string).unwrap_or_default();
     let flags = arguments.get(1).map(to_js_string).unwrap_or_default();
+
+    if pattern.len() > MAX_REGEX_PATTERN_LENGTH {
+        return Err(RuntimeError::new(
+            RuntimeErrorKind::RangeError,
+            format!("Regular expression pattern exceeds {MAX_REGEX_PATTERN_LENGTH} bytes."),
+            span,
+        ));
+    }
 
     let mut global = false;
     let mut ignore_case = false;
@@ -6344,6 +6417,9 @@ fn construct_regexp(arguments: &[Value], span: Span) -> Result<Value, RuntimeErr
     if unicode {
         builder.unicode_mode(true);
     }
+    // Explicit backtracking budget: fancy-regex's default is 1M as well, but
+    // pinning it here keeps this security control independent of upgrades.
+    builder.backtrack_limit(REGEX_BACKTRACK_LIMIT);
 
     let regex = builder.build().map_err(|e| {
         RuntimeError::type_error(format!("Invalid regular expression: {}", e), span)
@@ -10100,6 +10176,58 @@ mod tests {
         // which the regex engine reads as the digit class.
         let value = run_value("return \"abc 123\".match(new RegExp(\"\\\\d+\"))[0];");
         assert_eq!(value, Value::String("123".to_string()));
+    }
+
+    #[test]
+    fn catastrophic_regexp_fails_within_timeout() {
+        use std::time::{Duration, Instant};
+
+        // `^(a+)+$` is simplified to `^(a+)$` by fancy-regex's nested-repeat
+        // optimizer. Use an equally ambiguous pattern the optimizer keeps:
+        // partitioning a run of `a`s into 1- and 2-character chunks is
+        // exponential. The negative lookahead makes the whole pattern "hard",
+        // forcing fancy-regex's backtracking VM (easy patterns are delegated to
+        // regex-automata, which has no backtracking limit); the trailing `!`
+        // makes `$` fail after every partition.
+        let allocator = Allocator::default();
+        let program = parse_program(
+            &allocator,
+            "return /^(a|aa)+(?!x)$/.test('a'.repeat(4000) + '!');",
+        )
+        .expect("fixture should parse");
+        let mut interpreter = Interpreter::new();
+        let timeout_ms = 2_000;
+        interpreter.set_limits(&ExecutionLimits {
+            timeout_ms: Some(timeout_ms),
+            ..ExecutionLimits::default()
+        });
+        let started = Instant::now();
+        let error = interpreter
+            .run(&program)
+            .expect_err("must reject ReDoS pattern");
+        assert!(
+            started.elapsed() < Duration::from_millis(timeout_ms),
+            "regex took {:?}, expected under {timeout_ms}ms",
+            started.elapsed()
+        );
+        assert_eq!(error.kind(), super::RuntimeErrorKind::RangeError);
+    }
+
+    #[test]
+    fn regexp_pattern_and_input_lengths_are_capped() {
+        let pattern_source = format!(
+            "return new RegExp('a'.repeat({}));",
+            super::MAX_REGEX_PATTERN_LENGTH + 1
+        );
+        let error = run(&pattern_source).expect_err("overlong pattern");
+        assert_eq!(error.kind(), super::RuntimeErrorKind::RangeError);
+
+        let input_source = format!(
+            "return /a/.test('a'.repeat({}));",
+            super::MAX_REGEX_INPUT_LENGTH + 1
+        );
+        let error = run(&input_source).expect_err("overlong input");
+        assert_eq!(error.kind(), super::RuntimeErrorKind::RangeError);
     }
 
     #[test]

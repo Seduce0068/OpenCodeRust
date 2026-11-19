@@ -23,6 +23,14 @@ const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
 const MAX_HEADER_LINES: usize = 64;
 /// 1 ヘッダ行の最大長（改行を除く）。値はエラー本文に含めない。
 const MAX_HEADER_LINE_BYTES: usize = 8192;
+/// ストリーム全体の上限は RPC タイムアウトのこの倍数（最大 30 分）。
+const STREAM_TOTAL_TIMEOUT_FACTOR: u32 = 30;
+const STREAM_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// チャンクキューが満杯のとき、終端エラーを届けるための猶予。
+const STREAM_OVERFLOW_ERROR_GRACE: Duration = Duration::from_millis(100);
+
+type StreamStart = Result<(u16, std::collections::HashMap<String, String>), PluginSubprocessError>;
+type StreamChunk = Result<String, PluginSubprocessError>;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -107,7 +115,7 @@ pub struct AuthFetchResult {
 pub struct AuthFetchStreamResult {
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
-    pub chunks: mpsc::Receiver<Result<String, PluginSubprocessError>>,
+    pub chunks: mpsc::Receiver<StreamChunk>,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +284,50 @@ impl PluginSubprocess {
         self.call("auth.fetch", Some(params)).await
     }
 
+    /// Deliver a chunk without ever blocking on a slow consumer: the reader task
+    /// holds the RPC and stdout locks, so `send().await` here would deadlock all
+    /// other RPCs. On overflow, terminate the stream with an explicit error.
+    /// The bounded grace period only applies to that terminal error, never to
+    /// normal chunks.
+    async fn push_chunk(tx: &mpsc::Sender<StreamChunk>, item: StreamChunk) -> bool {
+        match tx.try_send(item) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let deadline = tokio::time::Instant::now() + STREAM_OVERFLOW_ERROR_GRACE;
+                loop {
+                    let error = PluginSubprocessError::Protocol(
+                        "plugin fetch stream chunk buffer overflow".into(),
+                    );
+                    match tx.try_send(Err(error)) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            if tokio::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Report a protocol/timeout failure to the caller: before the start frame
+    /// via the oneshot, afterwards through the chunk channel.
+    async fn report_stream_error(
+        chunk_tx: &mpsc::Sender<StreamChunk>,
+        start_tx: &mut Option<oneshot::Sender<StreamStart>>,
+        error: PluginSubprocessError,
+    ) {
+        if let Some(tx) = start_tx.take() {
+            let _ = tx.send(Err(error));
+        } else {
+            Self::push_chunk(chunk_tx, Err(error)).await;
+        }
+    }
+
     /// Proxy an HTTP request through the plugin's custom fetch as a real-time stream.
     pub async fn auth_fetch_stream(
         &self,
@@ -296,54 +348,71 @@ impl PluginSubprocess {
         self.write_request(id, "auth.fetch.stream", Some(params))
             .await?;
 
-        let (start_tx, start_rx) = oneshot::channel::<
-            Result<(u16, std::collections::HashMap<String, String>), PluginSubprocessError>,
-        >();
+        let (start_tx, start_rx) = oneshot::channel::<StreamStart>();
         let (chunk_tx, chunk_rx) = mpsc::channel(128);
         let stdout = Arc::clone(&self.stdout);
+        let idle_timeout = self.timeout;
+        let total_timeout = self
+            .timeout
+            .saturating_mul(STREAM_TOTAL_TIMEOUT_FACTOR)
+            .min(STREAM_MAX_TOTAL_TIMEOUT);
 
-        // Keep the JoinHandle: if the start frame never arrives, the spawned task
-        // would otherwise retain `rpc_guard` and the stdout lock forever, making
-        // every subsequent RPC block indefinitely.
+        // The reader task owns `rpc_guard` and the stdout lock for the entire
+        // stream. Idle plus overall timeouts guarantee both are released even
+        // when the plugin never sends `auth.fetch.stream.end`.
         let task = tokio::spawn(async move {
-            let _rpc_guard = rpc_guard;
             let mut start_tx = Some(start_tx);
             let mut reader = stdout.lock().await;
+            let overall_deadline = tokio::time::Instant::now() + total_timeout;
 
             loop {
-                let raw = match Self::read_raw_message(&mut reader).await {
-                    Ok(raw) => raw,
-                    Err(err) => {
-                        if let Some(tx) = start_tx.take() {
-                            let _ = tx.send(Err(err));
-                        } else {
-                            let _ = chunk_tx.send(Err(err)).await;
-                        }
+                let raw = match tokio::time::timeout_at(
+                    overall_deadline,
+                    tokio::time::timeout(idle_timeout, Self::read_raw_message(&mut reader)),
+                )
+                .await
+                {
+                    // Overall or idle timeout: end the stream and let the
+                    // guard-drop below unblock every waiting RPC.
+                    Err(_) | Ok(Err(_)) => {
+                        Self::report_stream_error(
+                            &chunk_tx,
+                            &mut start_tx,
+                            PluginSubprocessError::Timeout,
+                        )
+                        .await;
                         break;
                     }
+                    Ok(Ok(result)) => match result {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            Self::report_stream_error(&chunk_tx, &mut start_tx, err).await;
+                            break;
+                        }
+                    },
                 };
 
                 if raw.get("id").and_then(Value::as_u64) == Some(id) {
                     let response: RpcResponse = match serde_json::from_value(raw) {
                         Ok(response) => response,
                         Err(err) => {
-                            let send_err = PluginSubprocessError::Json(err);
-                            if let Some(tx) = start_tx.take() {
-                                let _ = tx.send(Err(send_err));
-                            } else {
-                                let _ = chunk_tx.send(Err(send_err)).await;
-                            }
+                            Self::report_stream_error(
+                                &chunk_tx,
+                                &mut start_tx,
+                                PluginSubprocessError::Json(err),
+                            )
+                            .await;
                             break;
                         }
                     };
 
                     if let Some(error) = response.error {
-                        let send_err = PluginSubprocessError::from(error);
-                        if let Some(tx) = start_tx.take() {
-                            let _ = tx.send(Err(send_err));
-                        } else {
-                            let _ = chunk_tx.send(Err(send_err)).await;
-                        }
+                        Self::report_stream_error(
+                            &chunk_tx,
+                            &mut start_tx,
+                            PluginSubprocessError::from(error),
+                        )
+                        .await;
                         break;
                     }
 
@@ -374,7 +443,7 @@ impl PluginSubprocess {
                 match method {
                     Some("auth.fetch.stream.chunk") => {
                         if let Some(chunk) = params.get("chunk").and_then(Value::as_str) {
-                            if chunk_tx.send(Ok(chunk.to_string())).await.is_err() {
+                            if !Self::push_chunk(&chunk_tx, Ok(chunk.to_string())).await {
                                 break;
                             }
                         }
@@ -385,12 +454,12 @@ impl PluginSubprocess {
                             .and_then(Value::as_str)
                             .unwrap_or("plugin custom fetch stream failed")
                             .to_string();
-                        let error = PluginSubprocessError::Protocol(message);
-                        if let Some(tx) = start_tx.take() {
-                            let _ = tx.send(Err(error));
-                        } else {
-                            let _ = chunk_tx.send(Err(error)).await;
-                        }
+                        Self::report_stream_error(
+                            &chunk_tx,
+                            &mut start_tx,
+                            PluginSubprocessError::Protocol(message),
+                        )
+                        .await;
                         break;
                     }
                     Some("auth.fetch.stream.end") => {
@@ -399,6 +468,9 @@ impl PluginSubprocess {
                     _ => {}
                 }
             }
+            // Explicitly drop both locks on every exit path, including timeouts.
+            drop(reader);
+            drop(rpc_guard);
         });
 
         // Abort the reader task on every failure path so that `rpc_lock` and the
@@ -618,6 +690,129 @@ mod tests {
         assert!(
             acquired.is_ok(),
             "rpc_lock remained held after stream start timeout"
+        );
+    }
+
+    fn stream_frame(value: serde_json::Value) -> Vec<u8> {
+        let content = serde_json::to_string(&value).expect("serialize fixture frame");
+        format!("Content-Length: {}\r\n\r\n{}", content.len(), content).into_bytes()
+    }
+
+    fn stream_start_frame(id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"status": 200, "headers": {}},
+            "error": null,
+        })
+    }
+
+    /// `cat` echoes whatever the client writes, so the test can inject framed
+    /// responses without a shell or a second helper binary.
+    async fn cat_subprocess(frames: &[Vec<u8>], timeout: Duration) -> PluginSubprocess {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat fixture");
+        let mut stdin = child.stdin.take().expect("take cat stdin");
+        for frame in frames {
+            stdin.write_all(frame).await.expect("write fixture frame");
+        }
+        let stdout = child.stdout.take().expect("take cat stdout");
+        PluginSubprocess {
+            name: String::new(),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            rpc_lock: Arc::new(Mutex::new(())),
+            process: Mutex::new(child),
+            request_id: AtomicU64::new(1),
+            hooks: Vec::new(),
+            auth_meta: None,
+            timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_without_end_releases_rpc_lock_on_timeout() {
+        let sub = cat_subprocess(
+            &[stream_frame(stream_start_frame(1))],
+            Duration::from_millis(150),
+        )
+        .await;
+        let headers = std::collections::HashMap::new();
+        let stream = sub
+            .auth_fetch_stream("http://example.invalid", "GET", &headers, None)
+            .await
+            .expect("start frame should arrive");
+        assert_eq!(stream.status, 200);
+        let mut chunks = stream.chunks;
+
+        // The plugin never sends `stream.end`: the idle timeout must abort the
+        // reader and hand the locks back.
+        let terminal = tokio::time::timeout(Duration::from_secs(2), chunks.recv()).await;
+        assert!(
+            matches!(terminal, Ok(Some(Err(PluginSubprocessError::Timeout)))),
+            "stream should time out without stream.end: {terminal:?}"
+        );
+
+        let acquired = tokio::time::timeout(Duration::from_secs(1), sub.rpc_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "rpc_lock remained held after stream timeout"
+        );
+        drop(acquired);
+
+        // A later RPC must succeed instead of blocking on a leaked lock. `cat`
+        // echoes the request frame, which doubles as a null-result response.
+        let rpc = tokio::time::timeout(
+            Duration::from_secs(2),
+            sub.call::<serde_json::Value>("ping", None),
+        )
+        .await;
+        assert!(rpc.is_ok(), "subsequent RPC timed out");
+        assert!(rpc.expect("rpc result").is_ok(), "subsequent RPC failed");
+    }
+
+    #[tokio::test]
+    async fn stream_chunk_overflow_ends_without_deadlock() {
+        let mut frames = vec![stream_frame(stream_start_frame(1))];
+        for index in 0..300 {
+            frames.push(stream_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "auth.fetch.stream.chunk",
+                "params": {"requestId": 1, "chunk": format!("chunk-{index}")},
+            })));
+        }
+        let sub = cat_subprocess(&frames, Duration::from_millis(150)).await;
+        let headers = std::collections::HashMap::new();
+        let stream = sub
+            .auth_fetch_stream("http://example.invalid", "GET", &headers, None)
+            .await
+            .expect("start frame should arrive");
+        let mut chunks = stream.chunks;
+
+        // Let the reader hit the 128-item buffer limit before draining.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut saw_overflow = false;
+        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), chunks.recv()).await
+        {
+            match item {
+                Ok(_) => {}
+                Err(PluginSubprocessError::Protocol(message)) if message.contains("overflow") => {
+                    saw_overflow = true;
+                    break;
+                }
+                Err(err) => panic!("unexpected stream error: {err}"),
+            }
+        }
+        assert!(saw_overflow, "chunk overflow must terminate with an error");
+
+        let acquired = tokio::time::timeout(Duration::from_secs(1), sub.rpc_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "rpc_lock remained held after chunk overflow"
         );
     }
 
