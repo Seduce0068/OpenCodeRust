@@ -181,10 +181,17 @@ impl ModelsRegistry {
 
         let url = format!("{}/api.json", MODELS_DEV_URL);
 
-        match reqwest::Client::new()
+        // 接続タイムアウトを明示しつつ、既存のリクエストタイムアウト 10 秒を維持する。
+        let client = crate::provider::build_http_client(
+            crate::provider::DEFAULT_CONNECT_TIMEOUT,
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+        match client
             .get(&url)
             .header("User-Agent", "opencode-rust")
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
             .send()
             .await
         {

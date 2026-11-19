@@ -1,5 +1,5 @@
 use crate::anthropic::AnthropicProvider;
-use crate::auth::AuthInfo;
+use crate::auth::{ensure_oauth_not_expired, now_unix_ms, AuthInfo, DEFAULT_OAUTH_EXPIRY_SKEW_MS};
 use crate::azure::AzureProvider;
 use crate::bedrock::BedrockProvider;
 use crate::cerebras::CerebrasProvider;
@@ -1322,7 +1322,27 @@ impl ProviderBootstrapState {
             }
             let maybe_key = match auth {
                 AuthInfo::Api { key } => Some(key.clone()),
-                AuthInfo::OAuth { access, .. } => Some(access.clone()),
+                AuthInfo::OAuth { .. } => {
+                    // 起動時に期限検知を行い、期限切れトークンを ProviderPatch へ渡さない。
+                    // 起動自体を失敗させず warn を出してスキップする方針。
+                    // これにより env や他 auth エントリによるフォールバックが維持される。
+                    match ensure_oauth_not_expired(
+                        provider_id,
+                        auth,
+                        now_unix_ms(),
+                        DEFAULT_OAUTH_EXPIRY_SKEW_MS,
+                    ) {
+                        Ok(()) => match auth {
+                            AuthInfo::OAuth { access, .. } => Some(access.clone()),
+                            _ => None,
+                        },
+                        Err(error) => {
+                            // error には provider_id のみが含まれ、トークン値は出さない。
+                            tracing::warn!(%error, provider_id, "skipping expired OAuth token");
+                            None
+                        }
+                    }
+                }
                 AuthInfo::WellKnown { token, .. } => Some(token.clone()),
             };
             if let Some(key) = maybe_key {
@@ -3389,6 +3409,54 @@ mod tests {
         assert_eq!(
             state.options.get("region"),
             Some(&serde_json::Value::String("dummy-region".to_string()))
+        );
+    }
+
+    #[test]
+    fn bootstrap_init_skips_expired_oauth_but_keeps_unexpired_token() {
+        let expired_id = "oauth-expired-dummy";
+        let fresh_id = "oauth-fresh-dummy";
+        let model = model_info("dummy-oauth-model");
+        let models_dev: ModelsData = HashMap::from([
+            (
+                expired_id.to_string(),
+                provider_info(expired_id, model.clone()),
+            ),
+            (fresh_id.to_string(), provider_info(fresh_id, model)),
+        ]);
+        let auth_store = HashMap::from([
+            (
+                expired_id.to_string(),
+                AuthInfo::OAuth {
+                    access: "EXPIRED_DUMMY_TOKEN".to_string(),
+                    refresh: String::new(),
+                    expires: Some(1),
+                    account_id: None,
+                    enterprise_url: None,
+                },
+            ),
+            (
+                fresh_id.to_string(),
+                AuthInfo::OAuth {
+                    access: "FRESH_DUMMY_TOKEN".to_string(),
+                    refresh: String::new(),
+                    expires: Some(now_unix_ms() + 3_600_000),
+                    account_id: None,
+                    enterprise_url: None,
+                },
+            ),
+        ]);
+
+        let state =
+            ProviderBootstrapState::init(&models_dev, &BootstrapConfig::default(), &auth_store);
+
+        assert!(
+            !state.providers.contains_key(expired_id),
+            "expired OAuth token must not create a provider at all"
+        );
+        assert_eq!(
+            state.providers.get(fresh_id).and_then(|p| p.key.as_deref()),
+            Some("FRESH_DUMMY_TOKEN")
         );
     }
 }
