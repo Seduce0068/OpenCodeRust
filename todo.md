@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定/CI/ドキュメント 3 件]** PTY 追随・NO_AUTH fail-open・all-features
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery high 3 件]** deny 最優先・OAuth 0600・deps 再検証
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[discovery low 3 件]** util symlink・SSE 上限・limit クランプ
@@ -498,6 +500,14 @@ status: current
 
 ## メモ
 
+- 2026-11-19 R4 残存（設定/CI/ドキュメント 3 件、記録のみ）: CLI main.rs:1939 が
+  `is_ok()` 判定で fail-open（server と挙動矛盾。認証強制自体は server 側が行うため
+  バイパスは起きず誤通知のみ）、起動時警告が CLI と server で二重、
+  警告文が `OPENCODE_NO_AUTH=1` ハードコード（true/yes も受け付けるため不一致）、
+  README:158-163 の検証コマンドが CI ゲートと不整合、
+  共通ワークフローの extra_gates 複数行実行は CI 初回ログで確認必要。
+  履歴文書（cross-review-report-2026-11-17.md:22 の「22 crate」、
+  adr-0008:118 の opencode-pty カバレッジ行）は履歴スナップショットとして保持。
 - 2026-11-19 discovery（swarm57、観点: セキュリティ/CI/テスト）27 件。対応済み 3 件:
   PermissionEngine の deny 優先化、MCP OAuth ストアの 0600 atomic 化、
   plugin キャッシュ deps の再検証。残存（要 triage、優先度順）:
