@@ -160,34 +160,9 @@ status: current
     O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
-- [ ] **[L-10]** grep ツールの不正 glob が黙って無視され検索範囲が広がる
-  - `tool/grep_tool.rs:132-134`。`glob::Pattern::new(g).ok()` が parse 失敗を None
-    （フィルタなし）へ変換。glob_tool は InvalidArguments を返しており非対称。
-- [ ] **[L-11]** provider/retry.rs の sleep/delay/定数が本番配線ゼロの重複実装
-  - `provider/retry.rs:8-11,28-43,58-103`。IsRetryable のみ再エクスポートされ、
-    sleep/delay/RETRY_* は参照 0。session/retry.rs を単一情報源へ縮小候補
-    （pub API のため外部利用確認が必要、M-49 の別ヘルパとは別）。
-- [ ] **[L-12]** parse_anthropic_sse が本番未使用のレガシーラッパー
-  - `stream.rs:385-393`。呼び出しはテストのみで anthropic.rs は AnthropicSseParser を
-    直接使用。tool_use id が空文字列になる誤挙動を含むラッパーが pub API として残存。
-    削除 or pub(crate) 化 or #[deprecated]。
-- [ ] **[L-13]** ls ツールが serde 解析失敗を既定値にフォールバック
-  - `tool/ls.rs:97-102`。`unwrap_or(LsInput{path:None,...})` のため型違反でも path="." で
-    実行され意図しない permission プロンプト。他ツールと入力検証方針が不整合。
-- [ ] **[L-14b]** read/bash/grep の数値・真偽引数が型違反/負値を黙って既定値へ丸める
-  - `tool/read.rs:100-105`, `bash.rs:91`, `grep_tool.rs:94-96`。
-    as_u64().unwrap_or /
-    as_bool().unwrap_or のため offset=-1 が 1 に丸まる等。InvalidArguments を返すか
-    型付き Input 構造体へ寄せる。
-- [ ] **[L-15]** delete_message が存在しない message_id でも 200 deleted:true
-  - `server/routes.rs:1151-1163,1273-1277`。remove_message の戻り値を破棄。delete_part は
-    NotFound を返しており同一 API 内で契約が不一致。
 - [ ] **[L-16]** retry_queued_prompts に上限・バックオフがなく永続失敗時に無限リトライ
   - `server/routes.rs:2243-2247,2284-2289`。DB 破損等で 1 秒間隔が終了条件なしに回り
     エラーログとタスク生成が際限なく増える。H-10/H-11 とは別の失敗時終端化欠落。
-- [ ] **[L-17]** CORS localhost 許可が明示的ポートを要求
-  - `server/server.rs:940-943,1047-1062`。is_localhost が port.is_some() を要求するため
-    ブラウザがポート省略する既定ポート（`http://localhost`）の Origin が拒否されうる。
 - [ ] **[L-18]** GitWatcher の BranchChanged / CommitMade が一切発行されない
   - `core/git_watcher.rs:6-15,31-36`。受け取った Event を _event として無視し常に
     IndexChanged を send。バリアント削除 or HEAD/refs 変更の実検出。
@@ -265,6 +240,8 @@ status: current
 
 ## 完了
 
+- [x] **[L-10〜L-17 一部]** 入力検証・デッドコード・CORS 等を修正
+  （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-61/62/63/65/66]** TodoManager・SQLite・FileWatcher を修正
   （2026-11-19、swarm-coding R1-R6）
 - [x] **[M-60/M-64/M-67]** worktree・cleanup・edit を修正
@@ -470,6 +447,13 @@ status: current
 
 ## メモ
 
+- L-10〜17 R4 の残存（2026-11-19、記録のみ）:
+  - `truncation.rs:16` に同種の `floor_char_boundary` が既に存在。grep_tool.rs と
+    read.rs にもローカル実装を置いたため 3 重複。共通化は別タスク候補。
+  - スキーマを `type:number` → `integer` に変更したため、浮動小数表記（2000.0）を
+    送るクライアントは影響を受ける（整数リテラルは従来どおり）。
+  - delete_message の 404 化、CORS の localhost port 省略許可はいずれも他ホストを
+    緩めていない。DNS rebinding 対策（Host ヘッダ検証）は別途検討課題。
 - M-61〜66 R4 の残存（2026-11-19、記録のみ）:
   - `Storage::new`（lib.rs:31）は `after_connect` を適用せず FK cascade が無効なまま
     （Database::new/in_memory は有効）。セッション単位 writer 直列化は実装済み。
