@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use base64::Engine;
 use futures::StreamExt;
 use opencode_plugin::{HookContext, HookEvent};
-use opencode_provider::transform::{apply_caching, ProviderType};
+use opencode_provider::{apply_caching, ProviderType};
 use opencode_provider::{
     get_model_context_limit, ChatRequest, Content, ContentPart, Message, Provider, Role,
     StreamEvent, ToolDefinition,

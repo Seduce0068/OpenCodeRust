@@ -56,6 +56,9 @@ impl ProviderType {
     }
 }
 
+/// P-04 の interleaved thinking で使用していた型。本番配線は削除済みだが
+/// 将来の再配線に備えて残す（pub(crate) 化に伴う dead_code 警告を抑制）。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReasoningContent {
     pub text: String,
@@ -205,6 +208,7 @@ pub fn normalize_messages_for_caching(messages: &mut [Message]) {
 // apply_interleaved_thinking
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub fn apply_interleaved_thinking(messages: &mut [Message], provider_type: ProviderType) {
     if !provider_type.supports_interleaved_thinking() {
         return;

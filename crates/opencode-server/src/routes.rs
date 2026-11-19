@@ -1422,8 +1422,16 @@ async fn stream_message(
         let mut pending_tool_calls: HashMap<String, PendingToolCall> = HashMap::new();
         let mut stream_failed: Option<String> = None;
 
-        match provider.chat_stream(request).await {
-            Ok(mut provider_stream) => {
+        // 初期ストリーム確立前の切断を検知する。`tx.closed()` を優先して競わせ、
+        // クライアントが既に切断していれば `chat_stream` の future をドロップして
+        // 早期リターンする（不要な生成の課金を防ぐ）。通常経路では SSE の
+        // イベント内容・順序・wire format は不変。
+        match tokio::select! {
+            biased;
+            _ = tx.closed() => None,
+            result = provider.chat_stream(request) => Some(result),
+        } {
+            Some(Ok(mut provider_stream)) => {
                 'provider_stream: loop {
                     // クライアント切断時は Sse/ReceiverStream がドロップされ `rx` が閉じる。
                     // `tx.closed()` も同時に待つことで、切断後もプロバイダーの
@@ -1599,7 +1607,7 @@ async fn stream_message(
                     }
                 }
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 let error_message = err.to_string();
                 stream_failed = Some(error_message.clone());
                 send_sse_event(
@@ -1619,6 +1627,14 @@ async fn stream_message(
                     },
                 )
                 .await;
+            }
+            None => {
+                // クライアント切断を検知。`chat_stream` の future は select! により
+                // ドロップ済み。ストリームは消費していないが、select! より前に
+                // add_user_message / add_assistant_message でセッションを変更済み
+                // （両者が touch() を呼ぶ）ため、永続化してからリターンする。
+                persist_sessions_if_enabled(&stream_state).await;
+                return;
             }
         }
 

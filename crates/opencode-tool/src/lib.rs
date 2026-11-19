@@ -24,7 +24,7 @@ pub mod multiedit;
 pub mod plan;
 pub mod question;
 pub mod read;
-pub mod registry;
+pub(crate) mod registry;
 pub mod skill;
 pub mod task;
 pub mod todo;
