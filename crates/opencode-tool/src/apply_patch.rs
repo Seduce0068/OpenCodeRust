@@ -46,6 +46,15 @@ struct Hunk {
     new_start: usize,
     new_count: usize,
     lines: Vec<PatchLine>,
+    /// `@@ -a,b +c,d @@` でカンマ付き明示された行数 (old, new)。
+    /// 裸の `@@` や `@@ -a +b @@`（行数省略）は None とし、本文から算出する。
+    /// Some の場合は本文から再計算した値と一致しなければならない。
+    declared_counts: Option<(usize, usize)>,
+    /// model patch の `*** Move To:` が `*** Begin File:` の Add コンテンツを
+    /// 伴った場合に true。通常の apply_hunks は旧内容を末尾へ連結するため
+    /// 「新内容 + 旧内容」となり Move 先が壊れる。この場合だけ旧内容を
+    /// 完全に破棄し、追加行のみを新内容として扱う。
+    replace_entire_file: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +535,9 @@ fn parse_multi_file_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError>
                     new_start,
                     new_count,
                     lines: Vec::new(),
+                    // git diff は apply_hunks 側で宣言値を検証するため再検証不要。
+                    declared_counts: None,
+                    replace_entire_file: false,
                 });
                 in_hunk = true;
             }
@@ -562,41 +574,192 @@ fn parse_multi_file_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError>
     Ok(file_patches)
 }
 
+/// `***`-形式（LLM が出力する apply_patch 形式）をパースする。
+///
+/// 従来は `Begin File` / `Delete File` / `Move To` / `End File` のみを解釈し、
+/// 最も一般的な `*** Update File:` + `@@` hunk を読み飛ばしていた。ここでは
+/// Update と hunk を正式に解釈し、`Move To` についても旧内容を連結しない
+/// 正しい Move を生成する。
 fn parse_model_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError> {
     let mut file_patches = Vec::new();
     let begin_file = Regex::new(r"^\*\*\*\s+Begin\s+File:\s+(.+)$").unwrap();
+    let update_file = Regex::new(r"(?i)^\*\*\*\s+Update\s+File:\s+(.+)$").unwrap();
     let delete_file = Regex::new(r"^\*\*\*\s+Delete\s+File:\s+(.+)$").unwrap();
     let end_patch = Regex::new(r"^\*\*\*\s+End\s+Patch$").unwrap();
-    let move_to = Regex::new(r"^\*\*\*\s+Move\s+To:\s+(.+)$").unwrap();
+    let move_to = Regex::new(r"(?i)^\*\*\*\s+Move\s+To:\s+(.+)$").unwrap();
+    // `@@ -a,b +c,d @@` の他、行数を省略した裸の `@@` も受け付ける。
+    // 行数は hunk 本体から算出するため（R2 の count 検証と整合する）。
+    let hunk_header =
+        Regex::new(r"^@@(?: -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*|\s*)$").unwrap();
 
     let mut current_file: Option<FilePatch> = None;
+    // Begin File の生コンテンツ（従来どおり接頭辞を落とさず保持する）。
     let mut content_lines: Vec<String> = Vec::new();
+    let mut current_hunk: Option<Hunk> = None;
     let mut in_content = false;
+    let mut in_hunk = false;
+    // 裸の `@@` が続く場合に使う元ファイル上のカーソル。
+    let mut next_old_start: usize = 1;
+    let mut next_new_start: usize = 1;
+
+    // hunk 本体から old/new の行数を算出する。apply_hunks の厳密な
+    // カウント検証（R2）と同じ定義を使う。
+    fn count_lines(lines: &[PatchLine]) -> (usize, usize) {
+        let old_count = lines
+            .iter()
+            .filter(|l| matches!(l, PatchLine::Remove(_) | PatchLine::Context(_)))
+            .count();
+        let new_count = lines
+            .iter()
+            .filter(|l| matches!(l, PatchLine::Add(_) | PatchLine::Context(_)))
+            .count();
+        (old_count, new_count)
+    }
+
+    // 現在の FilePatch を確定して file_patches へ移送する。
+    // Add ファイルは content_lines から Add-only hunk を作る（従来どおり）。
+    // Update/Move は解析済みの hunks を使い、行数をここで確定させる。
+    fn finalize_file(
+        file_patches: &mut Vec<FilePatch>,
+        current_file: &mut Option<FilePatch>,
+        current_hunk: &mut Option<Hunk>,
+        content_lines: &[String],
+        add_content_mode: bool,
+        next_old_start: &mut usize,
+        next_new_start: &mut usize,
+    ) -> Result<(), ToolError> {
+        let Some(mut file) = current_file.take() else {
+            return Ok(());
+        };
+        if let Some(hunk) = current_hunk.take() {
+            file.hunks.push(hunk);
+        }
+        if add_content_mode {
+            let content = content_lines.join("\n");
+            file.hunks.push(Hunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: content.lines().count(),
+                lines: content
+                    .lines()
+                    .map(|l| PatchLine::Add(l.to_string()))
+                    .collect(),
+                declared_counts: None,
+                // Begin File + Move To のときは旧内容を連結しない。
+                replace_entire_file: matches!(file.operation, PatchOperation::Move { .. }),
+            });
+        }
+        for hunk in file.hunks.iter_mut() {
+            if hunk.replace_entire_file {
+                continue;
+            }
+            let (old_count, new_count) = count_lines(&hunk.lines);
+            match hunk.declared_counts {
+                Some((declared_old, declared_new)) => {
+                    // 明示された宣言行数が本文と食い違う場合は、途中切れ等の
+                    // 壊れたパッチとして拒否する。git diff 形式と検証強度を揃える。
+                    if declared_old != old_count || declared_new != new_count {
+                        return Err(ToolError::InvalidArguments(format!(
+                            "Model patch hunk line-count mismatch: declared {} old / {} new lines, but found {} old / {} new lines",
+                            declared_old, declared_new, old_count, new_count
+                        )));
+                    }
+                }
+                None => {
+                    // 裸の `@@` あるいは行数省略形式は本文から算出する（従来どおり）。
+                    hunk.old_count = old_count;
+                    hunk.new_count = new_count;
+                }
+            }
+        }
+        // 純粋な rename（hunk なしの Move）も移送対象として残す。
+        if !file.hunks.is_empty() || matches!(file.operation, PatchOperation::Move { .. }) {
+            file_patches.push(file);
+        }
+        *next_old_start = 1;
+        *next_new_start = 1;
+        Ok(())
+    }
 
     for line in patch_text.lines() {
         if line == "*** Begin Patch" {
             continue;
         }
 
+        if let Some(caps) = begin_file.captures(line) {
+            finalize_file(
+                &mut file_patches,
+                &mut current_file,
+                &mut current_hunk,
+                &content_lines,
+                in_content,
+                &mut next_old_start,
+                &mut next_new_start,
+            )?;
+            let path = caps[1].trim().to_string();
+            current_file = Some(FilePatch {
+                path,
+                operation: PatchOperation::Add,
+                hunks: Vec::new(),
+            });
+            content_lines.clear();
+            current_hunk = None;
+            in_content = true;
+            in_hunk = false;
+            continue;
+        }
+
+        if let Some(caps) = update_file.captures(line) {
+            finalize_file(
+                &mut file_patches,
+                &mut current_file,
+                &mut current_hunk,
+                &content_lines,
+                in_content,
+                &mut next_old_start,
+                &mut next_new_start,
+            )?;
+            let path = caps[1].trim().to_string();
+            current_file = Some(FilePatch {
+                path,
+                operation: PatchOperation::Update,
+                hunks: Vec::new(),
+            });
+            content_lines.clear();
+            current_hunk = None;
+            in_content = false;
+            in_hunk = false;
+            continue;
+        }
+
         // Detect delete file directive
         if let Some(caps) = delete_file.captures(line) {
-            if let Some(file) = current_file.take() {
-                if !content_lines.is_empty() {
-                    file_patches.push(file);
-                }
-            }
+            finalize_file(
+                &mut file_patches,
+                &mut current_file,
+                &mut current_hunk,
+                &content_lines,
+                in_content,
+                &mut next_old_start,
+                &mut next_new_start,
+            )?;
             let path = caps[1].trim().to_string();
             file_patches.push(FilePatch {
                 path,
                 operation: PatchOperation::Delete,
                 hunks: Vec::new(),
             });
-            content_lines = Vec::new();
+            content_lines.clear();
+            current_hunk = None;
             in_content = false;
+            in_hunk = false;
             continue;
         }
 
-        // Detect move-to directive (applies to current file)
+        // Detect move-to directive (applies to current file).
+        // 標準的な apply_patch では `@@` より前に現れるため、ここでは
+        // コンテンツ読み取り状態を変えずに operation だけを差し替える。
         if let Some(caps) = move_to.captures(line) {
             if let Some(ref mut file) = current_file {
                 let target = caps[1].trim().to_string();
@@ -605,54 +768,126 @@ fn parse_model_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError> {
             continue;
         }
 
-        if let Some(caps) = begin_file.captures(line) {
-            if let Some(file) = current_file.take() {
-                if !content_lines.is_empty() {
-                    file_patches.push(file);
-                }
-            }
-            let path = caps[1].trim().to_string();
-            current_file = Some(FilePatch {
-                path: path.clone(),
-                operation: PatchOperation::Add,
-                hunks: Vec::new(),
-            });
-            content_lines = Vec::new();
-            in_content = true;
-            continue;
-        }
-
         if line == "*** End File" {
-            if let Some(file) = current_file.take() {
-                let content = content_lines.join("\n");
-                let hunk = Hunk {
-                    old_start: 1,
-                    old_count: 0,
-                    new_start: 1,
-                    new_count: content.lines().count(),
-                    lines: content
-                        .lines()
-                        .map(|l| PatchLine::Add(l.to_string()))
-                        .collect(),
-                };
-                let mut file = file;
-                file.hunks.push(hunk);
-                file_patches.push(file);
-            }
-            current_file = None;
-            content_lines = Vec::new();
+            finalize_file(
+                &mut file_patches,
+                &mut current_file,
+                &mut current_hunk,
+                &content_lines,
+                in_content,
+                &mut next_old_start,
+                &mut next_new_start,
+            )?;
+            content_lines.clear();
+            current_hunk = None;
             in_content = false;
+            in_hunk = false;
             continue;
         }
 
         if end_patch.is_match(line) {
+            finalize_file(
+                &mut file_patches,
+                &mut current_file,
+                &mut current_hunk,
+                &content_lines,
+                in_content,
+                &mut next_old_start,
+                &mut next_new_start,
+            )?;
             break;
+        }
+
+        // hunk ヘッダは Update/Move ファイルのときだけ解釈する。
+        // Add ファイルのコンテンツが `@@` で始まる場合は通常行として扱う。
+        let is_update_or_move = matches!(
+            current_file.as_ref().map(|f| &f.operation),
+            Some(PatchOperation::Update) | Some(PatchOperation::Move { .. })
+        );
+        if is_update_or_move {
+            if let Some(caps) = hunk_header.captures(line) {
+                if let Some(file) = current_file.as_mut() {
+                    if let Some(hunk) = current_hunk.take() {
+                        let (old_count, new_count) = count_lines(&hunk.lines);
+                        next_old_start = hunk.old_start + old_count;
+                        next_new_start = hunk.new_start + new_count;
+                        file.hunks.push(hunk);
+                    }
+                }
+                let parse_num = |value: &str| -> Result<usize, ToolError> {
+                    value.parse::<usize>().map_err(|e| {
+                        ToolError::InvalidArguments(format!("invalid line number: {}", e))
+                    })
+                };
+                let old_start = match caps.get(1) {
+                    Some(m) => parse_num(m.as_str())?,
+                    None => next_old_start,
+                };
+                let new_start = match caps.get(3) {
+                    Some(m) => parse_num(m.as_str())?,
+                    None => next_new_start,
+                };
+                // カンマ付きで行数が明示された場合だけ検証対象にする。
+                // `@@ -a +b @@` は行数省略（git diff では既定 1）だが、LLM 出力に
+                // 寛容なため本文から算出する（None）として扱う。
+                let declared_old = match caps.get(2) {
+                    Some(m) => Some(parse_num(m.as_str())?),
+                    None => None,
+                };
+                let declared_new = match caps.get(4) {
+                    Some(m) => Some(parse_num(m.as_str())?),
+                    None => None,
+                };
+                let declared_counts = match (declared_old, declared_new) {
+                    (Some(old), Some(new)) => Some((old, new)),
+                    _ => None,
+                };
+                let (old_count, new_count) = declared_counts.unwrap_or((0, 0));
+                current_hunk = Some(Hunk {
+                    old_start,
+                    old_count,
+                    new_start,
+                    new_count,
+                    lines: Vec::new(),
+                    declared_counts,
+                    replace_entire_file: false,
+                });
+                in_hunk = true;
+                in_content = false;
+                continue;
+            }
+        }
+
+        if in_hunk {
+            if let Some(ref mut hunk) = current_hunk {
+                // 先頭の 1 文字だけが PatchLine の種別を表す。
+                // `__pycache__/foo.pyc` のような接頭辞の無いノイズ行は無視する。
+                if let Some(rest) = line.strip_prefix(' ') {
+                    hunk.lines.push(PatchLine::Context(rest.to_string()));
+                } else if line.starts_with('-') && !line.starts_with("--- ") {
+                    hunk.lines.push(PatchLine::Remove(line[1..].to_string()));
+                } else if line.starts_with('+') && !line.starts_with("+++") {
+                    hunk.lines.push(PatchLine::Add(line[1..].to_string()));
+                }
+            }
+            continue;
         }
 
         if in_content {
             content_lines.push(line.to_string());
         }
     }
+
+    // `*** End Patch` が無い場合でも解析済みの内容は保存する。
+    finalize_file(
+        &mut file_patches,
+        &mut current_file,
+        &mut current_hunk,
+        &content_lines,
+        in_content,
+        &mut next_old_start,
+        &mut next_new_start,
+    )?;
 
     Ok(file_patches)
 }
@@ -757,6 +992,21 @@ async fn process_file_patch(
 }
 
 fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, ToolError> {
+    // `*** Move To:` に Add-only hunk が転用された場合、旧内容を一切残さず
+    // 追加行だけを新内容にする。git diff 由来の Move は通常の hunk を持つため
+    // この分岐には入らず、従来どおり apply_hunks の照合・カウント検証を通る。
+    if hunks.len() == 1 && hunks[0].replace_entire_file {
+        return Ok(hunks[0]
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                PatchLine::Add(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
     let mut lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
     let mut offset = 0isize;
 
@@ -1272,6 +1522,8 @@ mod tests {
                 PatchLine::Add("NEW2".into()),
                 PatchLine::Context("line3".into()),
             ],
+            declared_counts: None,
+            replace_entire_file: false,
         };
         assert_eq!(
             apply_hunks("line1\nline2\nline3", &[hunk]).unwrap(),
@@ -1293,6 +1545,8 @@ mod tests {
                     PatchLine::Remove("line1".into()),
                     PatchLine::Add("NEW1".into()),
                 ],
+                declared_counts: None,
+                replace_entire_file: false,
             },
             Hunk {
                 old_start: 2,
@@ -1303,6 +1557,8 @@ mod tests {
                     PatchLine::Remove("WRONG".into()),
                     PatchLine::Add("NEW2".into()),
                 ],
+                declared_counts: None,
+                replace_entire_file: false,
             },
         ];
         let err = apply_hunks("line1\nline2\nline3", &hunks).unwrap_err();
@@ -1326,6 +1582,8 @@ mod tests {
                 PatchLine::Add("NEW2".into()),
                 PatchLine::Context("WRONG".into()),
             ],
+            declared_counts: None,
+            replace_entire_file: false,
         };
         let err = apply_hunks("line1\nline2\nline3", &[hunk]).unwrap_err();
         assert!(
@@ -1346,6 +1604,8 @@ mod tests {
                 PatchLine::Remove("line1".into()),
                 PatchLine::Add("NEW".into()),
             ],
+            declared_counts: None,
+            replace_entire_file: false,
         };
         let err = apply_hunks("line1\nline2", &[hunk]).unwrap_err();
         assert!(
@@ -1366,6 +1626,8 @@ mod tests {
                 PatchLine::Remove("line1".into()),
                 PatchLine::Add("NEW".into()),
             ],
+            declared_counts: None,
+            replace_entire_file: false,
         };
         let err = apply_hunks("line1\nline2", &[hunk]).unwrap_err();
         assert!(
@@ -1426,5 +1688,200 @@ mod tests {
                 patch
             );
         }
+    }
+
+    // ---- model patch: Update / Move (R2 受け入れ条件) -------------------------
+
+    #[test]
+    fn parse_update_file_patch_with_hunk() {
+        let text = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: src/main.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " fn main() {\n",
+            "-    println!(\"old\");\n",
+            "+    println!(\"new\");\n",
+            " }\n",
+            "*** End Patch"
+        );
+        let patches = parse_model_patch(text).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "src/main.rs");
+        assert!(matches!(patches[0].operation, PatchOperation::Update));
+        assert_eq!(patches[0].hunks.len(), 1);
+
+        let hunk = &patches[0].hunks[0];
+        assert_eq!(hunk.old_start, 1);
+        assert_eq!(hunk.new_start, 1);
+        // 2 Context + 1 Remove / 1 Add から算出されること。
+        assert_eq!(hunk.old_count, 3);
+        assert_eq!(hunk.new_count, 3);
+        assert_eq!(hunk.lines.len(), 4);
+        assert!(matches!(&hunk.lines[0], PatchLine::Context(s) if s == "fn main() {"));
+        assert!(matches!(&hunk.lines[1], PatchLine::Remove(s) if s == "    println!(\"old\");"));
+        assert!(matches!(&hunk.lines[2], PatchLine::Add(s) if s == "    println!(\"new\");"));
+        assert!(matches!(&hunk.lines[3], PatchLine::Context(s) if s == "}"));
+    }
+
+    #[test]
+    fn parse_update_file_patch_rejects_declared_count_mismatch() {
+        // 宣言は old=3/new=3 だが本文は Remove 1 / Add 1 だけ（途中切れ相当）。
+        // 本文から再計算して上書きすると静かな部分適用になるため拒否する。
+        let text = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: file.txt\n",
+            "@@ -1,3 +1,3 @@\n",
+            "-only line\n",
+            "+replacement\n",
+            "*** End Patch"
+        );
+        let err = parse_model_patch(text).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::InvalidArguments(_)),
+            "declared line-count mismatch in model patch must be InvalidArguments, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_update_file_patch_bare_hunk_ignores_noise_lines() {
+        let text = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: file.txt\n",
+            "@@\n",
+            "-old\n",
+            "+new\n",
+            "__pycache__/noise.pyc\n",
+            "*** End Patch"
+        );
+        let patches = parse_model_patch(text).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].hunks.len(), 1);
+        let hunk = &patches[0].hunks[0];
+        // 接頭辞の無い `__pycache__/...` は PatchLine に変換されない。
+        assert_eq!(hunk.lines.len(), 2);
+        assert_eq!(hunk.old_count, 1);
+        assert_eq!(hunk.new_count, 1);
+    }
+
+    #[test]
+    fn parse_update_file_move_patch() {
+        let text = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: old.txt\n",
+            "*** Move To: new.txt\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "*** End Patch"
+        );
+        let patches = parse_model_patch(text).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "old.txt");
+        assert!(
+            matches!(&patches[0].operation, PatchOperation::Move { move_path } if move_path == "new.txt")
+        );
+        assert_eq!(patches[0].hunks.len(), 1);
+        assert_eq!(patches[0].hunks[0].old_count, 1);
+        assert_eq!(patches[0].hunks[0].new_count, 1);
+    }
+
+    #[tokio::test]
+    async fn model_patch_update_writes_expected_content_via_execute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn main() {\n    println!(\"old\");\n}\n").unwrap();
+
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: src/main.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " fn main() {\n",
+            "-    println!(\"old\");\n",
+            "+    println!(\"new\");\n",
+            " }\n",
+            "*** End Patch"
+        );
+        let (ctx, _asks) = recording_context(&root);
+        ApplyPatchTool
+            .execute(serde_json::json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+
+        // 既存仕様どおり末尾改行は付かないが、更新行は正しく反映される。
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn main() {\n    println!(\"new\");\n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_patch_move_writes_only_new_content_to_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.txt");
+        let new = root.join("new.txt");
+        std::fs::write(&old, "old first\nold second\n").unwrap();
+
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: old.txt\n",
+            "*** Move To: new.txt\n",
+            "@@ -1,2 +1,2 @@\n",
+            "-old first\n",
+            "+NEW first\n",
+            " old second\n",
+            "*** End Patch"
+        );
+        let (ctx, _asks) = recording_context(&root);
+        ApplyPatchTool
+            .execute(serde_json::json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+
+        assert!(!old.exists(), "移送元は削除されること");
+        assert_eq!(
+            std::fs::read_to_string(&new).unwrap(),
+            "NEW first\nold second",
+            "移送先に旧内容が連結されていないこと"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_patch_move_from_add_content_discards_old_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.txt");
+        let new = root.join("new.txt");
+        std::fs::write(&old, "STALE CONTENT THAT MUST NOT SURVIVE\n").unwrap();
+
+        // Add-only hunk を Move に転用した従来の壊れる形。
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Begin File: old.txt\n",
+            "*** Move To: new.txt\n",
+            "brand new content\n",
+            "*** End File\n",
+            "*** End Patch"
+        );
+        let (ctx, _asks) = recording_context(&root);
+        ApplyPatchTool
+            .execute(serde_json::json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+
+        assert!(!old.exists(), "移送元は削除されること");
+        assert_eq!(
+            std::fs::read_to_string(&new).unwrap(),
+            "brand new content",
+            "旧内容が連結されず新内容のみが配置されること"
+        );
     }
 }
