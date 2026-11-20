@@ -558,6 +558,11 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（auth/llm/codemode の修正時、記録のみ）: キーローテーション
+  は API のみ提供で server.rs の 401/429 検知・反映は未配線、再起動でプール消滅。
+  CodeMode の同期 ToolHost では壁時計の完全強制不可（async 化が必要）。
+  local-llm の同期 stdout flush が select ループをブロックし得る。
+  CodeMode の timeout チェックが単一式中では行われない。
 - 2026-11-20 R4 残存（plugin/provider の修正時、記録のみ）: verify_script が
   load_all 開始時の一度のみで spawn 直前の TOCTOU を覆えていない。deno が
   ローカルに未インストールのため plugin-host.ts の deno check / smoke test 未実施。
