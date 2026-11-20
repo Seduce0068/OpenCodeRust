@@ -40,18 +40,35 @@ tags: [storage, sqlite, persistence, crate]
 See [ADR-0004](adr/adr-0004-durable-session-input-queue.md) for queue
 recovery semantics and the single-server-per-database constraint.
 
+## Database path resolution
+
+`Database::database_path()` is the single source of truth for the active
+database path. It resolves as follows:
+
+1. If `OPENCODE_DATA_DIR` is set to a non-empty value, its trimmed value
+   replaces `dirs::data_local_dir()` as the base directory.
+2. Otherwise the base directory is `dirs::data_local_dir()`. Empty,
+   whitespace-only, and non-UTF-8 values are ignored.
+3. The database file is `<base>/opencode/opencode.db`.
+
+`opencoderust db path` prints this same resolved path. Use it to confirm
+which file a backup must cover before changing `OPENCODE_DATA_DIR` or
+starting a new server process.
+
 ## Backup and recovery runbook
 
 The SQLite database (by default
-`${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db`) is the durable
-source of truth for sessions, messages, todos, and the session-input queue.
-Back it up with SQLite's online facilities only; never copy a live `.db`
-file with `cp`.
+`${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db`, or
+`<OPENCODE_DATA_DIR>/opencode/opencode.db` when that variable is set) is the
+durable source of truth for sessions, messages, todos, and the
+session-input queue. Back it up with SQLite's online facilities only;
+never copy a live `.db` file with `cp`.
 
 ### Prerequisites
 
-- Determine the active database path from the server configuration before
-  taking a backup.
+- Determine the active database path with `opencoderust db path` (or
+  `Database::database_path()`) before taking a backup. Check
+  `OPENCODE_DATA_DIR` in the server's environment as well.
 - One database must be owned by exactly one storage-backed `ServerState`
   (one server process). See
   [ADR-0004](adr/adr-0004-durable-session-input-queue.md). Stop or isolate
@@ -100,7 +117,7 @@ sidecars.
 1. Stop the storage-backed server process to preserve the single-writer
    constraint from ADR-0004.
 2. Move the current database aside for rollback, then place the backup at
-   the configured database path.
+   the resolved database path (`opencoderust db path`).
 
 ### Post-restore integrity verification
 
