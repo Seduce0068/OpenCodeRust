@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn default_message_created_at() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
+}
+
 /// Usage statistics for a single message
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageUsage {
@@ -19,9 +23,11 @@ pub struct SessionMessage {
     pub session_id: String,
     pub role: MessageRole,
     pub parts: Vec<MessagePart>,
+    #[serde(default = "default_message_created_at")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<MessageUsage>,
 }
 
@@ -350,6 +356,20 @@ mod tests {
         msg.add_subtask("task_1", "investigate");
 
         assert_eq!(msg.parts.len(), 3);
+    }
+
+    #[test]
+    fn legacy_json_without_metadata_or_created_at_is_accepted() {
+        let value = serde_json::json!({
+            "id": "msg_1",
+            "session_id": "ses_1",
+            "role": "user",
+            "parts": [],
+        });
+        let msg: SessionMessage = serde_json::from_value(value).expect("legacy JSON must load");
+        assert!(msg.metadata.is_empty());
+        assert_eq!(msg.created_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert!(msg.usage.is_none());
     }
 
     #[test]

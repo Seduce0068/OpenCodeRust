@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
 /// エージェントを識別する文字列ベースの ID。
@@ -6,8 +6,15 @@ use std::collections::HashMap;
 pub struct AgentID(pub String);
 
 /// エージェントの表示色。組み込み色または任意の色名を表す。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// ワイヤ形式は常に単一の文字列（組み込み色は小文字名、任意色はその色名）。
+/// 旧形式の `{"custom":"red"}` も読み取り互換のために受け付ける。
+///
+/// 実装方針: 公開 enum へ素の `#[serde(untagged)]` を付けると unit バリアントが
+/// `null` として扱われ、組み込み色が文字列として往復しなくなる。そのため
+/// 内部の wire enum に `untagged` を適用し、`Serialize` は常に文字列を出力する
+/// 手実装で「タグ無しの文字列表現」を実現する。
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentColor {
     /// 主色。
     Primary,
@@ -25,6 +32,93 @@ pub enum AgentColor {
     Info,
     /// 任意の色名。
     Custom(String),
+}
+
+impl AgentColor {
+    /// ワイヤ上の文字列表現を返す（任意色は保持している色名そのもの）。
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Accent => "accent",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Info => "info",
+            Self::Custom(name) => name,
+        }
+    }
+}
+
+impl Serialize for AgentColor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// 組み込み色の文字列表現（内部 wire 用）。
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BuiltinAgentColor {
+    Primary,
+    Secondary,
+    Accent,
+    Success,
+    Warning,
+    Error,
+    Info,
+}
+
+impl From<BuiltinAgentColor> for AgentColor {
+    fn from(value: BuiltinAgentColor) -> Self {
+        match value {
+            BuiltinAgentColor::Primary => Self::Primary,
+            BuiltinAgentColor::Secondary => Self::Secondary,
+            BuiltinAgentColor::Accent => Self::Accent,
+            BuiltinAgentColor::Success => Self::Success,
+            BuiltinAgentColor::Warning => Self::Warning,
+            BuiltinAgentColor::Error => Self::Error,
+            BuiltinAgentColor::Info => Self::Info,
+        }
+    }
+}
+
+/// 旧外部タグ形式 `{"custom":"red"}` 用（内部 wire 用）。
+#[derive(Deserialize)]
+struct LegacyCustomAgentColor {
+    #[serde(alias = "Custom")]
+    custom: String,
+}
+
+/// 新形式は常に文字列、旧オブジェクト形式も許容する内部 wire 表現。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentColorWire {
+    Builtin(BuiltinAgentColor),
+    Custom(String),
+    Legacy(LegacyCustomAgentColor),
+}
+
+impl From<AgentColorWire> for AgentColor {
+    fn from(wire: AgentColorWire) -> Self {
+        match wire {
+            AgentColorWire::Builtin(builtin) => builtin.into(),
+            AgentColorWire::Custom(name) => Self::Custom(name),
+            AgentColorWire::Legacy(LegacyCustomAgentColor { custom }) => Self::Custom(custom),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(AgentColorWire::deserialize(deserializer)?.into())
+    }
 }
 
 /// エージェントの設定を表す情報。
@@ -97,5 +191,63 @@ mod tests {
         let serialized = serde_json::to_string(&agent).unwrap();
         let deserialized: AgentInfo = serde_json::from_str(&serialized).unwrap();
         assert_eq!(agent, deserialized);
+    }
+
+    #[test]
+    fn agent_color_wire_is_always_a_plain_string() {
+        use serde_json::json;
+
+        let cases = [
+            (AgentColor::Primary, json!("primary")),
+            (AgentColor::Secondary, json!("secondary")),
+            (AgentColor::Accent, json!("accent")),
+            (AgentColor::Success, json!("success")),
+            (AgentColor::Warning, json!("warning")),
+            (AgentColor::Error, json!("error")),
+            (AgentColor::Info, json!("info")),
+            (AgentColor::Custom("red".to_string()), json!("red")),
+        ];
+
+        for (color, expected) in cases {
+            let value = serde_json::to_value(&color).unwrap();
+            assert_eq!(value, expected, "色は常に文字列で表現される");
+            assert!(!value.is_object(), "旧 custom オブジェクト形式を出力しない");
+            assert_eq!(serde_json::from_value::<AgentColor>(value).unwrap(), color);
+            assert_eq!(color.as_str(), expected.as_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn agent_color_accepts_legacy_custom_object() {
+        use serde_json::json;
+
+        let decoded: AgentColor = serde_json::from_value(json!({"custom": "red"})).unwrap();
+        assert_eq!(decoded, AgentColor::Custom("red".to_string()));
+
+        let value = json!({
+            "id": "agent_legacy",
+            "model": null,
+            "request": {"headers": {}, "body": {}},
+            "system": null,
+            "description": null,
+            "mode": "all",
+            "hidden": false,
+            "color": {"custom": "teal"},
+            "steps": null,
+            "permissions": []
+        });
+        let info: AgentInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(info.color, Some(AgentColor::Custom("teal".to_string())));
+
+        let reserialized = serde_json::to_value(&info).unwrap();
+        assert_eq!(reserialized["color"], json!("teal"));
+    }
+
+    #[test]
+    fn agent_color_unknown_string_becomes_custom() {
+        use serde_json::json;
+
+        let decoded: AgentColor = serde_json::from_value(json!("#ff0000")).unwrap();
+        assert_eq!(decoded, AgentColor::Custom("#ff0000".to_string()));
     }
 }

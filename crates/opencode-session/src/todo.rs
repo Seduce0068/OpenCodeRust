@@ -437,11 +437,20 @@ impl Default for TodoManager {
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+/// セッション側の Todo 状態。
+///
+/// JSON 表現は [`TodoStatus::as_str`] と同じ snake_case を正式とし、
+/// 旧 serde 出力だった PascalCase は alias で読み取り互換を維持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    #[serde(alias = "Pending")]
     Pending,
+    #[serde(alias = "InProgress")]
     InProgress,
+    #[serde(alias = "Completed")]
     Completed,
+    #[serde(alias = "Cancelled")]
     Cancelled,
 }
 
@@ -462,10 +471,17 @@ impl std::fmt::Display for TodoStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+/// セッション側の Todo 優先度。
+///
+/// 状態と同じく、JSON 表現は [`TodoPriority::as_str`] と同じ小文字を正式とする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TodoPriority {
+    #[serde(alias = "High")]
     High,
+    #[serde(alias = "Medium")]
     Medium,
+    #[serde(alias = "Low")]
     Low,
 }
 
@@ -485,18 +501,31 @@ impl std::fmt::Display for TodoPriority {
     }
 }
 
+/// 比較用に小文字化し、区切り文字を除去して serde / as_str / 旧 PascalCase を統一する。
+fn normalize_todo_word(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(*c, '_' | '-' | ' '))
+        .collect()
+}
+
+/// serde の snake_case 表現・旧 PascalCase 表現・`as_str()` 由来の DB 値を
+/// すべて受け付けて状態へ復元する。未知の値は `Pending` にフォールバックする。
 pub fn parse_status(status: &str) -> TodoStatus {
-    match status.to_lowercase().as_str() {
+    match normalize_todo_word(status).as_str() {
         "pending" => TodoStatus::Pending,
-        "in_progress" | "in progress" => TodoStatus::InProgress,
+        "inprogress" => TodoStatus::InProgress,
         "completed" => TodoStatus::Completed,
         "cancelled" => TodoStatus::Cancelled,
         _ => TodoStatus::Pending,
     }
 }
 
+/// serde の小文字表現・旧 PascalCase 表現・`as_str()` 由来の DB 値を
+/// すべて受け付けて優先度へ復元する。未知の値は `Medium` にフォールバックする。
 pub fn parse_priority(priority: &str) -> TodoPriority {
-    match priority.to_lowercase().as_str() {
+    match normalize_todo_word(priority).as_str() {
         "high" => TodoPriority::High,
         "medium" => TodoPriority::Medium,
         "low" => TodoPriority::Low,
@@ -865,5 +894,58 @@ mod tests {
             manager.get(SESSION).await,
             vec![todo("B", "pending", "low")]
         );
+    }
+
+    /// serde 表現・as_str() 由来の DB 値・旧 PascalCase が parse で一致すること。
+    #[test]
+    fn todo_status_priority_serde_and_parse_are_symmetric() {
+        use serde_json::json;
+
+        let statuses = [
+            (TodoStatus::Pending, "pending", "Pending"),
+            (TodoStatus::InProgress, "in_progress", "InProgress"),
+            (TodoStatus::Completed, "completed", "Completed"),
+            (TodoStatus::Cancelled, "cancelled", "Cancelled"),
+        ];
+        for (variant, snake, pascal) in statuses {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(snake));
+            assert_eq!(
+                serde_json::from_value::<TodoStatus>(json!(snake)).unwrap(),
+                variant
+            );
+            assert_eq!(
+                serde_json::from_value::<TodoStatus>(json!(pascal)).unwrap(),
+                variant
+            );
+            assert_eq!(parse_status(snake), variant);
+            assert_eq!(parse_status(variant.as_str()), variant);
+            assert_eq!(parse_status(pascal), variant);
+            let wire: String =
+                serde_json::from_str(&serde_json::to_string(&variant).unwrap()).unwrap();
+            assert_eq!(parse_status(&wire), variant);
+        }
+
+        let priorities = [
+            (TodoPriority::High, "high", "High"),
+            (TodoPriority::Medium, "medium", "Medium"),
+            (TodoPriority::Low, "low", "Low"),
+        ];
+        for (variant, lower, pascal) in priorities {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(lower));
+            assert_eq!(
+                serde_json::from_value::<TodoPriority>(json!(lower)).unwrap(),
+                variant
+            );
+            assert_eq!(
+                serde_json::from_value::<TodoPriority>(json!(pascal)).unwrap(),
+                variant
+            );
+            assert_eq!(parse_priority(lower), variant);
+            assert_eq!(parse_priority(variant.as_str()), variant);
+            assert_eq!(parse_priority(pascal), variant);
+            let wire: String =
+                serde_json::from_str(&serde_json::to_string(&variant).unwrap()).unwrap();
+            assert_eq!(parse_priority(&wire), variant);
+        }
     }
 }

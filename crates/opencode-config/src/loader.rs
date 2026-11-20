@@ -1,6 +1,6 @@
 use crate::schema::{
-    known_config_keys, AgentConfig, AgentConfigs, AgentMode, CommandConfig, PermissionAction,
-    PermissionConfig, PermissionRule, ProviderConfig,
+    known_config_keys, AgentConfig, AgentConfigs, AgentMode, CommandConfig, McpConfig,
+    McpTimeoutConfig, PermissionAction, PermissionConfig, PermissionRule, ProviderConfig,
 };
 use crate::Config;
 use anyhow::{Context, Result};
@@ -42,8 +42,21 @@ impl ConfigLoader {
     }
 
     pub fn load_from_str(&mut self, content: &str) -> Result<()> {
+        // Inline config (OPENCODE_CONFIG_CONTENT) must go through the same
+        // placeholder expansion as file-based config. Relative `{file:...}`
+        // references resolve against the current directory. No value or path
+        // is logged here; only names are surfaced by the helpers on failure.
+        let mut env_lookup = self.config.env.clone().unwrap_or_default();
+        if let Some(local_env) = extract_local_env(content) {
+            // This inline layer is higher priority than the accumulated map.
+            env_lookup.extend(local_env);
+        }
+        let content = substitute_env_vars(content, Some(&env_lookup));
+        let content = resolve_file_references(&content, Path::new("."))
+            .with_context(|| "Failed to resolve file references in inline config")?;
+
         let config: Config =
-            parse_jsonc(content).with_context(|| "Failed to parse config content")?;
+            parse_jsonc(&content).with_context(|| "Failed to parse config content")?;
         self.config.merge(config);
         Ok(())
     }
@@ -57,8 +70,16 @@ impl ConfigLoader {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {:?}", path))?;
 
-        // Apply {env:VAR} substitution
-        let content = substitute_env_vars(&content);
+        // `{env:VAR}` resolves from the merged top-level `env` map first
+        // (config-scoped values, including this file's own `env` object), then
+        // from the process environment. This is text substitution only: no
+        // value is injected into the process or any child process.
+        let mut env_lookup = self.config.env.clone().unwrap_or_default();
+        if let Some(local_env) = extract_local_env(&content) {
+            // This file is a higher-priority layer than the accumulated map.
+            env_lookup.extend(local_env);
+        }
+        let content = substitute_env_vars(&content, Some(&env_lookup));
 
         // Apply {file:path} substitution
         let base_dir = path.parent().unwrap_or(Path::new("."));
@@ -508,7 +529,69 @@ fn json_string_body(value: &str) -> String {
     quoted[1..quoted.len() - 1].to_string()
 }
 
+/// Neutralize bare `{env:VAR}` tokens in raw config text so it can be parsed
+/// for the read-only extraction of the top-level `env` map. A bare token is
+/// not valid JSON; replacing it with an empty JSON string keeps the probe
+/// input parseable. Tokens inside string literals are already valid JSON and
+/// are left verbatim. No value is resolved or logged here.
+fn sanitize_bare_env_tokens(text: &str) -> String {
+    let re = regex::Regex::new(r"\{env:([^}]+)\}").unwrap();
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0).expect("regex capture");
+        result.push_str(&text[cursor..whole.start()]);
+        if inside_json_string_literal(text, whole.start()) {
+            result.push_str(whole.as_str());
+        } else {
+            result.push_str("\"\"");
+        }
+        cursor = whole.end();
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// Read this file's own top-level `env` object from raw JSONC text.
+///
+/// This read-only probe makes `{env:VAR}` placeholders in the same file
+/// resolvable from the config's own `env` map. Only string values are used;
+/// a missing, malformed, or non-object `env` is simply ignored and left to the
+/// normal schema parser. Values are never included in logs or errors.
+fn extract_local_env(text: &str) -> Option<HashMap<String, String>> {
+    let sanitized = sanitize_bare_env_tokens(text);
+    let options = ParseOptions {
+        allow_trailing_commas: true,
+        ..Default::default()
+    };
+    let value = parse_to_serde_value::<Option<serde_json::Value>>(&sanitized, &options).ok()??;
+    let env = value.as_object()?.get("env")?.as_object()?;
+    Some(
+        env.iter()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+            .collect(),
+    )
+}
+
+/// Hard upper bound for iterative `{env:VAR}` expansion.
+///
+/// Each pass resolves one level of chained references between `config.env`
+/// values. The cap guarantees termination even if cycle detection is defeated
+/// by a pathological configuration.
+const MAX_ENV_SUBSTITUTION_PASSES: usize = 16;
+
 /// Substitute `{env:VAR}` patterns with environment variable values.
+///
+/// Names are resolved from `config_env` (the merged top-level `env` map) first
+/// and only then from the process environment. `config_env` is a substitution
+/// source only: no value is injected into the process or child processes.
+///
+/// A value in `config_env` may itself contain `{env:VAR}` (for example
+/// `B = "{env:A}/suffix"`). Resolution is iterative: each pass expands one
+/// level until a fixpoint is reached, so such chains are fully resolved before
+/// the config text is substituted. A repeating set of pending references
+/// signals a cycle (e.g. `A = "{env:B}"`, `B = "{env:A}"`) and stops expansion;
+/// [`MAX_ENV_SUBSTITUTION_PASSES`] is the hard termination bound.
 ///
 /// Values are inserted as JSON string data, never as raw source text, so a
 /// value containing quotes, backslashes or newlines cannot terminate a string
@@ -524,14 +607,66 @@ fn json_string_body(value: &str) -> String {
 ///   of emitting invalid JSON or letting the value alter the object shape.
 ///
 /// Works on the raw JSONC text before parsing so `{file:...}` references can
-/// still be resolved afterwards.
-fn substitute_env_vars(text: &str) -> String {
+/// still be resolved afterwards. No value is written to logs: only variable
+/// names appear in undefined-variable warnings.
+fn substitute_env_vars(text: &str, config_env: Option<&HashMap<String, String>>) -> String {
     let re = regex::Regex::new(r"\{env:([^}]+)\}").unwrap();
+    let mut resolved_env = config_env.cloned().unwrap_or_default();
+
+    // Resolve chained references between config.env values iteratively. Every
+    // pass expands one level using the previous pass as the lookup source, so
+    // a chain A -> B -> ... -> value is fully collapsed at the fixpoint.
+    let mut previous_refs: Option<std::collections::HashSet<String>> = None;
+    for _ in 0..MAX_ENV_SUBSTITUTION_PASSES {
+        let snapshot = resolved_env.clone();
+        let mut changed = false;
+        for value in resolved_env.values_mut() {
+            let expanded = re
+                .replace_all(value.as_str(), |caps: &regex::Captures| {
+                    let name = &caps[1];
+                    match snapshot.get(name).cloned().or_else(|| env::var(name).ok()) {
+                        Some(value) => value,
+                        None => {
+                            // Undefined names expand to empty without blocking
+                            // startup. Log the name only, never the value.
+                            tracing::warn!(
+                                variable = %name,
+                                "undefined environment variable in config.env expanded to an empty string; startup continues"
+                            );
+                            String::new()
+                        }
+                    }
+                })
+                .to_string();
+            if expanded != *value {
+                changed = true;
+                *value = expanded;
+            }
+        }
+
+        // A stable set of pending references means the remaining tokens form a
+        // cycle: cut expansion off instead of looping until the pass cap.
+        let pending: std::collections::HashSet<String> = resolved_env
+            .values()
+            .flat_map(|value| re.captures_iter(value).map(|caps| caps[1].to_string()))
+            .collect();
+        if !changed || previous_refs.as_ref() == Some(&pending) {
+            break;
+        }
+        previous_refs = Some(pending);
+    }
+
+    // Substitute the config text with the fully resolved map. Values stay
+    // escaped JSON string data and are inserted per the surrounding context.
     re.replace_all(text, |caps: &regex::Captures| {
         let var_name = &caps[1];
-        let value = match std::env::var(var_name) {
-            Ok(value) => value,
-            Err(_) => {
+        let value = match resolved_env
+            .get(var_name)
+            .cloned()
+            .or_else(|| env::var(var_name).ok())
+        {
+            Some(value) => value,
+            None => {
                 // Keep the existing empty-string expansion so startup is not
                 // blocked, but surface the missing variable by name only.
                 // Never log the value (it may be a secret).
@@ -1674,6 +1809,29 @@ fn apply_post_load_transforms(config: &mut Config) {
         config.share = Some(crate::schema::ShareMode::Auto);
     }
 
+    // The legacy `experimental.mcp_timeout` was merged but never consumed:
+    // MCP timeout resolution only reads `mcp.timeout` and a server's own
+    // `timeout`. Fold it into the canonical location so it takes effect, and
+    // emit a deprecation warning that never includes the numeric value.
+    // Explicit `mcp.timeout` wins; the legacy value is only a fallback and is
+    // cleared afterwards so a single source of truth remains.
+    if let Some(legacy_timeout) = config
+        .experimental
+        .as_ref()
+        .and_then(|experimental| experimental.mcp_timeout)
+    {
+        tracing::warn!(
+            "experimental.mcp_timeout is deprecated; use mcp.timeout instead (value not logged)"
+        );
+        let mcp = config.mcp.get_or_insert_with(McpConfig::default);
+        if mcp.timeout.is_none() {
+            mcp.timeout = Some(McpTimeoutConfig::Millis(legacy_timeout));
+        }
+        if let Some(experimental) = config.experimental.as_mut() {
+            experimental.mcp_timeout = None;
+        }
+    }
+
     // Deduplicate plugins, preserving whether the source explicitly set the key.
     config.plugin = std::mem::take(&mut config.plugin).map_values(deduplicate_plugins);
 
@@ -2193,7 +2351,7 @@ mod tests {
     fn test_substitute_env_vars() {
         std::env::set_var("OPENCODE_TEST_VAR", "test_value");
         let input = r#"{"api_key": "{env:OPENCODE_TEST_VAR}"}"#;
-        let result = substitute_env_vars(input);
+        let result = substitute_env_vars(input, None);
         assert_eq!(result, r#"{"api_key": "test_value"}"#);
         std::env::remove_var("OPENCODE_TEST_VAR");
     }
@@ -2201,8 +2359,52 @@ mod tests {
     #[test]
     fn test_substitute_env_vars_missing() {
         let input = r#"{"api_key": "{env:NONEXISTENT_VAR_12345}"}"#;
-        let result = substitute_env_vars(input);
+        let result = substitute_env_vars(input, None);
         assert_eq!(result, r#"{"api_key": ""}"#);
+    }
+
+    /// R4: chained `{env:VAR}` references inside `config.env` must be resolved
+    /// before they are substituted into the config text.
+    #[test]
+    fn substitute_env_vars_resolves_chained_config_env_values() {
+        let mut env = HashMap::new();
+        env.insert("OPENCODE_CHAIN_ROOT".to_string(), "root-value".to_string());
+        env.insert(
+            "OPENCODE_CHAIN_MID".to_string(),
+            "{env:OPENCODE_CHAIN_ROOT}/mid".to_string(),
+        );
+        env.insert(
+            "OPENCODE_CHAIN_LEAF".to_string(),
+            "pre-{env:OPENCODE_CHAIN_MID}".to_string(),
+        );
+
+        let input = r#"{"model": "{env:OPENCODE_CHAIN_LEAF}"}"#;
+        let result = substitute_env_vars(input, Some(&env));
+        assert_eq!(result, r#"{"model": "pre-root-value/mid"}"#);
+    }
+
+    /// R4: a cycle between `config.env` values must be cut off, not loop until
+    /// the pass cap or produce unbounded output. The result stays valid JSON.
+    #[test]
+    fn substitute_env_vars_cuts_off_cyclic_config_env() {
+        let mut env = HashMap::new();
+        env.insert(
+            "OPENCODE_CYCLE_A".to_string(),
+            "{env:OPENCODE_CYCLE_B}".to_string(),
+        );
+        env.insert(
+            "OPENCODE_CYCLE_B".to_string(),
+            "{env:OPENCODE_CYCLE_A}".to_string(),
+        );
+
+        let result = substitute_env_vars(r#"{"model": "{env:OPENCODE_CYCLE_A}"}"#, Some(&env));
+        assert!(
+            result.len() < 512,
+            "cyclic env expansion must be cut off, got {result}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("cyclic expansion must remain valid JSON");
+        assert!(parsed["model"].as_str().is_some());
     }
 
     #[test]
@@ -2210,7 +2412,7 @@ mod tests {
         const VAR: &str = "OPENCODE_H17_TOKEN_SPECIAL";
         let value = "a\"b\\c\nd\re\tf";
         std::env::set_var(VAR, value);
-        let result = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_TOKEN_SPECIAL}}"#);
+        let result = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_TOKEN_SPECIAL}}"#, None);
         std::env::remove_var(VAR);
 
         // A bare token must become a complete JSON string literal.
@@ -2229,8 +2431,8 @@ mod tests {
         let value = "a\u{0008}b\u{000c}d";
         std::env::set_var(VAR, value);
 
-        let token = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_CTRL_CHARS}}"#);
-        let literal = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_CTRL_CHARS}"}"#);
+        let token = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_CTRL_CHARS}}"#, None);
+        let literal = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_CTRL_CHARS}"}"#, None);
         std::env::remove_var(VAR);
 
         for result in [&token, &literal] {
@@ -2254,7 +2456,8 @@ mod tests {
         const VAR: &str = "OPENCODE_H17_LITERAL_SPECIAL";
         let value = "a\"b\\c\nd\re\tf";
         std::env::set_var(VAR, value);
-        let result = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_LITERAL_SPECIAL}"}"#);
+        let result =
+            substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_LITERAL_SPECIAL}"}"#, None);
         std::env::remove_var(VAR);
 
         // The surrounding quotes are already present, so only escaped content
@@ -2270,8 +2473,10 @@ mod tests {
         const VAR: &str = "OPENCODE_H17_MID_STRING";
         let value = "a\"b\\c\nd";
         std::env::set_var(VAR, value);
-        let result =
-            substitute_env_vars(r#"{"api_key": "pre-{env:OPENCODE_H17_MID_STRING}-post"}"#);
+        let result = substitute_env_vars(
+            r#"{"api_key": "pre-{env:OPENCODE_H17_MID_STRING}-post"}"#,
+            None,
+        );
         std::env::remove_var(VAR);
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -2285,8 +2490,8 @@ mod tests {
         // Classic injection payload: close the string, then add another key.
         let value = "\" , \"theme\": \"injected";
         std::env::set_var(VAR, value);
-        let token = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_INJECTION}}"#);
-        let literal = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_INJECTION}"}"#);
+        let token = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_INJECTION}}"#, None);
+        let literal = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_INJECTION}"}"#, None);
         std::env::remove_var(VAR);
 
         for result in [&token, &literal] {
@@ -3422,6 +3627,131 @@ theme = "dark"
             .expect("project provider");
         assert_eq!(provider.name.as_deref(), Some("project-name"));
     }
+
+    // ── R2 regression tests: config.env / experimental.mcp_timeout ───
+
+    #[test]
+    fn config_env_wins_over_process_env_in_placeholder_expansion() {
+        const VAR: &str = "OPENCODE_R2_CONFIG_ENV_SAME_FILE";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TestDir::new("opencode_r2_env_same_file");
+        fs::write(
+            temp.path.join("opencode.json"),
+            r#"{
+                "env": {"OPENCODE_R2_CONFIG_ENV_SAME_FILE": "from-config"},
+                "model": "{env:OPENCODE_R2_CONFIG_ENV_SAME_FILE}"
+            }"#,
+        )
+        .unwrap();
+
+        // A process value with the same name must not win over config.env.
+        std::env::set_var(VAR, "from-process");
+        let mut loader = ConfigLoader::new().without_global_config();
+        let loaded = loader.load_all(&temp.path);
+        std::env::remove_var(VAR);
+
+        let config = loaded.expect("config with config.env placeholder must load");
+        assert_eq!(config.model.as_deref(), Some("from-config"));
+    }
+
+    #[test]
+    fn config_env_from_earlier_layer_is_used_for_placeholder() {
+        const VAR: &str = "OPENCODE_R2_CONFIG_ENV_LAYER";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TestDir::new("opencode_r2_env_layer");
+        let file = temp.path.join("opencode.json");
+        fs::write(&file, r#"{"model":"{env:OPENCODE_R2_CONFIG_ENV_LAYER}"}"#).unwrap();
+
+        // Ensure the process environment cannot satisfy the placeholder.
+        std::env::remove_var(VAR);
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader
+            .load_from_str(r#"{"env":{"OPENCODE_R2_CONFIG_ENV_LAYER":"layer-value"}}"#)
+            .unwrap();
+        loader.load_from_file(&file).unwrap();
+
+        assert_eq!(loader.config().model.as_deref(), Some("layer-value"));
+    }
+
+    /// R4: inline config from OPENCODE_CONFIG_CONTENT containing `{env:}` and
+    /// `{file:}` placeholders must expand like file-based config instead of
+    /// failing to parse at startup. No value or path is written to logs.
+    #[test]
+    fn load_from_str_expands_env_and_file_references() {
+        const ROOT_VAR: &str = "OPENCODE_INLINE_ROOT";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TestDir::new("opencode_inline_placeholders");
+        let model_file = temp.path.join("model.txt");
+        fs::write(&model_file, "file-model").unwrap();
+        std::env::set_var(ROOT_VAR, "env-model");
+
+        // `env.BASE` chains through the process variable, `model` uses the
+        // chained value, and `theme` reads a file via an absolute path so the
+        // inline base directory (".") is irrelevant to this test.
+        let inline = format!(
+            r#"{{
+                "env": {{ "OPENCODE_INLINE_BASE": "{{env:{ROOT_VAR}}}" }},
+                "model": "{{env:OPENCODE_INLINE_BASE}}",
+                "theme": "{{file:{}}}"
+            }}"#,
+            model_file.display()
+        );
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let result = loader.load_from_str(&inline);
+        std::env::remove_var(ROOT_VAR);
+
+        result.expect("inline config with env/file placeholders must load");
+        let config = loader.config();
+        assert_eq!(config.model.as_deref(), Some("env-model"));
+        assert_eq!(config.theme.as_deref(), Some("file-model"));
+    }
+
+    #[test]
+    fn experimental_mcp_timeout_migrates_to_mcp_timeout() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"experimental":{"mcp_timeout":1234}}"#).unwrap();
+        apply_post_load_transforms(&mut config);
+
+        let timeout = config
+            .mcp
+            .expect("mcp section created")
+            .timeout
+            .expect("mcp.timeout migrated");
+        assert_eq!(timeout.per_operation(), (1234, 1234, 1234));
+        assert!(
+            config
+                .experimental
+                .as_ref()
+                .and_then(|experimental| experimental.mcp_timeout)
+                .is_none(),
+            "deprecated key must be cleared after migration"
+        );
+    }
+
+    #[test]
+    fn explicit_mcp_timeout_wins_over_deprecated_experimental_value() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "experimental":{"mcp_timeout":1234},
+                "mcp":{"timeout":{"startup":9999}}
+            }"#,
+        )
+        .unwrap();
+        apply_post_load_transforms(&mut config);
+
+        let timeout = config.mcp.expect("mcp").timeout.expect("timeout");
+        assert_eq!(
+            timeout.per_operation().0,
+            9999,
+            "explicit mcp.timeout must keep priority"
+        );
+        assert!(config
+            .experimental
+            .as_ref()
+            .and_then(|experimental| experimental.mcp_timeout)
+            .is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3584,7 +3914,7 @@ mod provider_normalization_tests {
         std::env::set_var("OPENCODE_TEST_ENV_VAR", "resolved-value");
         // A placeholder outside a JSON string literal is emitted as a complete
         // JSON string literal (quotes included), not as raw source text.
-        let result = substitute_env_vars("prefix:{env:OPENCODE_TEST_ENV_VAR}:suffix");
+        let result = substitute_env_vars("prefix:{env:OPENCODE_TEST_ENV_VAR}:suffix", None);
         assert_eq!(result, "prefix:\"resolved-value\":suffix");
         std::env::remove_var("OPENCODE_TEST_ENV_VAR");
     }

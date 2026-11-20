@@ -12,7 +12,6 @@
 //! `routes::router()` に渡せる。
 
 #![allow(
-    ambiguous_glob_reexports,
     clippy::manual_unwrap_or_default,
     clippy::redundant_guards,
     clippy::manual_strip
@@ -26,10 +25,14 @@ pub mod routes;
 pub mod server;
 pub mod worktree;
 
+// `routes` の DTO は `routes::*` で crate 直下へ再露出しない。
+// oauth::AuthMethodInfo / worktree::WorktreeInfo と同名で衝突し、
+// ambiguous_glob_reexports を抑制する必要があったため。DTO は module 経由
+// (`opencode_server::routes::SessionInfo` 等) で参照する。
+
 pub use error::*;
 pub use mcp_oauth::*;
 pub use oauth::*;
 pub use pty::*;
-pub use routes::*;
 pub use server::*;
 pub use worktree::*;

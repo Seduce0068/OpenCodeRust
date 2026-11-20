@@ -603,6 +603,21 @@ pub struct TodoInfo {
     pub priority: String,
 }
 
+/// Todo の wire 値を canonical な表現へ正規化する。
+///
+/// 旧 PascalCase (`InProgress`, `High`) やハイフン区切り (`in-progress`) が
+/// そのままクライアントへ渡ると、snake_case / 小文字しか解釈しない TUI 側で
+/// `Pending` / `Medium` へ退化する。`opencode_session` の `parse_status` /
+/// `parse_priority` (ともに pub) を単一情報源として `as_str()` に落とす。
+fn normalize_todo_wire_values(status: &str, priority: &str) -> (String, String) {
+    (
+        opencode_session::parse_status(status).as_str().to_string(),
+        opencode_session::parse_priority(priority)
+            .as_str()
+            .to_string(),
+    )
+}
+
 async fn get_session_todos(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -617,11 +632,14 @@ async fn get_session_todos(
     let items = todos
         .into_iter()
         .enumerate()
-        .map(|(idx, todo)| TodoInfo {
-            id: format!("{}_{}", id, idx),
-            content: todo.content,
-            status: todo.status,
-            priority: todo.priority,
+        .map(|(idx, todo)| {
+            let (status, priority) = normalize_todo_wire_values(&todo.status, &todo.priority);
+            TodoInfo {
+                id: format!("{}_{}", id, idx),
+                content: todo.content,
+                status,
+                priority,
+            }
         })
         .collect();
     Ok(Json(items))
@@ -6224,6 +6242,24 @@ mod mapping_tests {
         assert_eq!(message_role_name(&MessageRole::Tool), "tool");
     }
 
+    /// R4: 旧 PascalCase / ハイフン区切りの Todo wire 値が TUI で Pending に
+    /// 退化しないよう、canonical な snake_case / 小文字へ正規化されること。
+    #[test]
+    fn todo_wire_values_are_normalized() {
+        let (status, priority) = normalize_todo_wire_values("InProgress", "High");
+        assert_eq!(status, "in_progress");
+        assert_eq!(priority, "high");
+
+        let (status, priority) = normalize_todo_wire_values("in-progress", "MEDIUM");
+        assert_eq!(status, "in_progress");
+        assert_eq!(priority, "medium");
+
+        // 既存の canonical 値は不変。
+        let (status, priority) = normalize_todo_wire_values("completed", "low");
+        assert_eq!(status, "completed");
+        assert_eq!(priority, "low");
+    }
+
     /// serde ベースへ置換しても `/session/status` の status 値は従来と同一。
     #[test]
     fn session_status_wire_names_match_legacy_values() {
@@ -6285,7 +6321,7 @@ mod mapping_tests {
 
     #[test]
     fn text_from_parts_joins_text() {
-        use crate::TextPartInput;
+        use crate::routes::TextPartInput;
         let parts = vec![
             TextPartInput {
                 part_type: Some("text".to_owned()),
