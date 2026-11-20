@@ -276,21 +276,6 @@ status: current
   — `logging.rs:458-465` / LOG-NO-ROTATION
 - [ ] **/health が静的 ok で DB 状態を反映せずスキーマも不統一**
   — `routes.rs:5150-5155` / HEALTH-STATIC-OK
-- [ ] **グローバルとプロジェクトで jsonc/json の優先順位が逆**
-  — `loader.rs:95-101,124-134` / CONFIG-EXT-PRECEDENCE
-- [ ] **{file:...} 参照のコメント判定が // のみで重複時に実設定もスキップ**
-  — `loader.rs:607-609` / CONFIG-FILE-REF-COMMENT
-- [ ] **MCP 接続状態が色のみで文言が状態非依存** — `session.rs:441-452` / UX-02
-- [ ] **対話ヘルプが存在しない --provider / --prompt を案内**
-  — `cli/main.rs:2315-2317` / UX-03
-- [ ] **ユーザー向け文言に "Rust rewrite" / "parity" が露出**
-  — `cli/main.rs:3422-3425` / UX-04
-- [ ] **HTTP エラーの生レスポンスボディを toast へそのまま表示**
-  — `tui/api.rs:371,506,531,875` / UX-07
-- [ ] **ツール出力の途中切り詰めに明示マーカーが無い** — `message.rs:192-198,216-222` / UX-08
-- [ ] **Ctrl+X のヘルプが実装と不一致で leader 待機表示が無い**
-  — `help.rs:79`, `app.rs:452-482` / UX-09
-- [ ] **IME 非対応がヘルプに明記されていない** — `prompt.rs:397-415` / UX-10
 - [ ] **ファイル監視テストが 200ms sleep + Empty 無視でイベント未発行も合格**
   — `watcher/lib.rs:313-335` / TQ-03
 - [ ] **tui の 2 モジュールが同じ ENV_LOCK を別インスタンスで守る**
@@ -302,13 +287,10 @@ status: current
   — `provider_integration.rs:1-12` / TQ-07
 - [ ] **delete_session が実行中タスクを残し同一 ID 再作成で二重実行**
   — `routes.rs:466-479` / R1-CONC-04
-- [ ] **SseTransport 差し替えで古いリスナ task が abort されずリーク**
-  — `transport.rs:461-473` / R1-CONC-05
 - [ ] **Responses ストリームが受信側切断をアイドル中に検知しない**
   — `responses.rs:1462-1465` / R1-CONC-06
 - [ ] **MCP progress が期限を無制限に延長し transport ロックを保持**
   — `client.rs:487-525` / R1-CONC-07
-- [ ] **with_file_lock の FILE_LOCKS が無解放で無限成長** — `tool.rs:16-41` / R1-CONC-08
 - [ ] **MCP OAuth の保留状態・クライアント生成が Check-Then-Act で競合**
   — `oauth.rs:309-351` / R1-CONC-09
 - [ ] **docs/opencode-config.md が実装と矛盾（timeout・snapshots・wellknown）**
@@ -318,6 +300,8 @@ status: current
 
 ## 完了
 
+- [x] **[config/UX/並行 11 件]** コメント判定・トークンマスク・リーク解消
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[config/storage 永続化 3 件]** 0600 atomic・jsonc 整合・DB パス
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[新 discovery high 10 件]** env/500/stream/権限/plugin
@@ -595,6 +579,13 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（config/UX/並行の修正時、記録のみ）: 更新 API は
+  `.opencode/` と継承祖先設定を書き込まず、実効 `.opencode/opencode.json` が
+  あるとパッチが次回ロードでシャドーされる旨を docs へ明記した。
+  SSE Drop abort の回帰テストは tokio AbortHandle に is_aborted() が無いため
+  二重 abort が安全なことのみを検証（実装の Drop abort は維持）。
+  R4 の「{file:...} 側が不完全」という指摘は実コードと逆で、不完全だったのは
+  {env:...} 側だった（子が実コードを確認して {file:...} を修正）。
 - 2026-11-20 R4 残存（config/storage の修正時、記録のみ）: atomic write が
   親ディレクトリを fsync しないため、クラッシュ時にディレクトリエントリが
   失われる可能性（プロセス中断に対しては atomic、電源断永続性は未保証）。
