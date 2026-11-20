@@ -201,10 +201,6 @@ status: current
     O(n) を除去できず、不完全木／構造共有は wire・永続化形式の変更リスクが高い。
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
-- [ ] **README のクレート数が 22 で現行 21 と不一致** — `README.md:142` / R1-TS02
-- [ ] **差分コーパスが RegExp/URL/normalize を完全に除外** — `parity_corpus.rs:1-7` / R1-TS10
-- [ ] **once_cell / lazy_static が std::sync::OnceLock / LazyLock で置換可能**
-  — — `Cargo.toml:70-71` / R1-DP09
 
 ### 優先度: 高（残タスク調査で追加）
 
@@ -272,7 +268,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **認証キーのローテーションが無く 1 プロバイダ 1 キー固定** — `auth.rs:57-64,179-193` / P-07
 - [ ] **Bedrock の autoload 判定と Provider 生成で認証方式が不一致**
   — `bootstrap.rs:553-581,2217-2241` / P-08
 - [ ] **CodeMode の timeoutMs がホストツール呼び出しを拘束できない**
@@ -293,6 +288,8 @@ status: current
 
 ## 完了
 
+- [x] **[rotation/LazyLock/corpus 4 件]** API 提供・標準化・コーパス拡張
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[plugin/provider 3 件]** symlink 防御・モデル決定性・EOF 終了
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[CLI/session/docs 11 件]** JSON 契約・実配線・セッション保全
@@ -558,6 +555,10 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 指摘（rotation/LazyLock/corpus の修正時）: 2 件とも対応済み。
+  rotate_provider_key の doc comment に「HTTP 経路へ未配線」を明記し、
+  AGENTS.md のクレート数も 21 に追随。once_cell / lazy_static は syntax.rs と
+  クレート Cargo.toml が scope 外で残存（workspace.dependencies 削除は未実施）。
 - 2026-11-20 R4 残存（auth/llm/codemode の修正時、記録のみ）: キーローテーション
   は API のみ提供で server.rs の 401/429 検知・反映は未配線、再起動でプール消滅。
   CodeMode の同期 ToolHost では壁時計の完全強制不可（async 化が必要）。
