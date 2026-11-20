@@ -272,12 +272,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **update_config が常に opencode.json へ書き込み jsonc を shadow**
-  — `loader.rs:1626-1641` / CONFIG-UPDATE-WRONG-FILE
-- [ ] **Config 書き込みが非 atomic かつ umask 依存で秘密が 0644 露出**
-  — `loader.rs:1640-1641` / CONFIG-WRITE-PERM-ATOMICITY
-- [ ] **DB パスに環境変数オーバーライドが無く Runbook と矛盾**
-  — `database.rs:219-225` / STORAGE-DB-PATH-NO-OVERRIDE
 - [ ] **ログにローテーション・保持・サイズ上限が無く同一秒起動で truncate**
   — `logging.rs:458-465` / LOG-NO-ROTATION
 - [ ] **/health が静的 ok で DB 状態を反映せずスキーマも不統一**
@@ -324,6 +318,8 @@ status: current
 
 ## 完了
 
+- [x] **[config/storage 永続化 3 件]** 0600 atomic・jsonc 整合・DB パス
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[新 discovery high 10 件]** env/500/stream/権限/plugin
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[CORS 分離/Renovate 2 件]** ServerState 単位化と依存グループ化
@@ -599,6 +595,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（config/storage の修正時、記録のみ）: atomic write が
+  親ディレクトリを fsync しないため、クラッシュ時にディレクトリエントリが
+  失われる可能性（プロセス中断に対しては atomic、電源断永続性は未保証）。
+  jsonc 再シリアライズでコメント/trailing comma が失われるトレードオフは
+  doc コメントへ明記済み。server.rs の auth_data_dir は OPENCODE_DATA_DIR の
+  サブディレクトリ規約が DB と異なる（scope 外・既存挙動）。
 - 2026-11-20 R4 残存（high 10 件の修正時、記録のみ）: stream_message の
   AbortHandle 登録が spawn 後で、極短命タスクでは終了済みハンドルが残り得る
   （AbortHandle::new_pair で先に登録する設計判断が必要）。
