@@ -49,19 +49,22 @@ impl SessionRow {
     /// 特に `permission` を `.ok()` で None にすると権限制限が無い状態として
     /// 扱われ（fail-open）、破損した設定がセキュリティ上安全に失われるため、
     /// 読み取り側で明示的に失敗させる。
+    ///
+    /// serde のエラー詳細には保存値（型不一致なら文字列そのもの）が含まれうるため、
+    /// warn / `CorruptData` にはフィールド名だけを載せる
+    /// （`decode_message_json_field` と同じ方針）。
     fn decode_json_field<T>(field: &str, raw: Option<&str>) -> Result<Option<T>, DatabaseError>
     where
         T: serde::de::DeserializeOwned,
     {
         match raw {
             None => Ok(None),
-            Some(value) => serde_json::from_str(value).map(Some).map_err(|e| {
+            Some(value) => serde_json::from_str(value).map(Some).map_err(|_| {
                 tracing::warn!(
                     field = %field,
-                    error = %e,
                     "failed to parse stored session JSON field"
                 );
-                DatabaseError::CorruptData(format!("session has invalid {field} JSON: {e}"))
+                DatabaseError::CorruptData(format!("session has invalid {field} JSON"))
             }),
         }
     }
@@ -88,14 +91,10 @@ impl SessionRow {
                 ))
             }
             Some(raw) => {
-                let diffs: Vec<FileDiff> = serde_json::from_str(raw).map_err(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to parse stored summary_diffs"
-                    );
-                    DatabaseError::CorruptData(format!(
-                        "session has invalid summary_diffs JSON: {e}"
-                    ))
+                // serde 詳細には保存値が出るため、warn / エラーには出さない。
+                let diffs: Vec<FileDiff> = serde_json::from_str(raw).map_err(|_| {
+                    tracing::warn!("failed to parse stored summary_diffs");
+                    DatabaseError::CorruptData("session has invalid summary_diffs JSON".to_string())
                 })?;
                 Ok(Some(SessionSummary {
                     additions: additions.max(0) as u64,
@@ -161,6 +160,9 @@ impl SessionRow {
                     read: self.usage_cache_read_tokens.unwrap_or(0) as f64,
                     write: self.usage_cache_write_tokens.unwrap_or(0) as f64,
                 },
+                // 実コスト列をそのまま復元する。トークン総数は input/output 列で
+                // 表現するため、コスト列をトークン数で代用することはしない。
+                total_cost: self.usage_total_cost.unwrap_or(0.0),
             }),
             status: self.status,
             metadata,
@@ -226,13 +228,9 @@ impl SessionRepository {
         .bind(session.usage.as_ref().map(|u| u.reasoning).unwrap_or(0.0))
         .bind(session.usage.as_ref().map(|u| u.cache.write).unwrap_or(0.0))
         .bind(session.usage.as_ref().map(|u| u.cache.read).unwrap_or(0.0))
-        .bind(
-            session
-                .usage
-                .as_ref()
-                .map(|u| u.input + u.output)
-                .unwrap_or(0.0),
-        ) // Placeholder for total cost
+        // 実コストをそのまま保存する。トークン総数は input/output 列で
+        // 賄うため、usage_total_cost にトークン数を入れることはしない。
+        .bind(session.usage.as_ref().map(|u| u.total_cost).unwrap_or(0.0))
         .bind(&session.status)
         .bind(session.created_at.timestamp_millis())
         .bind(session.updated_at.timestamp_millis())
@@ -391,7 +389,7 @@ impl SessionRepository {
         .bind(usage.map(|u| u.reasoning).unwrap_or(0.0))
         .bind(usage.map(|u| u.cache.write).unwrap_or(0.0))
         .bind(usage.map(|u| u.cache.read).unwrap_or(0.0))
-        .bind(usage.map(|u| u.input + u.output).unwrap_or(0.0))
+        .bind(usage.map(|u| u.total_cost).unwrap_or(0.0))
         .bind(&session.status)
         .bind(session.updated_at.timestamp_millis())
         .bind(session.time.compacting.map(|t| t as i64))
@@ -444,6 +442,35 @@ struct MessageRow {
     role: String,
     created_at: i64,
     data: Option<String>,
+    /// v3 で追加された JSON 列。旧行は NULL（空 HashMap / None へフォールバック）。
+    metadata: Option<String>,
+    /// v3 で追加された JSON 列。旧行は NULL（usage なしとして扱う）。
+    usage: Option<String>,
+}
+
+/// v3 の JSON 列を復元する。NULL は「値なし」、破損 JSON は fail-loud。
+///
+/// ログ・エラーにはフィールド名とメッセージ ID だけを載せ、保存値（トークン数や
+/// 任意メタデータの内容）は一切含めない。パス情報も扱わない。
+fn decode_message_json_field<T>(
+    field: &'static str,
+    message_id: &str,
+    raw: Option<&str>,
+) -> Result<Option<T>, DatabaseError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match raw {
+        None => Ok(None),
+        Some(value) => serde_json::from_str(value).map(Some).map_err(|_| {
+            tracing::warn!(
+                field = %field,
+                message_id = %message_id,
+                "failed to parse stored message JSON field"
+            );
+            DatabaseError::CorruptData(format!("message has invalid {field} JSON"))
+        }),
+    }
 }
 
 /// 保存済みメッセージを `SessionMessage` に復元する。
@@ -458,33 +485,37 @@ fn decode_message_row(row: &MessageRow) -> Result<SessionMessage, DatabaseError>
         "assistant" => MessageRole::Assistant,
         "system" => MessageRole::System,
         "tool" => MessageRole::Tool,
-        other => {
+        _ => {
+            // 保存された role の値そのものは warn / エラーへ出さない（message id のみ）。
             tracing::warn!(
                 message_id = %row.id.as_str(),
-                role = %other,
                 "unknown message role; refusing to silently drop the row"
             );
             return Err(DatabaseError::CorruptData(format!(
-                "message '{}' has unknown role '{}'",
-                row.id, other
+                "message '{}' has unknown role",
+                row.id
             )));
         }
     };
 
     let parts: Vec<MessagePart> = match row.data.as_deref() {
         None => Vec::new(),
-        Some(data) => serde_json::from_str(data).map_err(|e| {
+        Some(data) => serde_json::from_str(data).map_err(|_| {
+            // serde エラー詳細には保存値が含まれうるため、message id だけを残す。
             tracing::warn!(
                 message_id = %row.id.as_str(),
-                error = %e,
                 "failed to parse stored message parts"
             );
-            DatabaseError::CorruptData(format!(
-                "message '{}' has invalid parts JSON: {}",
-                row.id, e
-            ))
+            DatabaseError::CorruptData(format!("message '{}' has invalid parts JSON", row.id))
         })?,
     };
+
+    // v3 の JSON 列を復元する。旧行は NULL なので空 HashMap / usage なしとする。
+    let metadata: HashMap<String, serde_json::Value> =
+        decode_message_json_field("metadata", &row.id, row.metadata.as_deref())?
+            .unwrap_or_default();
+    let usage: Option<opencode_types::MessageUsage> =
+        decode_message_json_field("usage", &row.id, row.usage.as_deref())?;
 
     let created = DateTime::from_timestamp_millis(row.created_at).unwrap_or_else(Utc::now);
 
@@ -494,11 +525,8 @@ fn decode_message_row(row: &MessageRow) -> Result<SessionMessage, DatabaseError>
         role,
         parts,
         created_at: created,
-        // messages テーブルには metadata / usage 用の列が無いため、
-        // 現行スキーマでは復元値を持たない（session -> types 変換側の
-        // フィールド保持は server.rs の明示変換で担保する）。
-        metadata: HashMap::new(),
-        usage: None,
+        metadata,
+        usage,
     })
 }
 
@@ -508,7 +536,7 @@ async fn count_corrupt_messages(
     session_id: &str,
 ) -> Result<usize, DatabaseError> {
     let rows = sqlx::query_as::<_, MessageRow>(
-        r#"SELECT id, session_id, role, created_at, data
+        r#"SELECT id, session_id, role, created_at, data, metadata, usage
            FROM messages WHERE session_id = ?"#,
     )
     .bind(session_id)
@@ -544,6 +572,16 @@ impl MessageRepository {
     {
         let data_json = serde_json::to_string(&message.parts)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        let metadata_json = serde_json::to_string(&message.metadata)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        // usage が None のメッセージは SQL NULL として保存し、読み取り側で
+        // None に復元する（空 JSON オブジェクトと区別するため）。
+        let usage_json = message
+            .usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         let role_str = match message.role {
             MessageRole::User => "user",
@@ -554,8 +592,8 @@ impl MessageRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO messages (id, session_id, role, created_at, data)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO messages (id, session_id, role, created_at, data, metadata, usage)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&message.id)
@@ -563,6 +601,8 @@ impl MessageRepository {
         .bind(role_str)
         .bind(message.created_at.timestamp_millis())
         .bind(&data_json)
+        .bind(&metadata_json)
+        .bind(usage_json)
         .execute(executor)
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
@@ -578,6 +618,14 @@ impl MessageRepository {
     pub async fn upsert(&self, message: &SessionMessage) -> Result<(), DatabaseError> {
         let data_json = serde_json::to_string(&message.parts)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        let metadata_json = serde_json::to_string(&message.metadata)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        let usage_json = message
+            .usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         let role_str = match message.role {
             MessageRole::User => "user",
@@ -588,13 +636,15 @@ impl MessageRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO messages (id, session_id, role, created_at, data)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO messages (id, session_id, role, created_at, data, metadata, usage)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 session_id = excluded.session_id,
                 role = excluded.role,
                 created_at = excluded.created_at,
-                data = excluded.data
+                data = excluded.data,
+                metadata = excluded.metadata,
+                usage = excluded.usage
             "#,
         )
         .bind(&message.id)
@@ -602,6 +652,8 @@ impl MessageRepository {
         .bind(role_str)
         .bind(message.created_at.timestamp_millis())
         .bind(&data_json)
+        .bind(&metadata_json)
+        .bind(usage_json)
         .execute(&self.pool)
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
@@ -614,7 +666,7 @@ impl MessageRepository {
         session_id: &str,
     ) -> Result<Vec<SessionMessage>, DatabaseError> {
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, session_id, role, created_at, data 
+            r#"SELECT id, session_id, role, created_at, data, metadata, usage
                FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC"#,
         )
         .bind(session_id)
@@ -629,7 +681,7 @@ impl MessageRepository {
 
     pub async fn get(&self, id: &str) -> Result<Option<SessionMessage>, DatabaseError> {
         let row = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, session_id, role, created_at, data 
+            r#"SELECT id, session_id, role, created_at, data, metadata, usage
                FROM messages WHERE id = ?"#,
         )
         .bind(id)
@@ -1087,12 +1139,75 @@ impl InputRepository {
 }
 
 #[cfg(test)]
+mod log_capture {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// `tracing::warn!` 等に渡されたフィールドを集めるテスト用バッファ。
+    #[derive(Clone, Default)]
+    pub(crate) struct LogBuffer(Arc<Mutex<String>>);
+
+    impl LogBuffer {
+        pub(crate) fn text(&self) -> String {
+            self.0.lock().expect("log buffer lock").clone()
+        }
+    }
+
+    struct CaptureVisitor(LogBuffer);
+
+    impl Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    /// tracing-subscriber を依存追加せずにイベント本文を捕捉する最小 Subscriber。
+    pub(crate) struct CaptureSubscriber {
+        buffer: LogBuffer,
+    }
+
+    impl CaptureSubscriber {
+        pub(crate) fn new(buffer: LogBuffer) -> Self {
+            Self { buffer }
+        }
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(self.buffer.clone()));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+}
+
+#[cfg(test)]
 mod message_repository_tests {
+    use super::log_capture::{CaptureSubscriber, LogBuffer};
     use super::MessageRepository;
     use crate::database::DatabaseError;
     use crate::Database;
     use chrono::{TimeZone, Utc};
-    use opencode_types::SessionMessage;
+    use opencode_types::{MessageUsage, SessionMessage};
 
     #[tokio::test]
     async fn list_for_session_breaks_created_at_ties_by_insertion_order() {
@@ -1231,6 +1346,182 @@ mod message_repository_tests {
         );
     }
 
+    fn sample_usage() -> MessageUsage {
+        MessageUsage {
+            input_tokens: 11,
+            output_tokens: 22,
+            reasoning_tokens: 33,
+            cache_write_tokens: 44,
+            cache_read_tokens: 55,
+            total_cost: 0.125,
+        }
+    }
+
+    fn message_with_fields(id: &str, source: &str, usage: Option<MessageUsage>) -> SessionMessage {
+        let mut message = SessionMessage::user("session-1", "hello");
+        message.id = id.to_string();
+        message
+            .metadata
+            .insert("source".to_string(), serde_json::json!(source));
+        message.metadata.insert(
+            "tags".to_string(),
+            serde_json::json!(["metadata", "roundtrip"]),
+        );
+        message.usage = usage;
+        message
+    }
+
+    /// メッセージ単位の metadata / usage が create/get/list/upsert/replace で往復すること。
+    #[tokio::test]
+    async fn message_metadata_and_usage_round_trip_through_all_write_paths() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+
+        let original = message_with_fields("with-usage", "create", Some(sample_usage()));
+        repository
+            .create(&original)
+            .await
+            .expect("message created with metadata and usage");
+        let loaded = repository
+            .get("with-usage")
+            .await
+            .expect("get works")
+            .expect("message found");
+        assert_eq!(loaded.metadata, original.metadata);
+        assert_eq!(loaded.usage, original.usage);
+        let listed = repository
+            .list_for_session("session-1")
+            .await
+            .expect("list works");
+        assert_eq!(listed[0].metadata, original.metadata);
+        assert_eq!(listed[0].usage, original.usage);
+
+        // usage=None は空 JSON ではなく NULL として保存され、None に戻ること。
+        let no_usage = message_with_fields("no-usage", "create", None);
+        repository.create(&no_usage).await.expect("message created");
+        let loaded = repository
+            .get("no-usage")
+            .await
+            .expect("get works")
+            .expect("message found");
+        assert_eq!(loaded.metadata, no_usage.metadata);
+        assert!(loaded.usage.is_none());
+
+        // upsert は既存行の metadata / usage も更新すること。
+        let mut updated = message_with_fields("with-usage", "upsert", Some(sample_usage()));
+        updated.usage.as_mut().expect("usage").total_cost = 0.5;
+        repository.upsert(&updated).await.expect("upsert works");
+        let loaded = repository
+            .get("with-usage")
+            .await
+            .expect("get works")
+            .expect("message found");
+        assert_eq!(loaded.metadata, updated.metadata);
+        assert_eq!(loaded.usage, updated.usage);
+
+        // replace_for_session も同じ INSERT ヘルパーを共有するため保持されること。
+        repository
+            .replace_for_session("session-1", &[original.clone(), no_usage.clone()])
+            .await
+            .expect("replace works");
+        let loaded = repository
+            .get("with-usage")
+            .await
+            .expect("get works")
+            .expect("message found");
+        assert_eq!(loaded.metadata, original.metadata);
+        assert_eq!(loaded.usage, original.usage);
+    }
+
+    /// v3 より前の行（metadata / usage が NULL）は空値として復元されること。
+    #[tokio::test]
+    async fn legacy_message_row_with_null_fields_yields_empty_metadata_and_no_usage() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, created_at, data) VALUES ('legacy', 'session-1', 'user', 1, '[]')",
+        )
+        .execute(database.pool())
+        .await
+        .expect("legacy message row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+
+        let loaded = repository
+            .get("legacy")
+            .await
+            .expect("get works")
+            .expect("legacy message found");
+        assert!(loaded.metadata.is_empty());
+        assert!(loaded.usage.is_none());
+    }
+
+    /// 破損した JSON 列は黙って捨てず fail-loud とし、値をエラーへ出さないこと。
+    #[tokio::test]
+    async fn corrupt_message_json_fields_fail_loud_without_values() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        let repository = MessageRepository::new(database.pool().clone());
+        repository
+            .create(&message_with_fields(
+                "corrupt",
+                "create",
+                Some(sample_usage()),
+            ))
+            .await
+            .expect("message created");
+
+        sqlx::query("UPDATE messages SET metadata = 'not-json' WHERE id = 'corrupt'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt metadata");
+        let error = repository
+            .get("corrupt")
+            .await
+            .expect_err("corrupt metadata must fail loud")
+            .to_string();
+        assert!(
+            matches!(
+                repository.get("corrupt").await,
+                Err(DatabaseError::CorruptData(_))
+            ),
+            "corrupt metadata must be CorruptData"
+        );
+        assert!(!error.contains("create"), "保存値をエラーに含めないこと");
+        assert!(!error.contains("0.125"), "トークン値をエラーに含めないこと");
+
+        sqlx::query("UPDATE messages SET metadata = '{}' WHERE id = 'corrupt'")
+            .execute(database.pool())
+            .await
+            .expect("restore metadata");
+        sqlx::query("UPDATE messages SET usage = 'not-json' WHERE id = 'corrupt'")
+            .execute(database.pool())
+            .await
+            .expect("corrupt usage");
+        assert!(
+            matches!(
+                repository.get("corrupt").await,
+                Err(DatabaseError::CorruptData(_))
+            ),
+            "corrupt usage must be CorruptData"
+        );
+    }
+
     /// 破損行の挿入に使う共通フィクスチャ（session-1 と 3 種類のメッセージ）。
     async fn seed_with_corrupt_rows(pool: &sqlx::SqlitePool) {
         sqlx::query(
@@ -1351,6 +1642,78 @@ mod message_repository_tests {
                 .await
                 .expect("read remaining ids");
         assert_eq!(ids, ["bad-json", "bad-role", "good", "null-data"]);
+    }
+
+    /// 型不一致（f64 列へ文字列）・未知 role・壊れた parts の保存値が
+    /// CorruptData と warn のどちらにも出ないことを検証する回帰テスト。
+    #[tokio::test]
+    async fn corrupt_message_values_do_not_leak_into_error_or_warn() {
+        const SENTINEL_COST: &str = "SENTINEL_COST_F64_MISMATCH";
+        const SENTINEL_ROLE: &str = "SENTINEL_UNKNOWN_ROLE_VALUE";
+        const SENTINEL_PARTS: &str = "SENTINEL_PARTS_TYPE_MISMATCH";
+
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+
+        // MessageUsage.total_cost は f64。文字列を入れた型不一致の serde 詳細には
+        // 保存値そのものが含まれるため、出力側で落とす必要がある。
+        let usage_json = format!(
+            "{{\"input_tokens\":0,\"output_tokens\":0,\"reasoning_tokens\":0,\"cache_write_tokens\":0,\"cache_read_tokens\":0,\"total_cost\":\"{SENTINEL_COST}\"}}"
+        );
+        let parts_json = format!("\"{SENTINEL_PARTS}\"");
+        for (id, role, data, usage) in [
+            ("bad-usage", "user", Some("[]"), Some(usage_json.as_str())),
+            ("bad-role", SENTINEL_ROLE, Some("[]"), None),
+            ("bad-parts", "user", Some(parts_json.as_str()), None),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages (id, session_id, role, created_at, data, usage) VALUES (?, 'session-1', ?, 1, ?, ?)",
+            )
+            .bind(id)
+            .bind(role)
+            .bind(data)
+            .bind(usage)
+            .execute(database.pool())
+            .await
+            .expect("corrupt message seeded");
+        }
+
+        let repository = MessageRepository::new(database.pool().clone());
+        let logs = LogBuffer::default();
+        let guard = tracing::subscriber::set_default(CaptureSubscriber::new(logs.clone()));
+        let usage_result = repository.get("bad-usage").await;
+        let role_result = repository.get("bad-role").await;
+        let parts_result = repository.get("bad-parts").await;
+        drop(guard);
+
+        assert!(matches!(&usage_result, Err(DatabaseError::CorruptData(_))));
+        assert!(matches!(&role_result, Err(DatabaseError::CorruptData(_))));
+        assert!(matches!(&parts_result, Err(DatabaseError::CorruptData(_))));
+
+        let errors = format!(
+            "{} {} {}",
+            usage_result.expect_err("usage error"),
+            role_result.expect_err("role error"),
+            parts_result.expect_err("parts error"),
+        );
+        let combined = format!("{errors} {}", logs.text());
+        assert!(
+            !combined.contains(SENTINEL_COST),
+            "f64 型不一致の保存値を error / warn に出さないこと"
+        );
+        assert!(
+            !combined.contains(SENTINEL_ROLE),
+            "未知 role の保存値を error / warn に出さないこと"
+        );
+        assert!(
+            !combined.contains(SENTINEL_PARTS),
+            "parts の保存値を error / warn に出さないこと"
+        );
     }
 }
 
@@ -1625,6 +1988,7 @@ mod todo_repository_tests {
 
 #[cfg(test)]
 mod session_repository_restore_tests {
+    use super::log_capture::{CaptureSubscriber, LogBuffer};
     use super::SessionRepository;
     use crate::database::DatabaseError;
     use crate::Database;
@@ -1666,6 +2030,7 @@ mod session_repository_restore_tests {
                     read: 0.0,
                     write: 0.0,
                 },
+                total_cost: 0.0,
             }),
             status: SessionStatus::Active,
             metadata: std::collections::HashMap::new(),
@@ -2055,6 +2420,57 @@ mod session_repository_restore_tests {
         assert_eq!(reloaded.metadata, session.metadata);
     }
 
+    /// `usage_total_cost` にはトークン数ではなく実コストが入り、復元も実コストであること。
+    #[tokio::test]
+    async fn total_cost_round_trips_without_being_replaced_by_token_counts() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        let mut session = sample_session("cost-session");
+        {
+            let usage = session.usage.as_mut().expect("usage exists");
+            usage.input = 150.0;
+            usage.output = 75.0;
+            usage.total_cost = 0.125;
+        }
+        repository.create(&session).await.expect("session created");
+
+        let stored: f64 = sqlx::query_scalar("SELECT usage_total_cost FROM sessions WHERE id = ?")
+            .bind("cost-session")
+            .fetch_one(database.pool())
+            .await
+            .expect("cost column readable");
+        assert!(
+            (stored - 0.125).abs() < f64::EPSILON,
+            "実コストが usage_total_cost に保存されること"
+        );
+
+        let loaded = repository
+            .get("cost-session")
+            .await
+            .expect("get works")
+            .expect("session found");
+        let usage = loaded.usage.expect("usage restored");
+        assert!(
+            (usage.total_cost - 0.125).abs() < f64::EPSILON,
+            "実コストが復元されること"
+        );
+        assert_eq!(usage.input, 150.0, "トークン総数は input 列で賄うこと");
+        assert_eq!(usage.output, 75.0, "トークン総数は output 列で賄うこと");
+
+        // update 経由でも実コストが上書きされないこと。
+        session.usage.as_mut().expect("usage").total_cost = 0.25;
+        repository.update(&session).await.expect("session updated");
+        let reloaded = repository
+            .get("cost-session")
+            .await
+            .expect("get works")
+            .expect("session found");
+        assert!(
+            (reloaded.usage.expect("usage").total_cost - 0.25).abs() < f64::EPSILON,
+            "update 後も実コストが保たれること"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_row_with_null_metadata_yields_empty_map() {
         let database = Database::in_memory().await.expect("database initializes");
@@ -2219,5 +2635,64 @@ mod session_repository_restore_tests {
         );
         drop(verify);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 型不一致（JSON の型違い・f64 列へ文字列）の保存値が
+    /// error / warn のどちらにも出ないことを検証する回帰テスト。
+    #[tokio::test]
+    async fn corrupt_session_values_do_not_leak_into_error_or_warn() {
+        const SENTINEL_JSON: &str = "SENTINEL_SESSION_TYPE_MISMATCH";
+        const SENTINEL_COST: &str = "SENTINEL_COST_COLUMN_VALUE";
+
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+        repository
+            .create(&sample_session("typed-mismatch"))
+            .await
+            .expect("session created");
+
+        // metadata は HashMap を期待するところへ JSON 文字列を入れた型不一致。
+        // serde の詳細には SENTINEL_JSON が含まれるが、error / warn には出さない。
+        let bad_json = format!("\"{SENTINEL_JSON}\"");
+        sqlx::query("UPDATE sessions SET metadata = ? WHERE id = 'typed-mismatch'")
+            .bind(&bad_json)
+            .execute(database.pool())
+            .await
+            .expect("corrupt metadata with type mismatch");
+
+        let logs = LogBuffer::default();
+        let guard = tracing::subscriber::set_default(CaptureSubscriber::new(logs.clone()));
+        let json_result = repository.get("typed-mismatch").await;
+        drop(guard);
+        assert!(matches!(&json_result, Err(DatabaseError::CorruptData(_))));
+
+        // f64 列へ文字列を保存（SQLite は動的型付けのため格納できる）。
+        sqlx::query(
+            "UPDATE sessions SET metadata = '{}', usage_total_cost = ? WHERE id = 'typed-mismatch'",
+        )
+        .bind(SENTINEL_COST)
+        .execute(database.pool())
+        .await
+        .expect("corrupt f64 column with text");
+        let cost_result = repository.get("typed-mismatch").await;
+        assert!(
+            cost_result.is_err(),
+            "type mismatch in f64 column must fail"
+        );
+
+        let errors = format!(
+            "{} {}",
+            json_result.expect_err("json error"),
+            cost_result.expect_err("cost error"),
+        );
+        let combined = format!("{errors} {}", logs.text());
+        assert!(
+            !combined.contains(SENTINEL_JSON),
+            "session JSON の保存値を error / warn に出さないこと"
+        );
+        assert!(
+            !combined.contains(SENTINEL_COST),
+            "f64 列の保存値を error / warn に出さないこと"
+        );
     }
 }

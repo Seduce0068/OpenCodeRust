@@ -832,10 +832,10 @@ impl ServerState {
                     reasoning_tokens: u.reasoning as u64,
                     cache_write_tokens: u.cache.write as u64,
                     cache_read_tokens: u.cache.read as u64,
-                    // M-44: 永続化された input/output はトークン数でありコストではない。
-                    // 復元時にトークン数を total_cost として誤表示しないよう 0.0 で初期化する。
-                    // 実コストの永続化はスキーマ変更を伴うため本次スコープ外。
-                    total_cost: 0.0,
+                    // usage_total_cost 列には実コストのみを保存しているため、
+                    // トークン数をコストとして誤表示せずそのまま復元する。
+                    // トークン総数は input_tokens / output_tokens で賄う。
+                    total_cost: u.total_cost,
                 }),
                 status: match stored.status {
                     opencode_types::SessionStatus::Active => {
@@ -853,7 +853,7 @@ impl ServerState {
                 },
                 // 従来は空 HashMap で上書きしており、保存済み metadata を
                 // 起動時に失していた。保存値をそのまま復元する。
-                metadata: stored.metadata,
+                metadata: stored.metadata.clone(),
                 created_at: stored.created_at,
                 updated_at: stored.updated_at,
             };
@@ -1271,6 +1271,8 @@ fn stored_session_from_session(session: &opencode_session::Session) -> opencode_
                     read: usage.cache_read_tokens as f64,
                     write: usage.cache_write_tokens as f64,
                 },
+                // 実コストは input/output のトークン数とは別に保存する。
+                total_cost: usage.total_cost,
             }),
         status,
         metadata: session.metadata.clone(),
@@ -2383,9 +2385,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_restore_sets_total_cost_to_zero() {
-        // M-44: 復元時に input/output のトークン数が total_cost として
-        // 誤設定されないことを検証する回帰テスト。
+    async fn storage_restore_keeps_persisted_total_cost() {
+        // 復元時に input/output のトークン数を total_cost へ持ち込まず、
+        // 永続化済みの実コストだけを復元することを検証する回帰テスト。
         let db = Database::in_memory()
             .await
             .expect("in-memory db should initialize");
@@ -2423,6 +2425,7 @@ mod tests {
                     read: 0.0,
                     write: 0.0,
                 },
+                total_cost: 0.125,
             });
             session_repo
                 .update(&stored)
@@ -2446,7 +2449,75 @@ mod tests {
         let usage = session.usage.as_ref().expect("usage should be restored");
         assert_eq!(usage.input_tokens, 150);
         assert_eq!(usage.output_tokens, 75);
-        assert_eq!(usage.total_cost, 0.0);
+        assert_eq!(
+            usage.total_cost, 0.125,
+            "トークン数ではなく実コストが復元されること"
+        );
+    }
+
+    /// 起動時復元で保存済み session.metadata が空 HashMap に上書きされないこと。
+    #[tokio::test]
+    async fn storage_restore_keeps_session_metadata() {
+        let db = Database::in_memory()
+            .await
+            .expect("in-memory db should initialize");
+        let pool = db.pool().clone();
+        let state = state_with_repos(
+            SessionRepository::new(pool.clone()),
+            MessageRepository::new(pool.clone()),
+        );
+
+        let session_id = {
+            let mut manager = state.sessions.lock().await;
+            let id = manager.create("default", ".").id.clone();
+            let session = manager.get_mut(&id).expect("session available");
+            session
+                .metadata
+                .insert("source".to_string(), serde_json::json!("startup-restore"));
+            session
+                .metadata
+                .insert("priority".to_string(), serde_json::json!(7));
+            id
+        };
+
+        state
+            .sync_sessions_to_storage()
+            .await
+            .expect("session snapshot should sync");
+
+        // 別リポジトリインスタンス（= DB 読み出し）でも metadata が読めること。
+        let stored = SessionRepository::new(pool.clone())
+            .get(&session_id)
+            .await
+            .expect("get works")
+            .expect("stored session exists");
+        assert_eq!(
+            stored.metadata.get("source"),
+            Some(&serde_json::json!("startup-restore"))
+        );
+
+        let reloaded = state_with_repos(
+            SessionRepository::new(pool.clone()),
+            MessageRepository::new(pool),
+        );
+        reloaded
+            .load_sessions_from_storage()
+            .await
+            .expect("sessions should reload from storage");
+
+        let manager = reloaded.sessions.lock().await;
+        let session = manager
+            .get(&session_id)
+            .expect("session should exist after reload");
+        assert_eq!(
+            session.metadata.get("source"),
+            Some(&serde_json::json!("startup-restore")),
+            "起動時復元で metadata が失われないこと"
+        );
+        assert_eq!(
+            session.metadata.get("priority"),
+            Some(&serde_json::json!(7))
+        );
     }
 
     #[tokio::test]
@@ -3896,6 +3967,7 @@ mod tests {
         assert_eq!(usage.reasoning, 303.0);
         assert_eq!(usage.cache.write, 404.0);
         assert_eq!(usage.cache.read, 505.0);
+        assert_eq!(usage.total_cost, 0.75, "実コストが型変換で落ちないこと");
 
         // メッセージ単位 usage / metadata / Text フラグが保持される。
         let stored_message = &stored.messages[0];

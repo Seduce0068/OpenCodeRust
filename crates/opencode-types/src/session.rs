@@ -126,6 +126,11 @@ pub struct TokenUsage {
     pub reasoning: f64,
     /// キャッシュの使用量。
     pub cache: CacheUsage,
+    /// 実コスト（USD）。トークン数ではなく金額であり、
+    /// SQLite の `sessions.usage_total_cost` 列へそのまま永続化する。
+    /// 旧データにフィールドが無い場合は 0.0 を既定値とする。
+    #[serde(default)]
+    pub total_cost: f64,
 }
 
 /// トークンキャッシュの読み書き使用量。
@@ -294,6 +299,7 @@ mod tests {
                 read: 10.0,
                 write: 20.0,
             },
+            total_cost: 0.125,
         });
         roundtrip(&SessionRevert {
             message_id: "msg_1".to_string(),

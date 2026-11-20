@@ -99,6 +99,17 @@ mod tests {
         assert!(!columns.contains(&"time_created".to_string()));
         assert!(!columns.contains(&"time_updated".to_string()));
 
+        // v3 の messages JSON 列もマイグレーションで作られている。
+        let message_columns = column_names(&pool, "messages").await;
+        assert!(
+            message_columns.contains(&"metadata".to_string()),
+            "messages.metadata must exist after migration"
+        );
+        assert!(
+            message_columns.contains(&"usage".to_string()),
+            "messages.usage must exist after migration"
+        );
+
         // ALL_MIGRATIONS の他のテーブルも作られている。
         for table in ["messages", "parts", "todos", "session_input"] {
             let count: i64 = sqlx::query_scalar(

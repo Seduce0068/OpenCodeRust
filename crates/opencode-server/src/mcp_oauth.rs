@@ -962,8 +962,9 @@ mod tests {
         .await
         .expect("store tokens");
         assert!(
-            opencode_mcp::auth::get_for_url("remote", server_url)
+            opencode_mcp::auth::try_get_for_url("remote", server_url)
                 .await
+                .expect("read auth store")
                 .is_some_and(|entry| entry.tokens.is_some()),
             "precondition: credentials are stored"
         );
@@ -985,7 +986,9 @@ mod tests {
 
         // Logging out must remove the credentials from disk, not just from
         // memory, or a later connect would silently reuse them.
-        let remaining = opencode_mcp::auth::get_for_url("remote", server_url).await;
+        let remaining = opencode_mcp::auth::try_get_for_url("remote", server_url)
+            .await
+            .expect("read auth store");
         assert!(
             remaining.and_then(|entry| entry.tokens).is_none(),
             "credentials must be deleted on logout"
@@ -1416,8 +1419,9 @@ mod tests {
             state.authorization_url
         );
 
-        let stored_state = opencode_mcp::auth::get_oauth_state("remote")
+        let stored_state = opencode_mcp::auth::try_get_oauth_state("remote")
             .await
+            .expect("read auth store")
             .expect("persisted csrf state");
 
         let status = manager
@@ -1471,8 +1475,9 @@ mod tests {
         // Each callback stores that server's tokens and connects immediately.
         for name in ["alpha", "beta"] {
             manager.start_oauth(name).await.expect("start oauth");
-            let state = opencode_mcp::auth::get_oauth_state(name)
+            let state = opencode_mcp::auth::try_get_oauth_state(name)
                 .await
+                .expect("read auth store")
                 .expect("csrf state");
             let info = manager
                 .handle_callback(name, "oauth-code", Some(&state))
@@ -1547,8 +1552,9 @@ mod tests {
             .await;
 
         manager.start_oauth("remote").await.expect("start oauth");
-        let stored_state = opencode_mcp::auth::get_oauth_state("remote")
+        let stored_state = opencode_mcp::auth::try_get_oauth_state("remote")
             .await
+            .expect("read auth store")
             .expect("csrf state");
 
         // A wrong code is rejected by the authorization server, so the server
@@ -2077,8 +2083,9 @@ mod tests {
             .await;
 
         let first = manager.start_oauth("remote").await.expect("first flow");
-        let first_state = opencode_mcp::auth::get_oauth_state("remote")
+        let first_state = opencode_mcp::auth::try_get_oauth_state("remote")
             .await
+            .expect("read auth store")
             .expect("first csrf state");
         assert!(
             first.authorization_url.contains(&first_state),
@@ -2087,8 +2094,9 @@ mod tests {
 
         manager.remove_oauth("remote").await;
         let second = manager.start_oauth("remote").await.expect("second flow");
-        let second_state = opencode_mcp::auth::get_oauth_state("remote")
+        let second_state = opencode_mcp::auth::try_get_oauth_state("remote")
             .await
+            .expect("read auth store")
             .expect("second csrf state");
         assert_ne!(
             first_state, second_state,

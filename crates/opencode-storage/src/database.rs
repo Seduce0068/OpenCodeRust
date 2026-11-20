@@ -12,7 +12,8 @@ use tracing::info;
 /// 既存 DB は `user_version = 0`（SQLite のデフォルト）なので、
 /// 初回起動時は必ずマイグレーションが実行される。
 /// v2: sessions.metadata 列を追加（session_input.metadata は既存）。
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+/// v3: messages.metadata / messages.usage 列を追加（メッセージ単位の metadata/usage 永続化）。
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -79,7 +80,31 @@ pub(crate) async fn migrate_pool(pool: &SqlitePool) -> Result<(), DatabaseError>
         return Ok(());
     }
 
+    // 旧バージョンの DB では ADD COLUMN 済みの列が既に存在する。
+    // 列ごとに PRAGMA で存在を判定し、二重追加になる ALTER だけスキップする
+    // （CREATE TABLE / CREATE INDEX は IF NOT EXISTS なので再実行しても安全）。
+    let session_columns = sqlx::query("PRAGMA table_info(sessions)")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+    let message_columns = sqlx::query("PRAGMA table_info(messages)")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+
     for migration in crate::schema::ALL_MIGRATIONS {
+        let already_applied = if *migration == crate::schema::MIGRATE_SESSION_METADATA {
+            has_column(&session_columns, "metadata")
+        } else if *migration == crate::schema::MIGRATE_MESSAGES_METADATA {
+            has_column(&message_columns, "metadata")
+        } else if *migration == crate::schema::MIGRATE_MESSAGES_USAGE {
+            has_column(&message_columns, "usage")
+        } else {
+            false
+        };
+        if already_applied {
+            continue;
+        }
         sqlx::raw_sql(*migration)
             .execute(&mut *tx)
             .await
@@ -120,6 +145,17 @@ pub(crate) async fn migrate_pool(pool: &SqlitePool) -> Result<(), DatabaseError>
         .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
 
     Ok(())
+}
+
+/// `PRAGMA table_info` の結果に `name` 列が存在するかを構造的に判定する。
+/// SQLite のエラー文字列（"duplicate column name"）に依存しないため、
+/// バージョンをまたいだ再実行でも安全に列追加をスキップできる。
+fn has_column(rows: &[sqlx::sqlite::SqliteRow], name: &str) -> bool {
+    rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .map(|column| column == name)
+            .unwrap_or(false)
+    })
 }
 
 /// すべてのプール生成経路（`Database::new` / `Database::in_memory` / `Storage::new`）が
@@ -247,7 +283,7 @@ impl Database {
 mod migration_tests {
     use super::{sqlite_pool_options, Database, SCHEMA_VERSION};
     use sqlx::sqlite::SqlitePoolOptions;
-    use sqlx::SqlitePool;
+    use sqlx::{Row, SqlitePool};
 
     async fn read_user_version(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
@@ -310,6 +346,91 @@ mod migration_tests {
         .await
         .expect("sqlite_master readable");
         assert_eq!(table_count, 1, "sessions table created on first migration");
+    }
+
+    /// v2 DB（sessions.metadata 追加済み・messages に新列なし・user_version=2）から
+    /// v3 へ移行できることを固定する。v2 の ALTER を再実行すると
+    /// "duplicate column name: metadata" で失敗するため、列存在チェックが必須。
+    #[tokio::test]
+    async fn v2_database_migrates_to_v3_without_duplicate_column() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("empty database");
+
+        // v2 時点のスキーマを手組みで再現する（v3 の 2 本の ALTER は含めない）。
+        for migration in [
+            crate::schema::CREATE_SESSIONS_TABLE_LEGACY,
+            crate::schema::MIGRATE_SESSION_METADATA,
+            crate::schema::CREATE_MESSAGES_TABLE,
+            crate::schema::CREATE_PARTS_TABLE,
+            crate::schema::CREATE_TODOS_TABLE,
+            crate::schema::CREATE_PERMISSIONS_TABLE,
+            crate::schema::CREATE_SESSION_SHARES_TABLE,
+            crate::schema::CREATE_SESSION_INPUT_TABLE_WITH_METADATA,
+            crate::schema::CREATE_INDEXES,
+            crate::schema::IDX_SESSION_INPUT,
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .expect("v2 schema statement");
+        }
+
+        // 既存データ（セッション metadata とメッセージ）が移行で消えないこと。
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at, metadata) \
+             VALUES ('v2-session', 'project-1', 'test', '.', 'Test', 1, 1, '{\"kept\":true}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("v2 session row");
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, created_at, data) \
+             VALUES ('v2-message', 'v2-session', 'user', 1, '[]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("v2 message row");
+        set_user_version(&pool, 2).await;
+
+        let database = Database { pool };
+        database
+            .run_migrations()
+            .await
+            .expect("v2 -> v3 migration must not fail on already-existing columns");
+
+        assert_eq!(
+            read_user_version(database.pool()).await,
+            i64::from(SCHEMA_VERSION),
+            "v3 version must be recorded"
+        );
+        let rows = sqlx::query("PRAGMA table_info(messages)")
+            .fetch_all(database.pool())
+            .await
+            .expect("table_info readable");
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").expect("column name"))
+            .collect();
+        assert!(names.iter().any(|name| name == "metadata"));
+        assert!(names.iter().any(|name| name == "usage"));
+
+        let metadata: String = sqlx::query_scalar("SELECT metadata FROM sessions WHERE id = ?")
+            .bind("v2-session")
+            .fetch_one(database.pool())
+            .await
+            .expect("session metadata readable");
+        assert_eq!(
+            metadata, "{\"kept\":true}",
+            "既存 metadata は変更されないこと"
+        );
+        assert_eq!(
+            count_sessions(database.pool(), "v2-session").await,
+            1,
+            "既存セッションが残ること"
+        );
     }
 
     #[tokio::test]
