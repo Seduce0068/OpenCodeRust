@@ -5,10 +5,47 @@
 //! model but uses a synchronous host: a tool call produces data immediately and
 //! `await` passes that data through. Arguments and results cross the same
 //! plain-data boundary as every other host interaction.
+//!
+//! A caller can pass a remaining wall-clock budget with
+//! [`ToolHost::invoke_with_deadline`]. Because the boundary is synchronous, that
+//! budget is advisory: a blocking host implementation must enforce it itself.
 
+use std::cell::Cell;
 use std::fmt::{self, Display, Formatter};
 
 use serde_json::Value as JsonValue;
+
+/// Budget used when the caller has no deadline to pass.
+///
+/// `u64::MAX` means "unbounded": the host is not asked to bound the call. This
+/// is what the legacy [`ToolHost::invoke`] entry point forwards.
+pub const DEFAULT_TOOL_TIMEOUT_MS: u64 = u64::MAX;
+
+thread_local! {
+    /// Breaks the mutual fallback between the two provided `invoke` methods so
+    /// a host that overrides neither fails safely instead of recursing.
+    static DEFAULT_INVOKE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct DefaultInvokeGuard;
+
+impl DefaultInvokeGuard {
+    fn enter() -> Option<Self> {
+        DEFAULT_INVOKE_ACTIVE.with(|active| {
+            if active.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for DefaultInvokeGuard {
+    fn drop(&mut self) {
+        DEFAULT_INVOKE_ACTIVE.with(|active| active.set(false));
+    }
+}
 
 /// A safe tool failure reported to the sandboxed program.
 ///
@@ -71,22 +108,64 @@ pub trait ToolHost {
         Vec::new()
     }
 
-    /// Invokes the tool at `path` with plain-data arguments.
+    /// Invokes the tool at `path` with plain-data arguments and an explicit
+    /// remaining wall-clock budget in milliseconds.
     ///
-    /// Returning `Err` makes the call throw inside the sandbox, so a program can
-    /// handle it with `try`/`catch`.
+    /// `duration_ms` is the time still available to this call when the
+    /// interpreter enters the host. [`DEFAULT_TOOL_TIMEOUT_MS`] means no
+    /// deadline was configured. Returning `Err` makes the call throw inside the
+    /// sandbox, so a program can handle it with `try`/`catch`.
+    ///
+    /// # Host obligations
+    ///
+    /// This trait is **synchronous**. Passing a budget cannot interrupt a host
+    /// that is blocked in I/O, and the interpreter cannot abort such a call: it
+    /// only checks the deadline before and after the call. A host therefore
+    /// **must enforce the limit itself** (check its clock during I/O, use a
+    /// bounded I/O API, etc.) when a hard wall-clock guarantee is required.
+    /// Fully enforcing the deadline, including cancellation of a blocking call,
+    /// would require making the host interface `async` with cancellation; that
+    /// is out of scope here and is left as a separate proposal.
+    ///
+    /// The default implementation ignores `duration_ms` and delegates to
+    /// [`ToolHost::invoke`], so existing hosts need no changes.
+    fn invoke_with_deadline(
+        &mut self,
+        path: &[String],
+        arguments: Vec<JsonValue>,
+        duration_ms: u64,
+    ) -> Result<JsonValue, ToolError> {
+        let _ = duration_ms;
+        self.invoke(path, arguments)
+    }
+
+    /// Invokes the tool at `path` using the default (unbounded) time budget.
+    ///
+    /// This is the legacy entry point kept as a wrapper that forwards
+    /// [`DEFAULT_TOOL_TIMEOUT_MS`] to [`ToolHost::invoke_with_deadline`].
+    /// Hosts that need a deadline override `invoke_with_deadline` instead.
     fn invoke(
         &mut self,
         path: &[String],
         arguments: Vec<JsonValue>,
-    ) -> Result<JsonValue, ToolError>;
+    ) -> Result<JsonValue, ToolError> {
+        let Some(_guard) = DefaultInvokeGuard::enter() else {
+            return Err(ToolError::new(
+                "ToolHost must implement `invoke` or `invoke_with_deadline`.",
+            ));
+        };
+        self.invoke_with_deadline(path, arguments, DEFAULT_TOOL_TIMEOUT_MS)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use serde_json::{json, Value as JsonValue};
 
-    use super::{ToolError, ToolHost};
+    use super::{ToolError, ToolHost, DEFAULT_TOOL_TIMEOUT_MS};
 
     /// Host stub: no external execution, only a fixed plain-data result.
     struct DummyHost;
@@ -148,5 +227,39 @@ mod tests {
             .invoke(&path, vec![json!(1), json!(2)])
             .expect("dummy host returns a plain value");
         assert_eq!(result, json!("dummy-result"));
+
+        // A legacy host that only implements `invoke` still receives calls made
+        // through the new deadline-aware entry point.
+        let result = host
+            .invoke_with_deadline(&path, vec![json!(1)], 25)
+            .expect("legacy host works through the overload");
+        assert_eq!(result, json!("dummy-result"));
+    }
+
+    /// Host recording the budget handed to the deadline-aware entry point.
+    struct BudgetHost(Rc<RefCell<Vec<u64>>>);
+
+    impl ToolHost for BudgetHost {
+        fn invoke_with_deadline(
+            &mut self,
+            _path: &[String],
+            _arguments: Vec<JsonValue>,
+            duration_ms: u64,
+        ) -> Result<JsonValue, ToolError> {
+            self.0.borrow_mut().push(duration_ms);
+            Ok(json!("ok"))
+        }
+    }
+
+    #[test]
+    fn legacy_invoke_forwards_the_default_budget() {
+        let budgets = Rc::new(RefCell::new(Vec::new()));
+        let mut host = BudgetHost(Rc::clone(&budgets));
+
+        assert_eq!(
+            host.invoke(&[], vec![]).expect("host should respond"),
+            json!("ok")
+        );
+        assert_eq!(*budgets.borrow(), vec![DEFAULT_TOOL_TIMEOUT_MS]);
     }
 }
