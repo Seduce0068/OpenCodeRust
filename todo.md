@@ -178,10 +178,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **MCP OAuth テストが OPENCODE_MCP_AUTH_FILE を remove_var で後始末**
-  — `mcp_oauth.rs:826` / TQ-08
-- [ ] **SessionPrompt::start が Once 解放後に再取得し二重開始を許す**
-  — `prompt.rs:881-897` / R1-CONC-10
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -276,15 +272,6 @@ status: current
   — `logging.rs:458-465` / LOG-NO-ROTATION
 - [ ] **/health が静的 ok で DB 状態を反映せずスキーマも不統一**
   — `routes.rs:5150-5155` / HEALTH-STATIC-OK
-- [ ] **ファイル監視テストが 200ms sleep + Empty 無視でイベント未発行も合格**
-  — `watcher/lib.rs:313-335` / TQ-03
-- [ ] **tui の 2 モジュールが同じ ENV_LOCK を別インスタンスで守る**
-  — `home.rs:346`, `prompt.rs:1493` / TQ-04
-- [ ] **SystemPrompt::for_model の 6 テストが "opencode" 含有しか見ない**
-  — `system.rs:162-199` / TQ-05
-- [ ] **constant_time_eq テストがソース文字列のトークン存在で検証** — `server.rs:2633-2657` / TQ-06
-- [ ] **provider 統合テストが外部 NO_PROXY 設定を要求し未設定で panic**
-  — `provider_integration.rs:1-12` / TQ-07
 - [ ] **delete_session が実行中タスクを残し同一 ID 再作成で二重実行**
   — `routes.rs:466-479` / R1-CONC-04
 - [ ] **Responses ストリームが受信側切断をアイドル中に検知しない**
@@ -293,13 +280,13 @@ status: current
   — `client.rs:487-525` / R1-CONC-07
 - [ ] **MCP OAuth の保留状態・クライアント生成が Check-Then-Act で競合**
   — `oauth.rs:309-351` / R1-CONC-09
-- [ ] **docs/opencode-config.md が実装と矛盾（timeout・snapshots・wellknown）**
-  — `opencode-config.md:55-57,72-73` / DOCS-CONFIG-DRIFT
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
 ## 完了
 
+- [x] **[テスト品質 8 件]** 恒真・環境依存・env 後始末・start 原子的化
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[config/UX/並行 11 件]** コメント判定・トークンマスク・リーク解消
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[config/storage 永続化 3 件]** 0600 atomic・jsonc 整合・DB パス
@@ -579,6 +566,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（テスト品質 8 件の修正時、記録のみ）: constant_time_eq の
+  戻り値検証では定数時間性（短絡の有無）を検出できないため、テスト名とコメントを
+  検証内容に合わせて改名し、実装・レビューで担保する方針へ変更した。
+  TUI の STATE_DIR_LOCK は home.rs / prompt.rs のヘルパのみが参加し、
+  app.rs / app_context.rs / session.rs の AppContext::new() テストは並行時に
+  一時 OPENCODE_STATE_DIR を observe し得る（Drop ガード化も未対応）。
 - 2026-11-20 R4 残存（config/UX/並行の修正時、記録のみ）: 更新 API は
   `.opencode/` と継承祖先設定を書き込まず、実効 `.opencode/opencode.json` が
   あるとパッチが次回ロードでシャドーされる旨を docs へ明記した。
