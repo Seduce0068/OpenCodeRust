@@ -754,6 +754,12 @@ pub struct SessionManager {
     /// 含めず、セッション削除時にエントリごと破棄する。
     dynamic_allows: HashMap<String, Vec<DynamicPermissionAllow>>,
     events: Vec<SessionEvent>,
+    /// `session.start` / `session.end` フックの spawned task を保持する。
+    ///
+    /// ハングした task がアプリ終了まで残り続けないよう、`Drop` 実装が全件 abort する。
+    /// 明示的な `shutdown()` 呼び出しは必須ではない（任意のタイミングで即停止したい
+    /// 場合に限り呼び出す）。
+    plugin_hook_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionManager {
@@ -762,7 +768,45 @@ impl SessionManager {
             sessions: HashMap::new(),
             dynamic_allows: HashMap::new(),
             events: Vec::new(),
+            plugin_hook_handles: Vec::new(),
         }
+    }
+
+    /// プラグインフックを現在の Runtime に spawn し、ハンドルを保持する。
+    ///
+    /// Runtime コンテキストが無い（同期テスト等）場合は spawn せず、従来どおり
+    /// 何もしない。各ハンドラの timeout は `PluginSystem::trigger` 側で適用済み
+    /// のため、ここで trigger 全体を包まない（1 件のハングで後続フックまで
+    /// 実行されなくなるため）。保持ハンドルは `Drop` が abort する。
+    fn spawn_plugin_hook(&mut self, event: HookEvent, session_id: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        // 完了済みハンドルを回収し、長時間稼働での蓄積を防ぐ。
+        self.plugin_hook_handles
+            .retain(|handle| !handle.is_finished());
+
+        let session_id = session_id.to_string();
+        let handle = runtime.spawn(async move {
+            opencode_plugin::trigger(HookContext::new(event).with_session(&session_id)).await;
+        });
+        self.plugin_hook_handles.push(handle);
+    }
+
+    /// 保持中のプラグインフック task をすべて abort する（明示呼び出し用）。
+    ///
+    /// `SessionManager` の破棄時に `Drop` が同じ処理を自動で行うため、
+    /// 通常のライフサイクルでは呼び出し不要。即時に停止したい場合に限り使う。
+    pub fn shutdown(&mut self) {
+        self.abort_plugin_hooks();
+    }
+
+    fn abort_plugin_hooks(&mut self) {
+        for handle in &self.plugin_hook_handles {
+            handle.abort();
+        }
+        self.plugin_hook_handles.clear();
     }
 
     /// Create a new session
@@ -778,15 +822,7 @@ impl SessionManager {
         });
 
         // Plugin hook: session.start — notify plugins of new session
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let session_id = session.id.clone();
-            handle.spawn(async move {
-                opencode_plugin::trigger(
-                    HookContext::new(HookEvent::SessionStart).with_session(&session_id),
-                )
-                .await;
-            });
-        }
+        self.spawn_plugin_hook(HookEvent::SessionStart, &session.id);
 
         session
     }
@@ -1070,15 +1106,7 @@ impl SessionManager {
         });
 
         // Plugin hook: session.end — notify plugins of session deletion
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let session_id = session.id.clone();
-            handle.spawn(async move {
-                opencode_plugin::trigger(
-                    HookContext::new(HookEvent::SessionEnd).with_session(&session_id),
-                )
-                .await;
-            });
-        }
+        self.spawn_plugin_hook(HookEvent::SessionEnd, &session.id);
 
         Some(session)
     }
@@ -1146,6 +1174,14 @@ impl SessionManager {
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for SessionManager {
+    fn drop(&mut self) {
+        // 本番コードは shutdown() を呼ばないため、破棄時に自動で片付ける。
+        // ServerState が保持する SessionManager も同じ経路で cleanup される。
+        self.abort_plugin_hooks();
     }
 }
 
@@ -1691,5 +1727,126 @@ mod tests {
         });
         assert_eq!(recent.len(), 1);
         assert!(recent.iter().all(|s| s.time.updated >= threshold));
+    }
+
+    /// shutdown() が create()/delete() のプラグインフック task を abort すること。
+    ///
+    /// 実フックの代わりに「開始後に無限待機し、drop 時にフラグを立てる」
+    /// 観測用 task を同じ保持先へ積み、abort で future が破棄されることを検証する。
+    #[tokio::test]
+    async fn test_shutdown_aborts_plugin_hook_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut manager = SessionManager::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let started_flag = started.clone();
+        let dropped_flag = dropped.clone();
+        let observer = tokio::spawn(async move {
+            let _guard = DropFlag(dropped_flag);
+            started_flag.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        manager.plugin_hook_handles.push(observer);
+
+        // create() がフックを spawn し、ハンドルを保持すること。
+        manager.create("project-1", "/path/to/project");
+        assert!(
+            manager
+                .plugin_hook_handles
+                .iter()
+                .any(|handle| !handle.is_finished()),
+            "create() must retain the spawned plugin hook handle"
+        );
+
+        // 観測用 task が開始するまで待つ（abort 前に開始していることを保証）。
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observer hook must start");
+
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "observer must still be alive before shutdown"
+        );
+
+        manager.shutdown();
+        assert!(
+            manager.plugin_hook_handles.is_empty(),
+            "shutdown() must drop every retained hook handle"
+        );
+
+        // abort 後に scheduler が future を破棄するのを待つ。
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted hook future must be dropped by shutdown()");
+    }
+
+    /// R5(medium) 回帰: 明示的に `shutdown()` を呼ばずに `SessionManager` を
+    /// 破棄しても、`Drop` が保持中のフック task を abort すること。
+    #[tokio::test]
+    async fn test_drop_aborts_plugin_hook_tasks_without_explicit_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let started_flag = Arc::clone(&started);
+        let dropped_flag = Arc::clone(&dropped);
+        let observer = tokio::spawn(async move {
+            let _guard = DropFlag(dropped_flag);
+            started_flag.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+
+        {
+            let mut manager = SessionManager::new();
+            manager.plugin_hook_handles.push(observer);
+
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("observer hook must start before drop");
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "observer must still be alive before drop"
+            );
+            // shutdown() は呼ばない。スコープ退出時の Drop に期待する。
+        }
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop must abort every retained hook task");
     }
 }

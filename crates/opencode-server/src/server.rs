@@ -480,6 +480,9 @@ pub(crate) fn sync_custom_fetch_proxy(
 }
 
 pub struct ServerState {
+    /// `SessionManager` を所有する。`ServerState` の生成/破棄にそのまま追従し、
+    /// 破棄時は `SessionManager::drop` が plugin hook ハンドルを自動 abort する
+    /// （本番コードからの明示的な `shutdown()` 呼び出しは不要）。
     pub sessions: Mutex<SessionManager>,
     pub(crate) config: TokioRwLock<AppConfig>,
     /// provider レジストリ。`&ServerState` を取る HTTP ハンドラからも差し替えられる

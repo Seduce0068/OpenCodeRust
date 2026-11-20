@@ -16,9 +16,17 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 pub mod subprocess;
+
+/// 1 つのフックハンドラの実行時間上限。
+///
+/// `PluginSystem::trigger` がハンドラごとに適用するため、1 件がハングしても
+/// 後続フックの実行はブロックされない。タイムアウトしたハンドラの結果は
+/// `HookError::Timeout` となる。
+pub const PLUGIN_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 自由形式のエラー文字列に含まれる認証情報を伏せる。
 ///
@@ -405,7 +413,23 @@ impl PluginSystem {
         entry.sort_by_key(|h| std::cmp::Reverse(h.priority));
     }
 
+    /// 登録済みフックを優先度順に実行する。
+    ///
+    /// `PLUGIN_HOOK_TIMEOUT` は trigger 全体ではなく各ハンドラに個別適用する。
+    /// 1 件がハングしても timeout で打ち切って後続フックへ進むため、
+    /// trigger 全体が止まることはない。
     pub async fn trigger(&self, context: HookContext) -> Vec<HookResult> {
+        self.trigger_with_timeout(context, PLUGIN_HOOK_TIMEOUT)
+            .await
+    }
+
+    /// `trigger` の実体。`hook_timeout` を差し替えられるようにして
+    /// 回帰テストで短い timeout を使えるようにする。
+    async fn trigger_with_timeout(
+        &self,
+        context: HookContext,
+        hook_timeout: Duration,
+    ) -> Vec<HookResult> {
         // 読み取りロックはスナップショットを作るためだけに保持する。
         // ハンドラ実行中にロックを保持すると register/remove の write ロック待ちで
         // デッドロックするため、Arc だけをクローンしてガードを先に drop する。
@@ -425,7 +449,12 @@ impl PluginSystem {
 
         let mut results = Vec::with_capacity(snapshot.len());
         for hook in snapshot {
-            results.push((hook.handler)(context.clone()).await);
+            let outcome =
+                match tokio::time::timeout(hook_timeout, (hook.handler)(context.clone())).await {
+                    Ok(result) => result,
+                    Err(_) => Err(HookError::Timeout),
+                };
+            results.push(outcome);
         }
 
         results
@@ -531,6 +560,8 @@ pub fn global() -> Arc<PluginSystem> {
 
 /// Convenience: trigger a hook event on the global plugin system.
 /// Errors from individual hooks are logged but do not propagate.
+/// Each handler is bounded by `PLUGIN_HOOK_TIMEOUT`, so one hanging hook does
+/// not prevent later hooks from running.
 pub async fn trigger(context: HookContext) {
     let system = global();
     let results = system.trigger(context).await;
@@ -543,6 +574,8 @@ pub async fn trigger(context: HookContext) {
 
 /// Convenience: trigger a hook event and collect successful outputs.
 /// Errors from individual hooks are logged but do not propagate.
+/// As with `trigger`, `PLUGIN_HOOK_TIMEOUT` applies to each handler
+/// individually, not to the whole trigger.
 pub async fn trigger_collect(context: HookContext) -> Vec<HookOutput> {
     let system = global();
     let results = system.trigger(context).await;
@@ -708,6 +741,54 @@ mod tests {
         assert_eq!(
             *order.lock().unwrap(),
             vec!["high".to_string(), "low".to_string()]
+        );
+    }
+
+    /// R5(medium) 回帰: 1 件のハングしたフックで trigger 全体が止まらず、
+    /// timeout 後に後続フックが実行されること。
+    #[tokio::test]
+    async fn trigger_timeout_on_one_hook_does_not_block_later_hooks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let system = PluginSystem::new();
+        let later_ran = Arc::new(AtomicBool::new(false));
+        let later_ran_for_hook = Arc::clone(&later_ran);
+
+        system
+            .register(
+                Hook::new("hang", HookEvent::Error, |_ctx| async {
+                    std::future::pending::<Result<(), HookError>>().await
+                })
+                .with_priority(10),
+            )
+            .await;
+        system
+            .register(
+                Hook::new("later", HookEvent::Error, move |_ctx| {
+                    let later_ran = Arc::clone(&later_ran_for_hook);
+                    async move {
+                        later_ran.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                })
+                .with_priority(0),
+            )
+            .await;
+
+        // 実運用は PLUGIN_HOOK_TIMEOUT(5s)。テストは短い timeout に差し替える。
+        let results = system
+            .trigger_with_timeout(
+                HookContext::new(HookEvent::Error),
+                Duration::from_millis(50),
+            )
+            .await;
+
+        assert_eq!(results.len(), 2, "both hooks must appear in the results");
+        assert!(matches!(results[0], Err(HookError::Timeout)));
+        assert!(results[1].is_ok(), "later hook must complete successfully");
+        assert!(
+            later_ran.load(Ordering::SeqCst),
+            "later hook must run after the first one times out"
         );
     }
 
