@@ -330,6 +330,8 @@ status: current
 
 ## 完了
 
+- [x] **[R4 残存 4 件]** stream redact・serde 集約・OAuth fail-loud・折返し
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[wire/秘密/レンダ high 11 件]** 互換・redaction・fail-loud
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[テスト品質 8 件]** 恒真・環境依存・env 後始末・start 原子的化
@@ -613,12 +615,17 @@ status: current
 
 ## メモ
 
-- 2026-11-20 R4 残存（high 11 件の修正時、記録のみ）: SSE 経路の生エラー漏洩は
-  safe_prompt_failure_client_info 経由で修正済み。messages テーブルに
-  metadata/usage 列が無く DB 往復で失われる問題（v3 マイグレーション要）、
-  decode_stream_error の message 非 redact、MCP OAuth 本線が fail-open 互換
-  ラッパのまま、question.rs のクリック判定が折り返しを無視、
-  wrapped_row_count が単語境界を過小評価、session 側 serde 属性欠落（実害なし）。
+- 2026-11-20 R4 残存（high 11 件の修正時）: SSE 経路の生エラー漏洩は
+  safe_prompt_failure_client_info 経由で修正済み。decode_stream_error の
+  message 非 redact、MCP OAuth 本線の fail-open、question のクリック判定、
+  wrapped_row_count の単語境界、session 側 serde 属性は次ラウンドで対応済み。
+  残存は messages テーブルに metadata/usage 列が無く DB 往復で失われる問題
+  （v3 マイグレーション要）のみ。
+- 2026-11-20 R4 残存（stream/OAuth/レンダ 4 件の修正時、記録のみ）: OAuth
+  callback の保存確認が has_stored_tokens の互換ラッパのまま、response_body
+  preview と encode 側 Other が非 redact、引用符付き credential が session 側
+  redact 正規表現で伏せられない、相関 ID がボディ読取失敗時に 'unavailable'
+  へ落ちる。いずれも low・多層防御の問題で実害は限定的。
 - 2026-11-20 cross-skill 集約（swarm88、4 担当・36 件、観点: wire 形式 /
   レンダリング / エラー伝播 / 依存 feature）: high 11 / 中 25 を追記。親が
   high 4 件（audit.toml の stale ignore・LSP feature 未配線・Google の key=・
