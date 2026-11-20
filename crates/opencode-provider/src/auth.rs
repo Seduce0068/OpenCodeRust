@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -54,8 +54,35 @@ pub enum AuthMethodType {
     Code,
 }
 
+/// Auth state behind a single lock so the active credential and the rotation pool
+/// can never drift apart.
+struct AuthState {
+    /// Legacy flat map. Always holds the currently active credential for each
+    /// provider. Runtime-only: rotation swaps this entry without touching `primary`.
+    credentials: HashMap<String, AuthInfo>,
+    /// The credential registered for each provider, mirrored to `auth.json`.
+    /// Kept separate from `credentials` so a runtime rotation can never become
+    /// the credential restored on the next start.
+    primary: HashMap<String, AuthInfo>,
+    /// Additional credentials for round-robin rotation. In-memory only, so the
+    /// on-disk auth file format stays backward compatible.
+    key_pool: HashMap<String, VecDeque<AuthInfo>>,
+}
+
+/// Why a credential rotation was requested. Diagnostics only: never carries a key
+/// or token value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationReason {
+    /// HTTP 401 Unauthorized.
+    Unauthorized,
+    /// HTTP 429 Too Many Requests.
+    RateLimited,
+    /// Explicit caller-driven rotation.
+    Manual,
+}
+
 pub struct AuthManager {
-    credentials: Arc<RwLock<HashMap<String, AuthInfo>>>,
+    state: Arc<RwLock<AuthState>>,
     filepath: Option<PathBuf>,
     /// Reason the auth file could not be loaded, if any. Never contains file contents.
     load_error: Option<String>,
@@ -64,9 +91,17 @@ pub struct AuthManager {
 }
 
 impl AuthManager {
+    fn empty_state() -> AuthState {
+        AuthState {
+            credentials: HashMap::new(),
+            primary: HashMap::new(),
+            key_pool: HashMap::new(),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
-            credentials: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(Self::empty_state())),
             filepath: None,
             load_error: None,
             persist_error: Arc::new(RwLock::new(None)),
@@ -75,7 +110,7 @@ impl AuthManager {
 
     pub fn with_filepath(filepath: PathBuf) -> Self {
         Self {
-            credentials: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(Self::empty_state())),
             filepath: Some(filepath),
             load_error: None,
             persist_error: Arc::new(RwLock::new(None)),
@@ -103,7 +138,13 @@ impl AuthManager {
         // token value) can leak through the error chain.
         let data = serde_json::from_str::<HashMap<String, AuthInfo>>(&content)
             .map_err(|_| anyhow::anyhow!("failed to parse auth file {}", filepath.display()))?;
-        *manager.credentials.write().await = data;
+        *manager.state.write().await = AuthState {
+            // The on-disk entry is the registration-time primary. Runtime
+            // rotation starts from it but must never rewrite it.
+            credentials: data.clone(),
+            primary: data,
+            key_pool: HashMap::new(),
+        };
         Ok(manager)
     }
 
@@ -132,16 +173,118 @@ impl AuthManager {
         self.persist_error.read().await.clone()
     }
 
+    /// Legacy getter: returns the currently active credential for the provider.
     pub async fn get(&self, provider_id: &str) -> Option<AuthInfo> {
-        let creds = self.credentials.read().await;
-        creds.get(provider_id).cloned()
+        let state = self.state.read().await;
+        state.credentials.get(provider_id).cloned()
+    }
+
+    /// Alias for [`Self::get`] for callers using the `get_auth` name.
+    pub async fn get_auth(&self, provider_id: &str) -> Option<AuthInfo> {
+        self.get(provider_id).await
+    }
+
+    /// Number of registered credentials for a provider (active + pooled).
+    /// Counts only, never exposes key values.
+    pub async fn key_count(&self, provider_id: &str) -> usize {
+        let state = self.state.read().await;
+        let active = usize::from(state.credentials.contains_key(provider_id));
+        active + state.key_pool.get(provider_id).map_or(0, VecDeque::len)
+    }
+
+    /// Register an additional credential for `provider_id`.
+    ///
+    /// The first credential becomes the active one and is persisted to `auth.json`;
+    /// later credentials live in an in-memory round-robin pool. Call
+    /// [`Self::rotate_key`] (or [`Self::get_next_auth`]) on 401/429 to advance.
+    pub async fn try_add_key(&self, provider_id: &str, auth: AuthInfo) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            if state.credentials.contains_key(provider_id) {
+                state
+                    .key_pool
+                    .entry(provider_id.to_string())
+                    .or_default()
+                    .push_back(auth);
+            } else {
+                // First registration defines the primary that survives restarts.
+                state
+                    .credentials
+                    .insert(provider_id.to_string(), auth.clone());
+                state.primary.insert(provider_id.to_string(), auth);
+            }
+        }
+        self.persist().await
+    }
+
+    /// Register an additional credential, logging persistence errors without secrets.
+    pub async fn add_key(&self, provider_id: &str, auth: AuthInfo) {
+        if let Err(error) = self.try_add_key(provider_id, auth).await {
+            tracing::warn!(%error, provider_id, "failed to persist auth store");
+        }
+    }
+
+    /// Advance to the next credential for `provider_id` and make it active.
+    ///
+    /// Returns `true` when a rotation actually occurred. The log record contains
+    /// only the provider id and the reason — never a key or token value.
+    pub async fn rotate_key(&self, provider_id: &str, reason: RotationReason) -> bool {
+        let rotated = {
+            let mut state = self.state.write().await;
+            let can_rotate = state.credentials.contains_key(provider_id)
+                && state
+                    .key_pool
+                    .get(provider_id)
+                    .is_some_and(|pool| !pool.is_empty());
+            if can_rotate {
+                let current = state
+                    .credentials
+                    .remove(provider_id)
+                    .expect("active credential was checked");
+                let next = {
+                    let pool = state
+                        .key_pool
+                        .get_mut(provider_id)
+                        .expect("non-empty pool was checked");
+                    let next = pool.pop_front().expect("pool was checked non-empty");
+                    pool.push_back(current);
+                    next
+                };
+                state.credentials.insert(provider_id.to_string(), next);
+            }
+            can_rotate
+        };
+        if rotated {
+            tracing::info!(provider_id, reason = ?reason, "rotated to next provider credential");
+        }
+        rotated
+    }
+
+    /// Rotate (typically on 401/429) and return the newly active credential.
+    ///
+    /// When no alternate exists the current credential is returned unchanged.
+    pub async fn get_next_auth(
+        &self,
+        provider_id: &str,
+        reason: RotationReason,
+    ) -> Option<AuthInfo> {
+        self.rotate_key(provider_id, reason).await;
+        self.get_auth(provider_id).await
     }
 
     /// Insert credentials and persist them, returning a persistence error to the caller.
+    ///
+    /// Replaces the active credential and discards any pooled keys, matching the
+    /// historical single-credential `set` semantics.
     pub async fn try_set(&self, provider_id: &str, auth: AuthInfo) -> anyhow::Result<()> {
         {
-            let mut creds = self.credentials.write().await;
-            creds.insert(provider_id.to_string(), auth);
+            let mut state = self.state.write().await;
+            state
+                .credentials
+                .insert(provider_id.to_string(), auth.clone());
+            // An explicit set defines a new primary, unlike a runtime rotation.
+            state.primary.insert(provider_id.to_string(), auth);
+            state.key_pool.remove(provider_id);
         }
         self.persist().await
     }
@@ -157,8 +300,10 @@ impl AuthManager {
     /// Remove credentials and persist the deletion, returning a persistence error to the caller.
     pub async fn try_remove(&self, provider_id: &str) -> anyhow::Result<()> {
         {
-            let mut creds = self.credentials.write().await;
-            creds.remove(provider_id);
+            let mut state = self.state.write().await;
+            state.credentials.remove(provider_id);
+            state.primary.remove(provider_id);
+            state.key_pool.remove(provider_id);
         }
         self.persist().await
     }
@@ -172,13 +317,13 @@ impl AuthManager {
     }
 
     pub async fn has_auth(&self, provider_id: &str) -> bool {
-        let creds = self.credentials.read().await;
-        creds.contains_key(provider_id)
+        let state = self.state.read().await;
+        state.credentials.contains_key(provider_id)
     }
 
     pub async fn get_api_key(&self, provider_id: &str) -> Option<String> {
-        let creds = self.credentials.read().await;
-        match creds.get(provider_id) {
+        let state = self.state.read().await;
+        match state.credentials.get(provider_id) {
             Some(AuthInfo::Api { key }) => Some(key.clone()),
             _ => None,
         }
@@ -189,8 +334,8 @@ impl AuthManager {
     ///
     /// 呼び出し側は既存の `Option<String>` シグネチャをそのまま使える。
     pub async fn get_oauth_token(&self, provider_id: &str) -> Option<String> {
-        let creds = self.credentials.read().await;
-        let auth = creds.get(provider_id)?;
+        let state = self.state.read().await;
+        let auth = state.credentials.get(provider_id)?;
         let AuthInfo::OAuth { access, .. } = auth else {
             return None;
         };
@@ -207,9 +352,10 @@ impl AuthManager {
         Some(access.clone())
     }
 
+    /// Backward-compatible view: one entry per provider, holding the active credential.
     pub async fn list(&self) -> HashMap<String, AuthInfo> {
-        let creds = self.credentials.read().await;
-        creds.clone()
+        let state = self.state.read().await;
+        state.credentials.clone()
     }
 
     async fn persist(&self) -> anyhow::Result<()> {
@@ -241,8 +387,9 @@ impl AuthManager {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let creds = self.credentials.read().await;
-        let json = serde_json::to_vec_pretty(&*creds)?;
+        let state = self.state.read().await;
+        // Persist the registration-time primary, never the rotated runtime active.
+        let json = serde_json::to_vec_pretty(&state.primary)?;
         tokio::fs::write(path, json).await?;
 
         #[cfg(unix)]
@@ -615,5 +762,230 @@ mod tests {
             manager.get_oauth_token("github-copilot").await.as_deref(),
             Some("PASTE_DUMMY_TOKEN")
         );
+    }
+
+    fn api_key(label: &str) -> AuthInfo {
+        AuthInfo::Api {
+            key: format!("DUMMY_KEY_{label}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_keys_rotate_round_robin() {
+        let manager = AuthManager::new();
+        manager.add_key("openai", api_key("A")).await;
+        manager.add_key("openai", api_key("B")).await;
+        manager.add_key("openai", api_key("C")).await;
+
+        assert_eq!(manager.key_count("openai").await, 3);
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_A")
+        );
+
+        assert!(
+            manager
+                .rotate_key("openai", RotationReason::Unauthorized)
+                .await
+        );
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_B")
+        );
+
+        assert!(
+            manager
+                .rotate_key("openai", RotationReason::RateLimited)
+                .await
+        );
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_C")
+        );
+
+        // Wraps back to the first key.
+        assert!(manager.rotate_key("openai", RotationReason::Manual).await);
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_A")
+        );
+
+        // `list`, `get` and `get_auth` stay backward compatible: one active entry.
+        let listed = manager.list().await;
+        assert_eq!(listed.len(), 1);
+        assert!(matches!(
+            listed.get("openai"),
+            Some(AuthInfo::Api { key }) if key.as_str() == "DUMMY_KEY_A"
+        ));
+        assert!(matches!(
+            manager.get_auth("openai").await,
+            Some(AuthInfo::Api { ref key }) if key.as_str() == "DUMMY_KEY_A"
+        ));
+        assert!(matches!(
+            manager.get("openai").await,
+            Some(AuthInfo::Api { ref key }) if key.as_str() == "DUMMY_KEY_A"
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_next_auth_returns_successive_credentials() {
+        let manager = AuthManager::new();
+        manager.add_key("openai", api_key("A")).await;
+        manager.add_key("openai", api_key("B")).await;
+
+        // `AuthInfo` has no PartialEq, so compare the string fields explicitly.
+        let first = manager
+            .get_next_auth("openai", RotationReason::Unauthorized)
+            .await;
+        assert!(matches!(
+            first,
+            Some(AuthInfo::Api { ref key }) if key.as_str() == "DUMMY_KEY_B"
+        ));
+        let second = manager
+            .get_next_auth("openai", RotationReason::RateLimited)
+            .await;
+        assert!(matches!(
+            second,
+            Some(AuthInfo::Api { ref key }) if key.as_str() == "DUMMY_KEY_A"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rotate_without_alternate_keeps_active_credential() {
+        let manager = AuthManager::new();
+        manager.set("openai", api_key("ONLY")).await;
+
+        assert!(
+            !manager
+                .rotate_key("openai", RotationReason::Unauthorized)
+                .await
+        );
+        assert_eq!(manager.key_count("openai").await, 1);
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_ONLY")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_and_remove_reset_the_key_pool() {
+        let manager = AuthManager::new();
+        manager.add_key("openai", api_key("A")).await;
+        manager.add_key("openai", api_key("B")).await;
+        assert_eq!(manager.key_count("openai").await, 2);
+
+        manager.set("openai", api_key("REPLACEMENT")).await;
+        assert_eq!(manager.key_count("openai").await, 1);
+        assert!(
+            !manager
+                .rotate_key("openai", RotationReason::Unauthorized)
+                .await
+        );
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_REPLACEMENT")
+        );
+
+        manager.remove("openai").await;
+        assert_eq!(manager.key_count("openai").await, 0);
+        assert!(manager.get("openai").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn key_pool_does_not_leak_values_into_list_or_persisted_file() {
+        let dir = temp_auth_dir();
+        let manager = AuthManager::load_from_file(&dir).await;
+        manager.add_key("openai", api_key("PRIMARY")).await;
+        manager.add_key("openai", api_key("SECONDARY")).await;
+
+        // Only the active credential is visible to legacy consumers and on disk.
+        let listed = manager.list().await;
+        assert_eq!(listed.len(), 1);
+        let raw = tokio::fs::read_to_string(dir.join("auth.json"))
+            .await
+            .expect("read persisted auth file");
+        assert!(raw.contains("DUMMY_KEY_PRIMARY"));
+        assert!(!raw.contains("DUMMY_KEY_SECONDARY"));
+
+        let reloaded = AuthManager::load_from_file(&dir).await;
+        assert_eq!(reloaded.key_count("openai").await, 1);
+        assert_eq!(
+            reloaded.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_PRIMARY")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rotation_does_not_persist_active_as_primary() {
+        for mutation in ["add_key", "try_set", "try_remove"] {
+            let dir = temp_auth_dir();
+            let manager = AuthManager::load_from_file(&dir).await;
+            manager.add_key("openai", api_key("PRIMARY")).await;
+            manager.add_key("openai", api_key("SECONDARY")).await;
+
+            assert!(
+                manager
+                    .rotate_key("openai", RotationReason::Unauthorized)
+                    .await
+            );
+            assert_eq!(
+                manager.get_api_key("openai").await.as_deref(),
+                Some("DUMMY_KEY_SECONDARY")
+            );
+
+            // A later write re-persists the store. The rotated active credential
+            // must not be promoted to the on-disk primary by any of these paths.
+            match mutation {
+                "add_key" => manager.add_key("unrelated", api_key("OTHER")).await,
+                "try_set" => manager
+                    .try_set("unrelated", api_key("OTHER"))
+                    .await
+                    .expect("set must succeed"),
+                "try_remove" => manager
+                    .try_remove("unrelated")
+                    .await
+                    .expect("remove must succeed"),
+                other => unreachable!("unexpected mutation: {other}"),
+            }
+
+            let raw = tokio::fs::read_to_string(dir.join("auth.json"))
+                .await
+                .expect("read persisted auth file");
+            assert!(
+                raw.contains("DUMMY_KEY_PRIMARY"),
+                "{mutation}: registration-time primary must be persisted"
+            );
+            assert!(
+                !raw.contains("DUMMY_KEY_SECONDARY"),
+                "{mutation}: rotated active must not be persisted"
+            );
+
+            let reloaded = AuthManager::load_from_file(&dir).await;
+            assert_eq!(
+                reloaded.get_api_key("openai").await.as_deref(),
+                Some("DUMMY_KEY_PRIMARY"),
+                "{mutation}: restart must restore the primary"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_set_updates_persisted_primary() {
+        let dir = temp_auth_dir();
+        let manager = AuthManager::load_from_file(&dir).await;
+        manager.set("openai", api_key("FIRST")).await;
+        manager.set("openai", api_key("SECOND")).await;
+
+        let reloaded = AuthManager::load_from_file(&dir).await;
+        assert_eq!(
+            reloaded.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_SECOND")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

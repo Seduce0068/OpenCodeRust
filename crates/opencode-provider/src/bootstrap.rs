@@ -410,22 +410,6 @@ impl CustomLoader for AzureCognitiveServicesLoader {
 pub struct AmazonBedrockLoader;
 
 impl AmazonBedrockLoader {
-    fn provider_option_string(state: Option<&ProviderState>, keys: &[&str]) -> Option<String> {
-        let state = state?;
-        for key in keys {
-            let Some(value) = state.options.get(*key) else {
-                continue;
-            };
-            match value {
-                serde_json::Value::String(s) if !s.trim().is_empty() => return Some(s.clone()),
-                serde_json::Value::Number(n) => return Some(n.to_string()),
-                serde_json::Value::Bool(b) => return Some(b.to_string()),
-                _ => {}
-            }
-        }
-        None
-    }
-
     /// Apply cross-region model ID prefixing based on region.
     /// Returns the (possibly prefixed) model ID.
     /// Apply cross-region model ID prefixing based on region.
@@ -515,6 +499,91 @@ impl AmazonBedrockLoader {
     }
 }
 
+/// Credentials resolved from provider options / environment that `BedrockConfig`
+/// can actually consume. Shared by the autoload loader and `create_concrete_provider`
+/// so the two can never disagree about whether Bedrock is usable.
+// Deliberately no `Debug` derive: this struct holds raw AWS secret keys.
+struct BedrockCredentialResolution {
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+    endpoint_url: Option<String>,
+}
+
+/// Single source of truth for Bedrock credential resolution.
+///
+/// Chain-style sources (`profile`, bearer token, web identity token file, container
+/// credentials) are deliberately not accepted: `BedrockConfig` carries only static
+/// access keys, so treating those sources as autoloadable would advertise a provider
+/// that `create_concrete_provider` cannot construct. Returning `None` on chain-only
+/// configurations keeps both paths consistent instead of silently registering an
+/// unusable provider.
+fn resolve_bedrock_credentials(
+    provider: Option<&ProviderState>,
+) -> Option<BedrockCredentialResolution> {
+    let region = provider
+        .and_then(|p| provider_option_string(p, &["region"]))
+        .or_else(|| env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"]))
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    let access_key_id = provider
+        .and_then(|p| provider_option_string(p, &["accessKeyId", "access_key_id"]))
+        .or_else(|| env_any(&["AWS_ACCESS_KEY_ID"]))?;
+    let secret_access_key = provider
+        .and_then(|p| provider_option_string(p, &["secretAccessKey", "secret_access_key"]))
+        .or_else(|| env_any(&["AWS_SECRET_ACCESS_KEY"]))?;
+
+    let session_token = provider
+        .and_then(|p| provider_option_string(p, &["sessionToken", "awsSessionToken"]))
+        .or_else(|| env_any(&["AWS_SESSION_TOKEN"]));
+
+    let endpoint_url = provider.and_then(|p| {
+        provider_option_string(
+            p,
+            &[
+                "endpointUrl",
+                "endpointURL",
+                "endpoint",
+                "baseURL",
+                "baseUrl",
+                "url",
+            ],
+        )
+    });
+
+    Some(BedrockCredentialResolution {
+        region,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        endpoint_url,
+    })
+}
+
+/// Detect chain-style credential configuration so the autoload decision can be
+/// explained without logging any credential value.
+fn has_unsupported_bedrock_chain_source(provider: Option<&ProviderState>) -> bool {
+    let from_options = |keys: &[&str]| {
+        provider
+            .and_then(|p| provider_option_string(p, keys))
+            .is_some()
+    };
+    from_options(&[
+        "profile",
+        "awsBearerTokenBedrock",
+        "bearerToken",
+        "webIdentityTokenFile",
+    ]) || env_any(&[
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ])
+    .is_some()
+}
+
 impl CustomLoader for AmazonBedrockLoader {
     fn load(
         &self,
@@ -523,54 +592,46 @@ impl CustomLoader for AmazonBedrockLoader {
     ) -> CustomLoaderResult {
         let mut result = CustomLoaderResult::default();
 
-        // Region precedence: config options > env var > default.
-        let region = Self::provider_option_string(provider_state, &["region"])
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .unwrap_or_else(|| "us-east-1".to_string());
-
-        // Credential options from config or environment.
-        let profile = Self::provider_option_string(provider_state, &["profile"])
-            .or_else(|| std::env::var("AWS_PROFILE").ok());
-        let endpoint = Self::provider_option_string(
-            provider_state,
-            &["endpoint", "endpointUrl", "endpointURL"],
-        );
-
-        let aws_access_key_id = Self::provider_option_string(provider_state, &["accessKeyId"])
-            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok());
-        let aws_secret_access_key =
-            Self::provider_option_string(provider_state, &["secretAccessKey"])
-                .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok());
-        let aws_bearer_token =
-            Self::provider_option_string(provider_state, &["awsBearerTokenBedrock", "bearerToken"])
-                .or_else(|| std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok());
-        let aws_web_identity_token_file =
-            Self::provider_option_string(provider_state, &["webIdentityTokenFile"])
-                .or_else(|| std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok());
-        let container_creds = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_ok()
-            || std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_ok();
-
-        if profile.is_none()
-            && aws_access_key_id.is_none()
-            && aws_secret_access_key.is_none()
-            && aws_bearer_token.is_none()
-            && aws_web_identity_token_file.is_none()
-            && !container_creds
-        {
+        let has_chain_source = has_unsupported_bedrock_chain_source(provider_state);
+        let Some(resolved) = resolve_bedrock_credentials(provider_state) else {
+            // Chain-only (or missing) credentials cannot be represented by
+            // BedrockConfig; disable autoload to match create_concrete_provider.
+            if has_chain_source {
+                tracing::warn!(
+                    provider = "amazon-bedrock",
+                    "chain-style AWS credentials are unsupported; provider is not autoloaded"
+                );
+            }
             result.autoload = false;
             return result;
+        };
+
+        if has_chain_source {
+            // Static keys are what BedrockConfig consumes, so make the precedence
+            // explicit without logging the keys, profile or token values.
+            tracing::warn!(
+                provider = "amazon-bedrock",
+                "static AWS keys take precedence; chain-style settings are ignored"
+            );
         }
 
         result.autoload = true;
-        result
-            .options
-            .insert("region".to_string(), serde_json::Value::String(region));
+        result.options.insert(
+            "region".to_string(),
+            serde_json::Value::String(resolved.region),
+        );
+
+        // Keep `profile` in the merged options for downstream consumers, even
+        // though it no longer by itself enables autoload.
+        let profile = provider_state
+            .and_then(|p| provider_option_string(p, &["profile"]))
+            .or_else(|| env_any(&["AWS_PROFILE"]));
         if let Some(profile) = profile {
             result
                 .options
                 .insert("profile".to_string(), serde_json::Value::String(profile));
         }
-        if let Some(endpoint) = endpoint {
+        if let Some(endpoint) = resolved.endpoint_url {
             result
                 .options
                 .insert("endpoint".to_string(), serde_json::Value::String(endpoint));
@@ -2298,27 +2359,16 @@ fn create_concrete_provider(
             Some(Arc::new(AzureProvider::new(api_key, endpoint)))
         }
         "amazon-bedrock" => {
-            let region = provider_option_string(provider, &["region"])
-                .or_else(|| env_any(&["AWS_REGION"]))
-                .unwrap_or_else(|| "us-east-1".to_string());
-            let access_key_id = provider_option_string(provider, &["accessKeyId"])
-                .or_else(|| env_any(&["AWS_ACCESS_KEY_ID"]))?;
-            let secret_access_key = provider_option_string(provider, &["secretAccessKey"])
-                .or_else(|| env_any(&["AWS_SECRET_ACCESS_KEY"]))?;
-            let session_token = provider_option_string(provider, &["sessionToken"])
-                .or_else(|| env_any(&["AWS_SESSION_TOKEN"]));
-            let endpoint_url = provider_option_string(
-                provider,
-                &["endpointUrl", "endpointURL", "baseURL", "baseUrl"],
-            );
-
+            // Use the same resolver as the autoload loader so a provider that was
+            // advertised as autoloadable is always constructible here.
+            let resolved = resolve_bedrock_credentials(Some(provider))?;
             Some(Arc::new(BedrockProvider::with_config(
                 crate::bedrock::BedrockConfig {
-                    region,
-                    access_key_id,
-                    secret_access_key,
-                    session_token,
-                    endpoint_url,
+                    region: resolved.region,
+                    access_key_id: resolved.access_key_id,
+                    secret_access_key: resolved.secret_access_key,
+                    session_token: resolved.session_token,
+                    endpoint_url: resolved.endpoint_url,
                 },
             )))
         }
@@ -2891,6 +2941,50 @@ mod tests {
         }
     }
 
+    /// Serial guard for the process-global static AWS credential variables.
+    /// Env vars are shared by every test in the process, so the lock is held for
+    /// the whole lifetime of the guard and the original values are restored on
+    /// drop. This keeps Bedrock tests deterministic without leaking a cleared
+    /// environment into concurrently running tests.
+    static AWS_STATIC_KEYS_LOCK: Lazy<std::sync::Mutex<()>> =
+        Lazy::new(|| std::sync::Mutex::new(()));
+
+    struct AwsStaticKeysGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        access_key_id: Option<std::ffi::OsString>,
+        secret_access_key: Option<std::ffi::OsString>,
+    }
+
+    impl AwsStaticKeysGuard {
+        fn new() -> Self {
+            let lock = AWS_STATIC_KEYS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let access_key_id = std::env::var_os("AWS_ACCESS_KEY_ID");
+            let secret_access_key = std::env::var_os("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            Self {
+                _lock: lock,
+                access_key_id,
+                secret_access_key,
+            }
+        }
+    }
+
+    impl Drop for AwsStaticKeysGuard {
+        fn drop(&mut self) {
+            match &self.access_key_id {
+                Some(value) => std::env::set_var("AWS_ACCESS_KEY_ID", value),
+                None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+            }
+            match &self.secret_access_key {
+                Some(value) => std::env::set_var("AWS_SECRET_ACCESS_KEY", value),
+                None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+            }
+        }
+    }
+
     #[test]
     fn litert_provider_is_not_registered_until_ffi_is_implemented() {
         let mut state = provider_state("litert");
@@ -2929,6 +3023,7 @@ mod tests {
 
     #[test]
     fn creates_bedrock_provider_from_options() {
+        let _aws_env = AwsStaticKeysGuard::new();
         let mut state = provider_state("amazon-bedrock");
         state.options.insert(
             "accessKeyId".to_string(),
@@ -2981,11 +3076,22 @@ mod tests {
 
     #[test]
     fn bedrock_loader_reads_provider_state_options() {
+        let _aws_env = AwsStaticKeysGuard::new();
         let loader = AmazonBedrockLoader;
         let mut state = provider_state("amazon-bedrock");
         state.options.insert(
             "region".to_string(),
             serde_json::Value::String("us-west-2".to_string()),
+        );
+        // Static keys are required for autoload: BedrockConfig cannot consume
+        // chain-style sources such as `profile`.
+        state.options.insert(
+            "accessKeyId".to_string(),
+            serde_json::Value::String("akid".to_string()),
+        );
+        state.options.insert(
+            "secretAccessKey".to_string(),
+            serde_json::Value::String("secret".to_string()),
         );
         state.options.insert(
             "profile".to_string(),
@@ -3016,6 +3122,61 @@ mod tests {
             ))
         );
         assert!(result.has_custom_get_model);
+    }
+
+    #[test]
+    fn bedrock_autoload_matches_concrete_provider_creation() {
+        // Ambient AWS_* static keys must not decide whether chain-only config
+        // looks usable. The serial guard clears and restores them on drop.
+        let _aws_env = AwsStaticKeysGuard::new();
+        let loader = AmazonBedrockLoader;
+        let info = provider_info(
+            "amazon-bedrock",
+            model_info("anthropic.claude-3-5-haiku-20241022-v2:0"),
+        );
+
+        // Explicit static keys: both paths must report "usable".
+        let mut explicit = provider_state("amazon-bedrock");
+        explicit.options.insert(
+            "accessKeyId".to_string(),
+            serde_json::Value::String("akid".to_string()),
+        );
+        explicit.options.insert(
+            "secretAccessKey".to_string(),
+            serde_json::Value::String("secret".to_string()),
+        );
+        let autoload = loader.load(&info, Some(&explicit)).autoload;
+        let created = create_concrete_provider("amazon-bedrock", &explicit).is_some();
+        assert_eq!(autoload, created, "autoload and creation must agree");
+        assert!(created, "explicit keys must be usable on both paths");
+
+        // Chain-style-only and empty configurations: with static keys cleared,
+        // neither path may claim the provider is usable.
+        let mut chain_only_cases = Vec::new();
+        for (key, value) in [
+            ("profile", "dev-profile"),
+            ("bearerToken", "bearer-token"),
+            ("webIdentityTokenFile", "/tmp/token.jwt"),
+        ] {
+            let mut state = provider_state("amazon-bedrock");
+            state.options.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            chain_only_cases.push(state);
+        }
+        chain_only_cases.push(provider_state("amazon-bedrock"));
+
+        for state in &chain_only_cases {
+            let autoload = loader.load(&info, Some(state)).autoload;
+            let created = create_concrete_provider("amazon-bedrock", state).is_some();
+            assert_eq!(
+                autoload, created,
+                "chain-only config must never be autoloadable but unconstructible"
+            );
+            assert!(!autoload, "chain-only config must disable autoload");
+            assert!(!created, "chain-only config must not create a provider");
+        }
     }
 
     #[test]

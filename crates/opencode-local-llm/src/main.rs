@@ -4,15 +4,26 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::future::Future;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 /// ollama サブプロセスの既定タイムアウト（秒）。
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+
+/// 同時に実行する `tools/call` の上限。超過時はサブプロセスを起動せずに
+/// 即座 JSON-RPC エラーを返し、ollama プロセスの暴走によるリソース枯渇を防ぐ。
+const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
+
+/// 同時実行上限超過時に返す JSON-RPC サーバ定義エラーコード（-32000 番台）。
+const TOOL_CALL_LIMIT_EXCEEDED_CODE: i32 = -32000;
 
 /// サブプロセス出力・MCP レスポンスの 1 テキストあたりの最大バイト数（16 MiB）。
 ///
@@ -269,69 +280,201 @@ struct Tool {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut stdout = io::stdout();
-    let mut line = String::new();
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
 
+    // stdin のブロッキング読み取りを専用スレッドへ退避する。通常スレッドなので
+    // main が戻った時点でプロセスは終了し、shutdown 時に read_line の待機が
+    // 終了を妨げない。行はチャネルへ渡し、ループ側は select! で推論完了と
+    // 新着リクエストを等しく監視する。
+    let _stdin_reader = std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if line_tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+
+    serve_requests(
+        line_rx,
+        |response: JsonRpcResponse| {
+            let json = serde_json::to_string(&response).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to serialize JSON-RPC response",
+                )
+            })?;
+            writeln!(stdout, "{}", json)?;
+            stdout.flush()
+        },
+        |request: JsonRpcRequest, initialized: bool| async move {
+            let mut initialized = initialized;
+            respond_or_error(request, &mut initialized).await
+        },
+    )
+    .await
+}
+
+/// 入力行チャネルを読み、軽量リクエストは同期的に、長時間かかる `tools/call` は
+/// `tokio::spawn` で並列に処理するメインループ。
+///
+/// バックグラウンドタスクはレスポンスを `mpsc` チャネルへ送り、ループが
+/// 単一の stdout 書き込み位置から出力する。各レスポンスは JSON-RPC の `id` を
+/// 保持したまま多重化されるため、完了順が入れ替わっても対応が崩れない。
+/// `shutdown` / `initialize` / `tools/list` は推論の完了を待たずに処理され、
+/// `shutdown` を受け取った時点で未完了タスクを abort してループを抜ける。
+async fn serve_requests<F, Fut>(
+    mut requests: mpsc::UnboundedReceiver<String>,
+    mut emit: impl FnMut(JsonRpcResponse) -> io::Result<()>,
+    run_tool_call: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(JsonRpcRequest, bool) -> Fut,
+    Fut: Future<Output = JsonRpcResponse> + Send + 'static,
+{
     let mut initialized = false;
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<JsonRpcResponse>();
+    let mut tasks = JoinSet::new();
+    // 同時 tools/call 数の上限。permit は spawn したタスクへ移し、
+    // 完了（panic 時の unwind を含む）まで保持させて並列度を制限する。
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
+    // 入力が閉じた後に待つべき推論タスク数。正常タスクはレスポンス送信後に
+    // 完了するためレスポンス受信で減算するが、panic してレスポンスを送らない
+    // タスクは join_next の JoinError で減算する（EOF 後のハング防止）。
+    let mut in_flight: usize = 0;
+    let mut input_closed = false;
 
     loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break; // EOF
+        // EOF 済みで未完了タスクが無ければ、以降に待つイベントは存在しない。
+        if input_closed && in_flight == 0 {
+            break;
         }
+        // join_next のガードは bool で渡し、tasks の可変借用と競合させない。
+        let has_tasks = !tasks.is_empty();
 
-        let line_trimmed = line.trim();
-        if line_trimmed.is_empty() {
-            continue;
-        }
+        tokio::select! {
+            biased;
 
-        let request: JsonRpcRequest = match serde_json::from_str(line_trimmed) {
-            Ok(req) => req,
-            Err(e) => {
-                send_error(
-                    &mut stdout,
-                    None,
-                    -32700,
-                    "Parse error",
-                    Some(json!(e.to_string())),
-                )?;
-                continue;
+            Some(response) = response_rx.recv() => {
+                in_flight = in_flight.saturating_sub(1);
+                emit(response)?;
             }
-        };
 
-        let response = handle_request(request, &mut initialized).await?;
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{}", response_json)?;
-        stdout.flush()?;
+            maybe_line = requests.recv(), if !input_closed => {
+                let Some(line) = maybe_line else {
+                    // 入力終了。以降は未完了タスクのレスポンスだけを待つ。
+                    input_closed = true;
+                    continue;
+                };
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        // パースエラーの詳細には入力断片が含まれ得るため、
+                        // 固定文言のみを返し、prompt/token をエラーへ載せない。
+                        emit(parse_error_response())?;
+                        continue;
+                    }
+                };
+
+                if request.method == "tools/call" {
+                    // 同時実行数に上限を設け、超過時はサブプロセスを起動せず
+                    // JSON-RPC エラーを即座に返す（リソース枯渇の防止）。
+                    match permits.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            // 300 秒の ollama 待機でループを止めない。spawn 時点の
+                            // initialized 状態を渡し、初期化前の呼び出しも確実に拒否する。
+                            let future = run_tool_call(request, initialized);
+                            let tx = response_tx.clone();
+                            tasks.spawn(async move {
+                                // permit は完了（panic 時の unwind を含む）まで保持する。
+                                let _permit = permit;
+                                let response = future.await;
+                                let _ = tx.send(response);
+                            });
+                            in_flight += 1;
+                        }
+                        Err(_) => {
+                            let id = request.id.clone();
+                            emit(error_response(
+                                id,
+                                TOOL_CALL_LIMIT_EXCEEDED_CODE,
+                                "Too many concurrent tool calls",
+                            ))?;
+                        }
+                    }
+                    continue;
+                }
+
+                let is_shutdown = request.method == "shutdown";
+                let response = respond_or_error(request, &mut initialized).await;
+                emit(response)?;
+                if is_shutdown {
+                    tasks.abort_all();
+                    return Ok(());
+                }
+            }
+
+            // タスクの完了を監視する。panic してレスポンスを送らなかった
+            // タスク（JoinError）も完了として数え、in_flight を減算する。
+            // これによりレスポンスが届かないタスクが残っても EOF 後にハングしない。
+            completed = tasks.join_next(), if has_tasks => {
+                if let Some(Err(_join_error)) = completed {
+                    in_flight = in_flight.saturating_sub(1);
+                }
+                // 正常完了 (Ok) はレスポンス受信側で減算済みのため、ここでは減算しない。
+            }
+        }
     }
 
+    // shutdown / EOF で推論中の ollama 子プロセスも即座に終了させる。
+    // kill_on_drop により abort 時に子プロセスが kill される。
+    tasks.abort_all();
     Ok(())
 }
 
-fn send_error(
-    stdout: &mut io::Stdout,
-    id: Option<Value>,
-    code: i32,
-    message: &str,
-    data: Option<Value>,
-) -> io::Result<()> {
-    let response = JsonRpcResponse {
+/// `handle_request` の失敗を JSON-RPC エラーへ変換する。
+///
+/// エラーの本文は固定文言とし、prompt / token を含む可能性のある文字列を
+/// クライアントやログへ出さない。
+async fn respond_or_error(request: JsonRpcRequest, initialized: &mut bool) -> JsonRpcResponse {
+    let id = request.id.clone();
+    match handle_request(request, initialized).await {
+        Ok(response) => response,
+        Err(_) => error_response(id, -32603, "Internal error"),
+    }
+}
+
+/// 入力が不正な JSON だった場合の固定エラーレスポンス。
+fn parse_error_response() -> JsonRpcResponse {
+    JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
-        id,
+        id: None,
         result: None,
         error: Some(JsonRpcError {
-            code,
-            message: message.to_string(),
-            data,
+            code: -32700,
+            message: "Parse error".to_string(),
+            data: Some(json!("invalid JSON-RPC request")),
         }),
-    };
-    let response_json = serde_json::to_string(&response)?;
-    writeln!(stdout, "{}", response_json)?;
-    stdout.flush()
+    }
 }
 
 async fn handle_request(
@@ -366,6 +509,12 @@ async fn handle_request(
         "initialized" => Ok(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: None,
+            result: Some(json!({})),
+            error: None,
+        }),
+        "shutdown" => Ok(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
             result: Some(json!({})),
             error: None,
         }),
@@ -704,5 +853,410 @@ mod tests {
         let marker_start = out.len() - TRUNCATION_MARKER.len();
         assert!(std::str::from_utf8(&out.as_bytes()[..marker_start]).is_ok());
         assert!(out.ends_with(TRUNCATION_MARKER));
+    }
+
+    // --- 直列処理バグの回帰テスト -------------------------------------
+    // 実際の ollama / 外部プロセスを起動せず、ガート付きのフェイク・ハンドラで
+    // 「推論中」を再現する。確定性的にタイムアウト付きで検証する。
+
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{broadcast, oneshot};
+    use tokio::time::timeout;
+
+    fn rpc_line(id: i32, method: &str, params: Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        })
+        .to_string()
+    }
+
+    fn initialize_line(id: i32) -> String {
+        rpc_line(
+            id,
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" }
+            }),
+        )
+    }
+
+    fn tool_call_line(id: i32) -> String {
+        rpc_line(
+            id,
+            "tools/call",
+            json!({
+                "name": "local_llm_query",
+                "arguments": { "model": "test-model", "prompt": "hello" }
+            }),
+        )
+    }
+
+    async fn next_response(rx: &mut mpsc::UnboundedReceiver<JsonRpcResponse>) -> JsonRpcResponse {
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("response must arrive without waiting for inference")
+            .expect("response channel must stay open")
+    }
+
+    type BoxedResponseFuture = Pin<Box<dyn Future<Output = JsonRpcResponse> + Send>>;
+
+    fn boxed_future<F>(future: F) -> BoxedResponseFuture
+    where
+        F: Future<Output = JsonRpcResponse> + Send + 'static,
+    {
+        Box::pin(future)
+    }
+
+    /// 推論完了までガートで待たせ、開始を oneshot で通知するフェイク。
+    fn gated_tool_handler(
+        started: oneshot::Sender<()>,
+        gate: oneshot::Receiver<()>,
+    ) -> impl Fn(JsonRpcRequest, bool) -> BoxedResponseFuture + Send + 'static {
+        let started = Arc::new(Mutex::new(Some(started)));
+        let gate = Arc::new(Mutex::new(Some(gate)));
+        move |request: JsonRpcRequest, _initialized: bool| {
+            let id = request.id.clone();
+            let started = Arc::clone(&started);
+            let gate = Arc::clone(&gate);
+            boxed_future(async move {
+                if let Some(tx) = started.lock().expect("lock").take() {
+                    let _ = tx.send(());
+                }
+                let gate_rx = gate.lock().expect("lock").take();
+                if let Some(rx) = gate_rx {
+                    let _ = rx.await;
+                }
+                JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id,
+                    result: Some(json!({ "content": [] })),
+                    error: None,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_does_not_block_followup_requests() {
+        let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
+        let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<JsonRpcResponse>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+
+        line_tx.send(initialize_line(1)).expect("send");
+        line_tx.send(tool_call_line(2)).expect("send");
+
+        let server = tokio::spawn(async move {
+            serve_requests(
+                line_rx,
+                |response: JsonRpcResponse| {
+                    emit_tx
+                        .send(response)
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+                },
+                gated_tool_handler(started_tx, gate_rx),
+            )
+            .await
+        });
+
+        // 全行を事前投入して sender を閉じると、ループがバッファを一気に
+        // 処理して EOF に達し、spawn 直後のタスクが poll 前に abort される。
+        // まず開始を確認してから後続リクエストを送る。
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("tool call must be started in the background")
+            .expect("started signal");
+
+        line_tx
+            .send(rpc_line(3, "tools/list", json!({})))
+            .expect("send");
+
+        // 推論がガートで止まっている間に initialize と tools/list が応答する。
+        let first = next_response(&mut emit_rx).await;
+        assert_eq!(first.id, Some(json!(1)));
+        let list = next_response(&mut emit_rx).await;
+        assert_eq!(
+            list.id,
+            Some(json!(3)),
+            "tools/list must not wait for inference"
+        );
+        assert!(
+            list.result.is_some(),
+            "tools/list must succeed during inference"
+        );
+
+        gate_tx.send(()).expect("release inference gate");
+        let tool = next_response(&mut emit_rx).await;
+        assert_eq!(tool.id, Some(json!(2)));
+
+        drop(line_tx);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server must exit after EOF")
+            .expect("serve_requests must succeed")
+            .expect("inner result must succeed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_handled_immediately_during_inference() {
+        let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
+        let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<JsonRpcResponse>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (_gate_tx, gate_rx) = oneshot::channel::<()>();
+
+        line_tx.send(initialize_line(1)).expect("send");
+        line_tx.send(tool_call_line(2)).expect("send");
+
+        let server = tokio::spawn(async move {
+            serve_requests(
+                line_rx,
+                |response: JsonRpcResponse| {
+                    emit_tx
+                        .send(response)
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+                },
+                gated_tool_handler(started_tx, gate_rx),
+            )
+            .await
+        });
+
+        // 推論タスクが開始する前に shutdown を処理すると abort で started が
+        // 届かないため、開始を確認してから shutdown を投入する。
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("tool call must be started in the background")
+            .expect("started signal");
+
+        line_tx
+            .send(rpc_line(3, "shutdown", json!({})))
+            .expect("send");
+
+        let first = next_response(&mut emit_rx).await;
+        assert_eq!(first.id, Some(json!(1)));
+        let shutdown = next_response(&mut emit_rx).await;
+        assert_eq!(shutdown.id, Some(json!(3)));
+        assert!(shutdown.result.is_some());
+        assert!(shutdown.error.is_none());
+
+        // ガートを解放しないまま、つまり推論完了を待たずにループが終了する。
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("shutdown must stop the loop without waiting for the 300s inference")
+            .expect("serve_requests must succeed")
+            .expect("inner result must succeed");
+    }
+
+    #[tokio::test]
+    async fn responses_are_multiplexed_by_id_when_tools_finish_out_of_order() {
+        let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
+        let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<JsonRpcResponse>();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel::<i32>();
+        let (gate2_tx, gate2_rx) = oneshot::channel::<()>();
+        let (gate3_tx, gate3_rx) = oneshot::channel::<()>();
+
+        line_tx.send(initialize_line(1)).expect("send");
+        line_tx.send(tool_call_line(2)).expect("send");
+        line_tx.send(tool_call_line(3)).expect("send");
+        // sender は両方の推論が開始するまで保持する（早期 EOF で abort されないように）。
+
+        let gates = Arc::new(Mutex::new(std::collections::HashMap::from([
+            (2, gate2_rx),
+            (3, gate3_rx),
+        ])));
+
+        let server = tokio::spawn(async move {
+            serve_requests(
+                line_rx,
+                |response: JsonRpcResponse| {
+                    emit_tx
+                        .send(response)
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+                },
+                move |request: JsonRpcRequest, _initialized: bool| {
+                    let id = request.id.clone();
+                    let number = id.as_ref().and_then(Value::as_i64).unwrap_or(0) as i32;
+                    let started_tx = started_tx.clone();
+                    let gates = Arc::clone(&gates);
+                    async move {
+                        let _ = started_tx.send(number);
+                        let gate = gates.lock().expect("lock").remove(&number);
+                        if let Some(rx) = gate {
+                            let _ = rx.await;
+                        }
+                        JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: Some(json!({ "content": [] })),
+                            error: None,
+                        }
+                    }
+                },
+            )
+            .await
+        });
+
+        // 2 つの推論が両方開始するのを待つ（順序は問わない）。
+        for _ in 0..2 {
+            timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .expect("tool calls must start")
+                .expect("started signal");
+        }
+        let first = next_response(&mut emit_rx).await;
+        assert_eq!(first.id, Some(json!(1)));
+
+        // id=3 を先に完了させても、レスポンスの id は対応したまま届く。
+        gate3_tx.send(()).expect("release id=3");
+        let third = next_response(&mut emit_rx).await;
+        assert_eq!(third.id, Some(json!(3)));
+        gate2_tx.send(()).expect("release id=2");
+        let second = next_response(&mut emit_rx).await;
+        assert_eq!(second.id, Some(json!(2)));
+
+        drop(line_tx);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server must exit after EOF")
+            .expect("serve_requests must succeed")
+            .expect("inner result must succeed");
+    }
+
+    /// 回帰テスト: 推論タスクが panic してレスポンスを送らない場合でも、
+    /// join_next の JoinError で in_flight が減算され EOF 後にハングしない。
+    #[tokio::test]
+    async fn server_exits_after_eof_when_tool_task_panics() {
+        let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
+        let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<JsonRpcResponse>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+
+        line_tx.send(initialize_line(1)).expect("send");
+        line_tx.send(tool_call_line(2)).expect("send");
+
+        let started = Arc::new(Mutex::new(Some(started_tx)));
+        let server = tokio::spawn(async move {
+            serve_requests(
+                line_rx,
+                |response: JsonRpcResponse| {
+                    emit_tx
+                        .send(response)
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+                },
+                move |_request: JsonRpcRequest, _initialized: bool| {
+                    let started = Arc::clone(&started);
+                    boxed_future(async move {
+                        if let Some(tx) = started.lock().expect("lock").take() {
+                            let _ = tx.send(());
+                        }
+                        panic!("simulated tool panic");
+                    })
+                },
+            )
+            .await
+        });
+
+        // panic する前にタスクが開始したことを確認する。
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("tool call must be started in the background")
+            .expect("started signal");
+
+        let first = next_response(&mut emit_rx).await;
+        assert_eq!(first.id, Some(json!(1)));
+
+        // 推論レスポンスは届かないが、EOF でサーバが終了しなければならない。
+        drop(line_tx);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server must exit after EOF even when a tool task panicked")
+            .expect("serve_requests must succeed")
+            .expect("inner result must succeed");
+    }
+
+    /// 回帰テスト: 同時 tools/call が上限に達した時、以降の呼び出しは
+    /// サブプロセスを起動せず JSON-RPC エラーとして即座に返る。
+    #[tokio::test]
+    async fn tool_call_limit_exceeded_returns_json_rpc_error() {
+        let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
+        let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<JsonRpcResponse>();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel::<i32>();
+        let (gate_tx, _) = broadcast::channel::<()>(1);
+        let gate_tx = Arc::new(gate_tx);
+        let gate_tx_for_test = Arc::clone(&gate_tx);
+
+        line_tx.send(initialize_line(1)).expect("send");
+        for id in 10..10 + MAX_CONCURRENT_TOOL_CALLS as i32 {
+            line_tx.send(tool_call_line(id)).expect("send");
+        }
+
+        let server = tokio::spawn(async move {
+            serve_requests(
+                line_rx,
+                |response: JsonRpcResponse| {
+                    emit_tx
+                        .send(response)
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+                },
+                move |request: JsonRpcRequest, _initialized: bool| {
+                    let id = request.id.clone();
+                    let number = id.as_ref().and_then(Value::as_i64).unwrap_or(0) as i32;
+                    let started_tx = started_tx.clone();
+                    let gate_tx = Arc::clone(&gate_tx);
+                    async move {
+                        let _ = started_tx.send(number);
+                        // subscribe は同期的に行い、ゲート解放より前に登録する。
+                        let mut gate = gate_tx.subscribe();
+                        let _ = gate.recv().await;
+                        JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: Some(json!({ "content": [] })),
+                            error: None,
+                        }
+                    }
+                },
+            )
+            .await
+        });
+
+        let init = next_response(&mut emit_rx).await;
+        assert_eq!(init.id, Some(json!(1)));
+
+        // 上限いっぱいの推論がすべて開始するまで待つ。
+        for _ in 0..MAX_CONCURRENT_TOOL_CALLS {
+            timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .expect("tool calls must start")
+                .expect("started signal");
+        }
+
+        // 上限超過の呼び出しは即座に JSON-RPC エラーになる。
+        let overflow_id = 10 + MAX_CONCURRENT_TOOL_CALLS as i32;
+        line_tx.send(tool_call_line(overflow_id)).expect("send");
+        let overflow = next_response(&mut emit_rx).await;
+        assert_eq!(overflow.id, Some(json!(overflow_id)));
+        let error = overflow.error.expect("overflow must be a JSON-RPC error");
+        assert_eq!(error.code, TOOL_CALL_LIMIT_EXCEEDED_CODE);
+
+        // ガートを解放して保留中の推論を完了させ、サーバを正常終了させる。
+        let _ = gate_tx_for_test.send(());
+        for _ in 0..MAX_CONCURRENT_TOOL_CALLS {
+            let response = next_response(&mut emit_rx).await;
+            assert!(
+                response.result.is_some(),
+                "held tool calls must still complete normally"
+            );
+        }
+        drop(line_tx);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server must exit after EOF")
+            .expect("serve_requests must succeed")
+            .expect("inner result must succeed");
     }
 }

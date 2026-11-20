@@ -25,7 +25,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::BinaryOperator;
 
 use crate::limits::ToolCallBudget;
-use crate::tools::{ToolError, ToolHost};
+use crate::tools::{ToolError, ToolHost, DEFAULT_TOOL_TIMEOUT_MS};
 use crate::value::{
     check_data, is_blocked_member, ordered_keys, ErrorKind, FunctionId, MapValue, PromiseState,
     RegExpValue, SetValue, UrlSearchParamsValue, UrlValue, Value,
@@ -535,8 +535,6 @@ impl<'a> Interpreter<'a> {
             ("URL", Value::Builtin("URL")),
             ("URLSearchParams", Value::Builtin("URLSearchParams")),
             ("RegExp", Value::Builtin("RegExp")),
-            ("RegExp", Value::Builtin("RegExp")),
-            ("URLSearchParams", Value::Builtin("URLSearchParams")),
             ("undefined", Value::Undefined),
             ("NaN", Value::Number(f64::NAN)),
             ("Infinity", Value::Number(f64::INFINITY)),
@@ -5343,7 +5341,7 @@ impl<'a> Interpreter<'a> {
                 ));
             }
         }
-        let Some(host) = self.tool_host.as_mut() else {
+        if self.tool_host.is_none() {
             let message = format!("Tool '{name}' is not available in this execution.");
             let error = ToolError::new(message.clone());
             return Err(RuntimeError::tool_failure(
@@ -5351,32 +5349,79 @@ impl<'a> Interpreter<'a> {
                 tool_error_value(&error, span),
                 span,
             ));
-        };
+        }
         let arguments = arguments.iter().map(Value::to_json).collect();
-        match host.invoke(path.as_slice(), arguments) {
-            Ok(json) => {
-                let value = json_to_value(&json, span).map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorKind::InvalidToolOutput,
-                        format!("Invalid output from tool '{name}': {}", error.message()),
+        let json = self.call_host_tool(path.as_slice(), arguments, span)?;
+        let value = json_to_value(&json, span).map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorKind::InvalidToolOutput,
+                format!("Invalid output from tool '{name}': {}", error.message()),
+                span,
+            )
+        })?;
+        check_data(&value, &format!("tool '{name}' result")).map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorKind::InvalidToolOutput,
+                format!("Invalid output from tool '{name}': {error}"),
+                span,
+            )
+        })?;
+        Ok(value)
+    }
+
+    /// Calls a host tool with the wall-clock time remaining at entry.
+    ///
+    /// The budget is computed from the execution deadline immediately before
+    /// the call. When no timeout is configured,
+    /// [`DEFAULT_TOOL_TIMEOUT_MS`] is passed (an unbounded budget).
+    ///
+    /// The host boundary is synchronous, so a blocking implementation cannot be
+    /// interrupted here. The deadline is checked before entering the host and
+    /// again after it returns, which surfaces an overrun as a `Timeout` error;
+    /// the host itself must enforce the budget for a hard wall-clock limit.
+    /// Cancelling a blocking call would require an `async` host API and is out
+    /// of scope (proposed separately). No path or argument values are included
+    /// in the errors produced here.
+    fn call_host_tool(
+        &mut self,
+        path: &[String],
+        arguments: Vec<serde_json::Value>,
+        span: Span,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let duration_ms = match self.deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorKind::Timeout,
+                        "Execution timed out.",
                         span,
-                    )
-                })?;
-                check_data(&value, &format!("tool '{name}' result")).map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorKind::InvalidToolOutput,
-                        format!("Invalid output from tool '{name}': {error}"),
-                        span,
-                    )
-                })?;
-                Ok(value)
+                    ));
+                }
+                let remaining = deadline.duration_since(now);
+                // Round a sub-millisecond remainder up so the host never sees an
+                // already-expired zero budget.
+                let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                millis
+                    .saturating_add(u64::from(remaining.as_nanos() % 1_000_000 != 0))
+                    .max(1)
             }
-            Err(error) => Err(RuntimeError::tool_failure(
+            None => DEFAULT_TOOL_TIMEOUT_MS,
+        };
+        let result = self
+            .tool_host
+            .as_mut()
+            .expect("tool host availability was checked")
+            .invoke_with_deadline(path, arguments, duration_ms);
+        // The host call cannot be interrupted; detect overrun on return.
+        self.check_timeout(span)?;
+        result.map_err(|error| {
+            RuntimeError::tool_failure(
                 error.message().to_owned(),
                 tool_error_value(&error, span),
                 span,
-            )),
-        }
+            )
+        })
     }
 
     fn invoke_function(
@@ -9542,11 +9587,15 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
     use oxc_allocator::Allocator;
 
     use super::{execute, Interpreter, RuntimeError};
     use crate::limits::ExecutionLimits;
-    use crate::tools::{ToolError, ToolHost};
+    use crate::tools::{ToolError, ToolHost, DEFAULT_TOOL_TIMEOUT_MS};
     use crate::{parse_program, Value};
 
     fn run(source: &str) -> Result<Value, RuntimeError> {
@@ -10531,6 +10580,97 @@ mod tests {
         let value = interpreter.run(&program).expect("valid call should run");
         assert_eq!(value, number(2.0));
         assert_eq!(interpreter.tool_calls(), ["echo"]);
+    }
+
+    /// Host that records the budget it receives and can simulate a blocking
+    /// implementation by sleeping before returning.
+    struct BudgetHost {
+        budgets: Rc<RefCell<Vec<u64>>>,
+        delay: Duration,
+    }
+
+    impl ToolHost for BudgetHost {
+        fn keys(&self, path: &[String]) -> Vec<String> {
+            if path.is_empty() {
+                vec!["echo".to_owned()]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn invoke_with_deadline(
+            &mut self,
+            _path: &[String],
+            arguments: Vec<serde_json::Value>,
+            duration_ms: u64,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.budgets.borrow_mut().push(duration_ms);
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            Ok(arguments
+                .into_iter()
+                .next()
+                .unwrap_or(serde_json::Value::Null))
+        }
+    }
+
+    fn run_with_budget_host(
+        source: &str,
+        timeout_ms: Option<u64>,
+        delay: Duration,
+    ) -> (Result<Value, RuntimeError>, Rc<RefCell<Vec<u64>>>) {
+        let allocator = Allocator::default();
+        let program = parse_program(&allocator, source).expect("fixture should parse");
+        let budgets = Rc::new(RefCell::new(Vec::new()));
+        let mut interpreter = Interpreter::new();
+        interpreter.set_tool_host(Box::new(BudgetHost {
+            budgets: Rc::clone(&budgets),
+            delay,
+        }));
+        interpreter.set_limits(&ExecutionLimits {
+            timeout_ms,
+            ..ExecutionLimits::default()
+        });
+        (interpreter.run(&program), budgets)
+    }
+
+    #[test]
+    fn passes_the_remaining_time_to_the_host() {
+        let (result, budgets) =
+            run_with_budget_host("return tools.echo(42);", Some(5_000), Duration::ZERO);
+
+        assert_eq!(result.expect("program should run"), number(42.0));
+        let recorded = budgets.borrow();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0] > 0 && recorded[0] <= 5_000,
+            "unexpected remaining budget: {}",
+            recorded[0]
+        );
+    }
+
+    #[test]
+    fn passes_an_unbounded_budget_when_no_timeout_is_configured() {
+        let (result, budgets) = run_with_budget_host("return tools.echo(7);", None, Duration::ZERO);
+
+        assert_eq!(result.expect("program should run"), number(7.0));
+        assert_eq!(*budgets.borrow(), vec![DEFAULT_TOOL_TIMEOUT_MS]);
+    }
+
+    #[test]
+    fn reports_timeout_when_a_blocking_host_overruns_the_deadline() {
+        let (result, budgets) = run_with_budget_host(
+            "return tools.echo(42);",
+            Some(50),
+            Duration::from_millis(200),
+        );
+
+        let error = result.expect_err("an overrun should time out");
+        assert_eq!(error.kind(), super::RuntimeErrorKind::Timeout);
+        let recorded = budgets.borrow();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0] > 0 && recorded[0] <= 50);
     }
 
     #[test]
