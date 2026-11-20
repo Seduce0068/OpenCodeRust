@@ -322,16 +322,14 @@ mod tests {
         let test_file = temp_dir.path().join("test.txt");
         fs::write(&test_file, "hello").unwrap();
 
-        sleep(Duration::from_millis(200)).await;
-
-        match rx.try_recv() {
-            Ok(event) => {
-                assert!(event.file.ends_with("test.txt"));
-                assert_eq!(event.event, FileEvent::Add);
-            }
-            Err(broadcast::error::TryRecvError::Empty) => {}
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
+        // 固定 sleep + try_recv の Empty 無視ではイベント未発行でも合格してしまう。
+        // deadline 付きで 1 件の受信を必須化し、同ファイルの他テストと同じ方式に揃える。
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for watch event")
+            .expect("watch event channel closed unexpectedly");
+        assert!(event.file.ends_with("test.txt"));
+        assert_eq!(event.event, FileEvent::Add);
     }
 
     #[tokio::test]

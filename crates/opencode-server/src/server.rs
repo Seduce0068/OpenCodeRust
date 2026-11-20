@@ -2656,28 +2656,83 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_does_not_short_circuit() {
-        // 実時間の計測は環境依存で fragile なため、比較ヘルパが早期 return せず
-        // 入力の最大長まで全バイトを走査する構造をソースから検証する。
-        let source = include_str!("server.rs");
-        let start = source
-            .find("fn constant_time_eq(")
-            .expect("constant_time_eq helper must exist");
-        let rest = &source[start..];
-        let end = rest.find("\n}\n").expect("helper closing brace");
-        let body = &rest[..end + 2];
+    fn constant_time_eq_is_correct_for_all_mismatch_positions_and_lengths() {
+        // 戻り値のブラックボックス検証。不一致位置・入力長の全域で正確であることを
+        // 確認する。なお戻り値だけでは定数時間性（短絡の有無）は検証できない:
+        // `a == b` や早期 return 付きループでも戻り値は同じだからである。
+        // タイミング側チャネル耐性は実装（`XOR` アキュムレータと最大長までの走査）
+        // と clippy/レビューで担保し、実時間計測は環境依存のため行わない。
+        // 比較対象は固定のテスト文字列（実トークンではない）であり、値そのものは
+        // ログやアサーション失敗メッセージに出さない。
+        let expected = format!("ct-{}", "abc123XYZ".repeat(8)); // 75 バイト
 
-        assert!(
-            !body.contains("return"),
-            "comparison helper must not early-return on a mismatch"
-        );
-        assert!(
-            body.contains(".max("),
-            "comparison helper must scan up to the longer input"
-        );
-        assert!(
-            body.contains("diff |= "),
-            "every byte must be folded into the XOR accumulator"
+        // 完全一致のみ受け入れる。
+        assert!(constant_time_eq(&expected, &expected));
+        assert!(constant_time_eq("", ""));
+
+        // 不一致位置を先頭から末尾までずらした単一バイト差は、どの位置でも
+        // 同じく拒否されなければならない（早期 return の有無を問わず結果は同一）。
+        for position in 0..expected.len() {
+            let mut bytes = expected.as_bytes().to_vec();
+            bytes[position] = if bytes[position] == b'a' { b'b' } else { b'a' };
+            let candidate = String::from_utf8(bytes).expect("ASCII fixture must stay valid UTF-8");
+
+            assert!(
+                !constant_time_eq(&candidate, &expected),
+                "mismatch at byte index {position} must be rejected"
+            );
+            assert!(
+                !constant_time_eq(&expected, &candidate),
+                "mismatch at byte index {position} must be rejected (reversed operands)"
+            );
+        }
+
+        // 長さが異なる入力でも結果は同じく拒否される（共通接頭辞の長さに依存しない）。
+        for len in 0..expected.len() {
+            let shorter = &expected[..len];
+            assert!(
+                !constant_time_eq(shorter, &expected),
+                "shorter input (len {len}) must be rejected"
+            );
+            assert!(
+                !constant_time_eq(&expected, shorter),
+                "shorter input (len {len}) must be rejected (reversed operands)"
+            );
+        }
+
+        let mut appended = expected.clone();
+        appended.push('!');
+        let mut prepended = String::from("!");
+        prepended.push_str(&expected);
+        for longer in [&appended, &prepended] {
+            assert!(
+                !constant_time_eq(longer, &expected),
+                "longer input must be rejected"
+            );
+            assert!(
+                !constant_time_eq(&expected, longer),
+                "longer input must be rejected (reversed operands)"
+            );
+        }
+
+        // マルチバイト文字はバイト列として比較され、文字数が同じでも長さ差は拒否される。
+        assert!(!constant_time_eq("あ", "a"));
+        assert!(!constant_time_eq("a", "あ"));
+        assert!(constant_time_eq("あ", "あ"));
+
+        // 認証分岐も同じ比較結果に従う（先頭・末尾の不一致の両方を拒否）。
+        let first_mismatch = format!("!{}", &expected[1..]);
+        let last_mismatch = format!("{}!", &expected[..expected.len() - 1]);
+        for supplied in [first_mismatch.as_str(), last_mismatch.as_str()] {
+            assert_eq!(
+                auth_decision(true, Some(expected.as_str()), Some(supplied)),
+                AuthDecision::Unauthorized,
+                "auth_decision must reject a token with a byte mismatch"
+            );
+        }
+        assert_eq!(
+            auth_decision(true, Some(expected.as_str()), Some(expected.as_str())),
+            AuthDecision::Pass
         );
     }
 

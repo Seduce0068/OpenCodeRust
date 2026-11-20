@@ -20,7 +20,7 @@ It is the configuration entrypoint for runtime behaviour.
 
 - `loader.rs` – Config loading, path lookup, merge flow
 - `schema.rs` – Config structure definitions
-- `wellknown.rs` – Common directory/file path constants
+- `wellknown.rs` – リモート `.well-known/opencode` の取得・キャッシュ
 
 ## Config paths (common)
 
@@ -97,13 +97,13 @@ The current-schema `mcp.servers` wrapper is unwrapped into the runtime `mcp`
 map: `disabled` is inverted to `enabled`, `command` accepts a string or an argv
 array, and `headers` / `environment` / `oauth: false` / `cwd` are carried over.
 The `cwd` value is forwarded to the local MCP subprocess (see
-[ALIGNMENT](../ALIGNMENT.md)). The per-operation `timeout` object is not
-mapped yet.
+[ALIGNMENT](../ALIGNMENT.md)). The per-operation `timeout` object is mapped
+through `McpTimeoutConfig::resolve()` as described above.
 
 The following keys are accepted but not mapped to runtime behaviour yet
 (see [MAPPING](../MAPPING.md)):
 
-- `snapshots`, `websearch`, `shell`
+- `snapshot`, `websearch`, `shell`
 
 Tests use `ConfigLoader::without_global_config()` so they do not depend on the
 machine's `~/.config/opencode`.

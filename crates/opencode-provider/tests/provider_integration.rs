@@ -3,19 +3,67 @@
 //! ## 実行上の注意（ループバックモック）
 //!
 //! 本ファイルの `anthropic_stream_*` テストは `127.0.0.1` の 1 ショット HTTP
-//! モックを使う。**`NO_PROXY=127.0.0.1,localhost` を付与して実行すること。**
-//! `HTTP_PROXY` / `HTTPS_PROXY` が設定された環境では reqwest がループバック
-//! 接続もプロキシ経由で試み、モックへ到達せず `chat_stream` が panic する。
-//!
-//! ```bash
-//! NO_PROXY=127.0.0.1,localhost cargo test -p opencode-provider
-//! ```
+//! モックを使う。各テスト冒頭の `ensure_no_proxy()` がプロセス内の `NO_PROXY` /
+//! `no_proxy` にループバックを追加し、テスト終了時に元値へ復元するため、
+//! 実行者の `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 設定に依存せず動作する。
+//! 送信先はループバックのモックのみで、外部送信は行わない。
 
 use futures::StreamExt;
 use opencode_provider::{
     anthropic::{AnthropicConfig, AnthropicProvider},
     ChatRequest, Message, ModelInfo, Provider, ProviderRegistry, StreamEvent,
 };
+
+/// 環境変数の書き換えをテスト間で直列化するロック。
+/// `std::sync::MutexGuard` を `.await` を跨いで保持すると clippy の
+/// `await_holding_lock` に抵触するため、tokio の非同期 Mutex を使う。
+static NO_PROXY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `ensure_no_proxy()` が保存した元値を `Drop` で復元するガード。
+/// ロックも保持するため、ガードの生存期間中は他テストが env を書き換えない。
+struct EnsureNoProxyGuard {
+    no_proxy: Option<String>,
+    lowercase_no_proxy: Option<String>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+fn restore_env(key: &str, original: Option<&str>) {
+    match original {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
+impl Drop for EnsureNoProxyGuard {
+    fn drop(&mut self) {
+        restore_env("NO_PROXY", self.no_proxy.as_deref());
+        restore_env("no_proxy", self.lowercase_no_proxy.as_deref());
+    }
+}
+
+fn set_no_proxy_with_loopback(key: &str, original: Option<&str>) {
+    const LOOPBACK: &str = "127.0.0.1,localhost";
+    let value = match original {
+        Some(original) if !original.trim().is_empty() => format!("{original},{LOOPBACK}"),
+        _ => LOOPBACK.to_string(),
+    };
+    std::env::set_var(key, value);
+}
+
+/// ループバック接続がプロキシを経由しないよう `NO_PROXY` / `no_proxy` を設定する。
+/// 元値（未設定を含む）を保存して `Drop` で復元するので、実行者の設定に依存しない。
+async fn ensure_no_proxy() -> EnsureNoProxyGuard {
+    let lock = NO_PROXY_ENV_LOCK.lock().await;
+    let no_proxy = std::env::var("NO_PROXY").ok();
+    let lowercase_no_proxy = std::env::var("no_proxy").ok();
+    set_no_proxy_with_loopback("NO_PROXY", no_proxy.as_deref());
+    set_no_proxy_with_loopback("no_proxy", lowercase_no_proxy.as_deref());
+    EnsureNoProxyGuard {
+        no_proxy,
+        lowercase_no_proxy,
+        _lock: lock,
+    }
+}
 
 fn create_test_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
@@ -187,7 +235,8 @@ const ANTHROPIC_SSE_BODY: &str = concat!(
 ///
 /// ループバックへの bind が不可な環境では `SKIPPED` マーカーを出して `None` を返す。
 /// 新規依存は使わず、`std::net::TcpListener` と `std::thread` のみで構成する。
-/// 実行時は `NO_PROXY=127.0.0.1,localhost` を付与すること（ファイル先頭の注意書き参照）。
+/// 呼び出し側の `ensure_no_proxy()` がループバックをプロキシ対象外にするため、
+/// 実行者のプロキシ設定に依存しない（ガードは終了時に元値を復元する）。
 fn spawn_anthropic_sse_mock(writes: Vec<Vec<u8>>) -> Option<(String, std::thread::JoinHandle<()>)> {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -291,6 +340,7 @@ fn assert_expected_anthropic_events(events: &[StreamEvent]) {
 
 #[tokio::test]
 async fn anthropic_stream_single_chunk_events_unchanged() {
+    let _no_proxy = ensure_no_proxy().await;
     let Some((base_url, server)) =
         spawn_anthropic_sse_mock(vec![ANTHROPIC_SSE_BODY.as_bytes().to_vec()])
     else {
@@ -313,6 +363,7 @@ const ANTHROPIC_SSE_BODY_JAPANESE: &str = concat!(
 
 #[tokio::test]
 async fn anthropic_stream_reassembles_data_line_split_across_writes() {
+    let _no_proxy = ensure_no_proxy().await;
     let split_at = ANTHROPIC_SSE_BODY
         .find("\"text\":\"hel")
         .map(|index| index + "\"text\":\"hel".len())
@@ -335,6 +386,7 @@ async fn anthropic_stream_reassembles_data_line_split_across_writes() {
 
 #[tokio::test]
 async fn anthropic_stream_preserves_multibyte_text_split_mid_character() {
+    let _no_proxy = ensure_no_proxy().await;
     let text = "こんにちは";
     let kana_start = ANTHROPIC_SSE_BODY_JAPANESE
         .find(text)

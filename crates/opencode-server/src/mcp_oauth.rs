@@ -823,6 +823,7 @@ mod tests {
         // process-global store as the OAuth flow tests.
         let _guard = auth_store_lock();
         let auth_file = temp_auth_file("logout");
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let manager = McpOAuthManager::new();
@@ -864,7 +865,6 @@ mod tests {
         assert_eq!(status.status, "needs_auth");
         assert_eq!(status.oauth_status, None);
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -875,6 +875,7 @@ mod tests {
     async fn remove_oauth_drops_cached_registry_manager() {
         let _guard = auth_store_lock();
         let auth_file = temp_auth_file("logout-registry");
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let manager = McpOAuthManager::new();
@@ -922,7 +923,6 @@ mod tests {
             "logout must drop the manager registry entry"
         );
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -931,6 +931,7 @@ mod tests {
     async fn logout_deletes_persisted_credentials() {
         let _guard = auth_store_lock();
         let auth_file = temp_auth_file("logout-delete");
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let server_url = "https://example.com/mcp";
@@ -976,7 +977,6 @@ mod tests {
             "credentials must be deleted on logout"
         );
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -996,6 +996,21 @@ mod tests {
     fn auth_store_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores `OPENCODE_MCP_AUTH_FILE` to its original state on drop.
+    ///
+    /// Tests are serialized by `auth_store_lock()`, but a panic or early return
+    /// must still leave the process environment as it was found.
+    struct RestoreMcpAuthFile(Option<String>);
+
+    impl Drop for RestoreMcpAuthFile {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("OPENCODE_MCP_AUTH_FILE", value),
+                None => std::env::remove_var("OPENCODE_MCP_AUTH_FILE"),
+            }
+        }
     }
 
     /// Returns a temp path for a test-scoped MCP credential store.
@@ -1343,6 +1358,7 @@ mod tests {
     async fn oauth_flow_discovers_endpoints_and_stores_tokens() {
         let auth_file = temp_auth_file("flow");
         let _guard = auth_store_lock();
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let (issuer, seen) = spawn_mock_authorization_server().await;
@@ -1401,7 +1417,6 @@ mod tests {
         );
         assert!(seen.lock().await.iter().any(|request| request == "token"));
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -1414,6 +1429,7 @@ mod tests {
     async fn oauth_bearer_tokens_are_scoped_per_server() {
         let auth_file = temp_auth_file("per-server-bearer");
         let _guard = auth_store_lock();
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let (issuer_a, _) = spawn_mock_authorization_server_with_token("token-for-alpha").await;
@@ -1488,7 +1504,6 @@ mod tests {
             "beta MCP server must not receive alpha's token: {seen_b:?}"
         );
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -1497,6 +1512,7 @@ mod tests {
     async fn callback_without_stored_tokens_fails() {
         let auth_file = temp_auth_file("negative");
         let _guard = auth_store_lock();
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let (issuer, _) = spawn_mock_authorization_server().await;
@@ -1530,7 +1546,6 @@ mod tests {
         let status = manager.get_server("remote").await.expect("remote server");
         assert_ne!(status.oauth_status, Some(McpOAuthStatus::Authorized));
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -1831,6 +1846,7 @@ mod tests {
     async fn start_oauth_rejects_second_concurrent_flow() {
         let auth_file = temp_auth_file("in-progress");
         let _guard = auth_store_lock();
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let (issuer, _) = spawn_mock_authorization_server().await;
@@ -1860,7 +1876,6 @@ mod tests {
             .expect_err("second concurrent flow must be rejected");
         assert!(matches!(error, McpOAuthError::OAuthInProgress));
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 
@@ -1869,6 +1884,7 @@ mod tests {
     async fn each_start_oauth_generates_a_fresh_state() {
         let auth_file = temp_auth_file("fresh-state");
         let _guard = auth_store_lock();
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
         std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
 
         let (issuer, _) = spawn_mock_authorization_server().await;
@@ -1908,7 +1924,6 @@ mod tests {
         );
         assert!(second.authorization_url.contains(&second_state));
 
-        std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
         let _ = std::fs::remove_file(&auth_file);
     }
 }
