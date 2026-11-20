@@ -6,13 +6,17 @@ use tokio::sync::Mutex;
 
 use crate::{AgentInfo, Conversation, ToolCall};
 use opencode_plugin::{HookContext, HookEvent};
-use opencode_provider::{ChatRequest, Provider, ProviderRegistry, StreamEvent};
+use opencode_provider::{ChatRequest, Provider, ProviderError, ProviderRegistry, StreamEvent};
 use opencode_tool::{ToolContext, ToolError, ToolRegistry};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    /// 型付き `ProviderError` を保持する。
+    ///
+    /// `String` へ平坦化すると status / headers / source チェーンが失われ、
+    /// session 側の retry 判定が機能しなくなるため `agent.rs` の定義と統一する。
     #[error("Provider error: {0}")]
-    ProviderError(String),
+    ProviderError(#[from] ProviderError),
 
     #[error("Tool error: {0}")]
     ToolError(String),
@@ -166,7 +170,7 @@ impl AgentExecutor {
             let stream = provider
                 .chat_stream(request)
                 .await
-                .map_err(|e| AgentError::ProviderError(e.to_string()))?;
+                .map_err(AgentError::ProviderError)?;
 
             let (response, reasoning, tool_calls, invalid_arguments) =
                 self.process_stream(stream).await?;
@@ -232,7 +236,7 @@ impl AgentExecutor {
             let stream = provider
                 .chat_stream(request)
                 .await
-                .map_err(|e| AgentError::ProviderError(e.to_string()))?;
+                .map_err(AgentError::ProviderError)?;
 
             let (response, reasoning, tool_calls, invalid_arguments) =
                 self.process_stream(stream).await?;
@@ -284,11 +288,9 @@ impl AgentExecutor {
         let stream = provider
             .chat_stream(request)
             .await
-            .map_err(|e| AgentError::ProviderError(e.to_string()))?;
+            .map_err(AgentError::ProviderError)?;
 
-        Ok(stream
-            .map(|r| r.map_err(|e| AgentError::ProviderError(e.to_string())))
-            .boxed())
+        Ok(stream.map(|r| r.map_err(AgentError::ProviderError)).boxed())
     }
 
     fn get_provider(&self) -> Result<Arc<dyn Provider>, AgentError> {
@@ -401,10 +403,12 @@ impl AgentExecutor {
                 }
                 Ok(StreamEvent::Done) => break,
                 Ok(StreamEvent::Error(e)) => {
-                    return Err(AgentError::ProviderError(e));
+                    // StreamEvent::Error は文字列ペイロードのため型情報は無いが、
+                    // AgentError 側を構造化したままにするため ProviderError で包む。
+                    return Err(AgentError::ProviderError(ProviderError::ApiError(e)));
                 }
                 Err(e) => {
-                    return Err(AgentError::ProviderError(e.to_string()));
+                    return Err(AgentError::ProviderError(e));
                 }
                 _ => {}
             }
@@ -1104,5 +1108,42 @@ mod tests {
         assert!(recorded.is_error);
         assert!(recorded.content.contains("Invalid arguments"));
         assert!(!recorded.content.contains("/secret/path"));
+    }
+
+    /// 回帰ガード: AgentError が型付き ProviderError を保持し、
+    /// retry 判定・status・source チェーンが失われないこと。
+    #[test]
+    fn agent_error_preserves_structured_provider_error() {
+        use opencode_provider::retry::IsRetryable;
+
+        let error: AgentError =
+            ProviderError::api_error_from_status(503, "Service Unavailable").into();
+        match &error {
+            AgentError::ProviderError(ProviderError::ApiErrorWithStatus {
+                status_code, ..
+            }) => {
+                assert_eq!(*status_code, 503);
+            }
+            other => panic!("expected structured provider error, got {other:?}"),
+        }
+        if let AgentError::ProviderError(inner) = error {
+            assert_eq!(inner.status_code(), Some(503));
+            assert!(
+                inner.is_retryable().is_some(),
+                "retry decision material must survive the AgentError boundary"
+            );
+        }
+
+        let with_source: AgentError = ProviderError::network_error_with_source(
+            "connection reset",
+            std::io::Error::other("underlying cause"),
+        )
+        .into();
+        match &with_source {
+            AgentError::ProviderError(ProviderError::NetworkErrorWithSource { source, .. }) => {
+                assert!(source.downcast_ref::<std::io::Error>().is_some());
+            }
+            other => panic!("expected source-preserving provider error, got {other:?}"),
+        }
     }
 }

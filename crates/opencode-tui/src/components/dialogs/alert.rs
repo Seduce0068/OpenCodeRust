@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::components::permission::wrapped_row_count;
 use crate::theme::Theme;
 
 use super::DialogClickMap;
@@ -104,9 +105,21 @@ impl AlertDialog {
         let color = self.get_color(theme);
         let icon = self.get_icon();
 
-        let line_count = self.message.lines().count().max(1);
-        let dialog_width = 50.min(area.width.saturating_sub(4));
-        let dialog_height = (line_count + 6).min(16) as u16;
+        let dialog_width = 50.min(area.width.saturating_sub(4)).max(1);
+        // 枠(2) と dialog_inner の左右 padding(2) を除いた幅が本文の折り返し幅。
+        let content_width = dialog_width.saturating_sub(4).max(1);
+        let message_lines: Vec<Line<'_>> = if self.message.is_empty() {
+            vec![Line::from("")]
+        } else {
+            self.message.lines().map(Line::from).collect()
+        };
+        let wrapped_rows = wrapped_row_count(&message_lines, content_width);
+        // 改行数ではなく折り返し後の行数で本文領域を確保する（端末高さが上限）。
+        let max_height = area.height.saturating_sub(2).max(1);
+        let dialog_height = (wrapped_rows as u16)
+            .saturating_add(6)
+            .min(max_height)
+            .max(1);
 
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
         self.click_map.set_area(dialog_area);
@@ -382,6 +395,25 @@ mod tests {
         assert!(text.contains("Close"), "close hint label");
         assert!(text.contains("[Ctrl+C]"), "copy hint key");
         assert!(text.contains("[ OK ]"), "ok button");
+    }
+
+    #[test]
+    fn render_wraps_long_message_and_shows_full_text() {
+        let message = format!("ALERTSTART-{} -ALERTEND", "z".repeat(220));
+        let mut alert = AlertDialog::error(&message);
+        alert.open();
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            alert.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("ALERTSTART"), "message head should render");
+        assert!(
+            text.contains("-ALERTEND"),
+            "the end of a long alert must be wrapped and visible"
+        );
+        assert!(text.contains("[ OK ]"), "ok button must remain visible");
     }
 
     #[test]

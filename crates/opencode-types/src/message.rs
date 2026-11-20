@@ -17,18 +17,55 @@ pub struct SessionMessage {
     pub created_at: DateTime<Utc>,
     /// メッセージに付随する任意のメタデータ。
     pub metadata: HashMap<String, serde_json::Value>,
+    /// メッセージ単位のトークン使用量。
+    ///
+    /// `opencode_session::SessionMessage` の `usage` と同じ形を持ち、
+    /// `serde_json` の往復で情報が落ちないようにする。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<MessageUsage>,
+}
+
+/// メッセージ単位のトークン使用量。
+///
+/// セッション単位の [`crate::session::TokenUsage`] とは JSON 形が異なるため、
+/// メッセージ側は session クレートの `MessageUsage` と同じフィールド名を採用する。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MessageUsage {
+    /// 入力トークン数。
+    pub input_tokens: u64,
+    /// 出力トークン数。
+    pub output_tokens: u64,
+    /// 推論トークン数。
+    pub reasoning_tokens: u64,
+    /// キャッシュ書き込みトークン数。
+    pub cache_write_tokens: u64,
+    /// キャッシュ読み出しトークン数。
+    pub cache_read_tokens: u64,
+    /// 実コスト。
+    pub total_cost: f64,
 }
 
 /// メッセージの送信者種別。
+///
+/// JSON 表現は小文字（`user` / `assistant` / `system` / `tool`）を正式とし、
+/// 旧 PascalCase（`User` 等）は `alias` で読み取り互換を維持する。
+/// `opencode-session` 側の `MessageRole` は別型のため同じ serde 属性を付与する
+/// 提案を親へ報告する（当スコープ外）。サーバの往復変換は enum を直接 match
+/// して文字列を経由しないため、session 側の wire 形式に依存しない。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     /// ユーザーによるメッセージ。
+    #[serde(alias = "User")]
     User,
     /// アシスタントによるメッセージ。
+    #[serde(alias = "Assistant")]
     Assistant,
     /// システムからのメッセージ。
+    #[serde(alias = "System")]
     System,
     /// ツール実行に関するメッセージ。
+    #[serde(alias = "Tool")]
     Tool,
 }
 
@@ -54,6 +91,12 @@ pub enum PartType {
     Text {
         /// テキスト本文。
         text: String,
+        /// 合成テキストかどうか。`opencode_session::PartType::Text` と同じ形で保持する。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        synthetic: Option<bool>,
+        /// 無視すべきテキストかどうか。`opencode_session::PartType::Text` と同じ形で保持する。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ignored: Option<bool>,
     },
     /// ツールの呼び出し要求。
     ToolCall {
@@ -154,12 +197,17 @@ impl SessionMessage {
             role: MessageRole::User,
             parts: vec![MessagePart {
                 id: format!("prt_{}", uuid::Uuid::new_v4()),
-                part_type: PartType::Text { text: text.into() },
+                part_type: PartType::Text {
+                    text: text.into(),
+                    synthetic: None,
+                    ignored: None,
+                },
                 created_at: Utc::now(),
                 message_id: None,
             }],
             created_at: Utc::now(),
             metadata: HashMap::new(),
+            usage: None,
         }
     }
 
@@ -172,6 +220,7 @@ impl SessionMessage {
             parts: Vec::new(),
             created_at: Utc::now(),
             metadata: HashMap::new(),
+            usage: None,
         }
     }
 
@@ -180,7 +229,7 @@ impl SessionMessage {
         self.parts
             .iter()
             .filter_map(|p| match &p.part_type {
-                PartType::Text { text } => Some(text.clone()),
+                PartType::Text { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -198,6 +247,8 @@ mod tests {
             id: "prt_fixed".to_string(),
             part_type: PartType::Text {
                 text: text.to_string(),
+                synthetic: None,
+                ignored: None,
             },
             created_at: Utc::now(),
             message_id: None,
@@ -216,11 +267,14 @@ mod tests {
         assert_eq!(
             msg.parts[0].part_type,
             PartType::Text {
-                text: "hello".to_string()
+                text: "hello".to_string(),
+                synthetic: None,
+                ignored: None,
             }
         );
         assert!(msg.parts[0].message_id.is_none());
         assert!(msg.metadata.is_empty());
+        assert!(msg.usage.is_none());
         assert_eq!(msg.get_text(), "hello");
     }
 
@@ -233,6 +287,7 @@ mod tests {
         assert_eq!(msg.role, MessageRole::Assistant);
         assert!(msg.parts.is_empty());
         assert!(msg.metadata.is_empty());
+        assert!(msg.usage.is_none());
         assert_eq!(msg.get_text(), "");
     }
 
@@ -263,27 +318,42 @@ mod tests {
     }
 
     #[test]
-    fn message_role_wire_format_has_no_serde_rename() {
-        // MessageRole には serde rename が無いため、バリアント名がそのまま使われる
+    fn message_role_wire_format_is_lowercase_with_pascalcase_aliases() {
+        // serde rename_all = "lowercase" により小文字が正式表現になる。
         assert_eq!(
             serde_json::to_value(MessageRole::User).unwrap(),
-            json!("User")
+            json!("user")
         );
         assert_eq!(
             serde_json::to_value(MessageRole::Assistant).unwrap(),
-            json!("Assistant")
+            json!("assistant")
         );
         assert_eq!(
             serde_json::to_value(MessageRole::System).unwrap(),
-            json!("System")
+            json!("system")
         );
         assert_eq!(
             serde_json::to_value(MessageRole::Tool).unwrap(),
-            json!("Tool")
+            json!("tool")
         );
 
+        // 旧 PascalCase も alias で受け付ける。
+        let legacy = [
+            (json!("User"), MessageRole::User),
+            (json!("Assistant"), MessageRole::Assistant),
+            (json!("System"), MessageRole::System),
+            (json!("Tool"), MessageRole::Tool),
+        ];
+        for (raw, expected) in legacy {
+            assert_eq!(
+                serde_json::from_value::<MessageRole>(raw).unwrap(),
+                expected
+            );
+        }
+
+        // 小文字も当然デシリアライズできる。
         assert_eq!(
-            serde_json::from_value::<MessageRole>(json!("User")).unwrap(),
+            serde_json::from_value::<MessageRole>(json!("user")).unwrap(),
             MessageRole::User
         );
     }
@@ -292,7 +362,14 @@ mod tests {
     fn part_type_tag_wire_format_is_camel_case() {
         // #[serde(tag = "type", rename_all = "camelCase")] によりタグ値は camelCase
         let cases = [
-            (PartType::Text { text: "t".into() }, "text"),
+            (
+                PartType::Text {
+                    text: "t".into(),
+                    synthetic: None,
+                    ignored: None,
+                },
+                "text",
+            ),
             (
                 PartType::ToolCall {
                     id: "c".into(),
@@ -423,5 +500,56 @@ mod tests {
         };
         let value = serde_json::to_value(&with_parent).unwrap();
         assert_eq!(value["message_id"], json!("msg_1"));
+    }
+
+    #[test]
+    fn message_json_roundtrip_preserves_usage_metadata_and_text_flags() {
+        let mut msg = SessionMessage::assistant("sess_roundtrip");
+        msg.metadata.insert("source".to_string(), json!("test"));
+        msg.metadata.insert("priority".to_string(), json!(7));
+        msg.usage = Some(MessageUsage {
+            input_tokens: 11,
+            output_tokens: 22,
+            reasoning_tokens: 33,
+            cache_write_tokens: 44,
+            cache_read_tokens: 55,
+            total_cost: 0.125,
+        });
+        msg.parts.push(MessagePart {
+            id: "prt_flags".to_string(),
+            part_type: PartType::Text {
+                text: "flagged".to_string(),
+                synthetic: Some(true),
+                ignored: Some(false),
+            },
+            created_at: Utc::now(),
+            message_id: Some("msg_parent".to_string()),
+        });
+
+        let value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["role"], json!("assistant"));
+        assert_eq!(value["usage"]["input_tokens"], json!(11));
+        assert_eq!(value["usage"]["total_cost"], json!(0.125));
+        assert_eq!(value["metadata"]["source"], json!("test"));
+        assert_eq!(value["parts"][0]["part_type"]["synthetic"], json!(true));
+        assert_eq!(value["parts"][0]["part_type"]["ignored"], json!(false));
+
+        let decoded: SessionMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn message_text_flags_default_to_none_for_legacy_json() {
+        // 旧 JSON に synthetic / ignored が無くてもデフォルト None で読める。
+        let decoded: PartType =
+            serde_json::from_value(json!({ "type": "text", "text": "legacy" })).unwrap();
+        assert_eq!(
+            decoded,
+            PartType::Text {
+                text: "legacy".to_string(),
+                synthetic: None,
+                ignored: None,
+            }
+        );
     }
 }

@@ -45,6 +45,74 @@ use opencode_provider::{
 use opencode_session::system::{EnvironmentContext, SystemPrompt};
 use opencode_tool::create_default_registry;
 
+/// prompt 失敗の内部詳細を error.rs の共通 redact 経路へ渡し、
+/// クライアント向けの汎用文言と相関 ID を取り出す。
+///
+/// [`ApiError::InternalError`] の `IntoResponse` が `redact_sensitive_detail` を
+/// 通して詳細を tracing ログへ残し、ボディには汎用文言と相関 ID だけを載せる。
+/// ここではそのボディを読み取るだけで、生の `error.to_string()` は一切
+/// metadata / add_text / 独自ログへ書き込まない。
+async fn safe_prompt_failure_client_info(detail: &str) -> (String, String) {
+    let response = ApiError::InternalError(detail.to_string()).into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let correlation_id = body
+        .get("error")
+        .and_then(|error| error.get("correlation_id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unavailable")
+        .to_owned();
+    let message = body
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Internal server error")
+        .to_owned();
+    (correlation_id, message)
+}
+
+#[cfg(test)]
+mod prompt_failure_redaction_tests {
+    use super::*;
+
+    /// 回帰ガード: prompt 失敗の生エラー文言・トークン・パスが
+    /// クライアント向けの値へ流出しないこと。
+    #[tokio::test]
+    async fn prompt_failure_client_info_is_generic_and_correlated() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let detail = format!(
+            "read /home/user/.secrets/auth.json with token={secret} while calling provider"
+        );
+        let (correlation_id, message) = safe_prompt_failure_client_info(&detail).await;
+
+        assert_eq!(message, "Internal server error");
+        assert!(
+            uuid::Uuid::parse_str(&correlation_id).is_ok(),
+            "correlation id must be a UUID: {correlation_id}"
+        );
+        for leaked in [secret, "/home/user", "auth.json", "provider"] {
+            assert!(!message.contains(leaked), "client message leaked: {leaked}");
+            assert!(
+                !correlation_id.contains(leaked),
+                "correlation id leaked: {leaked}"
+            );
+        }
+    }
+
+    /// 回帰ガード: 失敗ごとに相関 ID が変わり、文言は一定であること。
+    #[tokio::test]
+    async fn prompt_failure_client_info_uses_fresh_correlation_id() {
+        let (id_a, message_a) = safe_prompt_failure_client_info("failure A").await;
+        let (id_b, message_b) = safe_prompt_failure_client_info("failure B").await;
+
+        assert_eq!(message_a, "Internal server error");
+        assert_eq!(message_b, message_a);
+        assert_ne!(id_a, id_b, "each failure needs its own correlation id");
+    }
+}
+
 /// アプリケーション全体のルータ。
 ///
 /// 既存の全ルート（prefix なし）を維持したまま、同じハンドラを `/api` 配下にも
@@ -1424,7 +1492,9 @@ async fn finalize_stream_message(
                 }
                 if let Some(error) = stream_failed {
                     if message.parts.is_empty() {
-                        message.add_text(format!("Stream error: {}", error));
+                        // 生のプロバイダエラーを会話へ永続化しない。
+                        let (_, safe_message) = safe_prompt_failure_client_info(&error).await;
+                        message.add_text(safe_message);
                     }
                 }
             }
@@ -1719,6 +1789,8 @@ async fn stream_message(
                         Err(err) => {
                             let error_message = err.to_string();
                             stream_failed = Some(error_message.clone());
+                            let (_, safe_error) =
+                                safe_prompt_failure_client_info(&error_message).await;
                             send_sse_event(
                                 &tx,
                                 "error",
@@ -1732,7 +1804,7 @@ async fn stream_message(
                                     input: None,
                                     prompt_tokens: None,
                                     completion_tokens: None,
-                                    error: Some(error_message),
+                                    error: Some(safe_error),
                                 },
                             )
                             .await;
@@ -1745,6 +1817,7 @@ async fn stream_message(
             Some(Err(err)) => {
                 let error_message = err.to_string();
                 stream_failed = Some(error_message.clone());
+                let (_, safe_error) = safe_prompt_failure_client_info(&error_message).await;
                 send_sse_event(
                     &tx,
                     "error",
@@ -1758,7 +1831,7 @@ async fn stream_message(
                         input: None,
                         prompt_tokens: None,
                         completion_tokens: None,
-                        error: Some(error_message),
+                        error: Some(safe_error),
                     },
                 )
                 .await;
@@ -2379,17 +2452,25 @@ fn spawn_prompt_execution(
             )
             .await;
         if let Err(error) = &result {
+            // 内部詳細は error.rs の共通 redact を通してログへ残し、
+            // クライアントには汎用文言と相関 ID だけを渡す（生文字列は出さない）。
+            let (correlation_id, client_message) =
+                safe_prompt_failure_client_info(&error.to_string()).await;
             tracing::error!(
                 session_id = %session_id,
                 provider_id = %task_provider,
                 model_id = %task_model,
-                %error,
+                correlation_id = %correlation_id,
                 "session prompt failed"
             );
             let assistant = session.add_assistant_message();
             assistant
                 .metadata
-                .insert("error".to_string(), serde_json::json!(error.to_string()));
+                .insert("error".to_string(), serde_json::json!(&client_message));
+            assistant.metadata.insert(
+                "correlation_id".to_string(),
+                serde_json::json!(&correlation_id),
+            );
             assistant
                 .metadata
                 .insert("finish_reason".to_string(), serde_json::json!("error"));
@@ -2405,7 +2486,7 @@ fn spawn_prompt_execution(
                     .metadata
                     .insert("agent".to_string(), serde_json::json!(agent));
             }
-            assistant.add_text(format!("Provider error: {}", error));
+            assistant.add_text(format!("{client_message} (reference: {correlation_id})"));
             if let (Some(queue_id), Some(input_repo)) =
                 (queue_id.as_deref(), task_state.input_repo.as_ref())
             {

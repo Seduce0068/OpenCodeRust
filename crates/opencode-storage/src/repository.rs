@@ -494,7 +494,11 @@ fn decode_message_row(row: &MessageRow) -> Result<SessionMessage, DatabaseError>
         role,
         parts,
         created_at: created,
+        // messages テーブルには metadata / usage 用の列が無いため、
+        // 現行スキーマでは復元値を持たない（session -> types 変換側の
+        // フィールド保持は server.rs の明示変換で担保する）。
         metadata: HashMap::new(),
+        usage: None,
     })
 }
 

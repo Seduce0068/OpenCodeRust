@@ -31,8 +31,10 @@ tool invocation, MCP/LSP integration, and plugin extensions.
 
 ### 1. Requirements
 
-- Rust stable
+- Rust 1.97 or later (MSRV declared as `rust-version` in the workspace root `Cargo.toml`)
 - Cargo
+- C compiler and build tools (`gcc` and `make`; also `pkg-config` when linking
+  against a system SQLite instead of the bundled build)
 - Git (recommended)
 
 ### 2. Build

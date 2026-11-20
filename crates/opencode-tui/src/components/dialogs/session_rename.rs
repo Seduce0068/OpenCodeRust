@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::theme::Theme;
 
-use super::DialogClickMap;
+use super::{command_palette::visible_query_tail, DialogClickMap};
 
 pub struct SessionRenameDialog {
     open: bool,
@@ -101,7 +101,10 @@ impl SessionRenameDialog {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("> ", Style::default().fg(theme.primary)),
-                Span::styled(&self.input, Style::default().fg(theme.text)),
+                Span::styled(
+                    visible_query_tail(&self.input, layout[0].width),
+                    Style::default().fg(theme.text),
+                ),
                 Span::styled("▏", Style::default().fg(theme.primary)),
             ])),
             layout[0],
@@ -419,5 +422,27 @@ mod tests {
 
         assert!(text.contains("After"));
         assert!(!text.contains("Before"));
+    }
+
+    #[test]
+    fn render_with_long_input_shows_the_tail_and_cursor() {
+        let long_input = format!("HEADMARK{}TAILMARK", "x".repeat(80));
+        let mut dialog = SessionRenameDialog::new();
+        dialog.open("sess".to_string(), long_input);
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.contains("TAILMARK"),
+            "the input tail next to the cursor must stay visible"
+        );
+        assert!(
+            !text.contains("HEADMARK"),
+            "the overflowing input head must be scrolled out"
+        );
+        assert!(text.contains("▏"), "cursor must remain visible");
     }
 }

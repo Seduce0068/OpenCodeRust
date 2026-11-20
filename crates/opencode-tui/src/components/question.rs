@@ -4,11 +4,13 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
 use crate::theme::Theme;
+
+use super::permission::wrapped_row_count;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuestionType {
@@ -299,8 +301,15 @@ impl QuestionPrompt {
             )));
         }
 
-        let height = (content.len() as u16 + 2).min(area.height.saturating_sub(2));
         let width = area.width.saturating_sub(2).min(80);
+        // 枠 2 行を除いた幅で折り返した内容行数から高さを算出する。
+        let content_width = width.saturating_sub(2).max(1);
+        let wrapped_rows = wrapped_row_count(&content, content_width);
+        let max_height = area.height.saturating_sub(2).max(1);
+        let height = (wrapped_rows as u16)
+            .saturating_add(2)
+            .min(max_height)
+            .max(1);
 
         // Render inline at the bottom of the area
         let popup_area = Rect::new(
@@ -320,7 +329,8 @@ impl QuestionPrompt {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.primary)),
             )
-            .style(Style::default().bg(theme.background_panel));
+            .style(Style::default().bg(theme.background_panel))
+            .wrap(Wrap { trim: false });
 
         frame.render_widget(paragraph, popup_area);
     }
@@ -335,6 +345,29 @@ impl Default for QuestionPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
 
     fn choice_question(question_type: QuestionType) -> QuestionRequest {
         QuestionRequest {
@@ -459,6 +492,39 @@ mod tests {
         }
         assert_eq!(prompt.confirm_selected(), Some(vec!["answer".to_string()]));
         assert!(!prompt.is_open);
+    }
+
+    #[test]
+    fn render_wraps_long_question_and_keeps_options_and_hint_visible() {
+        let mut prompt = QuestionPrompt::new();
+        prompt.ask(QuestionRequest {
+            id: "qst_long".to_string(),
+            question: format!("LONGQ-{} -ENDQ", "q".repeat(180)),
+            question_type: QuestionType::SingleChoice,
+            options: vec![
+                QuestionOption {
+                    id: "Yes".to_string(),
+                    label: "Yes".to_string(),
+                },
+                QuestionOption {
+                    id: "No".to_string(),
+                    label: "No".to_string(),
+                },
+            ],
+        });
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            prompt.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.contains("-ENDQ"),
+            "the end of a long question must be wrapped and visible"
+        );
+        assert!(text.contains("[ ] (a) Yes"), "first option must be visible");
+        assert!(text.contains("[ ] (b) No"), "last option must be visible");
+        assert!(text.contains("Esc to cancel"), "hint must be visible");
     }
 
     #[test]

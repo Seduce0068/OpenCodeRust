@@ -79,17 +79,34 @@ pub struct FileDiff {
 }
 
 /// セッションのライフサイクル上の状態。
+///
+/// JSON 表現は小文字（`active` / `completed` / `archived` / `compacting`）を正式とし、
+/// 旧 PascalCase（`Active` 等）は `alias` で読み取り互換を維持する。
+/// `#[sqlx(rename_all = "lowercase")]` は DB 側の表現を決めるだけなので、
+/// この変更で既存の DB 行の読み書きは変わらない。
+///
+/// 方針メモ: `opencode-server::routes` の `opencode_session::SessionStatus` を
+/// 小文字文字列へ変換する手動 match は、変換元が別クレートの別型であるため
+/// 本次スコープ外で残置する（routes.rs は担当外）。session 側にも同じ serde 属性を
+/// 付与できれば手動 match を `serde_json::to_value` ベースへ置き換えて一元化できる。
+/// 本クレート側の変換は enum を直接 match しており、文字列の再変換は行わないため
+/// 二重変換は発生しない。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
 #[sqlx(rename_all = "lowercase")]
 pub enum SessionStatus {
     /// 現在進行中のセッション（デフォルト）。
     #[default]
+    #[serde(alias = "Active")]
     Active,
     /// 完了したセッション。
+    #[serde(alias = "Completed")]
     Completed,
     /// アーカイブ済みのセッション。
+    #[serde(alias = "Archived")]
     Archived,
     /// 会話の圧縮処理中。
+    #[serde(alias = "Compacting")]
     Compacting,
 }
 
@@ -206,28 +223,52 @@ mod tests {
     fn session_status_default_and_wire_format() {
         assert_eq!(SessionStatus::default(), SessionStatus::Active);
 
-        // sqlx 側は #[sqlx(rename_all = "lowercase")] だが serde の rename は無いため
-        // JSON では PascalCase のバリアント名になる
+        // serde 側も #[serde(rename_all = "lowercase")] となり、JSON では小文字になる。
         assert_eq!(
             serde_json::to_value(SessionStatus::Active).unwrap(),
-            json!("Active")
+            json!("active")
         );
         assert_eq!(
             serde_json::to_value(SessionStatus::Completed).unwrap(),
-            json!("Completed")
+            json!("completed")
         );
         assert_eq!(
             serde_json::to_value(SessionStatus::Archived).unwrap(),
-            json!("Archived")
+            json!("archived")
         );
         assert_eq!(
             serde_json::to_value(SessionStatus::Compacting).unwrap(),
-            json!("Compacting")
+            json!("compacting")
         );
 
+        // 正規表現の小文字は当然デシリアライズできる。
         assert_eq!(
-            serde_json::from_value::<SessionStatus>(json!("Active")).unwrap(),
+            serde_json::from_value::<SessionStatus>(json!("active")).unwrap(),
             SessionStatus::Active
+        );
+    }
+
+    #[test]
+    fn session_status_accepts_legacy_pascalcase_aliases() {
+        // 旧 PascalCase の永続化データ / 外部 JSON も alias で受け付ける。
+        let cases = [
+            (json!("Active"), SessionStatus::Active),
+            (json!("Completed"), SessionStatus::Completed),
+            (json!("Archived"), SessionStatus::Archived),
+            (json!("Compacting"), SessionStatus::Compacting),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                serde_json::from_value::<SessionStatus>(raw).unwrap(),
+                expected
+            );
+        }
+
+        // 小文字・PascalCase どちらから読んでもシリアライズ結果は小文字に正規化される。
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<SessionStatus>(json!("Active")).unwrap())
+                .unwrap(),
+            json!("active")
         );
     }
 
@@ -311,7 +352,7 @@ mod tests {
         assert!(value.get("parent_id").is_none());
         assert!(value.get("summary").is_none());
         // status / metadata は #[serde(default)] だがシリアライズはされる
-        assert_eq!(value["status"], json!("Active"));
+        assert_eq!(value["status"], json!("active"));
         assert_eq!(value["metadata"], json!({}));
         assert_eq!(value["id"], json!("sess_1"));
         assert_eq!(value["project_id"], json!("proj_1"));

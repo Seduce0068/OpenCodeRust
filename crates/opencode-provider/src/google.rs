@@ -11,6 +11,26 @@ use crate::{
 
 const GOOGLE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
+/// Google API のエンドポイント URL を構築する。
+///
+/// credential はクエリへ一切含めない。認証は [`with_google_api_key`] が
+/// `x-goog-api-key` ヘッダで付与するため、URL にはモデル種別と SSE 指定だけが載る。
+fn google_content_url(base_url: &str, model: &str, stream: bool) -> String {
+    let action = if stream {
+        "streamGenerateContent?alt=sse"
+    } else {
+        "generateContent"
+    };
+    format!("{base_url}/{model}:{action}")
+}
+
+/// リクエストへ Google API キーをヘッダとして付与する。
+///
+/// `?key=` クエリは URL や reqwest エラー・ログへ秘密が流出するため使用しない。
+fn with_google_api_key(builder: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+    builder.header("x-goog-api-key", api_key)
+}
+
 /// 構造化エラーへ渡すレスポンスヘッダから機微情報を除外する。
 ///
 /// 実装は [`crate::provider::sanitize_response_headers`] へ一本化した薄いラッパ。
@@ -183,21 +203,20 @@ impl Provider for GoogleProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let base_url = self.config.base_url.as_deref().unwrap_or(GOOGLE_API_URL);
-        let url = format!(
-            "{}/{}:generateContent?key={}",
-            base_url, request.model, self.config.api_key
-        );
+        let url = google_content_url(base_url, &request.model, false);
 
         let google_request = self.convert_request(request);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&google_request)
-            .send()
-            .await
-            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
+        let response = with_google_api_key(
+            self.client
+                .post(&url)
+                .header("Content-Type", "application/json"),
+            &self.config.api_key,
+        )
+        .json(&google_request)
+        .send()
+        .await
+        .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -223,22 +242,21 @@ impl Provider for GoogleProvider {
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<StreamResult, ProviderError> {
         let base_url = self.config.base_url.as_deref().unwrap_or(GOOGLE_API_URL);
-        let url = format!(
-            "{}/{}:streamGenerateContent?key={}&alt=sse",
-            base_url, request.model, self.config.api_key
-        );
+        let url = google_content_url(base_url, &request.model, true);
 
         let google_request = self.convert_request(request);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .json(&google_request)
-            .send()
-            .await
-            .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
+        let response = with_google_api_key(
+            self.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream"),
+            &self.config.api_key,
+        )
+        .json(&google_request)
+        .send()
+        .await
+        .map_err(|e| ProviderError::network_error_with_source(e.to_string(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -425,6 +443,42 @@ mod tests {
             api_key: "dummy-key-for-tests".to_string(),
             base_url: None,
         }
+    }
+
+    /// 回帰ガード: API キーを URL クエリへ載せず、ヘッダで送ること。
+    #[test]
+    fn google_endpoints_never_embed_api_key_in_url() {
+        let key = "dummy-secret-key-value";
+        let chat_url = google_content_url(GOOGLE_API_URL, "gemini-2.0-flash", false);
+        let stream_url = google_content_url(GOOGLE_API_URL, "gemini-2.0-flash", true);
+
+        for url in [&chat_url, &stream_url] {
+            assert!(!url.contains(key), "URL leaked key: {url}");
+            assert!(!url.contains("key="), "URL carries a key= param: {url}");
+            assert!(!url.contains("api_key="), "URL carries api_key=: {url}");
+        }
+        assert!(chat_url.ends_with(":generateContent"));
+        assert!(stream_url.ends_with(":streamGenerateContent?alt=sse"));
+    }
+
+    /// 回帰ガード: 認証ヘッダは付与され、URL には秘密が残らないこと。
+    #[test]
+    fn google_api_key_travels_in_header_only() {
+        let key = "dummy-secret-key-value";
+        let url = google_content_url(GOOGLE_API_URL, "gemini-2.0-flash", false);
+        let request = with_google_api_key(Client::new().post(&url), key)
+            .build()
+            .expect("request must build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some(key)
+        );
+        assert_eq!(request.url().as_str(), url);
+        assert!(!request.url().as_str().contains(key));
     }
 
     #[test]
