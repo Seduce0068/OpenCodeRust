@@ -313,10 +313,6 @@ status: current
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
-- [ ] **ログにローテーション・保持・サイズ上限が無く同一秒起動で truncate**
-  — `logging.rs:458-465` / LOG-NO-ROTATION
-- [ ] **/health が静的 ok で DB 状態を反映せずスキーマも不統一**
-  — `routes.rs:5150-5155` / HEALTH-STATIC-OK
 - [ ] **delete_session が実行中タスクを残し同一 ID 再作成で二重実行**
   — `routes.rs:466-479` / R1-CONC-04
 - [ ] **Responses ストリームが受信側切断をアイドル中に検知しない**
@@ -330,6 +326,8 @@ status: current
 
 ## 完了
 
+- [x] **[ログ/health 2 件]** 一意名と世代保持、liveness/readiness 分離
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[R4 残存 4 件]** stream redact・serde 集約・OAuth fail-loud・折返し
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[wire/秘密/レンダ high 11 件]** 互換・redaction・fail-loud
@@ -615,6 +613,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（ログ/health の修正時、記録のみ）: /health 系は認証
+  middleware の対象で CLI の起動待ちが Bearer を送らないため、既定設定では
+  401 になりうる（liveness の認証除外または CLI 側のトークン送信が必要、
+  両方 scope 外）。readiness の DB ping が list_pending_all の全件フェッチで
+  あり、軽量 ping メソッドは repository.rs 側の追加が必要。削除失敗が
+  黙って無視され、保持世代数が守られないことを運用者が検知できない。
 - 2026-11-20 R4 残存（high 11 件の修正時）: SSE 経路の生エラー漏洩は
   safe_prompt_failure_client_info 経由で修正済み。decode_stream_error の
   message 非 redact、MCP OAuth 本線の fail-open、question のクリック判定、
