@@ -159,43 +159,48 @@ fn trim_for_prompt(input: &str, max_chars: usize) -> (&str, bool) {
 mod tests {
     use super::*;
 
+    // for_model の分岐テスト。全テンプレートが含む "opencode" / "OpenCode" の
+    // 含有チェックは恒真で分岐を特定できないため、期待テンプレート定数との
+    // 完全一致（＝先頭行を含む全内容の一致）で各分岐を一意に特定する。
+    // テンプレート同士は内容が異なるため、誤分岐なら必ず失敗する。
+
     #[test]
     fn test_for_model_claude() {
         let prompt = SystemPrompt::for_model("claude-sonnet-4-20250514");
-        assert!(prompt.contains("OpenCode"));
+        assert_eq!(prompt, PROMPT_ANTHROPIC, "claude must select anthropic.txt");
     }
 
     #[test]
     fn test_for_model_gpt4() {
         let prompt = SystemPrompt::for_model("gpt-4o");
-        // beast.txt starts with "You are opencode, an agent"
-        assert!(prompt.contains("opencode"));
+        assert_eq!(prompt, PROMPT_BEAST, "gpt-* must select beast.txt");
     }
 
     #[test]
     fn test_for_model_gpt5() {
         let prompt = SystemPrompt::for_model("gpt-5-turbo");
-        // codex_header.txt
-        assert!(prompt.contains("OpenCode"));
+        assert_eq!(prompt, PROMPT_CODEX, "gpt-5 must select codex_header.txt");
     }
 
     #[test]
     fn test_for_model_gemini() {
         let prompt = SystemPrompt::for_model("gemini-2.0-flash");
-        assert!(prompt.contains("opencode"));
+        assert_eq!(prompt, PROMPT_GEMINI, "gemini-* must select gemini.txt");
     }
 
     #[test]
     fn test_for_model_trinity() {
         let prompt = SystemPrompt::for_model("Trinity-Large");
-        assert!(prompt.contains("opencode"));
+        assert_eq!(prompt, PROMPT_TRINITY, "trinity must select trinity.txt");
     }
 
     #[test]
     fn test_for_model_fallback() {
         let prompt = SystemPrompt::for_model("some-unknown-model");
-        // qwen.txt fallback
-        assert!(prompt.contains("opencode"));
+        assert_eq!(
+            prompt, PROMPT_QWEN,
+            "unknown model must select qwen.txt fallback"
+        );
     }
 
     #[test]

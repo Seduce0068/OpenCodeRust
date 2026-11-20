@@ -1504,16 +1504,28 @@ fn extract_line_range(input: &str) -> (&str, Option<(usize, Option<usize>)>) {
     (input, None)
 }
 
+/// crate 共通のテスト専用ロック。
+///
+/// `OPENCODE_STATE_DIR` を書き換えるテストは home.rs / prompt.rs の別モジュールに
+/// 分散しており、個別のロックでは同じテストバイナリ内の並行実行時に環境変数が
+/// 汚染し合う。ここで 1 つのミューテックスを定義して両モジュールから共有する。
+/// lib.rs は担当スコープ外のため、このモジュールを `pub(crate)` で公開する。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{LazyLock, Mutex};
+
+    /// `OPENCODE_STATE_DIR` を守る crate 共通ロック。
+    pub(crate) static STATE_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::prompt::test_support::STATE_DIR_LOCK;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn with_isolated_prompt<T>(f: impl FnOnce(Prompt) -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = STATE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state_dir =
             std::env::temp_dir().join(format!("opencode-tui-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir).expect("create state dir");

@@ -338,18 +338,16 @@ fn parse_tip_highlights(tip: &str, theme: &crate::theme::Theme) -> Vec<Span<'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::prompt::test_support::STATE_DIR_LOCK;
     use crate::context::{McpServerStatus, Session};
     use crate::theme::Theme;
     use ratatui::{backend::TestBackend, Terminal};
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// OPENCODE_STATE_DIR を一時ディレクトリへ切り替えて AppContext を構築する。
     /// prompt.rs のテストと同じ方式で、履歴・frecency・stash の実状態との接触を避ける。
     /// ネットワークアクセスや外部サービスは行わない。
     fn with_isolated_context<T>(f: impl FnOnce(Arc<AppContext>) -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = STATE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state_dir =
             std::env::temp_dir().join(format!("opencode-tui-home-{}", uuid::Uuid::new_v4()));
         let previous = std::env::var("OPENCODE_STATE_DIR").ok();

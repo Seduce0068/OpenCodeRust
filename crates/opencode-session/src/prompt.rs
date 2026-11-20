@@ -878,21 +878,20 @@ impl SessionPrompt {
         names.join("\n")
     }
 
+    /// Registers a run for `session_id` and returns its cancellation token.
+    ///
+    /// The busy check and the insertion share one lock acquisition, so two
+    /// concurrent callers can never both install a token for the same session.
     async fn start(&self, session_id: &str) -> Option<CancellationToken> {
-        let state = self.state.lock().await;
-        if state.contains_key(session_id) {
-            return None;
-        }
-        drop(state);
-
-        let token = CancellationToken::new();
         let mut state = self.state.lock().await;
-        state.insert(
-            session_id.to_string(),
-            PromptState {
-                cancel_token: token.clone(),
-            },
-        );
+        let entry = match state.entry(session_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => return None,
+            std::collections::hash_map::Entry::Vacant(entry) => entry,
+        };
+        let token = CancellationToken::new();
+        entry.insert(PromptState {
+            cancel_token: token.clone(),
+        });
         Some(token)
     }
 
@@ -960,12 +959,11 @@ impl SessionPrompt {
         permission_callback: PermissionCallback,
         question_callback: QuestionCallback,
     ) -> anyhow::Result<()> {
-        self.assert_not_busy(&input.session_id).await?;
-
-        let cancel_token = self.start(&input.session_id).await;
-        let token = match cancel_token {
-            Some(t) => t,
-            None => return Err(anyhow::anyhow!("Session already running")),
+        // `start` performs the busy check and the registration under a single
+        // lock, so no separate pre-check may run outside that critical section.
+        let token = match self.start(&input.session_id).await {
+            Some(token) => token,
+            None => return Err(anyhow::anyhow!("Session {} is busy", input.session_id)),
         };
 
         self.create_user_message(&input, session).await?;
@@ -3646,6 +3644,46 @@ mod tests {
         StreamUsage,
     };
     use std::sync::Mutex as StdMutex;
+
+    /// Concurrent `start` calls must register exactly one cancellation token:
+    /// the busy check and the insertion share a single lock acquisition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_start_installs_exactly_one_cancellation_token() {
+        const CALLERS: usize = 32;
+
+        let prompt = Arc::new(SessionPrompt::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut handles = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let prompt = Arc::clone(&prompt);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                prompt.start("same-session").await
+            }));
+        }
+
+        barrier.wait().await;
+        let mut winners = Vec::new();
+        for handle in handles {
+            if let Some(token) = handle.await.expect("start task should not panic") {
+                winners.push(token);
+            }
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "only one concurrent start may own the cancellation token"
+        );
+        assert!(prompt.is_running("same-session").await);
+
+        prompt.cancel("same-session").await;
+        assert!(
+            winners[0].is_cancelled(),
+            "the stored token must be the one handed out by the winning start"
+        );
+    }
 
     struct StaticModelProvider {
         model: Option<ModelInfo>,
