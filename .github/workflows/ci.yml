@@ -1,6 +1,7 @@
 # 個人リポジトリ共通の再利用可能ワークフロー
 # （Seduce0068/workflows の rust-gates.yml）へ委譲する。
-# native-tls（reqwest / oauth2 経由）のビルド用に libssl-dev を導入する。
+# TLS は reqwest / oauth2 ともに rustls 系へ統一済みのため、
+# native-tls（OpenSSL）用の libssl-dev は不要（apt 追加パッケージなし）。
 # 依存監査（cargo audit）も有効化する。ignore は .cargo/audit.toml。
 name: CI
 
@@ -28,8 +29,6 @@ jobs:
   gates:
     uses: Seduce0068/workflows/.github/workflows/rust-gates.yml@v1
     with:
-      apt_packages: |
-        libssl-dev
       # Cargo.lock をコミット済みなので --locked を明示的に必須化する
       #（共通ワークフローの locked 既定値も true のため挙動は不変）
       locked: true

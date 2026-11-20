@@ -1824,6 +1824,71 @@ fn correlate_assistant_messages_with_queue(
     }
 }
 
+/// HTTP 経路の permission コールバック本体。
+///
+/// `Always` 応答時にセッションスコープの動的 allow を記録し、以降は同一の
+/// `(permission, patterns)` リクエストをプロンプトなしでスキップする。
+/// 静的な `AgentInfo.permission` ルール（deny/allow）は変更しない。
+async fn handle_permission_request(
+    state: &Arc<ServerState>,
+    broker: &crate::server::PermissionBroker,
+    session_id: &str,
+    req: opencode_tool::PermissionRequest,
+) -> std::result::Result<(), opencode_tool::ToolError> {
+    let permission = req.permission.clone();
+    let patterns = req.patterns.clone();
+
+    // 動的 allow の事前判定。broker 待機の前にロックを必ず解放する。
+    {
+        let sessions = state.sessions.lock().await;
+        if sessions.is_permission_approved(session_id, &permission, &patterns) {
+            return Ok(());
+        }
+    }
+
+    let metadata = req.metadata.clone();
+    let always = req.always.clone();
+    let info = crate::server::PermissionRequestInfo {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        tool: permission.clone(),
+        input: serde_json::json!({
+            "patterns": patterns,
+            "metadata": metadata,
+            "always": always,
+        }),
+        message: format!("Tool '{}' is requesting permission", permission),
+        permission_type: permission.clone(),
+        patterns: patterns.clone(),
+        metadata,
+        always,
+    };
+
+    match broker.ask(info).await {
+        crate::server::PermissionResponse::Once => Ok(()),
+        crate::server::PermissionResponse::Always => {
+            // 承認時に要求された pattern をそのまま記録する（ワイルドカード拡張なし）。
+            // broker.ask() 待機中にセッションが削除されていた場合は記録せず、
+            // 孤立した動的 allow が残らないようにする。
+            let mut sessions = state.sessions.lock().await;
+            let recorded = sessions.record_permission_allow(session_id, &permission, patterns);
+            if !recorded {
+                // パターンはパスを含み得るためログに出さず、session_id のみを残す。
+                tracing::debug!(
+                    session_id = %session_id,
+                    "dynamic permission allow discarded: session no longer exists"
+                );
+            }
+            Ok(())
+        }
+        crate::server::PermissionResponse::Reject { message } => {
+            Err(opencode_tool::ToolError::PermissionDenied(
+                message.unwrap_or_else(|| "Permission denied".to_string()),
+            ))
+        }
+    }
+}
+
 fn spawn_prompt_execution(
     task_state: Arc<ServerState>,
     session_id: String,
@@ -1981,44 +2046,19 @@ fn spawn_prompt_execution(
             let _ = update_tx.send(snapshot.clone());
         });
 
-        // Create permission callback that uses the server's PermissionBroker
+        // Create permission callback that uses the server's PermissionBroker.
+        // `Always` 応答はセッションスコープの動的 allow として記録され、
+        // 同一ツールの次回呼び出しではプロンプトをスキップする。
         let permission_broker = task_state.permission_broker.clone();
+        let permission_state = task_state.clone();
         let session_id_for_cb = session_id.clone();
         let permission_callback: opencode_session::prompt::PermissionCallback =
             Some(Arc::new(move |req: opencode_tool::PermissionRequest| {
                 let broker = permission_broker.clone();
+                let state = permission_state.clone();
                 let session_id = session_id_for_cb.clone();
-                let tool_name = req.permission.clone();
-                let patterns = req.patterns.clone();
-                let metadata = req.metadata.clone();
-                let always = req.always.clone();
-
                 Box::pin(async move {
-                    let info = crate::server::PermissionRequestInfo {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_id,
-                        tool: tool_name,
-                        input: serde_json::json!({
-                            "patterns": patterns,
-                            "metadata": metadata,
-                            "always": always,
-                        }),
-                        message: format!("Tool '{}' is requesting permission", req.permission),
-                        permission_type: req.permission.clone(),
-                        patterns,
-                        metadata,
-                        always,
-                    };
-                    let response = broker.ask(info).await;
-                    match response {
-                        crate::server::PermissionResponse::Once => Ok(()),
-                        crate::server::PermissionResponse::Always => Ok(()),
-                        crate::server::PermissionResponse::Reject { message } => {
-                            Err(opencode_tool::ToolError::PermissionDenied(
-                                message.unwrap_or_else(|| "Permission denied".to_string()),
-                            ))
-                        }
-                    }
+                    handle_permission_request(&state, &broker, &session_id, req).await
                 })
             }));
 
@@ -6917,5 +6957,162 @@ mod worktree_error_mapping_tests {
                 serde_json::from_str(&body).expect("body should be JSON");
             assert_eq!(value["error"]["type"], expected_type);
         }
+    }
+}
+
+#[cfg(test)]
+mod permission_always_tests {
+    use super::*;
+
+    fn spawn_permission(
+        state: &Arc<ServerState>,
+        session_id: &str,
+        permission: &str,
+        pattern: &str,
+    ) -> tokio::task::JoinHandle<std::result::Result<(), opencode_tool::ToolError>> {
+        let state = state.clone();
+        let broker = state.permission_broker.clone();
+        let sid = session_id.to_string();
+        let req = opencode_tool::PermissionRequest::new(permission).with_pattern(pattern);
+        tokio::spawn(async move { handle_permission_request(&state, &broker, &sid, req).await })
+    }
+
+    async fn wait_for_pending(
+        broker: &crate::server::PermissionBroker,
+    ) -> crate::server::PermissionRequestInfo {
+        for _ in 0..100 {
+            if let Some(info) = broker.list().await.first().cloned() {
+                return info;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("permission request was never brokered");
+    }
+
+    /// Always 応答の回帰テスト:
+    /// - Always 後は同一 (permission, patterns) がプロンプトなしでスキップ
+    /// - 別ツールは依然としてプロンプトが出る
+    /// - セッション終了で動的 allow はクリアされる
+    #[tokio::test]
+    async fn always_skips_same_tool_only_and_clears_on_session_end() {
+        let state = Arc::new(ServerState::new());
+        let session = state.sessions.lock().await.create("project", "/work");
+        let session_id = session.id.clone();
+        let broker = state.permission_broker.clone();
+
+        // 1) 初回はプロンプトが出て Always で応答する。
+        let first = spawn_permission(&state, &session_id, "bash", "git status");
+        let pending = wait_for_pending(&broker).await;
+        assert_eq!(pending.permission_type, "bash");
+        assert_eq!(pending.patterns, vec!["git status".to_string()]);
+        assert!(
+            broker
+                .reply(&pending.id, crate::server::PermissionResponse::Always)
+                .await
+        );
+        assert!(first.await.expect("task should join").is_ok());
+
+        // 2) 同一ツール・同一パターンは待たずにスキップされ、新規プロンプトも出ない。
+        let second = tokio::time::timeout(Duration::from_secs(1), async {
+            handle_permission_request(
+                &state,
+                &broker,
+                &session_id,
+                opencode_tool::PermissionRequest::new("bash").with_pattern("git status"),
+            )
+            .await
+        })
+        .await
+        .expect("approved request must not wait for a prompt");
+        assert!(second.is_ok());
+        assert!(
+            broker.list().await.is_empty(),
+            "no new permission prompt should be queued"
+        );
+
+        // 3) 別ツールは依然としてプロンプトが出る（Once で応答）。
+        let third = spawn_permission(&state, &session_id, "write", "src/lib.rs");
+        let pending = wait_for_pending(&broker).await;
+        assert_eq!(pending.permission_type, "write");
+        assert!(
+            broker
+                .reply(&pending.id, crate::server::PermissionResponse::Once)
+                .await
+        );
+        assert!(third.await.expect("task should join").is_ok());
+
+        // 4) セッション削除で動的 allow が消え、同一ツールが再びプロンプトを出す。
+        assert!(state.sessions.lock().await.delete(&session_id).is_some());
+        let fourth = spawn_permission(&state, &session_id, "bash", "git status");
+        let pending = wait_for_pending(&broker).await;
+        assert_eq!(pending.permission_type, "bash");
+        assert!(
+            broker
+                .reply(&pending.id, crate::server::PermissionResponse::Once)
+                .await
+        );
+        assert!(fourth.await.expect("task should join").is_ok());
+    }
+
+    /// 承認時に批准されていないパターンへワイルドカード拡張されないことを検証する。
+    #[tokio::test]
+    async fn always_does_not_expand_patterns() {
+        let state = Arc::new(ServerState::new());
+        let session = state.sessions.lock().await.create("project", "/work");
+        let session_id = session.id.clone();
+        let broker = state.permission_broker.clone();
+
+        let first = spawn_permission(&state, &session_id, "bash", "git status");
+        let pending = wait_for_pending(&broker).await;
+        assert!(
+            broker
+                .reply(&pending.id, crate::server::PermissionResponse::Always)
+                .await
+        );
+        assert!(first.await.expect("task should join").is_ok());
+
+        // 別パターンは別リクエストとしてプロンプトが出る。
+        let second = spawn_permission(&state, &session_id, "bash", "git push --force");
+        let pending = wait_for_pending(&broker).await;
+        assert_eq!(pending.patterns, vec!["git push --force".to_string()]);
+        assert!(
+            broker
+                .reply(&pending.id, crate::server::PermissionResponse::Once)
+                .await
+        );
+        assert!(second.await.expect("task should join").is_ok());
+    }
+
+    /// R4(high) 回帰: broker.ask() 待機中にセッションが削除されても、
+    /// Always 応答で孤立した動的 allow が作られないこと。
+    #[tokio::test]
+    async fn always_after_session_deletion_does_not_record_orphan() {
+        let state = Arc::new(ServerState::new());
+        let session = state.sessions.lock().await.create("project", "/work");
+        let session_id = session.id.clone();
+        let broker = state.permission_broker.clone();
+
+        // 1) プロンプトを broker に積んだ状態で待機させる。
+        let pending_task = spawn_permission(&state, &session_id, "bash", "git status");
+        let pending = wait_for_pending(&broker).await;
+
+        // 2) 応答前にセッションを削除する（競合の再現）。
+        assert!(state.sessions.lock().await.delete(&session_id).is_some());
+
+        // 3) Always で応答しても孤立エントリは作られない。
+        assert!(
+            broker
+                .reply(&pending.id, crate::server::PermissionResponse::Always)
+                .await
+        );
+        assert!(pending_task.await.expect("task should join").is_ok());
+        assert!(
+            !state.sessions.lock().await.is_permission_approved(
+                &session_id,
+                "bash",
+                &["git status".to_string()]
+            ),
+            "orphaned dynamic allow must not be recorded for a deleted session"
+        );
     }
 }
