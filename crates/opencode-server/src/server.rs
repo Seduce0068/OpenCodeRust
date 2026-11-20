@@ -6,14 +6,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -33,6 +32,7 @@ use opencode_provider::{
     unregister_custom_fetch_proxy, AuthInfo, AuthManager, ConfigModel as BootstrapConfigModel,
     ConfigProvider as BootstrapConfigProvider, CustomFetchProxy, CustomFetchRequest,
     CustomFetchResponse, CustomFetchStreamResponse, ProviderError, ProviderRegistry,
+    RotationReason,
 };
 use opencode_session::SessionManager;
 use opencode_storage::InputRepository;
@@ -482,6 +482,8 @@ pub(crate) fn sync_custom_fetch_proxy(
 pub struct ServerState {
     pub sessions: Mutex<SessionManager>,
     pub(crate) config: TokioRwLock<AppConfig>,
+    /// 起動時に構築された provider レジストリ。
+    /// 認証キーローテーション後の差し替え状況は `rotate_provider_key` の NOTE を参照。
     pub providers: ProviderRegistry,
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
@@ -613,35 +615,12 @@ impl ServerState {
         });
         state.auth_manager = auth_manager.clone();
         load_plugin_auth_store(&server_url, auth_manager.clone()).await;
-        let auth_store = auth_manager.list().await;
 
-        // Load config and convert providers to bootstrap format
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let loaded_config = load_config(&cwd).ok();
-        if let Some(config) = loaded_config.as_ref() {
-            // Keep this instance's config in sync with the loaded config so
-            // routes that read it (model resolution, /config) see the same
-            // values as the provider bootstrap.
-            *state.config.write().await = config.clone();
-        }
-        let bootstrap_config = match loaded_config {
-            Some(config) => {
-                let providers = convert_config_providers_for_bootstrap(&config);
-                bootstrap_config_from_raw(
-                    providers,
-                    config.disabled_providers.clone(),
-                    config.enabled_providers.clone(),
-                    config.model.clone(),
-                    config.small_model.clone(),
-                )
-            }
-            None => {
-                tracing::warn!("failed to load config for provider bootstrap, using defaults");
-                opencode_provider::BootstrapConfig::default()
-            }
-        };
-
-        state.providers = create_registry_from_bootstrap_config(&bootstrap_config, &auth_store);
+        // 起動時の config 読み込みと BootstrapConfig 変換は
+        // `build_initial_provider_registry` に集約する。401/429 ローテーション後の
+        // 再 bootstrap は `build_provider_registry_from_auth` を使う（下記 NOTE 参照）。
+        let initial_registry = state.build_initial_provider_registry().await;
+        state.providers = initial_registry;
         let db = Database::new().await?;
         let pool = db.pool().clone();
         state.session_repo = Some(SessionRepository::new(pool.clone()));
@@ -652,6 +631,99 @@ impl ServerState {
             input_repo.reset_processing().await?;
         }
         Ok(state)
+    }
+
+    /// HTTP status をローテーション理由へ変換する純粋関数（401/429 のみ対象）。
+    ///
+    /// キー値や provider の応答本文を一切受け取らないため、ここから秘密情報が
+    /// ログ・エラーへ漏れる経路は存在しない。
+    fn rotation_reason_for_status(status: StatusCode) -> Option<RotationReason> {
+        match status {
+            StatusCode::UNAUTHORIZED => Some(RotationReason::Unauthorized),
+            StatusCode::TOO_MANY_REQUESTS => Some(RotationReason::RateLimited),
+            _ => None,
+        }
+    }
+
+    /// `AppConfig` → `BootstrapConfig` の変換を起動時と再 bootstrap で共有する。
+    fn bootstrap_config_from_app_config(config: &AppConfig) -> opencode_provider::BootstrapConfig {
+        let providers = convert_config_providers_for_bootstrap(config);
+        bootstrap_config_from_raw(
+            providers,
+            config.disabled_providers.clone(),
+            config.enabled_providers.clone(),
+            config.model.clone(),
+            config.small_model.clone(),
+        )
+    }
+
+    /// 起動時専用: config を読み込み `state.config` へ同期しつつ、
+    /// `AuthManager` のアクティブ認証から初期 `ProviderRegistry` を構築する。
+    pub async fn build_initial_provider_registry(&mut self) -> ProviderRegistry {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let loaded_config = load_config(&cwd).ok();
+        if let Some(config) = loaded_config.as_ref() {
+            // Keep this instance's config in sync with the loaded config so
+            // routes that read it (model resolution, /config) see the same
+            // values as the provider bootstrap.
+            *self.config.write().await = config.clone();
+        }
+        let bootstrap_config = match loaded_config {
+            Some(config) => Self::bootstrap_config_from_app_config(&config),
+            None => {
+                tracing::warn!("failed to load config for provider bootstrap, using defaults");
+                opencode_provider::BootstrapConfig::default()
+            }
+        };
+        let auth_store = self.auth_manager.list().await;
+        create_registry_from_bootstrap_config(&bootstrap_config, &auth_store)
+    }
+
+    /// 現在の `state.config` と `AuthManager.list()` から `ProviderRegistry` を
+    /// 作り直す（ローテーション後の再 bootstrap 経路）。
+    ///
+    /// キー値や provider の応答本文は受け取らず、ログにも出さない。
+    pub async fn build_provider_registry_from_auth(&self) -> ProviderRegistry {
+        let auth_store = self.auth_manager.list().await;
+        let config = self.config.read().await.clone();
+        let bootstrap_config = Self::bootstrap_config_from_app_config(&config);
+        create_registry_from_bootstrap_config(&bootstrap_config, &auth_store)
+    }
+
+    // NOTE(R2 主実行 / R4 残存 medium) — 現状は「API 提供のみ・未配線」。
+    // provider の HTTP 401/429 は routes.rs の provider 呼び出し側
+    // (`state.providers.get_provider(...) -> provider.chat/stream`) と
+    // opencode-provider クレート内で検出されるが、いずれも本タスクの書き込み
+    // 担当パス (`crates/opencode-server/src/server.rs`) の外側にある。
+    // また `ServerState.providers` は `ProviderRegistry` の値フィールドで
+    // interior mutability がなく、`&ServerState` を取る HTTP ハンドラからは
+    // 差し替えられない（差し替えにはフィールド型の変更と routes.rs の
+    // 呼び出し側修正が必要）。
+    // よって本ヘルパは「ローテーションを実行し、新しいアクティブ認証を反映した
+    // レジストリを返す API」として提供し、実呼び出しの配線は担当外変更として残す。
+    // 未配線でも受け取るのは provider_id と StatusCode のみで、
+    // トークン値・provider 応答本文をログ/エラーへ出す経路は存在しない。
+
+    /// provider の 401/429 でキーをローテーションする API（現状は HTTP 経路へ未配線）。
+    ///
+    /// 呼び出し側（`routes.rs` の provider 呼び出し）は本変更の担当外のため、
+    /// 本メソッドは API としてのみ提供され、実運用ではまだ自動発火しない。
+    ///
+    /// `provider_id` と `StatusCode` のみを受け取り、`RotationReason` を付けて
+    /// `AuthManager::rotate_key` を呼ぶ（同メソッドは provider_id と理由だけを
+    /// 構造化ログに出し、キー値は出さない）。ローテーションが起きた場合は
+    /// `auth_manager.list()` から再 bootstrap した `ProviderRegistry` を返す。
+    /// 401/429 以外、または代替キーが無い場合は `None`。
+    pub async fn rotate_provider_key(
+        &self,
+        provider_id: &str,
+        status: StatusCode,
+    ) -> Option<ProviderRegistry> {
+        let reason = Self::rotation_reason_for_status(status)?;
+        if !self.auth_manager.rotate_key(provider_id, reason).await {
+            return None;
+        }
+        Some(self.build_provider_registry_from_auth().await)
     }
 
     pub fn broadcast(&self, event: &str) {
@@ -1027,8 +1099,8 @@ impl Default for ServerState {
     }
 }
 
-static EXTRA_CORS_WHITELIST: Lazy<RwLock<HashSet<String>>> =
-    Lazy::new(|| RwLock::new(HashSet::new()));
+static EXTRA_CORS_WHITELIST: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 fn normalize_origin(origin: &str) -> Option<String> {
     let trimmed = origin.trim().trim_end_matches('/');
@@ -2808,5 +2880,174 @@ mod tests {
             "generated request id must be a UUID: {value}"
         );
         server.abort();
+    }
+
+    // ---- R2 主実行 / R4 残存 medium: 認証キーローテーション回帰テスト ----
+
+    #[test]
+    fn rotation_reason_accepts_only_401_and_429() {
+        assert_eq!(
+            ServerState::rotation_reason_for_status(StatusCode::UNAUTHORIZED),
+            Some(RotationReason::Unauthorized)
+        );
+        assert_eq!(
+            ServerState::rotation_reason_for_status(StatusCode::TOO_MANY_REQUESTS),
+            Some(RotationReason::RateLimited)
+        );
+        for status in [
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(
+                ServerState::rotation_reason_for_status(status),
+                None,
+                "non 401/429 status must not trigger rotation"
+            );
+        }
+    }
+
+    /// アクティブキー + プール済みキーを 1 つずつ持つ状態を作る。
+    /// ダミー値のみを使い、実の秘密情報は一切読まない。
+    async fn state_with_rotatable_key(provider_id: &str) -> ServerState {
+        let state = ServerState::new();
+        state
+            .auth_manager
+            .try_add_key(
+                provider_id,
+                AuthInfo::Api {
+                    key: "test-primary-key".to_string(),
+                },
+            )
+            .await
+            .expect("primary key registration");
+        state
+            .auth_manager
+            .try_add_key(
+                provider_id,
+                AuthInfo::Api {
+                    key: "test-next-key".to_string(),
+                },
+            )
+            .await
+            .expect("pooled key registration");
+        state
+    }
+
+    async fn active_key(auth: &AuthManager, provider_id: &str) -> Option<String> {
+        match auth.get(provider_id).await? {
+            AuthInfo::Api { key } => Some(key),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthorized_rotates_key_and_rebuilds_registry() {
+        let state = state_with_rotatable_key("openai").await;
+        assert_eq!(
+            active_key(&state.auth_manager, "openai").await.as_deref(),
+            Some("test-primary-key")
+        );
+        assert_eq!(state.auth_manager.key_count("openai").await, 2);
+
+        let rebuilt = state
+            .rotate_provider_key("openai", StatusCode::UNAUTHORIZED)
+            .await;
+
+        assert!(
+            rebuilt.is_some(),
+            "401 must rotate when a pooled key exists"
+        );
+        assert_eq!(
+            active_key(&state.auth_manager, "openai").await.as_deref(),
+            Some("test-next-key"),
+            "the next key must become active"
+        );
+        assert_eq!(state.auth_manager.key_count("openai").await, 2);
+        // 返されたレジストリは auth_manager.list() を読んだ再 bootstrap 結果。
+        let _ = rebuilt.expect("rebuilt registry").list();
+    }
+
+    #[tokio::test]
+    async fn rate_limited_rotates_key_and_rebuilds_registry() {
+        let state = state_with_rotatable_key("openai").await;
+
+        let rebuilt = state
+            .rotate_provider_key("openai", StatusCode::TOO_MANY_REQUESTS)
+            .await;
+
+        assert!(
+            rebuilt.is_some(),
+            "429 must rotate when a pooled key exists"
+        );
+        assert_eq!(
+            active_key(&state.auth_manager, "openai").await.as_deref(),
+            Some("test-next-key"),
+            "the next key must become active on 429 too"
+        );
+        let _ = rebuilt.expect("rebuilt registry").list();
+    }
+
+    #[tokio::test]
+    async fn rotation_is_noop_without_alternate_or_on_other_statuses() {
+        let single = ServerState::new();
+        single
+            .auth_manager
+            .try_add_key(
+                "openai",
+                AuthInfo::Api {
+                    key: "only-key".to_string(),
+                },
+            )
+            .await
+            .expect("primary key registration");
+        assert!(
+            single
+                .rotate_provider_key("openai", StatusCode::UNAUTHORIZED)
+                .await
+                .is_none(),
+            "no alternate key means no rotation"
+        );
+        assert_eq!(
+            active_key(&single.auth_manager, "openai").await.as_deref(),
+            Some("only-key")
+        );
+
+        let state = state_with_rotatable_key("openai").await;
+        assert!(
+            state
+                .rotate_provider_key("openai", StatusCode::INTERNAL_SERVER_ERROR)
+                .await
+                .is_none(),
+            "non 401/429 status must not rotate"
+        );
+        assert_eq!(
+            active_key(&state.auth_manager, "openai").await.as_deref(),
+            Some("test-primary-key")
+        );
+    }
+
+    #[test]
+    fn rotation_helper_accepts_no_key_or_response_body() {
+        // 秘密情報がヘルパへ入らないことをシグネチャ面でも固定する。
+        let source = include_str!("server.rs");
+        let start = source
+            .find("pub async fn rotate_provider_key(")
+            .expect("helper must exist");
+        let end = source[start..]
+            .find(") -> Option<ProviderRegistry>")
+            .expect("helper signature");
+        let signature = &source[start..start + end];
+        assert!(signature.contains("provider_id: &str"));
+        assert!(signature.contains("status: StatusCode"));
+        assert!(
+            !signature.contains("body"),
+            "response body must not be passed in"
+        );
+        assert!(
+            !signature.contains("key:"),
+            "key value must not be passed in"
+        );
     }
 }

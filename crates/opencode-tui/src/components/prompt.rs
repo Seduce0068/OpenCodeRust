@@ -1488,10 +1488,9 @@ fn extract_line_range(input: &str) -> (&str, Option<(usize, Option<usize>)>) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn with_isolated_prompt<T>(f: impl FnOnce(Prompt) -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

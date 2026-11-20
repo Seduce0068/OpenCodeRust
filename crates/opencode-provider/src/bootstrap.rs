@@ -23,12 +23,11 @@ use crate::vercel::VercelProvider;
 use crate::vertex::GoogleVertexProvider;
 use crate::xai::XaiProvider;
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing;
 
 // ---------------------------------------------------------------------------
@@ -58,7 +57,7 @@ pub enum BootstrapError {
 
 /// Map of bundled SDK package names to their provider identifiers.
 /// Mirrors the TS `BUNDLED_PROVIDERS` record.
-pub static BUNDLED_PROVIDERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+pub static BUNDLED_PROVIDERS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
     m.insert("@ai-sdk/amazon-bedrock", "amazon-bedrock");
     m.insert("@ai-sdk/anthropic", "anthropic");
@@ -90,7 +89,7 @@ pub static BUNDLED_PROVIDERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::
 
 /// Check if a model ID represents GPT-5 or later.
 pub fn is_gpt5_or_later(model_id: &str) -> bool {
-    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^gpt-(\d+)").unwrap());
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^gpt-(\d+)").unwrap());
     if let Some(caps) = RE.captures(model_id) {
         if let Some(num) = caps.get(1) {
             if let Ok(n) = num.as_str().parse::<u32>() {
@@ -2946,8 +2945,8 @@ mod tests {
     /// the whole lifetime of the guard and the original values are restored on
     /// drop. This keeps Bedrock tests deterministic without leaking a cleared
     /// environment into concurrently running tests.
-    static AWS_STATIC_KEYS_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
+    static AWS_STATIC_KEYS_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
 
     struct AwsStaticKeysGuard {
         _lock: std::sync::MutexGuard<'static, ()>,

@@ -1,9 +1,8 @@
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::{ChatRequest, ChatResponse, StreamResult};
@@ -184,7 +183,7 @@ fn source_is_transient_reqwest_error(
         .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
 }
 
-static OVERFLOW_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)prompt is too long").unwrap(),
         Regex::new(r"(?i)input is too long for requested model").unwrap(),
@@ -202,8 +201,8 @@ static OVERFLOW_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static NO_BODY_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^4(00|13)\s*(status code)?\s*\(no body\)").unwrap());
+static NO_BODY_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^4(00|13)\s*(status code)?\s*\(no body\)").unwrap());
 
 impl ProviderError {
     /// API エラーを、下位エラーを `source()` に保持した状態で構築する。

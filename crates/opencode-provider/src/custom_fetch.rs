@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
 use futures::Stream;
-use once_cell::sync::Lazy;
 
 use crate::provider::ProviderError;
 
@@ -44,8 +43,8 @@ pub trait CustomFetchProxy: Send + Sync {
     ) -> Result<CustomFetchStreamResponse, ProviderError>;
 }
 
-static CUSTOM_FETCH_PROXIES: Lazy<RwLock<HashMap<String, Arc<dyn CustomFetchProxy>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static CUSTOM_FETCH_PROXIES: LazyLock<RwLock<HashMap<String, Arc<dyn CustomFetchProxy>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn register_custom_fetch_proxy(
     provider_id: impl Into<String>,

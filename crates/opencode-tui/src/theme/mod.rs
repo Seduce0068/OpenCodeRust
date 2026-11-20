@@ -1,8 +1,8 @@
-use once_cell::sync::Lazy;
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 const PRESET_SOURCES: &[(&str, &str)] = &[
     ("aura", include_str!("presets/aura.json")),
@@ -46,7 +46,7 @@ const PRESET_SOURCES: &[(&str, &str)] = &[
     ("zenburn", include_str!("presets/zenburn.json")),
 ];
 
-static PRESET_THEMES: Lazy<HashMap<String, ThemeFile>> = Lazy::new(|| {
+static PRESET_THEMES: LazyLock<HashMap<String, ThemeFile>> = LazyLock::new(|| {
     PRESET_SOURCES
         .iter()
         .filter_map(|(name, source)| {
