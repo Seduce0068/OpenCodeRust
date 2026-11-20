@@ -1083,6 +1083,8 @@ async fn wait_for_server_ready(
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let start = tokio::time::Instant::now();
+    // `/health` は server 側で認証 middleware の対象外（liveness）。
+    // 起動待ちでは Bearer を送らず、200 が返るまで待つ。
     let health = server_url(base_url, "/health");
     let mut server_handle = server_handle;
 
@@ -6794,6 +6796,49 @@ mod tests {
         );
         assert!(stats_cost_note(Some(f64::NAN)).is_some());
         assert_eq!(stats_cost_note(Some(1.25)), None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_server_ready_probes_health_without_a_bearer_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+
+        // 認証が有効なサーバでも、起動待ちはトークンを送らず /health を叩き、
+        // 200 で即座に完了する（server 側の liveness 除外と対になるガード）。
+        let probe = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept health probe");
+            let mut buf = [0u8; 2048];
+            let read = socket.read(&mut buf).await.expect("read probe request");
+            let request = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            assert!(
+                request.starts_with("get /health http/1.1"),
+                "startup probe must GET /health: {request}"
+            );
+            assert!(
+                !request.contains("authorization:"),
+                "startup probe must not send a Bearer token: {request}"
+            );
+
+            let body = r#"{"status":"ok","version":"test","healthy":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write health response");
+        });
+
+        wait_for_server_ready(&base_url, Duration::from_secs(3), None)
+            .await
+            .expect("tokenless health probe must report readiness");
+        probe.await.expect("probe server task");
     }
 
     #[tokio::test]

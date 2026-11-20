@@ -173,18 +173,41 @@ fn is_rotated_log_name(name: &str) -> bool {
     }
 }
 
-/// 保持世代数を超える古いログを削除し、削除したファイル数を返す。
+/// 削除失敗 1 件を WARN として記録する。
 ///
-/// 生成順は mtime で判定する。ファイル名は `<timestamp>-<pid>-<nanos>` で
-/// PID がナノ秒より前に来るため辞書順では新しいログが先に並ぶことがある。
-/// `keep` には「残す既存ファイル数」を渡す（呼び出し側で新規 1 世代分を引く）。
+/// 方針: フルパスは出力せず、ファイル名（basename）のみを `file` フィールドに
+/// 含める。ログ・ローテーション対象のファイル名は生成時に付与される
+/// `YYYY-MM-DDTHHMMSS-<pid>-<nanos>.log` 固定で、トークン値やユーザー入力は
+/// 入らない。エラーも `ErrorKind` の Debug のみを使い、パスを含みうる
+/// `io::Error` の Display は出力しない。
+fn warn_prune_failure(file_name: &str, kind: std::io::ErrorKind) {
+    tracing::warn!(
+        file = file_name,
+        error = ?kind,
+        "failed to remove expired log file; retention limit may be exceeded"
+    );
+}
+
+/// 削除失敗が 1 件以上ある場合の集計 WARN を記録する（件数のみ、パスは出さない）。
+fn warn_prune_summary(failed: usize) {
+    tracing::warn!(
+        failed = failed,
+        "some expired log files could not be removed; configured retention may be violated"
+    );
+}
+
+/// 削除対象ログの走査と削除を行い、`(削除成功件数, 削除失敗件数)` を返す内部ヘルパー。
 ///
-/// `tracing_appender::rolling::RollingFileAppender::builder()` の
-/// `max_log_files` も検討したが、内部で `append(true).create(true)` のみで
-/// ファイルを開くため `0600` 要件と衝突し、生成名に PID/ナノ秒を埋め込めない。
-/// よって既存の `tracing_appender::non_blocking` はそのまま再利用し、
-/// ローテーションと保持は `std::fs` で行う（新規依存なし）。
-fn prune_old_logs(dir: &Path, keep: usize) -> std::io::Result<usize> {
+/// `remove` を注入可能にすることで、読み取り専用 FS やファイルロックによる
+/// 削除失敗を権限変更なしに再現して検証できる。本番経路では
+/// [`std::fs::remove_file`] を渡す。生成順は mtime で判定する。ファイル名は
+/// `<timestamp>-<pid>-<nanos>` で PID がナノ秒より前に来るため辞書順では
+/// 新しいログが先に並ぶことがある。`keep` には「残す既存ファイル数」を渡す
+/// （呼び出し側で新規 1 世代分を引く）。
+fn prune_old_logs_with<F>(dir: &Path, keep: usize, mut remove: F) -> std::io::Result<(usize, usize)>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
     let mut logs = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -208,13 +231,38 @@ fn prune_old_logs(dir: &Path, keep: usize) -> std::io::Result<usize> {
     });
 
     let removable = logs.len().saturating_sub(keep);
-    let mut removed = 0;
+    let mut removed = 0usize;
+    let mut failed = 0usize;
     for path in logs.into_iter().take(removable) {
-        if std::fs::remove_file(path).is_ok() {
-            removed += 1;
+        match remove(&path) {
+            Ok(()) => removed += 1,
+            Err(err) => {
+                failed += 1;
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>");
+                warn_prune_failure(file_name, err.kind());
+            }
         }
     }
-    Ok(removed)
+    if failed > 0 {
+        warn_prune_summary(failed);
+    }
+    Ok((removed, failed))
+}
+
+/// 保持世代数を超える古いログを削除し、`(削除成功件数, 削除失敗件数)` を返す。
+///
+/// 削除失敗は黙って無視せず、WARN と失敗件数で運用者が検知できるようにする。
+///
+/// `tracing_appender::rolling::RollingFileAppender::builder()` の
+/// `max_log_files` も検討したが、内部で `append(true).create(true)` のみで
+/// ファイルを開くため `0600` 要件と衝突し、生成名に PID/ナノ秒を埋め込めない。
+/// よって既存の `tracing_appender::non_blocking` はそのまま再利用し、
+/// ローテーションと保持は `std::fs` で行う（ローテーション自体は新規依存なし）。
+fn prune_old_logs(dir: &Path, keep: usize) -> std::io::Result<(usize, usize)> {
+    prune_old_logs_with(dir, keep, |path: &Path| std::fs::remove_file(path))
 }
 
 /// 新しいログファイルのパスを決め、親ディレクトリを用意し、保持世代数を
@@ -916,8 +964,9 @@ mod tests {
         let unrelated = dir.join("notes.txt");
         std::fs::write(&unrelated, b"keep").unwrap();
 
-        let removed = prune_old_logs(&dir, 2).unwrap();
+        let (removed, failed) = prune_old_logs(&dir, 2).unwrap();
         assert_eq!(removed, 3, "5 世代 - 保持 2 世代 = 3 件削除");
+        assert_eq!(failed, 0, "通常時は削除失敗なし");
 
         let mut remaining: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -932,6 +981,103 @@ mod tests {
         assert!(!remaining.contains(&log_file_name("2026-11-01T120000", 42, 0)));
         assert_eq!(remaining.len(), 3);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `tracing` イベントをバッファへ取り込むテスト用ライター。
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut buffer = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 処理の間だけスコープ付き subscriber を設定し、出力されたログ文字列を返す。
+    ///
+    /// グローバル default を変更しないため、既存の `init_tracing` テストと競合しない。
+    fn capture_logs<F: FnOnce()>(f: F) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn prune_old_logs_reports_failed_count_and_warns_without_full_path() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-util-prune-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for day in 1..=5 {
+            let name = log_file_name(&format!("2026-11-{day:02}T120000"), 42, 0);
+            std::fs::write(dir.join(name), b"log line\n").unwrap();
+        }
+
+        let output = capture_logs(|| {
+            let (removed, failed) = prune_old_logs_with(&dir, 2, |_path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated read-only filesystem",
+                ))
+            })
+            .unwrap();
+            assert_eq!(removed, 0, "削除失敗は成功件数に数えない");
+            assert_eq!(failed, 3, "5 世代 - 保持 2 = 3 件の失敗を返す");
+        });
+
+        assert!(output.contains("WARN"), "削除失敗時に warn が出ること");
+        let full_path = dir.to_string_lossy();
+        assert!(
+            !output.contains(full_path.as_ref()),
+            "フルパスをログに出さないこと: {output}"
+        );
+        assert!(
+            !output.contains("simulated read-only filesystem"),
+            "生のエラーメッセージをログに出さないこと: {output}"
+        );
+        assert!(
+            output.contains("2026-11-"),
+            "ファイル名のみを特定可能な情報として残すこと: {output}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_old_logs_does_not_warn_when_all_deletions_succeed() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-util-prune-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for day in 1..=5 {
+            let name = log_file_name(&format!("2026-11-{day:02}T120000"), 42, 0);
+            std::fs::write(dir.join(name), b"log line\n").unwrap();
+        }
+
+        let output = capture_logs(|| {
+            let (removed, failed) =
+                prune_old_logs_with(&dir, 2, |path: &Path| std::fs::remove_file(path)).unwrap();
+            assert_eq!(removed, 3);
+            assert_eq!(failed, 0);
+        });
+
+        assert!(
+            !output.contains("WARN"),
+            "削除成功時は warn を出さないこと: {output}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

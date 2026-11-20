@@ -1853,11 +1853,33 @@ fn auth_decision(
     }
 }
 
+/// 認証 middleware の対象外にする liveness プローブのパス（完全一致）。
+///
+/// `starts_with("/health")` のような前方一致は readiness (`/health/ready`)
+/// まで誤って除外してしまうため使わない。readiness (`/health/ready`,
+/// `/global/ready`) は DB に触れるため認証対象のままにする。
+const UNAUTHENTICATED_LIVENESS_PATHS: &[&str] = &["/health", "/health/live", "/global/health"];
+
+/// クエリ文字列を除いたパスが認証不要の liveness プローブかどうかを判定する。
+///
+/// トークン値は一切扱わない。呼び出し側の `Uri::path()` は既にクエリを除くが、
+/// 完全な request target が渡されても安全なようにここでも防御的に除去する。
+fn is_unauthenticated_liveness_path(path: &str) -> bool {
+    let path_only = path.split('?').next().unwrap_or(path);
+    UNAUTHENTICATED_LIVENESS_PATHS.contains(&path_only)
+}
+
 async fn auth_middleware(
     state: Arc<ServerState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // CLI/TUI の起動待ちは Bearer を送らず `/health` を叩く。既定（認証有効）
+    // でここを通すと 401 になりタイムアウトするため liveness だけ素通しする。
+    if is_unauthenticated_liveness_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
     let supplied_bearer = request
         .headers()
         .get(HeaderName::from_static("authorization"))
@@ -2907,6 +2929,32 @@ mod tests {
             ))
     }
 
+    /// liveness / readiness / 通常ルートを同じ middleware 下に並べた検証用ルータ。
+    fn auth_liveness_test_app(state: Arc<ServerState>) -> axum::Router {
+        axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "liveness" }))
+            .route("/health/live", axum::routing::get(|| async { "liveness" }))
+            .route(
+                "/health/ready",
+                axum::routing::get(|| async { "readiness" }),
+            )
+            .route(
+                "/global/health",
+                axum::routing::get(|| async { "liveness" }),
+            )
+            .route(
+                "/global/ready",
+                axum::routing::get(|| async { "readiness" }),
+            )
+            .route("/protected", axum::routing::get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state,
+                |State(state): State<Arc<ServerState>>,
+                 request: Request<axum::body::Body>,
+                 next: Next| async move { auth_middleware(state, request, next).await },
+            ))
+    }
+
     fn parse_json_body(body: &str) -> serde_json::Value {
         // chunked 転送のフレームが付いても JSON オブジェクト部分だけを拾う。
         let start = body.find('{').expect("JSON object in body");
@@ -3124,6 +3172,93 @@ mod tests {
             AuthDecision::Unauthorized,
             "an auth-enabled state must stay enabled after env changes"
         );
+    }
+
+    #[test]
+    fn liveness_paths_use_exact_match_and_ignore_query_strings() {
+        for path in ["/health", "/health/live", "/global/health"] {
+            assert!(
+                is_unauthenticated_liveness_path(path),
+                "documented liveness path must be exempt: {path}"
+            );
+            let with_query = format!("{path}?probe=cli&ts=1");
+            assert!(
+                is_unauthenticated_liveness_path(&with_query),
+                "query string must not affect the exemption: {with_query}"
+            );
+        }
+
+        for path in [
+            "/health/ready",
+            "/global/ready",
+            "/health/live/extra",
+            "/health/",
+            "/HEALTH",
+            "/protected",
+        ] {
+            assert!(
+                !is_unauthenticated_liveness_path(path),
+                "only exact liveness paths may be exempt: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auth_middleware_exempts_liveness_but_not_readiness() {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreNoAuth(std::env::var("OPENCODE_NO_AUTH").ok());
+        std::env::remove_var("OPENCODE_NO_AUTH"); // auth enabled
+
+        let state = Arc::new(ServerState::new());
+        let token = state.auth_token.clone().expect("generated token");
+        let (addr, server) = start_test_server(auth_liveness_test_app(state)).await;
+
+        // Bearer なしで liveness は 200。クエリ付きも同様（CLI 起動待ちの想定）。
+        for target in [
+            "/health",
+            "/health?from=cli",
+            "/health/live",
+            "/health/live?from=cli",
+            "/global/health",
+            "/global/health?from=cli",
+        ] {
+            let request =
+                format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let (status, _, body) = http_exchange(addr, &request).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "liveness must not require a token: {target}"
+            );
+            assert!(
+                body.contains("liveness"),
+                "unexpected liveness response for {target}: {body}"
+            );
+            assert!(
+                !body.contains(&token),
+                "token value must never appear in a response body"
+            );
+        }
+
+        // readiness と通常ルートは従来どおり 401（前方一致で誤除外しないこと）。
+        for target in ["/health/ready", "/global/ready", "/protected"] {
+            let request =
+                format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let (status, _, body) = http_exchange(addr, &request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "readiness and protected routes must stay authenticated: {target}"
+            );
+            assert!(
+                !body.contains(&token),
+                "token value must never appear in an error body"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
