@@ -299,21 +299,10 @@ status: current
 - [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
   — `session/todo.rs:441` / API-10
 
-- [ ] **SessionInfo が status/usage/metadata を落とし status 値も二重化**
-  — `routes.rs:194-281` / WIRE-06
-- [ ] **MessageRepository が parts しか保存せず metadata/usage が DB 往復で失われる**
-  — `repository.rs:446-500` / WIRE-07
-- [ ] **Session.metadata が DB 保存されるが起動時復元で常に空** — `server.rs:843` / WIRE-08
-- [ ] **usage_total_cost にトークン数を書き復元で 0.0 へ戻す**
-  — `repository.rs:229-235` / WIRE-09
-- [ ] **rust-version 1.97 が 21 member crate に継承されていない**
-  — `Cargo.toml:36-43` / DEPS-03
 - [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
   — `tui/Cargo.toml:25` / DEPS-04
 - [ ] **README の Requirements に MSRV 1.97 と C ツールチェーンが無い**
   — `README.md:32-42` / DEPS-06
-- [ ] **Oauth 一時状態削除の Result が .ok() で破棄される** — `oauth.rs:410-412` / ERR-05
-- [ ] **既存認証ファイルの 0600 強制が best-effort で失敗が握り潰される** — `auth.rs:89-99` / ERR-06
 - [ ] **ストリーム再符号化で ApiErrorWithSource がプレーン ApiError に退化**
   — `llm.rs:205-254` / ERR-07
 - [ ] **ツールエラー文字列がプラグインとログへ無 redact で渡る** — `registry.rs:132-140` / ERR-08
@@ -349,6 +338,8 @@ status: current
 
 ## 完了
 
+- [x] **[storage/mcp 5 件]** metadata/cost 往復・v3 移行・権限 fail-closed
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[config/wire/glob 7 件]** env 配線・serde 対称化・連鎖置換
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース境界/ドキュメント 6 件]** 8 MiB 上限・ログ ring・ADR 追随
@@ -644,6 +635,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（storage/mcp の修正時、記録のみ）: user_version=3 なのに
+  messages.metadata/usage 列が欠ける不整合 DB は自己修復されない（エッジケース）。
+  起動時 tolerant 一覧のコメント（session 破損はスキップ）と message 側 fail-loud
+  の二層方針が矛盾。互換ラッパ read_all_or_default / get は fail-open のまま
+  （doc で明記、deprecated）。
 - 2026-11-21 R4 残存（config/wire/glob の修正時、記録のみ）: SSE の
   todo.updated ペイロードは旧値のまま（TUI は GET /session/{id}/todo 経由のため
   今回の退化は解消）。AgentColor::Custom("primary") 等組み込み名と衝突する
