@@ -178,6 +178,25 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **`.opencode/opencode.json{,c}` が load_project と load_all で二重読込**
+  — `loader.rs:126-136` / CFG-010
+- [ ] **shell_exec が子プロセス出力を read_to_end で無制限保持**
+  — `session/prompt.rs:3497` / RES-05
+- [ ] **FileWatcher の debounce DashMap が prune されず無期限残存**
+  — `watcher/lib.rs:88` / RES-06
+- [ ] **Task ツールのサブエージェント再帰に深さ上限なし** — `tool/task.rs:80-132` / RES-07
+- [ ] **wellknown 設定キャッシュが期限切れエントリを削除しない** — `wellknown.rs:191` / RES-08
+- [ ] **セッション生成時のプラグインフック task が JoinHandle を保持せずデタッチ**
+  — `session.rs:780` / RES-09
+- [ ] **storage のマイグレーション SQL 定数が pub で外部露出** — `storage/lib.rs:15,21` / API-07
+- [ ] **util/watcher/tui/tool の crate 級・pub 項目に doc 欠落** — `各 lib.rs` / API-08
+- [ ] **Plugin::register_hooks が手動 `Pin<Box>` で非同期パターンが 3 様式**
+  — `plugin/lib.rs:255` / API-09
+- [ ] **status: Current のクロスレビュー報告が過去スナップショットのまま**
+  — `cross-review-report:7` / CROSS-REVIEW
+- [ ] **文書索引が opencode-pty.md と報告書を案内していない**
+  — `docs/README.md:36-61` / DOCS-INDEX
+- [ ] **憲章の opencode コマンド互換主張が実バイナリ名と不一致** — `charter:43` / CHARTER-CLI
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -223,6 +242,27 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **`timezone` が Config::merge から欠落し全レイヤで失われる**
+  — `schema.rs:285-326` / R1-CFG-001 / 高
+- [ ] **`agents`（複数形）が Config::merge から欠落し未配線**
+  — `schema.rs:2007-2008` / R1-CFG-002 / 高
+- [ ] **PATCH /config が ProviderRegistry を再構築せず変更が反映されない**
+  — `routes.rs:3366-3389` / R1-CFG-003 / 高
+- [ ] **server セクション（port/hostname/cors）が起動経路で読まれない**
+  — `schema.rs:564-579` / R1-CFG-004 / 高
+- [ ] **provider/providers の競合がレイヤ順でなく拼写順で解決される**
+  — `schema.rs:2009-2010` / R1-CFG-006 / 高
+- [ ] **AgentError が 2 定義とも glob re-export され曖昧**
+  — `agent.rs:190`, `executor.rs:13` / API-01 / 高
+- [ ] **SessionOps が async_trait 化されず Send 保証と object safety を失う**
+  — `compaction.rs:167-168` / API-02 / 高
+- [ ] **opencode-session の glob re-export が同名型を多数抱える**
+  — `session/lib.rs:37-58` / API-03 / 高
+- [ ] **ADR-0002 の always 非永続化が実装（動的 allow）と逆転**
+  — `adr-0002:69-72` / ADR-0002-ALWAYS-PERSIST / 高
+- [ ] **ADR-0001 のトークン ログ出力が実装のマスク化と矛盾**
+  — `adr-0001:31,79` / ADR-0001-TOKEN-LOG / 高
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -267,6 +307,33 @@ status: current
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
+
+- [ ] **CLI CONFIG_CACHE に無効化手段が無く設定変更が永続的に反映されない**
+  — `cli/main.rs:55-67` / CFG-005
+- [ ] **experimental.mcp_timeout がマージされるだけで実行時に参照されない**
+  — `schema.rs:1396` / CFG-007
+- [ ] **トップレベル env マップがサブプロセスへ適用されない dead 設定** — `schema.rs:275` / CFG-008
+- [ ] **mcp.protocol auto が legacy と同一 revision で probe 未実装**
+  — `schema.rs:775-789` / CFG-009
+- [ ] **MCP OAuth のサーバ別メモリログが無上限で蓄積** — `mcp_oauth.rs:110,191` / RES-01
+- [ ] **セッション更新 Hook が unbounded_channel で全 Session clone を送る**
+  — `routes.rs:2260` / RES-02
+- [ ] **grep が全マッチを Vec 保持し巨大 1 行を丸ごと読む** — `grep_tool.rs:161,211` / RES-03
+- [ ] **Models/wellknown のリモート取得にレスポンスバイト上限なし** — `models.rs:165` / RES-04
+- [ ] **opencode-server の glob re-export で DTO とドメイン型が同名衝突**
+  — `server/lib.rs:29-35` / API-04
+- [ ] **lsp feature 経由の公開 API に doc が無い** — `tool/lsp_tool.rs:12-38` / API-05
+- [ ] **3 crate（codemode/local-llm/watcher）がどこからも依存されず孤立**
+  — `Cargo.toml:3-25` / API-06
+- [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
+  — `session/todo.rs:441` / API-10
+- [ ] **ADR-0007 の missing_docs 276 件残存が解消済みで古い** — `adr-0007:69-74` / ADR-0007
+- [ ] **ADR-0008 内で opencode-tool カバレッジ値が矛盾**
+  — `adr-0008:129,195` / ADR-0008-TOOL
+- [ ] **provider ドキュメントが未登録の LiteRT を責務に挙げる**
+  — `opencode-provider.md:19` / PROVIDER-LITERT
+- [ ] **status: Current の調査最終報告が完了済みタスクを未対応として提示**
+  — `investigation-final-report.md:18` / INVESTIGATION-REPORT
 
 - [ ] **TodoStatus/Priority の serde と `parse_*` が往復非対称**
   — `todo.rs:30-107` / WIRE-03
@@ -615,6 +682,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 cross-skill 集約（swarm93、4 担当・38 件、観点: リソース上限 /
+  API 境界 / ADR 整合 / 設定の実効性）: high 10 / 中 16 / 低 12 を追記。親が
+  high 4 件（timezone の merge 欠落・AgentError 2 定義・SessionOps の
+  async_fn_in_trait・ADR-0002 の always 記述）を read で事実確認。前回観点
+  （wire / レンダリング / エラー伝播 / 依存）とは重複しないよう既知対応を
+  プロンプトに明示した。
 - 2026-11-20 R4 残存（ログ/health の修正時）: 3 件とも次ラウンドで対応済み
   （liveness の認証除外・InputRepository::ping() による O(1) readiness・
   削除失敗の WARN と失敗数返却）。
