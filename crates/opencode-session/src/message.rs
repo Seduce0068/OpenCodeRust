@@ -25,11 +25,21 @@ pub struct SessionMessage {
     pub usage: Option<MessageUsage>,
 }
 
+/// メッセージの送信者種別。
+///
+/// JSON 表現は小文字（`user` / `assistant` / `system` / `tool`）を正式とし、
+/// 旧 PascalCase（`User` 等）は `alias` で読み取り互換を維持する。
+/// `opencode-types` 側の `MessageRole` と wire 形式を揃える。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageRole {
+    #[serde(alias = "User")]
     User,
+    #[serde(alias = "Assistant")]
     Assistant,
+    #[serde(alias = "System")]
     System,
+    #[serde(alias = "Tool")]
     Tool,
 }
 
@@ -275,6 +285,32 @@ mod tests {
         assert_eq!(msg.parts.len(), 1);
         assert_eq!(msg.get_text(), "hello");
         assert!(msg.id.starts_with("msg_"));
+    }
+
+    #[test]
+    fn message_role_serde_lowercase_and_pascal_alias() {
+        let cases = [
+            (MessageRole::User, "user", "User"),
+            (MessageRole::Assistant, "assistant", "Assistant"),
+            (MessageRole::System, "system", "System"),
+            (MessageRole::Tool, "tool", "Tool"),
+        ];
+
+        for (role, lower, pascal) in cases {
+            // 新 wire 形式は小文字。
+            assert_eq!(
+                serde_json::to_value(&role).expect("role must serialize"),
+                serde_json::json!(lower)
+            );
+            // 小文字は往復復元できる。
+            let from_lower: MessageRole =
+                serde_json::from_value(serde_json::json!(lower)).expect("lowercase must decode");
+            assert_eq!(from_lower, role);
+            // 旧 PascalCase も alias で復元できる。
+            let from_pascal: MessageRole =
+                serde_json::from_value(serde_json::json!(pascal)).expect("alias must decode");
+            assert_eq!(from_pascal, role);
+        }
     }
 
     #[test]

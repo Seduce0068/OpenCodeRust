@@ -149,12 +149,23 @@ pub struct SessionError {
 // Session Status
 // ============================================================================
 
+/// セッションのライフサイクル状態。
+///
+/// JSON 表現は小文字（`active` / `completed` / `archived` / `compacting`）を正式とし、
+/// 旧 PascalCase（`Active` 等）は `alias` で読み取り互換を維持する。
+/// `opencode-types` 側の `SessionStatus` と wire 形式を揃えることで、
+/// server 側の手書き lowercase match を serde ベースへ一元化できる。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     #[default]
+    #[serde(alias = "Active")]
     Active,
+    #[serde(alias = "Completed")]
     Completed,
+    #[serde(alias = "Archived")]
     Archived,
+    #[serde(alias = "Compacting")]
     Compacting,
 }
 
@@ -1181,6 +1192,32 @@ mod tests {
         assert!(session.title.starts_with("New session"));
         assert!(session.parent_id.is_none());
         assert_eq!(session.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn test_session_status_serde_lowercase_and_pascal_alias() {
+        let cases = [
+            (SessionStatus::Active, "active", "Active"),
+            (SessionStatus::Completed, "completed", "Completed"),
+            (SessionStatus::Archived, "archived", "Archived"),
+            (SessionStatus::Compacting, "compacting", "Compacting"),
+        ];
+
+        for (status, lower, pascal) in cases {
+            // 新 wire 形式は小文字。
+            assert_eq!(
+                serde_json::to_value(&status).expect("status must serialize"),
+                serde_json::json!(lower)
+            );
+            // 小文字は往復復元できる。
+            let from_lower: SessionStatus =
+                serde_json::from_value(serde_json::json!(lower)).expect("lowercase must decode");
+            assert_eq!(from_lower, status);
+            // 旧 PascalCase も alias で復元できる。
+            let from_pascal: SessionStatus =
+                serde_json::from_value(serde_json::json!(pascal)).expect("alias must decode");
+            assert_eq!(from_pascal, status);
+        }
     }
 
     #[test]

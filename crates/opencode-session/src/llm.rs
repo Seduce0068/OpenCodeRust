@@ -198,6 +198,31 @@ fn sanitize_stream_response_headers(
     })
 }
 
+/// credential クエリパラメータと Bearer 値を `<redacted>` へ伏せるローカルヘルパ。
+///
+/// `opencode_provider::redact_credential_query_params` は `pub(crate)` のため
+/// 他クレートから参照できない。構造化エラーの復元経路では `ProviderError` の
+/// タプルバリアント（`NetworkError` / `AuthError` / `ApiError`）へ文字列を直接
+/// 渡すため、ここで同種の redact を必ず通してから組み立てる。
+/// パラメータ名・ホスト・トークン種別は残し、値だけを伏せて障害追跡性を保つ。
+fn redact_stream_error_message(input: &str) -> String {
+    static CREDENTIAL_QUERY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+                r#"(?i)([?&\s"']?\b(?:x-goog-api-key|x-api-key|x-auth-token|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|authorization|sig|signature|key|token|secret|code)=)[^&\s#"<>']+"#,
+            )
+            .expect("credential query regex must compile")
+    });
+    static BEARER_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(\bbearer\s+)[^\s,;"'<>]+"#)
+            .expect("bearer value regex must compile")
+    });
+
+    let redacted = CREDENTIAL_QUERY.replace_all(input, "$1<redacted>");
+    BEARER_VALUE
+        .replace_all(&redacted, "$1<redacted>")
+        .into_owned()
+}
+
 /// `ProviderError` を `StreamEvent::Error(String)` へ載せられる構造化ペイロードへ変換する。
 ///
 /// 本文は 500 バイト preview に制限して保持する（free-usage-limit 検出に必要）。
@@ -306,7 +331,7 @@ fn decode_stream_error(payload: &str) -> Option<ProviderError> {
             response_body,
         } => ProviderError::api_error_with_headers(
             status_code,
-            message,
+            redact_stream_error_message(&message),
             // カスタム provider が混入した機微ヘッダをここで確実に除去する。
             sanitize_stream_response_headers(response_headers),
             response_body.map(|body| error_body_preview(&body)),
@@ -314,15 +339,24 @@ fn decode_stream_error(payload: &str) -> Option<ProviderError> {
         StructuredStreamError::ApiErrorWithStatus {
             status_code,
             message,
-        } => ProviderError::api_error_with_status(message, status_code),
+        } => {
+            ProviderError::api_error_with_status(redact_stream_error_message(&message), status_code)
+        }
         StructuredStreamError::RateLimit => ProviderError::RateLimit,
         StructuredStreamError::Timeout => ProviderError::Timeout,
-        StructuredStreamError::NetworkError { message } => ProviderError::NetworkError(message),
-        StructuredStreamError::AuthError { message } => ProviderError::AuthError(message),
-        StructuredStreamError::ContextOverflow { message } => {
-            ProviderError::context_overflow(message)
+        // タプルバリアントは provider 側の redact を通らないため、ここで必ず伏せる。
+        StructuredStreamError::NetworkError { message } => {
+            ProviderError::NetworkError(redact_stream_error_message(&message))
         }
-        StructuredStreamError::Other { message } => ProviderError::ApiError(message),
+        StructuredStreamError::AuthError { message } => {
+            ProviderError::AuthError(redact_stream_error_message(&message))
+        }
+        StructuredStreamError::ContextOverflow { message } => {
+            ProviderError::context_overflow(redact_stream_error_message(&message))
+        }
+        StructuredStreamError::Other { message } => {
+            ProviderError::ApiError(redact_stream_error_message(&message))
+        }
     })
 }
 
@@ -2673,6 +2707,65 @@ mod tests {
                 !headers.contains_key(dropped),
                 "sensitive header must be dropped: {dropped}"
             );
+        }
+    }
+
+    /// 構造化エラーの message に credential クエリ / Bearer 値が含まれても、
+    /// `ProviderError` へ再構成する時点で伏せられること。
+    /// ヘッダ allowlist は既存テストで担保されており、ここでは message を検証する。
+    #[test]
+    fn test_decode_stream_error_redacts_credential_values_in_message() {
+        let cases: [(&str, &str, &[&str]); 3] = [
+            (
+                "network_error",
+                "connect failed: https://api.example.com/v1?key=sk-network-secret&model=gpt-4",
+                &["sk-network-secret"],
+            ),
+            (
+                "auth_error",
+                "unauthorized: Authorization: Bearer sk-auth-secret-1234",
+                &["sk-auth-secret-1234"],
+            ),
+            (
+                "other",
+                "failed with api_key=sk-other-secret and token=sk-token-secret",
+                &["sk-other-secret", "sk-token-secret"],
+            ),
+        ];
+
+        for (kind, message, secrets) in cases {
+            let payload = format!(
+                "{STRUCTURED_STREAM_ERROR_MARKER}{}",
+                serde_json::json!({
+                    "_version": STRUCTURED_STREAM_ERROR_VERSION,
+                    "error": { "kind": kind, "message": message }
+                })
+            );
+            let decoded = decode_stream_error(&payload).expect("envelope must decode");
+            let text = decoded.to_string();
+
+            assert!(
+                text.contains("<redacted>"),
+                "no redaction for {kind}: {text}"
+            );
+            for &secret in secrets {
+                assert!(
+                    !text.contains(secret),
+                    "credential leaked into decoded {kind} error: {text}"
+                );
+            }
+            // 障害追跡に必要なホスト名とパラメータ名は残ること。
+            if kind == "network_error" {
+                assert!(
+                    text.contains("api.example.com"),
+                    "host must survive: {text}"
+                );
+                assert!(text.contains("key="), "parameter name must survive: {text}");
+                assert!(
+                    text.contains("model=gpt-4"),
+                    "safe query must survive: {text}"
+                );
+            }
         }
     }
 

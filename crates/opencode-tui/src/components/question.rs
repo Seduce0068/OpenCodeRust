@@ -10,7 +10,7 @@ use ratatui::{
 
 use crate::theme::Theme;
 
-use super::permission::wrapped_row_count;
+use super::permission::{wrapped_row_count, wrapped_text_rows};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuestionType {
@@ -47,6 +47,9 @@ pub struct QuestionPrompt {
     selected_options: Vec<bool>,
     text_input: String,
     last_rendered_area: Cell<Option<Rect>>,
+    /// 直近の描画で question 行が占めた行数。クリックの当たり判定で
+    /// オプションの開始行を算出するために使う。
+    last_rendered_question_rows: Cell<usize>,
 }
 
 impl QuestionPrompt {
@@ -58,6 +61,7 @@ impl QuestionPrompt {
             selected_options: Vec::new(),
             text_input: String::new(),
             last_rendered_area: Cell::new(None),
+            last_rendered_question_rows: Cell::new(1),
         }
     }
 
@@ -220,8 +224,13 @@ impl QuestionPrompt {
             {
                 return;
             }
-            // Options start at row area.y + 5 (border + title + blank + question + blank)
-            let options_start = area.y + 5;
+            // オプションは枠(1) + "Question:"(1) + 空行(1) + question 行(N) +
+            // 空行(1) の後から始まる。折り返しで N が増えても描画と同じ位置を指す。
+            let question_rows = self.last_rendered_question_rows.get();
+            let options_start = area
+                .y
+                .saturating_add(4)
+                .saturating_add(u16::try_from(question_rows).unwrap_or(u16::MAX));
             if row >= options_start {
                 let idx = (row - options_start) as usize;
                 if let Some(q) = &self.current_question {
@@ -304,6 +313,11 @@ impl QuestionPrompt {
         let width = area.width.saturating_sub(2).min(80);
         // 枠 2 行を除いた幅で折り返した内容行数から高さを算出する。
         let content_width = width.saturating_sub(2).max(1);
+        // question 行は単一 span なので、その行だけの折り返し行数を記録する。
+        // 高さ算出には全行の行数を使うが、クリック座標は question 行の
+        // 実際の行数に一致させる必要がある。
+        self.last_rendered_question_rows
+            .set(wrapped_text_rows(&question.question, content_width));
         let wrapped_rows = wrapped_row_count(&content, content_width);
         let max_height = area.height.saturating_sub(2).max(1);
         let height = (wrapped_rows as u16)
@@ -525,6 +539,67 @@ mod tests {
         assert!(text.contains("[ ] (a) Yes"), "first option must be visible");
         assert!(text.contains("[ ] (b) No"), "last option must be visible");
         assert!(text.contains("Esc to cancel"), "hint must be visible");
+    }
+
+    #[test]
+    fn handle_click_selects_options_after_question_wraps() {
+        let mut prompt = QuestionPrompt::new();
+        // 単語境界で複数行に折り返す long question（描画幅 76）。
+        prompt.ask(QuestionRequest {
+            id: "qst_wrapped".to_string(),
+            question: "please answer yes or no ".repeat(12),
+            question_type: QuestionType::SingleChoice,
+            options: vec![
+                QuestionOption {
+                    id: "Yes".to_string(),
+                    label: "Yes".to_string(),
+                },
+                QuestionOption {
+                    id: "No".to_string(),
+                    label: "No".to_string(),
+                },
+            ],
+        });
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            prompt.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        let question_rows = prompt.last_rendered_question_rows.get();
+        assert!(
+            question_rows >= 2,
+            "the long question must wrap into multiple rows"
+        );
+        let area = prompt
+            .last_rendered_area
+            .get()
+            .expect("render records the popup area");
+        let options_start = area.y + 4 + question_rows as u16;
+
+        let rendered_rows: Vec<&str> = text.lines().collect();
+        let first_option_row = rendered_rows
+            .iter()
+            .position(|line| line.contains("[ ] (a) Yes"))
+            .expect("first option must be rendered") as u16;
+        let second_option_row = rendered_rows
+            .iter()
+            .position(|line| line.contains("[ ] (b) No"))
+            .expect("second option must be rendered") as u16;
+        assert_eq!(
+            options_start, first_option_row,
+            "recorded question rows must match the rendered option position"
+        );
+
+        // 折り返しが発生してもオプションをクリックできる。
+        prompt.handle_click(area.x + 3, first_option_row);
+        assert_eq!(prompt.selected_index, 0);
+        assert!(prompt.selected_options[0]);
+
+        prompt.handle_click(area.x + 3, second_option_row);
+        assert_eq!(prompt.selected_index, 1);
+        assert!(!prompt.selected_options[0]);
+        assert!(prompt.selected_options[1]);
     }
 
     #[test]
