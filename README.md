@@ -158,10 +158,16 @@ See: `docs/opencode-config.md`
   editing config files.
 - TUI sessions write logs to a file. Non-TUI commands (`run`, `serve`, and
   other subcommands) print to stdout/stderr and do not create a log file.
+  Exception: `run --format json` creates a file log so stdout stays a clean
+  JSON Lines stream.
 - Default log directory (Unix): `$XDG_STATE_HOME/opencode/logs`, or
   `$HOME/.local/state/opencode/logs` when `XDG_STATE_HOME` is unset. If `HOME`
   is unavailable too, `./.opencode/logs` is used. Each launch writes a
-  timestamped `<YYYY-MM-DDTHHMMSS>.log` file.
+  `<YYYY-MM-DDTHHMMSS>-<pid>-<nanoseconds>.log` file; the suffix prevents
+  truncation when two processes start in the same second.
+- Seven generations (the current file plus six previous ones) are kept by
+  modification time. Override with `OPENCODE_LOG_RETENTION` (positive integer;
+  invalid or zero falls back to 7).
 - Log files are created with mode `0600`; pre-existing files with looser
   permissions are corrected to `0600` on open. If a log file cannot be opened,
   events fall back to stderr instead of being silently dropped.
@@ -170,15 +176,54 @@ See: `docs/opencode-config.md`
   logs to a known location. Buffered entries are flushed when the process
   exits normally.
 
-### Health check
+### Health checks
 
-`GET /health` returns `{"status":"ok","version":"<version>"}`. The CLI uses
-this same endpoint to wait for a local server to become ready, so it also
-works as a liveness probe:
+Two probes are exposed. Both `/health` and `/global/health` return the same
+JSON schema:
+
+```json
+{"status":"ok","version":"<version>","healthy":true}
+```
+
+The existing `status` and `version` fields are kept for compatibility; the
+`healthy` field mirrors `status == "ok"` and was previously only present on
+`/global/health`. Both probes pass through the same authentication middleware
+as other routes, so send the startup Bearer token when authentication is
+enabled.
+
+#### Liveness
+
+`GET /health` (aliases: `GET /health/live`, `GET /global/health`) is a pure
+liveness probe. It always returns `200` with `status: "ok"` while the process
+can serve HTTP; it does not inspect the database. The CLI and TUI use it to
+wait for a local server to start:
 
 ```bash
 curl -fsS http://127.0.0.1:3000/health
 ```
+
+Use liveness only to decide whether to restart a process. Never use it as a
+traffic or dependency gate.
+
+#### Readiness
+
+`GET /health/ready` (alias: `GET /global/ready`) probes the database with a
+real `SELECT` through the configured repository. It returns:
+
+- `200` with `status: "ok"` when the database is reachable, migrated and
+  usable.
+- `503` with `status: "error"` and `healthy: false` when the repository is not
+  initialized, the connection is closed, the database is locked or the stored
+  data is corrupt.
+
+```bash
+curl -fsS -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:3000/health/ready
+```
+
+Point load-balancer and orchestrator readiness gates at `/health/ready`, not
+at `/health`. A static `200` from `/health` no longer routes traffic to a
+server whose database is unavailable.
 
 Replace the host and port with the values passed to `serve --hostname` and
 `--port`.

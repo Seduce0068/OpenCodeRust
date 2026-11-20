@@ -131,7 +131,11 @@ pub fn router() -> Router<Arc<ServerState>> {
 fn api_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/", get(web_index))
+        // `/health` と `/health/live` は liveness（既存の静的 ok を維持）。
+        // `/health/ready` は DB を実際に問い合わせる readiness。
         .route("/health", get(health))
+        .route("/health/live", get(health))
+        .route("/health/ready", get(readiness))
         .route("/event", get(event_stream))
         .route("/path", get(get_paths))
         .route("/vcs", get(get_vcs_info))
@@ -5165,22 +5169,16 @@ async fn submit_tui_response(
 fn global_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/health", get(global_health))
+        .route("/ready", get(readiness))
         .route("/event", get(global_event_stream))
         .route("/config", get(get_global_config))
         .route("/dispose", post(dispose_all))
 }
 
-#[derive(Debug, Serialize)]
-pub struct GlobalHealthResponse {
-    pub healthy: bool,
-    pub version: String,
-}
-
-async fn global_health() -> Json<GlobalHealthResponse> {
-    Json(GlobalHealthResponse {
-        healthy: true,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+/// `/global/health` は liveness のまま既存の `healthy` フィールドを維持し、
+/// レスポンススキーマは `HealthResponse` に統一した（詳細は README 参照）。
+async fn global_health() -> Json<HealthResponse> {
+    Json(health_response("ok"))
 }
 
 async fn global_event_stream(
@@ -5417,17 +5415,72 @@ async fn list_resources() -> Response {
     not_implemented("resource")
 }
 
+/// `/health` と `/global/health` が共有するレスポンススキーマ。
+///
+/// 既存クライアント（CLI の起動待ち）を壊さないよう `status` / `version` は
+/// 維持したまま、global 側にあった `healthy` を追加して両者を統一する。
 #[derive(Debug, Serialize)]
-struct HealthResponse {
-    status: String,
-    version: String,
+pub struct HealthResponse {
+    /// `ok`（利用可能）または `error`（readiness 失敗）。
+    pub status: String,
+    /// サーババージョン。
+    pub version: String,
+    /// `/global/health` 互換の健全性フラグ。`status == "ok"` と同期する。
+    pub healthy: bool,
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
+/// 旧公開型名を維持するための別名。統合後も同一 JSON を返す。
+pub type GlobalHealthResponse = HealthResponse;
+
+/// `status` から統一スキーマのレスポンスを組み立てる。
+fn health_response(status: &str) -> HealthResponse {
+    HealthResponse {
+        status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+        healthy: status == "ok",
+    }
+}
+
+/// Liveness probe。プロセスが HTTP に応答できることだけを確認し、DB は見ない。
+///
+/// CLI の起動待ちと既存クライアント互換のため、従来どおり常に 200 の
+/// `{"status":"ok","version":...}` を返す（`healthy` は追加フィールド）。
+async fn health() -> Json<HealthResponse> {
+    Json(health_response("ok"))
+}
+
+/// Readiness probe。DB が利用可能かを実際のクエリで確認する。
+///
+/// `ServerState` は DB プールを直接保持しないため、`pub(crate)` な
+/// `input_repo` 経由で `session_input` に対する SELECT を発行して ping とする。
+/// この SELECT はマイグレーション済みスキーマを前提とするため、
+/// 未初期化・接続不可・ロック・破損のいずれでも失敗する。
+/// 利用可能なら 200、それ以外は 503 を返す。
+async fn readiness(State(state): State<Arc<ServerState>>) -> Response {
+    let db_ok = match &state.input_repo {
+        Some(repo) => match repo.list_pending_all().await {
+            Ok(_) => true,
+            Err(_) => {
+                // エラー文字列をログへ載せず、失敗事実だけを記録する。
+                tracing::warn!("readiness probe: database query failed");
+                false
+            }
+        },
+        None => {
+            tracing::warn!("readiness probe: database repository is not initialized");
+            false
+        }
+    };
+
+    if db_ok {
+        (StatusCode::OK, Json(health_response("ok"))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(health_response("error")),
+        )
+            .into_response()
+    }
 }
 
 async fn web_index() -> Html<&'static str> {
@@ -7249,6 +7302,90 @@ mod api_alias_tests {
         }
 
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    /// レスポンスボディを JSON として読み取る。
+    async fn response_body(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("health body must be readable");
+        serde_json::from_slice(&bytes).expect("health body must be json")
+    }
+
+    #[tokio::test]
+    async fn liveness_returns_static_ok_without_database() {
+        // DB 未初期化でも liveness は従来どおり 200 を返す（CLI 起動待ち互換）。
+        let resp = health().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["healthy"].as_bool(), Some(true));
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn health_and_global_health_share_one_schema() {
+        let plain = response_body(health().await.into_response()).await;
+        let global = response_body(global_health().await.into_response()).await;
+        assert_eq!(
+            plain, global,
+            "both endpoints must return the unified health schema"
+        );
+        // 旧クライアントが参照するフィールドが残っていることを明示的に守る。
+        assert!(plain.get("status").is_some());
+        assert!(plain.get("version").is_some());
+        assert!(global.get("healthy").is_some());
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_ok_when_database_is_available() {
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let repo = opencode_storage::InputRepository::new(db.pool().clone());
+        let mut state = ServerState::new();
+        state.input_repo = Some(repo);
+
+        let resp = readiness(State(Arc::new(state))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["healthy"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_service_unavailable_when_database_is_closed() {
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let pool = db.pool().clone();
+        let repo = opencode_storage::InputRepository::new(pool.clone());
+        // DB 停止を模擬: プールを閉じて全クエリを失敗させる。
+        pool.close().await;
+
+        let mut state = ServerState::new();
+        state.input_repo = Some(repo);
+        let resp = readiness(State(Arc::new(state))).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_body(resp).await;
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["healthy"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_service_unavailable_when_database_is_not_initialized() {
+        // `ServerState::new()` は repo を持たないため、DB 未初期化として 503。
+        let state = Arc::new(ServerState::new());
+        let resp = readiness(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_body(resp).await;
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["healthy"].as_bool(), Some(false));
     }
 }
 
