@@ -204,6 +204,25 @@ static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 static NO_BODY_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^4(00|13)\s*(status code)?\s*\(no body\)").unwrap());
 
+/// credential クエリパラメータの値をエラー文字列から伏せる中央ヘルパ。
+///
+/// reqwest エラーやレスポンス本文 preview にはリクエスト URL が含まれることがあり、
+/// `?key=` / `&api_key=` / `?token=` 等の形で秘密がログへ流出する。すべての
+/// `ProviderError` 生成経路はこの関数を通し、値を `<redacted>` へ置換する。
+/// パラメータ名・ホスト・それ以外のクエリは保持し、障害追跡性を落とさない。
+pub(crate) fn redact_credential_query_params(input: &str) -> String {
+    static CREDENTIAL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)([?&](?:x-goog-api-key|x-api-key|x-auth-token|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|authorization|sig|signature|key|token|secret|code)=)[^&\s#"<>]+"#,
+        )
+        .expect("credential query regex must compile")
+    });
+
+    CREDENTIAL_QUERY
+        .replace_all(input, "$1<redacted>")
+        .into_owned()
+}
+
 impl ProviderError {
     /// API エラーを、下位エラーを `source()` に保持した状態で構築する。
     pub fn api_error_with_source(
@@ -211,7 +230,7 @@ impl ProviderError {
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         ProviderError::ApiErrorWithSource {
-            message: message.into(),
+            message: redact_credential_query_params(&message.into()),
             source: Box::new(source),
         }
     }
@@ -222,7 +241,7 @@ impl ProviderError {
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         ProviderError::NetworkErrorWithSource {
-            message: message.into(),
+            message: redact_credential_query_params(&message.into()),
             source: Box::new(source),
         }
     }
@@ -234,7 +253,7 @@ impl ProviderError {
     /// エラーは必ずこのヘルパを通す。
     pub fn api_error_with_status(message: impl Into<String>, status_code: u16) -> Self {
         ProviderError::ApiErrorWithStatus {
-            message: message.into(),
+            message: redact_credential_query_params(&message.into()),
             status_code,
         }
     }
@@ -256,10 +275,10 @@ impl ProviderError {
         response_body: Option<String>,
     ) -> Self {
         ProviderError::ApiErrorWithHeaders {
-            message: message.into(),
+            message: redact_credential_query_params(&message.into()),
             status_code,
             response_headers,
-            response_body,
+            response_body: response_body.map(|body| redact_credential_query_params(&body)),
         }
     }
 
@@ -299,7 +318,7 @@ impl ProviderError {
     }
 
     pub fn context_overflow(message: impl Into<String>) -> Self {
-        ProviderError::ContextOverflow(message.into())
+        ProviderError::ContextOverflow(redact_credential_query_params(&message.into()))
     }
 
     pub fn is_overflow(message: &str) -> bool {
@@ -422,7 +441,9 @@ fn format_error_message(provider_id: &str, error: &ProviderError) -> String {
     {
         return "Please reauthenticate with the copilot provider to ensure your credentials work properly with OpenCode.".to_string();
     }
-    error.to_string()
+    // 直接バリアントを構築する呼び出し側（文字列化済みのエラー）もここで
+    // credential クエリを落とし、parse 結果・session ログへの漏洩を防ぐ。
+    redact_credential_query_params(&error.to_string())
 }
 
 /// 構造化エラーへ渡すレスポンスヘッダをサニタイズする共通ヘルパ。
@@ -1418,5 +1439,73 @@ mod tests {
         assert_eq!(carried.get("retry-after").map(String::as_str), Some("3"));
         assert!(!carried.values().any(|value| value.contains("secret")));
         assert!(!error.to_string().contains("secret"));
+    }
+
+    /// 回帰ガード: credential クエリ値がエラー文字列へ残らないこと。
+    #[test]
+    fn test_redact_credential_query_params_hides_known_keys() {
+        let secret = "supersecret-value-123";
+        for input in [
+            format!("https://api.example.com/v1?key={secret}&model=gpt-4"),
+            format!("https://api.example.com/v1?api_key={secret}"),
+            format!("https://api.example.com/v1?token={secret}"),
+            format!("https://api.example.com/v1?access_token={secret}"),
+            format!("https://api.example.com/v1&x-api-key={secret}"),
+            format!("https://api.example.com/v1?x-goog-api-key={secret}"),
+        ] {
+            let redacted = redact_credential_query_params(&input);
+            assert!(!redacted.contains(secret), "leak: {redacted}");
+            assert!(redacted.contains("<redacted>"), "no marker: {redacted}");
+        }
+
+        // 非機微クエリとホストは保持し、障害追跡性を落とさない。
+        let safe = redact_credential_query_params("https://api.example.com/v1?model=gpt-4&limit=2");
+        assert_eq!(safe, "https://api.example.com/v1?model=gpt-4&limit=2");
+    }
+
+    /// 回帰ガード: 共通コンストラクタを通す全生成経路で redact されること。
+    #[test]
+    fn test_error_constructors_redact_credentials_in_message() {
+        let secret = "supersecret-value-123";
+        let network = ProviderError::network_error_with_source(
+            format!("request to https://api.example.com/v1?key={secret} failed"),
+            std::io::Error::other("boom"),
+        );
+        assert!(!network.to_string().contains(secret));
+        assert!(network.to_string().contains("<redacted>"));
+
+        let api = ProviderError::api_error_with_status(
+            format!("call https://api.example.com?api_key={secret} failed"),
+            400,
+        );
+        assert!(!api.to_string().contains(secret));
+
+        let with_headers = ProviderError::api_error_with_headers(
+            429,
+            format!("rate limited at https://api.example.com?token={secret}"),
+            None,
+            Some(format!("see https://api.example.com?key={secret}")),
+        );
+        assert!(!with_headers.to_string().contains(secret));
+        assert!(!with_headers.response_body().expect("body").contains(secret));
+
+        let overflow = ProviderError::context_overflow(format!("too long ?token={secret}"));
+        assert!(!overflow.to_string().contains(secret));
+    }
+
+    /// 回帰ガード: 直接バリアント構築されたエラーも parse 時に redact されること。
+    #[test]
+    fn test_parse_api_call_error_redacts_directly_constructed_error() {
+        let secret = "supersecret-value-123";
+        let error = ProviderError::ApiError(format!(
+            "request to https://api.example.com/v1?token={secret} failed"
+        ));
+        match parse_api_call_error("openai", &error) {
+            ParsedAPICallError::ApiError { message, .. } => {
+                assert!(!message.contains(secret), "leak: {message}");
+                assert!(message.contains("<redacted>"));
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
     }
 }

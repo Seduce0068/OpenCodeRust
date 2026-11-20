@@ -8,6 +8,28 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 
+/// auth store の読み込み失敗。
+///
+/// 以前は I/O エラーと JSON 破損を「空の store」へ丸めて fail-open していた。
+/// 認証状態や PKCE state を黙って捨てると security 上問題があるため、
+/// 失敗を型として呼び出し側へ伝播できるようにする。
+#[derive(Debug, thiserror::Error)]
+pub enum AuthStoreError {
+    #[error("failed to read MCP auth store: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse MCP auth store: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl From<AuthStoreError> for std::io::Error {
+    fn from(error: AuthStoreError) -> Self {
+        match error {
+            AuthStoreError::Io(io_error) => io_error,
+            AuthStoreError::Json(json_error) => std::io::Error::other(json_error),
+        }
+    }
+}
+
 /// OAuth tokens obtained from the authorization server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -71,18 +93,41 @@ fn auth_file_path() -> PathBuf {
     data_dir.join("mcp-auth.json")
 }
 
-/// Read the entire auth store from disk.
-async fn read_all() -> HashMap<String, AuthEntry> {
+/// Read the entire auth store from disk, propagating I/O and JSON failures.
+///
+/// I/O エラー・JSON 破損を空 store へ丸めず [`AuthStoreError`] として返す。
+/// 新規コードはこの関数（または `try_*` 公開 API）を使うこと。
+async fn read_all() -> Result<HashMap<String, AuthEntry>, AuthStoreError> {
     let path = auth_file_path();
-    match fs::read_to_string(&path).await {
-        Ok(contents) => {
-            // On Unix, tighten a pre-existing over-permissive store on access.
-            // This is best-effort and never changes the read result.
-            #[cfg(unix)]
-            tighten_permissions(&path).await;
-            serde_json::from_str(&contents).unwrap_or_default()
+    // 未作成ファイルは初回状態なので空 store として扱う。破損や権限エラーは
+    // fail-loud を維持するため、NotFound のみ特別扱いする。
+    let contents = match fs::read_to_string(&path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(AuthStoreError::Io(error)),
+    };
+    // On Unix, tighten a pre-existing over-permissive store on access.
+    // This is best-effort and never changes the read result.
+    #[cfg(unix)]
+    tighten_permissions(&path).await;
+    Ok(serde_json::from_str(&contents)?)
+}
+
+/// 既存シグネチャ互換のラッパ。
+///
+/// 旧呼び出し側がコンパイルを続けられるように残すが、失敗を黙って飲まずに
+/// `tracing::error!` へ残す（fail-open の検知可能性を担保）。新規コードは
+/// [`read_all`] もしくは `try_*` API を使うこと。
+pub async fn read_all_or_default() -> HashMap<String, AuthEntry> {
+    match read_all().await {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "MCP auth store read failed; falling back to empty store for compatibility"
+            );
+            HashMap::new()
         }
-        Err(_) => HashMap::new(),
     }
 }
 
@@ -184,114 +229,231 @@ fn temp_sibling_path(path: &std::path::Path) -> PathBuf {
 // Public API – mirrors TS McpAuth namespace
 // ---------------------------------------------------------------------------
 
-/// Get the auth entry for a given MCP server name.
+/// Get the auth entry for a given MCP server name, propagating read failures.
+pub async fn try_get(mcp_name: &str) -> Result<Option<AuthEntry>, AuthStoreError> {
+    Ok(read_all().await?.get(mcp_name).cloned())
+}
+
+/// Get the auth entry for a given MCP server name (compatibility wrapper).
+///
+/// 読み込み失敗はログへ残し `None` を返す。新規コードは [`try_get`] を使うこと。
 pub async fn get(mcp_name: &str) -> Option<AuthEntry> {
-    let data = read_all().await;
-    data.get(mcp_name).cloned()
+    try_get(mcp_name).await.unwrap_or_else(|error| {
+        tracing::error!(%error, mcp_name, "MCP auth entry read failed");
+        None
+    })
 }
 
 /// Get the auth entry only if it was stored for the same `server_url`.
-pub async fn get_for_url(mcp_name: &str, server_url: &str) -> Option<AuthEntry> {
-    let entry = get(mcp_name).await?;
-    match &entry.server_url {
+pub async fn try_get_for_url(
+    mcp_name: &str,
+    server_url: &str,
+) -> Result<Option<AuthEntry>, AuthStoreError> {
+    let Some(entry) = try_get(mcp_name).await? else {
+        return Ok(None);
+    };
+    Ok(match &entry.server_url {
         Some(url) if url == server_url => Some(entry),
         _ => None,
-    }
+    })
 }
-/// Persist an auth entry (optionally updating the server URL).
-pub async fn set(
+
+/// Compatibility wrapper for [`try_get_for_url`].
+pub async fn get_for_url(mcp_name: &str, server_url: &str) -> Option<AuthEntry> {
+    try_get_for_url(mcp_name, server_url)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, mcp_name, "MCP auth entry read for URL failed");
+            None
+        })
+}
+
+/// Persist an auth entry, propagating store read/write failures.
+pub async fn try_set(
     mcp_name: &str,
     entry: AuthEntry,
     server_url: Option<&str>,
-) -> Result<(), std::io::Error> {
-    let mut data = read_all().await;
+) -> Result<(), AuthStoreError> {
+    let mut data = read_all().await?;
     let mut entry = entry;
     if let Some(url) = server_url {
         entry.server_url = Some(url.to_string());
     }
     data.insert(mcp_name.to_string(), entry);
-    write_all(&data).await
+    write_all(&data).await?;
+    Ok(())
 }
 
-/// Remove all stored auth data for a server.
-pub async fn remove(mcp_name: &str) -> Result<(), std::io::Error> {
-    let mut data = read_all().await;
+/// Compatibility wrapper for [`try_set`] (legacy `std::io::Error` signature).
+pub async fn set(
+    mcp_name: &str,
+    entry: AuthEntry,
+    server_url: Option<&str>,
+) -> Result<(), std::io::Error> {
+    try_set(mcp_name, entry, server_url)
+        .await
+        .map_err(std::io::Error::from)
+}
+
+/// Remove all stored auth data for a server, propagating failures.
+pub async fn try_remove(mcp_name: &str) -> Result<(), AuthStoreError> {
+    let mut data = read_all().await?;
     data.remove(mcp_name);
-    write_all(&data).await
+    write_all(&data).await?;
+    Ok(())
 }
 
-/// Update only the tokens portion of an entry.
+/// Compatibility wrapper for [`try_remove`].
+pub async fn remove(mcp_name: &str) -> Result<(), std::io::Error> {
+    try_remove(mcp_name).await.map_err(std::io::Error::from)
+}
+
+/// Update only the tokens portion of an entry, propagating failures.
+pub async fn try_update_tokens(
+    mcp_name: &str,
+    tokens: OAuthTokens,
+    server_url: Option<&str>,
+) -> Result<(), AuthStoreError> {
+    let mut entry = try_get(mcp_name).await?.unwrap_or_default();
+    entry.tokens = Some(tokens);
+    try_set(mcp_name, entry, server_url).await
+}
+
+/// Compatibility wrapper for [`try_update_tokens`].
 pub async fn update_tokens(
     mcp_name: &str,
     tokens: OAuthTokens,
     server_url: Option<&str>,
 ) -> Result<(), std::io::Error> {
-    let mut entry = get(mcp_name).await.unwrap_or_default();
-    entry.tokens = Some(tokens);
-    set(mcp_name, entry, server_url).await
+    try_update_tokens(mcp_name, tokens, server_url)
+        .await
+        .map_err(std::io::Error::from)
 }
 
-/// Store the discovered authorization/token endpoints for a server.
+/// Store the discovered authorization/token endpoints, propagating failures.
+pub async fn try_update_endpoints(
+    mcp_name: &str,
+    auth_url: &str,
+    token_url: &str,
+    server_url: Option<&str>,
+) -> Result<(), AuthStoreError> {
+    let mut entry = try_get(mcp_name).await?.unwrap_or_default();
+    entry.auth_url = Some(auth_url.to_string());
+    entry.token_url = Some(token_url.to_string());
+    try_set(mcp_name, entry, server_url).await
+}
+
+/// Compatibility wrapper for [`try_update_endpoints`].
 pub async fn update_endpoints(
     mcp_name: &str,
     auth_url: &str,
     token_url: &str,
     server_url: Option<&str>,
 ) -> Result<(), std::io::Error> {
-    let mut entry = get(mcp_name).await.unwrap_or_default();
-    entry.auth_url = Some(auth_url.to_string());
-    entry.token_url = Some(token_url.to_string());
-    set(mcp_name, entry, server_url).await
+    try_update_endpoints(mcp_name, auth_url, token_url, server_url)
+        .await
+        .map_err(std::io::Error::from)
 }
 
-/// Update only the client info portion of an entry.
+/// Update only the client info portion of an entry, propagating failures.
+pub async fn try_update_client_info(
+    mcp_name: &str,
+    info: OAuthClientInfo,
+    server_url: Option<&str>,
+) -> Result<(), AuthStoreError> {
+    let mut entry = try_get(mcp_name).await?.unwrap_or_default();
+    entry.client_info = Some(info);
+    try_set(mcp_name, entry, server_url).await
+}
+
+/// Compatibility wrapper for [`try_update_client_info`].
 pub async fn update_client_info(
     mcp_name: &str,
     info: OAuthClientInfo,
     server_url: Option<&str>,
 ) -> Result<(), std::io::Error> {
-    let mut entry = get(mcp_name).await.unwrap_or_default();
-    entry.client_info = Some(info);
-    set(mcp_name, entry, server_url).await
+    try_update_client_info(mcp_name, info, server_url)
+        .await
+        .map_err(std::io::Error::from)
 }
 
-/// Store the PKCE code verifier.
+/// Store the PKCE code verifier, propagating failures.
+pub async fn try_update_code_verifier(
+    mcp_name: &str,
+    code_verifier: &str,
+) -> Result<(), AuthStoreError> {
+    let mut entry = try_get(mcp_name).await?.unwrap_or_default();
+    entry.code_verifier = Some(code_verifier.to_string());
+    try_set(mcp_name, entry, None).await
+}
+
+/// Compatibility wrapper for [`try_update_code_verifier`].
 pub async fn update_code_verifier(
     mcp_name: &str,
     code_verifier: &str,
 ) -> Result<(), std::io::Error> {
-    let mut entry = get(mcp_name).await.unwrap_or_default();
-    entry.code_verifier = Some(code_verifier.to_string());
-    set(mcp_name, entry, None).await
+    try_update_code_verifier(mcp_name, code_verifier)
+        .await
+        .map_err(std::io::Error::from)
 }
 
-/// Clear the stored code verifier.
-pub async fn clear_code_verifier(mcp_name: &str) -> Result<(), std::io::Error> {
-    if let Some(mut entry) = get(mcp_name).await {
+/// Clear the stored code verifier, propagating failures.
+pub async fn try_clear_code_verifier(mcp_name: &str) -> Result<(), AuthStoreError> {
+    if let Some(mut entry) = try_get(mcp_name).await? {
         entry.code_verifier = None;
-        set(mcp_name, entry, None).await?;
+        try_set(mcp_name, entry, None).await?;
     }
     Ok(())
 }
-/// Store the OAuth state parameter.
-pub async fn update_oauth_state(mcp_name: &str, state: &str) -> Result<(), std::io::Error> {
-    let mut entry = get(mcp_name).await.unwrap_or_default();
+
+/// Compatibility wrapper for [`try_clear_code_verifier`].
+pub async fn clear_code_verifier(mcp_name: &str) -> Result<(), std::io::Error> {
+    try_clear_code_verifier(mcp_name)
+        .await
+        .map_err(std::io::Error::from)
+}
+
+/// Store the OAuth state parameter, propagating failures.
+pub async fn try_update_oauth_state(mcp_name: &str, state: &str) -> Result<(), AuthStoreError> {
+    let mut entry = try_get(mcp_name).await?.unwrap_or_default();
     entry.oauth_state = Some(state.to_string());
-    set(mcp_name, entry, None).await
+    try_set(mcp_name, entry, None).await
 }
 
-/// Read the stored OAuth state.
+/// Compatibility wrapper for [`try_update_oauth_state`].
+pub async fn update_oauth_state(mcp_name: &str, state: &str) -> Result<(), std::io::Error> {
+    try_update_oauth_state(mcp_name, state)
+        .await
+        .map_err(std::io::Error::from)
+}
+
+/// Read the stored OAuth state, propagating read failures.
+pub async fn try_get_oauth_state(mcp_name: &str) -> Result<Option<String>, AuthStoreError> {
+    Ok(try_get(mcp_name).await?.and_then(|entry| entry.oauth_state))
+}
+
+/// Compatibility wrapper for [`try_get_oauth_state`].
 pub async fn get_oauth_state(mcp_name: &str) -> Option<String> {
-    get(mcp_name).await.and_then(|e| e.oauth_state)
+    try_get_oauth_state(mcp_name).await.unwrap_or_else(|error| {
+        tracing::error!(%error, mcp_name, "MCP OAuth state read failed");
+        None
+    })
 }
 
-/// Clear the stored OAuth state.
-pub async fn clear_oauth_state(mcp_name: &str) -> Result<(), std::io::Error> {
-    if let Some(mut entry) = get(mcp_name).await {
+/// Clear the stored OAuth state, propagating failures.
+pub async fn try_clear_oauth_state(mcp_name: &str) -> Result<(), AuthStoreError> {
+    if let Some(mut entry) = try_get(mcp_name).await? {
         entry.oauth_state = None;
-        set(mcp_name, entry, None).await?;
+        try_set(mcp_name, entry, None).await?;
     }
     Ok(())
+}
+
+/// Compatibility wrapper for [`try_clear_oauth_state`].
+pub async fn clear_oauth_state(mcp_name: &str) -> Result<(), std::io::Error> {
+    try_clear_oauth_state(mcp_name)
+        .await
+        .map_err(std::io::Error::from)
 }
 
 /// Check whether stored tokens are expired.
@@ -442,7 +604,7 @@ mod tests {
         std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o644))
             .expect("set 0644");
 
-        let _ = read_all().await;
+        let _ = read_all().await.expect("valid JSON store must load");
 
         assert_eq!(
             permission_mode(&tmp.path),
@@ -533,7 +695,81 @@ mod tests {
     async fn scenario_missing_file_reads_empty() {
         let tmp = TempAuthFile::new("missing");
         tmp.activate();
-        assert!(read_all().await.is_empty());
+        // 未作成ファイルは初回状態なので空を返す。破損・権限エラーは fail-loud
+        // （下の scenario_corrupt_store_fails_loud で検証）。
+        assert!(
+            read_all()
+                .await
+                .expect("missing store is an empty store")
+                .is_empty(),
+            "a missing store must be treated as empty so first-time writes work"
+        );
+    }
+
+    /// 回帰ガード: JSON 破損を空 store へ丸めず fail-loud にすること。
+    async fn scenario_corrupt_store_fails_loud() {
+        let tmp = TempAuthFile::new("corrupt");
+        tmp.activate();
+        std::fs::write(&tmp.path, "{not valid json").expect("seed corrupt store");
+
+        assert!(matches!(read_all().await, Err(AuthStoreError::Json(_))));
+        assert!(try_get("server").await.is_err());
+        assert!(try_get_for_url("server", "https://example.com")
+            .await
+            .is_err());
+        assert!(try_get_oauth_state("server").await.is_err());
+        assert!(try_set("server", entry(None), None).await.is_err());
+        // 互換ラッパは落ちずに空を返す（失敗は tracing::error! に残る）。
+        assert!(get("server").await.is_none());
+    }
+
+    /// 回帰ガード: I/O エラーも fail-loud に伝播すること。
+    #[cfg(unix)]
+    async fn scenario_io_failure_fails_loud() {
+        let tmp = TempAuthFile::new("io-failure");
+        let directory = tmp.dir.join("not-a-file");
+        std::fs::create_dir_all(&directory).expect("create directory");
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &directory);
+
+        assert!(matches!(read_all().await, Err(AuthStoreError::Io(_))));
+        assert!(try_get("server").await.is_err());
+    }
+
+    /// 回帰ガード: try_* API が正常系で既存の永続化動作を維持すること。
+    async fn scenario_try_api_preserves_valid_store() {
+        let tmp = TempAuthFile::new("try-api");
+        tmp.activate();
+        try_update_tokens(
+            "server",
+            OAuthTokens {
+                access_token: "dummy-access".to_owned(),
+                refresh_token: None,
+                expires_at: None,
+                scope: None,
+            },
+            Some("https://example.com"),
+        )
+        .await
+        .expect("store tokens");
+
+        let loaded = try_get_for_url("server", "https://example.com")
+            .await
+            .expect("read must succeed")
+            .expect("entry must exist");
+        assert_eq!(loaded.tokens.expect("tokens").access_token, "dummy-access");
+
+        try_update_oauth_state("server", "state-1")
+            .await
+            .expect("store state");
+        assert_eq!(
+            try_get_oauth_state("server").await.expect("read state"),
+            Some("state-1".to_string())
+        );
+        try_clear_oauth_state("server").await.expect("clear state");
+        assert_eq!(
+            try_get_oauth_state("server").await.expect("read state"),
+            None
+        );
     }
 
     /// Env-var based scenarios run serially because the variable is global.
@@ -548,5 +784,9 @@ mod tests {
         #[cfg(unix)]
         scenario_concurrent_writes_never_expose_partial_json().await;
         scenario_missing_file_reads_empty().await;
+        scenario_corrupt_store_fails_loud().await;
+        #[cfg(unix)]
+        scenario_io_failure_fails_loud().await;
+        scenario_try_api_preserves_valid_store().await;
     }
 }

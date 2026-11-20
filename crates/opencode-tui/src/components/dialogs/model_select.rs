@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::theme::Theme;
 
-use super::DialogClickMap;
+use super::{command_palette::visible_query_tail, DialogClickMap};
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -217,7 +217,10 @@ impl ModelSelectDialog {
 
         let search_line = Line::from(vec![
             Span::styled("> ", Style::default().fg(theme.primary)),
-            Span::styled(&self.query, Style::default().fg(theme.text)),
+            Span::styled(
+                visible_query_tail(&self.query, inner_area.width),
+                Style::default().fg(theme.text),
+            ),
             Span::styled("▏", Style::default().fg(theme.primary)),
         ]);
 

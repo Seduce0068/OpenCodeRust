@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::theme::Theme;
 
-use super::DialogClickMap;
+use super::{command_palette::visible_query_tail, DialogClickMap};
 
 #[derive(Clone, Debug)]
 pub struct ThemeOption {
@@ -173,7 +173,10 @@ impl ThemeListDialog {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("> ", Style::default().fg(theme.primary)),
-                Span::styled(&self.query, Style::default().fg(theme.text)),
+                Span::styled(
+                    visible_query_tail(&self.query, layout[0].width),
+                    Style::default().fg(theme.text),
+                ),
                 Span::styled("▏", Style::default().fg(theme.primary)),
             ])),
             layout[0],

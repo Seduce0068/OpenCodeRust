@@ -4,11 +4,30 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
 use crate::theme::Theme;
+use unicode_width::UnicodeWidthStr;
+
+/// `Wrap { trim: false }` の Paragraph が `content_width` 内で占める行数を返す。
+///
+/// 空行も 1 行として数え、幅は `UnicodeWidthStr` で測るため全角文字は 2 幅になる。
+pub(crate) fn wrapped_row_count(lines: &[Line<'_>], content_width: u16) -> usize {
+    let width = usize::from(content_width).max(1);
+    lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            line_width.div_ceil(width).max(1)
+        })
+        .sum()
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PermissionType {
@@ -231,19 +250,9 @@ impl PermissionPrompt {
             None => return,
         };
 
-        // キーヒント行を追加したため 9 行（枠 2 行 + 内容 7 行）。
-        let height = 9u16;
         let width = area.width.saturating_sub(2).min(80);
-
-        // Render inline at the bottom of the session area
-        let popup_area = Rect::new(
-            area.x + 1,
-            area.y + area.height.saturating_sub(height + 1),
-            width,
-            height,
-        );
-
-        self.last_rendered_area.set(Some(popup_area));
+        // 枠 2 行分を除いた幅が Paragraph の折り返し幅。
+        let content_width = width.saturating_sub(2).max(1);
 
         let title = format!(
             "{} {} - Permission Request",
@@ -277,6 +286,25 @@ impl PermissionPrompt {
             )),
         ];
 
+        // 固定 9 行ではなく、折り返し後の内容行数 + 枠 2 行で高さを決める。
+        // 長い resource やヒント行が折り返しても末尾まで読める。
+        let wrapped_rows = wrapped_row_count(&content, content_width);
+        let max_height = area.height.saturating_sub(1).max(1);
+        let height = (wrapped_rows as u16)
+            .saturating_add(2)
+            .min(max_height)
+            .max(1);
+
+        // Render inline at the bottom of the session area
+        let popup_area = Rect::new(
+            area.x + 1,
+            area.y + area.height.saturating_sub(height + 1),
+            width,
+            height,
+        );
+
+        self.last_rendered_area.set(Some(popup_area));
+
         let paragraph = Paragraph::new(content)
             .block(
                 Block::default()
@@ -284,7 +312,8 @@ impl PermissionPrompt {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.warning)),
             )
-            .style(Style::default().bg(theme.background_panel));
+            .style(Style::default().bg(theme.background_panel))
+            .wrap(Wrap { trim: false });
 
         frame.render_widget(paragraph, popup_area);
     }
@@ -299,6 +328,29 @@ impl Default for PermissionPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// TestBackend に描画し、バッファの文本内容を文字列として返すヘルパー。
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        draw: impl for<'a> FnOnce(&mut Frame<'a>),
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal.draw(draw).expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
 
     fn sample_request() -> PermissionRequest {
         PermissionRequest {
@@ -625,6 +677,43 @@ mod tests {
         assert!(PERMISSION_KEY_HINT.contains("Enter: Deny"));
         assert!(PERMISSION_KEY_HINT.contains("Esc: Deny"));
         assert!(!PERMISSION_KEY_HINT.contains("Enter: Allow"));
+    }
+
+    #[test]
+    fn wrapped_row_count_counts_wrapped_and_empty_lines() {
+        let lines = vec![
+            Line::from("a".repeat(10)),
+            Line::from(""),
+            Line::from("日本語"),
+        ];
+        assert_eq!(wrapped_row_count(&lines, 5), 2 + 1 + 2);
+    }
+
+    #[test]
+    fn render_wraps_long_resource_and_keeps_the_tail_visible() {
+        let mut prompt = PermissionPrompt::new();
+        let request = PermissionRequest {
+            id: "perm-long".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: format!("HEAD-{} -TAIL", "x".repeat(150)),
+            tool_name: "bash".to_string(),
+        };
+        prompt.add_request(request);
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            prompt.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("HEAD-"), "resource head should render");
+        assert!(
+            text.contains("-TAIL"),
+            "the end of a long resource must be wrapped and visible"
+        );
+        assert!(
+            text.contains("[a] Always allow"),
+            "approval buttons must still be rendered"
+        );
     }
 
     #[test]

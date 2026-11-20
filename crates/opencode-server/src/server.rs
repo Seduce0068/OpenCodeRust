@@ -780,9 +780,14 @@ impl ServerState {
         let mut manager = self.sessions.lock().await;
 
         for stored in stored_sessions {
-            let stored_messages: Vec<opencode_session::SessionMessage> = serde_json::from_value(
-                serde_json::to_value(message_repo.list_for_session(&stored.id.0).await?)?,
-            )?;
+            // session 側 MessageRole には serde rename が無いため、JSON 往復では
+            // types 側の小文字 role を読めない。明示変換で enum を直接写す。
+            let stored_messages: Vec<opencode_session::SessionMessage> = message_repo
+                .list_for_session(&stored.id.0)
+                .await?
+                .into_iter()
+                .map(session_message_from_stored)
+                .collect();
             let session = opencode_session::Session {
                 id: stored.id.0,
                 slug: stored.slug,
@@ -840,7 +845,9 @@ impl ServerState {
                         opencode_session::SessionStatus::Compacting
                     }
                 },
-                metadata: HashMap::new(),
+                // 従来は空 HashMap で上書きしており、保存済み metadata を
+                // 起動時に失していた。保存値をそのまま復元する。
+                metadata: stored.metadata,
                 created_at: stored.created_at,
                 updated_at: stored.updated_at,
             };
@@ -872,12 +879,17 @@ impl ServerState {
         }
 
         for session in snapshot {
-            let stored_session: opencode_types::Session =
-                serde_json::from_value(serde_json::to_value(&session)?)?;
+            // serde_json 往復では usage / metadata / synthetic / ignored が落ち、
+            // session 側 SessionUsage と types 側 TokenUsage の JSON スキーマ差で
+            // 変換自体が失敗しうる。フィールド単位の明示変換を使う。
+            let stored_session = stored_session_from_session(&session);
 
             // Convert messages to opencode_types::SessionMessage
-            let messages: Vec<opencode_types::SessionMessage> =
-                serde_json::from_value(serde_json::to_value(&session.messages)?)?;
+            let messages: Vec<opencode_types::SessionMessage> = session
+                .messages
+                .iter()
+                .map(stored_message_from_session)
+                .collect();
 
             if session_repo.get(&stored_session.id.0).await?.is_some() {
                 session_repo.update(&stored_session).await?;
@@ -920,6 +932,344 @@ fn restore_session_summary(
                 })
                 .collect(),
         ),
+    }
+}
+
+/// in-memory の role を永続化用 role へ変換する（文字列を経由しない）。
+fn stored_role(role: &opencode_session::MessageRole) -> opencode_types::MessageRole {
+    match role {
+        opencode_session::MessageRole::User => opencode_types::MessageRole::User,
+        opencode_session::MessageRole::Assistant => opencode_types::MessageRole::Assistant,
+        opencode_session::MessageRole::System => opencode_types::MessageRole::System,
+        opencode_session::MessageRole::Tool => opencode_types::MessageRole::Tool,
+    }
+}
+
+/// 永続化用 role を in-memory の role へ変換する（文字列を経由しない）。
+/// session 側 `MessageRole` には serde rename が無いため、JSON 往復に依存すると
+/// types 側の小文字 wire 形式を読めない。
+fn session_role(role: &opencode_types::MessageRole) -> opencode_session::MessageRole {
+    match role {
+        opencode_types::MessageRole::User => opencode_session::MessageRole::User,
+        opencode_types::MessageRole::Assistant => opencode_session::MessageRole::Assistant,
+        opencode_types::MessageRole::System => opencode_session::MessageRole::System,
+        opencode_types::MessageRole::Tool => opencode_session::MessageRole::Tool,
+    }
+}
+
+/// in-memory のメッセージ部分を永続化用へ変換する。
+///
+/// `PartType::Text` の `synthetic` / `ignored` は session 側にしか無かったため、
+/// serde の往復では失われていた。types 側へ同じフィールドを追加した上で、
+/// ここでも明示的に受け渡す。
+fn stored_part_from_session(part: &opencode_session::MessagePart) -> opencode_types::MessagePart {
+    use opencode_session::PartType as SessionPart;
+    use opencode_types::PartType as StoredPart;
+
+    let part_type = match &part.part_type {
+        SessionPart::Text {
+            text,
+            synthetic,
+            ignored,
+        } => StoredPart::Text {
+            text: text.clone(),
+            synthetic: *synthetic,
+            ignored: *ignored,
+        },
+        SessionPart::ToolCall { id, name, input } => StoredPart::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        SessionPart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } => StoredPart::ToolResult {
+            tool_call_id: tool_call_id.clone(),
+            content: content.clone(),
+            is_error: *is_error,
+        },
+        SessionPart::Reasoning { text } => StoredPart::Reasoning { text: text.clone() },
+        SessionPart::File {
+            url,
+            filename,
+            mime,
+        } => StoredPart::File {
+            url: url.clone(),
+            filename: filename.clone(),
+            mime: mime.clone(),
+        },
+        SessionPart::StepStart { id, name } => StoredPart::StepStart {
+            id: id.clone(),
+            name: name.clone(),
+        },
+        SessionPart::StepFinish { id, output } => StoredPart::StepFinish {
+            id: id.clone(),
+            output: output.clone(),
+        },
+        SessionPart::Snapshot { content } => StoredPart::Snapshot {
+            content: content.clone(),
+        },
+        SessionPart::Patch {
+            old_string,
+            new_string,
+            filepath,
+        } => StoredPart::Patch {
+            old_string: old_string.clone(),
+            new_string: new_string.clone(),
+            filepath: filepath.clone(),
+        },
+        SessionPart::Agent { name, status } => StoredPart::Agent {
+            name: name.clone(),
+            status: status.clone(),
+        },
+        SessionPart::Subtask {
+            id,
+            description,
+            status,
+        } => StoredPart::Subtask {
+            id: id.clone(),
+            description: description.clone(),
+            status: status.clone(),
+        },
+        SessionPart::Retry { count, reason } => StoredPart::Retry {
+            count: *count,
+            reason: reason.clone(),
+        },
+        SessionPart::Compaction { summary } => StoredPart::Compaction {
+            summary: summary.clone(),
+        },
+    };
+
+    opencode_types::MessagePart {
+        id: part.id.clone(),
+        part_type,
+        created_at: part.created_at,
+        message_id: part.message_id.clone(),
+    }
+}
+
+/// 永続化用メッセージ部分を in-memory の表現へ変換する。
+fn session_part_from_stored(part: opencode_types::MessagePart) -> opencode_session::MessagePart {
+    use opencode_session::PartType as SessionPart;
+    use opencode_types::PartType as StoredPart;
+
+    let part_type = match part.part_type {
+        StoredPart::Text {
+            text,
+            synthetic,
+            ignored,
+        } => SessionPart::Text {
+            text,
+            synthetic,
+            ignored,
+        },
+        StoredPart::ToolCall { id, name, input } => SessionPart::ToolCall { id, name, input },
+        StoredPart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } => SessionPart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        },
+        StoredPart::Reasoning { text } => SessionPart::Reasoning { text },
+        StoredPart::File {
+            url,
+            filename,
+            mime,
+        } => SessionPart::File {
+            url,
+            filename,
+            mime,
+        },
+        StoredPart::StepStart { id, name } => SessionPart::StepStart { id, name },
+        StoredPart::StepFinish { id, output } => SessionPart::StepFinish { id, output },
+        StoredPart::Snapshot { content } => SessionPart::Snapshot { content },
+        StoredPart::Patch {
+            old_string,
+            new_string,
+            filepath,
+        } => SessionPart::Patch {
+            old_string,
+            new_string,
+            filepath,
+        },
+        StoredPart::Agent { name, status } => SessionPart::Agent { name, status },
+        StoredPart::Subtask {
+            id,
+            description,
+            status,
+        } => SessionPart::Subtask {
+            id,
+            description,
+            status,
+        },
+        StoredPart::Retry { count, reason } => SessionPart::Retry { count, reason },
+        StoredPart::Compaction { summary } => SessionPart::Compaction { summary },
+    };
+
+    opencode_session::MessagePart {
+        id: part.id,
+        part_type,
+        created_at: part.created_at,
+        message_id: part.message_id,
+    }
+}
+
+/// in-memory のメッセージを永続化用へ変換する。
+///
+/// `serde_json::to_value -> from_value` の往復では `usage` / `metadata` /
+/// `synthetic` / `ignored` が失われるため、フィールド単位で写す。
+fn stored_message_from_session(
+    message: &opencode_session::SessionMessage,
+) -> opencode_types::SessionMessage {
+    opencode_types::SessionMessage {
+        id: message.id.clone(),
+        session_id: message.session_id.clone(),
+        role: stored_role(&message.role),
+        parts: message.parts.iter().map(stored_part_from_session).collect(),
+        created_at: message.created_at,
+        metadata: message.metadata.clone(),
+        usage: message
+            .usage
+            .as_ref()
+            .map(|usage| opencode_types::MessageUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                total_cost: usage.total_cost,
+            }),
+    }
+}
+
+/// 永続化用メッセージを in-memory の表現へ変換する。
+fn session_message_from_stored(
+    message: opencode_types::SessionMessage,
+) -> opencode_session::SessionMessage {
+    opencode_session::SessionMessage {
+        id: message.id,
+        session_id: message.session_id,
+        role: session_role(&message.role),
+        parts: message
+            .parts
+            .into_iter()
+            .map(session_part_from_stored)
+            .collect(),
+        created_at: message.created_at,
+        metadata: message.metadata,
+        usage: message.usage.map(|usage| opencode_session::MessageUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            total_cost: usage.total_cost,
+        }),
+    }
+}
+
+/// in-memory のセッションを永続化用 `opencode_types::Session` へ変換する。
+///
+/// `serde_json` を挟むと session 側 `SessionUsage` の JSON 形
+/// (`input_tokens` 等）と types 側 `TokenUsage` の JSON 形（`input` 等）が
+/// 一致せず `missing field` で変換が失敗する。加えて metadata / メッセージの
+/// usage / Text の synthetic / ignored が落ちるため、全フィールドを明示的に写す。
+/// enum は直接 match するため、status / role の wire 形式変更にも影響されない。
+fn stored_session_from_session(session: &opencode_session::Session) -> opencode_types::Session {
+    use opencode_session::SessionStatus as SessionStatusInMemory;
+    use opencode_types::SessionStatus as StoredSessionStatus;
+
+    let status = match &session.status {
+        SessionStatusInMemory::Active => StoredSessionStatus::Active,
+        SessionStatusInMemory::Completed => StoredSessionStatus::Completed,
+        SessionStatusInMemory::Archived => StoredSessionStatus::Archived,
+        SessionStatusInMemory::Compacting => StoredSessionStatus::Compacting,
+    };
+
+    opencode_types::Session {
+        id: opencode_types::SessionID(session.id.clone()),
+        slug: session.slug.clone(),
+        project_id: opencode_types::ProjectID(session.project_id.clone()),
+        directory: session.directory.clone(),
+        parent_id: session.parent_id.clone().map(opencode_types::SessionID),
+        title: session.title.clone(),
+        version: session.version.clone(),
+        time: opencode_types::TimeInfo {
+            created: session.time.created as u64,
+            updated: session.time.updated as u64,
+            compacting: session.time.compacting.map(|t| t as u64),
+            archived: session.time.archived.map(|t| t as u64),
+        },
+        messages: session
+            .messages
+            .iter()
+            .map(stored_message_from_session)
+            .collect(),
+        summary: session
+            .summary
+            .as_ref()
+            .map(|summary| opencode_types::SessionSummary {
+                additions: summary.additions,
+                deletions: summary.deletions,
+                files: summary.files,
+                diffs: summary
+                    .diffs
+                    .as_ref()
+                    .map(|diffs| {
+                        diffs
+                            .iter()
+                            .map(|diff| opencode_types::FileDiff {
+                                path: diff.path.clone(),
+                                additions: diff.additions,
+                                deletions: diff.deletions,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+        share: session
+            .share
+            .as_ref()
+            .map(|share| opencode_types::SessionShareInfo {
+                url: share.url.clone(),
+            }),
+        revert: session
+            .revert
+            .as_ref()
+            .map(|revert| opencode_types::SessionRevert {
+                message_id: revert.message_id.clone(),
+                part_id: revert.part_id.clone(),
+                snapshot: revert.snapshot.clone(),
+                diff: revert.diff.clone(),
+            }),
+        permission: session.permission.as_ref().map(|permission| {
+            opencode_types::PermissionRuleset {
+                allow: permission.allow.clone(),
+                deny: permission.deny.clone(),
+                mode: permission.mode.clone(),
+            }
+        }),
+        usage: session
+            .usage
+            .as_ref()
+            .map(|usage| opencode_types::TokenUsage {
+                input: usage.input_tokens as f64,
+                output: usage.output_tokens as f64,
+                reasoning: usage.reasoning_tokens as f64,
+                cache: opencode_types::CacheUsage {
+                    read: usage.cache_read_tokens as f64,
+                    write: usage.cache_write_tokens as f64,
+                },
+            }),
+        status,
+        metadata: session.metadata.clone(),
+        created_at: session.created_at,
+        updated_at: session.updated_at,
     }
 }
 
@@ -3225,5 +3575,154 @@ mod tests {
             !signature.contains("key:"),
             "key value must not be passed in"
         );
+    }
+
+    /// R2(high) 回帰: session -> types の明示変換で usage / metadata /
+    /// synthetic / ignored が落ちず、JSON 往復でも保持されること。
+    #[test]
+    fn stored_session_conversion_preserves_wire_fields() {
+        let mut session = opencode_session::Session::new("proj-wire", "/work");
+        session
+            .metadata
+            .insert("source".to_string(), serde_json::json!("wire-test"));
+        session.usage = Some(opencode_session::SessionUsage {
+            input_tokens: 101,
+            output_tokens: 202,
+            reasoning_tokens: 303,
+            cache_write_tokens: 404,
+            cache_read_tokens: 505,
+            total_cost: 0.75,
+        });
+
+        let mut message = opencode_session::SessionMessage::user(&session.id, "hello");
+        message
+            .metadata
+            .insert("tag".to_string(), serde_json::json!("kept"));
+        message.usage = Some(opencode_session::MessageUsage {
+            input_tokens: 11,
+            output_tokens: 22,
+            reasoning_tokens: 33,
+            cache_write_tokens: 44,
+            cache_read_tokens: 55,
+            total_cost: 0.125,
+        });
+        message.parts = vec![opencode_session::MessagePart {
+            id: "prt_flags".to_string(),
+            part_type: opencode_session::PartType::Text {
+                text: "flagged".to_string(),
+                synthetic: Some(true),
+                ignored: Some(false),
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        }];
+        session.messages.push(message);
+
+        let stored = stored_session_from_session(&session);
+
+        // wire 形式は小文字に正規化される（alias で旧形式も読めることは types 側で検証）。
+        let stored_value = serde_json::to_value(&stored).unwrap();
+        assert_eq!(stored_value["status"], serde_json::json!("active"));
+        assert_eq!(
+            serde_json::to_value(&stored.messages[0]).unwrap()["role"],
+            serde_json::json!("user")
+        );
+
+        // セッション単位 usage / metadata が保持される。
+        assert_eq!(stored.metadata, session.metadata);
+        let usage = stored.usage.as_ref().expect("session usage preserved");
+        assert_eq!(usage.input, 101.0);
+        assert_eq!(usage.output, 202.0);
+        assert_eq!(usage.reasoning, 303.0);
+        assert_eq!(usage.cache.write, 404.0);
+        assert_eq!(usage.cache.read, 505.0);
+
+        // メッセージ単位 usage / metadata / Text フラグが保持される。
+        let stored_message = &stored.messages[0];
+        assert_eq!(stored_message.metadata, session.messages[0].metadata);
+        let message_usage = stored_message
+            .usage
+            .as_ref()
+            .expect("message usage preserved");
+        assert_eq!(message_usage.input_tokens, 11);
+        assert_eq!(message_usage.output_tokens, 22);
+        assert_eq!(message_usage.reasoning_tokens, 33);
+        assert_eq!(message_usage.cache_write_tokens, 44);
+        assert_eq!(message_usage.cache_read_tokens, 55);
+        assert_eq!(message_usage.total_cost, 0.125);
+        match &stored_message.parts[0].part_type {
+            opencode_types::PartType::Text {
+                synthetic, ignored, ..
+            } => {
+                assert_eq!(*synthetic, Some(true));
+                assert_eq!(*ignored, Some(false));
+            }
+            other => panic!("unexpected part type: {other:?}"),
+        }
+
+        // その後の JSON 往復でも情報が落ちない。
+        // Session.messages は #[serde(skip)] なので、メッセージは個別に往復検証する。
+        let decoded: opencode_types::Session = serde_json::from_value(stored_value).unwrap();
+        assert_eq!(decoded.metadata, stored.metadata);
+        assert_eq!(decoded.usage, stored.usage);
+
+        let message_value = serde_json::to_value(stored_message).unwrap();
+        let decoded_message: opencode_types::SessionMessage =
+            serde_json::from_value(message_value).unwrap();
+        assert_eq!(decoded_message.usage, stored_message.usage);
+        assert_eq!(decoded_message.metadata, stored_message.metadata);
+        assert_eq!(
+            decoded_message.parts[0].part_type,
+            stored_message.parts[0].part_type
+        );
+    }
+
+    /// R2(high) 回帰: types -> session の明示変換が role の wire 形式に依存せず、
+    /// PascalCase / lowercase どちらの入力 JSON からでも同じ enum へ復元されること。
+    #[test]
+    fn session_message_conversion_is_independent_of_role_wire_case() {
+        for raw in ["user", "User"] {
+            let message: opencode_types::SessionMessage =
+                serde_json::from_value(serde_json::json!({
+                    "id": "msg_wire",
+                    "session_id": "sess_wire",
+                    "role": raw,
+                    "parts": [{
+                        "id": "prt_wire",
+                        "part_type": { "type": "text", "text": "hi" },
+                        "created_at": "2024-01-01T00:00:00Z"
+                    }],
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "metadata": {},
+                }))
+                .unwrap_or_else(|error| panic!("role {raw} must deserialize: {error}"));
+
+            let restored = session_message_from_stored(message);
+            assert_eq!(restored.role, opencode_session::MessageRole::User);
+            assert_eq!(restored.get_text(), "hi");
+        }
+
+        // 逆方向の enum 変換も全バリアントで一致する。
+        for (stored, expected) in [
+            (
+                opencode_types::MessageRole::User,
+                opencode_session::MessageRole::User,
+            ),
+            (
+                opencode_types::MessageRole::Assistant,
+                opencode_session::MessageRole::Assistant,
+            ),
+            (
+                opencode_types::MessageRole::System,
+                opencode_session::MessageRole::System,
+            ),
+            (
+                opencode_types::MessageRole::Tool,
+                opencode_session::MessageRole::Tool,
+            ),
+        ] {
+            assert_eq!(session_role(&stored), expected);
+            assert_eq!(stored_role(&expected), stored);
+        }
     }
 }

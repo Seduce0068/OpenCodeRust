@@ -2,6 +2,7 @@
 name = "opencode-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
@@ -21,7 +22,7 @@ opencode-provider = { path = "../opencode-provider" }
 opencode-plugin = { path = "../opencode-plugin" }
 opencode-session = { path = "../opencode-session" }
 opencode-storage = { path = "../opencode-storage" }
-opencode-tool = { path = "../opencode-tool" }
+opencode-tool = { path = "../opencode-tool", features = ["lsp"] }
 opencode-tui = { path = "../opencode-tui" }
 opencode-types = { path = "../opencode-types" }
 opencode-command = { path = "../opencode-command" }

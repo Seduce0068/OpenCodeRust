@@ -9,8 +9,36 @@ use ratatui::{
 use crate::command::{fuzzy_match, CommandAction};
 use crate::context::MessageDensity;
 use crate::theme::Theme;
+use unicode_width::UnicodeWidthStr;
 
 use super::DialogClickMap;
+
+/// 検索行の `"> "` とカーソル `"▏"` の表示幅。
+const SEARCH_PREFIX_WIDTH: usize = 2;
+const SEARCH_CURSOR_WIDTH: usize = 1;
+
+/// 検索/入力行の先頭を省略し、末尾（カーソル位置）が見える入力文字列を返す。
+///
+/// `"> " + query + "▏"` の幅が `inner_width` を超えた場合だけ先頭を切り詰める。
+/// 幅は `UnicodeWidthStr` で測り、`char_indices` で Unicode 境界のみを省略するため
+/// 全角文字の途中で切れない。担当パス内に置く共通ヘルパとして各ダイアログから利用する。
+pub(crate) fn visible_query_tail(query: &str, inner_width: u16) -> &str {
+    let width = usize::from(inner_width);
+    let total_width = SEARCH_PREFIX_WIDTH + query.width() + SEARCH_CURSOR_WIDTH;
+    if total_width <= width {
+        return query;
+    }
+
+    let max_query_width = width.saturating_sub(SEARCH_PREFIX_WIDTH + SEARCH_CURSOR_WIDTH);
+    let mut skip = 0usize;
+    for (idx, ch) in query.char_indices() {
+        if query[idx..].width() <= max_query_width {
+            break;
+        }
+        skip = idx + ch.len_utf8();
+    }
+    &query[skip..]
+}
 
 #[derive(Clone, Debug)]
 pub struct Command {
@@ -414,7 +442,10 @@ impl CommandPalette {
 
         let search_line = Line::from(vec![
             Span::styled("> ", Style::default().fg(theme.primary)),
-            Span::styled(&self.query, Style::default().fg(theme.text)),
+            Span::styled(
+                visible_query_tail(&self.query, inner_area.width),
+                Style::default().fg(theme.text),
+            ),
             Span::styled("▏", Style::default().fg(theme.primary)),
         ]);
 
@@ -1047,5 +1078,52 @@ mod tests {
         assert!(text.contains("Commands"), "dialog title");
         assert!(text.contains("help"), "query text");
         assert!(text.contains("Show help"), "filtered command title");
+    }
+
+    // --- 検索行の水平スクロール ---
+
+    #[test]
+    fn visible_query_tail_keeps_short_query_unchanged() {
+        assert_eq!(visible_query_tail("help", 10), "help");
+        // "> "(2) + "help"(4) + "▏"(1) == 7
+        assert_eq!(visible_query_tail("help", 7), "help");
+    }
+
+    #[test]
+    fn visible_query_tail_drops_head_and_keeps_cursor_side() {
+        // inner_width 12 -> 入力に使える幅は 12 - 2 - 1 = 9
+        assert_eq!(visible_query_tail("abcdefghijklmnop", 12), "hijklmnop");
+    }
+
+    #[test]
+    fn visible_query_tail_does_not_split_wide_chars() {
+        let tail = visible_query_tail("日本語テスト", 12);
+        assert_eq!(tail, "語テスト");
+        assert_eq!(tail.width(), 8);
+    }
+
+    #[test]
+    fn render_with_long_query_shows_the_tail_and_cursor() {
+        let mut palette = CommandPalette::new();
+        palette.open();
+        let long_query = format!("HEADMARK{}TAILMARK", "x".repeat(80));
+        for c in long_query.chars() {
+            palette.handle_input(c);
+        }
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            palette.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.contains("TAILMARK"),
+            "the query tail next to the cursor must stay visible"
+        );
+        assert!(
+            !text.contains("HEADMARK"),
+            "the overflowing query head must be scrolled out"
+        );
+        assert!(text.contains("▏"), "cursor must remain visible");
     }
 }
