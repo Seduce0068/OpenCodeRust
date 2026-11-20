@@ -83,4 +83,5 @@ OpenCodeRust サーバモード（`opencoderust serve`）はローカル開発�
 ## Links
 
 - [ADR-0000: プロジェクト憲章](20260115-rust-reimplementation-charter.md)
-- 実装: `server.rs:72-101, 491-539, 1030-1209, 1259-1294`
+- 実装: `server.rs:72-101, 525-563, 1109-1245, 1294-1329`（CORS 判定と
+  `cors_layer` は `ServerState` のメソッドとして再配置済み）
