@@ -271,6 +271,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
 
+    /// Config-scoped variable map used as the primary lookup source for
+    /// `{env:VAR}` placeholders while loading config files. Values from this
+    /// map are never injected into the process environment or into child
+    /// processes; it only feeds text substitution. When a name is absent here,
+    /// loading falls back to the process environment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
 }
@@ -1392,6 +1397,10 @@ pub struct ExperimentalConfig {
     pub primary_tools: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continue_loop_on_deny: Option<bool>,
+    /// Deprecated millisecond MCP timeout. The post-load transform in
+    /// `ConfigLoader::load_all` folds this into `mcp.timeout` as a fallback;
+    /// an explicitly configured `mcp.timeout` always takes precedence. Kept
+    /// only so legacy config files still parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_timeout: Option<u64>,
 }

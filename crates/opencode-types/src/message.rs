@@ -2,6 +2,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// 旧データに `created_at` が無い場合の既定値（UNIX epoch）。
+fn default_message_created_at() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
+}
+
 /// セッション内で送受信される一つのメッセージ。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionMessage {
@@ -14,8 +19,14 @@ pub struct SessionMessage {
     /// メッセージを構成する部分のリスト。
     pub parts: Vec<MessagePart>,
     /// 作成時刻。
+    ///
+    /// 旧データにフィールドが無い場合は UNIX epoch を既定値とする。
+    #[serde(default = "default_message_created_at")]
     pub created_at: DateTime<Utc>,
     /// メッセージに付随する任意のメタデータ。
+    ///
+    /// 旧データにフィールドが無い場合は空の `HashMap` を既定値とする。
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
     /// メッセージ単位のトークン使用量。
     ///
@@ -551,5 +562,30 @@ mod tests {
                 ignored: None,
             }
         );
+    }
+
+    #[test]
+    fn session_message_defaults_metadata_and_created_at_for_legacy_json() {
+        let legacy = json!({
+            "id": "msg_legacy",
+            "session_id": "sess_legacy",
+            "role": "user",
+            "parts": []
+        });
+
+        let decoded: SessionMessage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.id, "msg_legacy");
+        assert_eq!(decoded.session_id, "sess_legacy");
+        assert_eq!(decoded.role, MessageRole::User);
+        assert!(decoded.metadata.is_empty());
+        assert_eq!(decoded.created_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert!(decoded.usage.is_none());
+
+        // 再シリアライズでは従来どおり両フィールドが出力される。
+        let value = serde_json::to_value(&decoded).unwrap();
+        assert!(value.get("metadata").is_some());
+        assert!(value.get("created_at").is_some());
+        let roundtrip: SessionMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, decoded);
     }
 }

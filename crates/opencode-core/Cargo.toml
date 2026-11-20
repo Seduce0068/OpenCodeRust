@@ -16,6 +16,8 @@ hex = { workspace = true }
 tokio = { workspace = true }
 regex = { workspace = true }
 async-trait = { workspace = true }
-tempfile = { workspace = true }
 anyhow = { workspace = true }
 notify = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
