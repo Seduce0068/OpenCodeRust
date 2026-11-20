@@ -178,6 +178,10 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **MCP OAuth テストが OPENCODE_MCP_AUTH_FILE を remove_var で後始末**
+  — `mcp_oauth.rs:826` / TQ-08
+- [ ] **SessionPrompt::start が Once 解放後に再取得し二重開始を許す**
+  — `prompt.rs:881-897` / R1-CONC-10
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -223,6 +227,27 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **`OPENCODE_DISABLE_*` が値を問わず is_ok() で無効化される**
+  — `loader.rs:1535-1542` / CONFIG-ENV-FLAG-ISOK / 高
+- [ ] **OPENCODE_PERMISSION の不正 JSON が無警告で無視され managed より後に適用**
+  — `loader.rs:1487-1497` / CONFIG-PERMISSION-ENV-FAILOPEN / 高
+- [ ] **権限プロンプトの Enter 暗黙 approve と question 未選択確定**
+  — `app.rs:393-397,413-417`, `permission.rs:265-269` / UX-01 / 高
+- [ ] **auth login のトークン入力が端末にエコーされる**
+  — `cli/main.rs:3734-3738` / UX-05 / 高
+- [ ] **InternalError が内部エラー文字列をそのまま 500 ボディへ露出**
+  — `error.rs:25-26,65-70` / UX-06 / 高
+- [ ] **server の CORS/認証回帰 8 件が loopback bind 失敗時に false green**
+  — `server.rs:2497-2520` / TQ-01 / 高
+- [ ] **/api エイリアス整合テストが bind 失敗時に false green**
+  — `routes.rs:6578-6588` / TQ-02 / 高
+- [ ] **/stream が prompt_locks を迂回し並行プロンプトで更新が失われる**
+  — `routes.rs:1353-1401,2266-2268` / R1-CONC-01 / 高
+- [ ] **abort がキュー項目の processing 状態と次項目起動を放置**
+  — `routes.rs:1958-1968,2408-2421` / R1-CONC-02 / 高
+- [ ] **PluginSystem::trigger が await 中に RwLock ガードを保持しデッドロック**
+  — `plugin/lib.rs:181-214` / R1-CONC-03 / 高
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -267,6 +292,54 @@ status: current
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
+
+- [ ] **update_config が常に opencode.json へ書き込み jsonc を shadow**
+  — `loader.rs:1626-1641` / CONFIG-UPDATE-WRONG-FILE
+- [ ] **Config 書き込みが非 atomic かつ umask 依存で秘密が 0644 露出**
+  — `loader.rs:1640-1641` / CONFIG-WRITE-PERM-ATOMICITY
+- [ ] **DB パスに環境変数オーバーライドが無く Runbook と矛盾**
+  — `database.rs:219-225` / STORAGE-DB-PATH-NO-OVERRIDE
+- [ ] **ログにローテーション・保持・サイズ上限が無く同一秒起動で truncate**
+  — `logging.rs:458-465` / LOG-NO-ROTATION
+- [ ] **/health が静的 ok で DB 状態を反映せずスキーマも不統一**
+  — `routes.rs:5150-5155` / HEALTH-STATIC-OK
+- [ ] **グローバルとプロジェクトで jsonc/json の優先順位が逆**
+  — `loader.rs:95-101,124-134` / CONFIG-EXT-PRECEDENCE
+- [ ] **{file:...} 参照のコメント判定が // のみで重複時に実設定もスキップ**
+  — `loader.rs:607-609` / CONFIG-FILE-REF-COMMENT
+- [ ] **MCP 接続状態が色のみで文言が状態非依存** — `session.rs:441-452` / UX-02
+- [ ] **対話ヘルプが存在しない --provider / --prompt を案内**
+  — `cli/main.rs:2315-2317` / UX-03
+- [ ] **ユーザー向け文言に "Rust rewrite" / "parity" が露出**
+  — `cli/main.rs:3422-3425` / UX-04
+- [ ] **HTTP エラーの生レスポンスボディを toast へそのまま表示**
+  — `tui/api.rs:371,506,531,875` / UX-07
+- [ ] **ツール出力の途中切り詰めに明示マーカーが無い** — `message.rs:192-198,216-222` / UX-08
+- [ ] **Ctrl+X のヘルプが実装と不一致で leader 待機表示が無い**
+  — `help.rs:79`, `app.rs:452-482` / UX-09
+- [ ] **IME 非対応がヘルプに明記されていない** — `prompt.rs:397-415` / UX-10
+- [ ] **ファイル監視テストが 200ms sleep + Empty 無視でイベント未発行も合格**
+  — `watcher/lib.rs:313-335` / TQ-03
+- [ ] **tui の 2 モジュールが同じ ENV_LOCK を別インスタンスで守る**
+  — `home.rs:346`, `prompt.rs:1493` / TQ-04
+- [ ] **SystemPrompt::for_model の 6 テストが "opencode" 含有しか見ない**
+  — `system.rs:162-199` / TQ-05
+- [ ] **constant_time_eq テストがソース文字列のトークン存在で検証** — `server.rs:2633-2657` / TQ-06
+- [ ] **provider 統合テストが外部 NO_PROXY 設定を要求し未設定で panic**
+  — `provider_integration.rs:1-12` / TQ-07
+- [ ] **delete_session が実行中タスクを残し同一 ID 再作成で二重実行**
+  — `routes.rs:466-479` / R1-CONC-04
+- [ ] **SseTransport 差し替えで古いリスナ task が abort されずリーク**
+  — `transport.rs:461-473` / R1-CONC-05
+- [ ] **Responses ストリームが受信側切断をアイドル中に検知しない**
+  — `responses.rs:1462-1465` / R1-CONC-06
+- [ ] **MCP progress が期限を無制限に延長し transport ロックを保持**
+  — `client.rs:487-525` / R1-CONC-07
+- [ ] **with_file_lock の FILE_LOCKS が無解放で無限成長** — `tool.rs:16-41` / R1-CONC-08
+- [ ] **MCP OAuth の保留状態・クライアント生成が Check-Then-Act で競合**
+  — `oauth.rs:309-351` / R1-CONC-09
+- [ ] **docs/opencode-config.md が実装と矛盾（timeout・snapshots・wellknown）**
+  — `opencode-config.md:55-57,72-73` / DOCS-CONFIG-DRIFT
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
@@ -545,6 +618,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 cross-skill 集約（swarm83、4 担当・38 件、観点: 並行性 /
+  テスト品質 / UX / 設定運用）: high 10 / 中 26 / 低 2 を追記。親が high 4 件
+  （DISABLE_* の is_ok、stream の prompt_locks 未取得、plugin trigger の
+  RwLock 保持、InternalError の生文字列）を read で事実確認。前回観点
+  （TUI 内部 / provider retry・rate-limit / codemode・local-llm・plugin host /
+  ADR 整合）とは重複しないよう既知対応をプロンプトに明示した。
 - 2026-11-20 R4 指摘（CORS/Renovate の修正時、記録のみ）: LEGACY_CORS_SEED は
   process-global static のまま残存（起動時シード専用、ServerState 生成後に
   pub fn set_cors_whitelist を再呼び出しても既存インスタンスには反映されない旨を
