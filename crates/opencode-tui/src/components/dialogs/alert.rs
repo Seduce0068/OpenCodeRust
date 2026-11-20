@@ -417,6 +417,26 @@ mod tests {
     }
 
     #[test]
+    fn render_wraps_word_separated_message_and_shows_full_text() {
+        // 単語境界での折り返しが高さ算出に反映され、末尾が見え続けること。
+        let message = format!("alert-start {} -ALERT-END", "word ".repeat(60));
+        let mut alert = AlertDialog::error(&message);
+        alert.open();
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            alert.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(text.contains("alert-start"), "message head should render");
+        assert!(
+            text.contains("-ALERT-END"),
+            "the end of a word-wrapped alert must be wrapped and visible"
+        );
+        assert!(text.contains("[ OK ]"), "ok button must remain visible");
+    }
+
+    #[test]
     fn render_reflects_updated_message() {
         let mut alert = AlertDialog::info("before");
         alert.open();

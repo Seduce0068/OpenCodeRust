@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
 
 use ratatui::{
     layout::Rect,
@@ -9,22 +10,112 @@ use ratatui::{
 };
 
 use crate::theme::Theme;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// ratatui の `WordWrapper { trim: false }` と同じ規則で、1 行が
+/// `content_width` 内で占める行数を数える。
+///
+/// 単語（空白以外の連続）を単位に折り返し、行末の空白は残す。
+/// 単語自体が行幅より長い場合は幅単位で分割する。
+/// 幅を超えるシンボルは ratatui と同じく無視する。
+pub(crate) fn wrapped_text_rows(text: &str, content_width: u16) -> usize {
+    let width = usize::from(content_width);
+    if width == 0 {
+        return 0;
+    }
+
+    // pending_line / pending_word / pending_whitespace の幅だけを追跡する。
+    // grapheme 単位の実体は不要で、幅と空白の有無だけ行数に影響する。
+    let mut rows = 0usize;
+    let mut line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace: VecDeque<usize> = VecDeque::new();
+    let mut whitespace_width = 0usize;
+    let mut previous_non_whitespace = false;
+
+    for c in text.chars() {
+        let is_whitespace = c.is_whitespace();
+        let symbol_width = UnicodeWidthChar::width(c).unwrap_or(0);
+        if symbol_width > width {
+            continue;
+        }
+
+        let word_found = previous_non_whitespace && is_whitespace;
+        // trim = false なので、単語と空白の合計が行幅を超えた時点で
+        // 保留中の単語を現在行に確定させる。
+        let untrimmed_overflow =
+            line_width == 0 && word_width + whitespace_width + symbol_width > width;
+
+        if word_found || untrimmed_overflow {
+            line_width += whitespace_width;
+            whitespace.clear();
+            whitespace_width = 0;
+            line_width += word_width;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= width;
+        let pending_word_overflow =
+            symbol_width > 0 && line_width + whitespace_width + word_width >= width;
+
+        if line_full || pending_word_overflow {
+            let mut remaining = width.saturating_sub(line_width);
+            rows += 1;
+            line_width = 0;
+
+            // 次の行に回る際、収まる分の空白だけを現在行に残す。
+            loop {
+                match whitespace.front().copied() {
+                    Some(ws) if ws <= remaining => {
+                        whitespace.pop_front();
+                        whitespace_width -= ws;
+                        remaining -= ws;
+                    }
+                    _ => break,
+                }
+            }
+
+            // 行頭に回った空白は破棄する（ratatui の trim = false と同じ）。
+            if is_whitespace && whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            whitespace.push_back(symbol_width);
+        } else {
+            word_width += symbol_width;
+        }
+        previous_non_whitespace = !is_whitespace;
+    }
+
+    if line_width > 0 || word_width > 0 || whitespace_width > 0 {
+        rows += 1;
+    }
+    rows.max(1)
+}
 
 /// `Wrap { trim: false }` の Paragraph が `content_width` 内で占める行数を返す。
 ///
-/// 空行も 1 行として数え、幅は `UnicodeWidthStr` で測るため全角文字は 2 幅になる。
+/// 空行も 1 行として数える。単語境界を考慮した折り返し行数と、従来の
+/// 幅のみからの見積もりの大きい方を採用する。後者を下限に残す理由は、
+/// 全角文字などで ratatui が幅をはみ出して 1 行に描画するケースでも
+/// 高さを過小評価して末尾が見えなくなることを避けるため。
 pub(crate) fn wrapped_row_count(lines: &[Line<'_>], content_width: u16) -> usize {
-    let width = usize::from(content_width).max(1);
+    let width_u16 = content_width.max(1);
+    let width = usize::from(width_u16);
     lines
         .iter()
         .map(|line| {
-            let line_width: usize = line
+            let text: String = line
                 .spans
                 .iter()
-                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                .sum();
-            line_width.div_ceil(width).max(1)
+                .map(|span| span.content.as_ref())
+                .collect();
+            let word_rows = wrapped_text_rows(&text, width_u16);
+            let width_rows = UnicodeWidthStr::width(text.as_str()).div_ceil(width).max(1);
+            word_rows.max(width_rows)
         })
         .sum()
 }
@@ -217,7 +308,7 @@ impl PermissionPrompt {
                 return;
             }
             // The button line is at the bottom of the content (area.y + area.height - 2 for border)
-            let button_row = area.y + area.height - 2;
+            let button_row = area.y.saturating_add(area.height.saturating_sub(2));
             if row == button_row {
                 // "[y] Allow  [n] Deny  [a] Always allow"
                 // Rough column ranges inside the border:
@@ -687,6 +778,18 @@ mod tests {
             Line::from("日本語"),
         ];
         assert_eq!(wrapped_row_count(&lines, 5), 2 + 1 + 2);
+    }
+
+    #[test]
+    fn wrapped_row_count_respects_word_boundaries() {
+        // 幅だけの計算だと ceil(7/4) = 2 だが、ratatui は単語境界で
+        // "a " / "bcd " / "e" の 3 行に折り返す。
+        let lines = vec![Line::from("a bcd e")];
+        assert!(wrapped_row_count(&lines, 4) >= 3);
+        assert_eq!(wrapped_text_rows("a bcd e", 4), 3);
+        // 短い行は従来どおり 1 行（クリック座標の基準を変えない）。
+        assert_eq!(wrapped_text_rows("Continue?", 76), 1);
+        assert_eq!(wrapped_row_count(&[Line::from("Continue?")], 76), 1);
     }
 
     #[test]

@@ -421,17 +421,11 @@ async fn session_status(
     let status: HashMap<String, SessionStatusInfo> = sessions
         .into_iter()
         .map(|s| {
-            let lifecycle_status = match s.status {
-                opencode_session::SessionStatus::Active => "active",
-                opencode_session::SessionStatus::Completed => "completed",
-                opencode_session::SessionStatus::Archived => "archived",
-                opencode_session::SessionStatus::Compacting => "compacting",
-            };
+            // session 側の serde 属性を単一情報源として wire 名を導出する。
+            let lifecycle_status = serde_enum_name(&s.status);
             let run = run_status.get(&s.id).cloned().unwrap_or_default();
             let (status, idle, busy, attempt, message, next) = match run {
-                SessionRunStatus::Idle => {
-                    (lifecycle_status.to_string(), true, false, None, None, None)
-                }
+                SessionRunStatus::Idle => (lifecycle_status, true, false, None, None, None),
                 SessionRunStatus::Busy => ("busy".to_string(), false, true, None, None, None),
                 SessionRunStatus::Retry {
                     attempt,
@@ -924,13 +918,21 @@ pub struct ToolResultInfo {
     pub is_error: bool,
 }
 
-fn message_role_name(role: &opencode_session::MessageRole) -> &'static str {
-    match role {
-        opencode_session::MessageRole::User => "user",
-        opencode_session::MessageRole::Assistant => "assistant",
-        opencode_session::MessageRole::System => "system",
-        opencode_session::MessageRole::Tool => "tool",
+/// enum の wire 名を serde の `rename_all` から導出する単一の変換経路。
+///
+/// `opencode_session::SessionStatus` / `MessageRole` に付与した
+/// `#[serde(rename_all = "lowercase")]` を共有し、routes 側の手書き
+/// lowercase match を排除する。unit enum の直列化は失敗しないため、
+/// フォールバックは防御用の空文字列にとどめる（既存の値は変化しない）。
+fn serde_enum_name<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => String::new(),
     }
+}
+
+fn message_role_name(role: &opencode_session::MessageRole) -> String {
+    serde_enum_name(role)
 }
 
 fn part_type_name(part_type: &opencode_session::PartType) -> &'static str {
@@ -1039,7 +1041,7 @@ fn message_to_info(session_id: &str, message: &opencode_session::SessionMessage)
     MessageInfo {
         id: message.id.clone(),
         session_id: session_id.to_string(),
-        role: message_role_name(&message.role).to_string(),
+        role: message_role_name(&message.role),
         parts: message.parts.iter().map(part_to_info).collect(),
         created_at: message.created_at.timestamp_millis(),
         completed_at: message
@@ -6057,6 +6059,16 @@ mod mapping_tests {
         assert_eq!(message_role_name(&MessageRole::Assistant), "assistant");
         assert_eq!(message_role_name(&MessageRole::System), "system");
         assert_eq!(message_role_name(&MessageRole::Tool), "tool");
+    }
+
+    /// serde ベースへ置換しても `/session/status` の status 値は従来と同一。
+    #[test]
+    fn session_status_wire_names_match_legacy_values() {
+        use opencode_session::SessionStatus;
+        assert_eq!(serde_enum_name(&SessionStatus::Active), "active");
+        assert_eq!(serde_enum_name(&SessionStatus::Completed), "completed");
+        assert_eq!(serde_enum_name(&SessionStatus::Archived), "archived");
+        assert_eq!(serde_enum_name(&SessionStatus::Compacting), "compacting");
     }
 
     #[test]

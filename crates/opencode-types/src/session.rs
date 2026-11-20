@@ -85,10 +85,8 @@ pub struct FileDiff {
 /// `#[sqlx(rename_all = "lowercase")]` は DB 側の表現を決めるだけなので、
 /// この変更で既存の DB 行の読み書きは変わらない。
 ///
-/// 方針メモ: `opencode-server::routes` の `opencode_session::SessionStatus` を
-/// 小文字文字列へ変換する手動 match は、変換元が別クレートの別型であるため
-/// 本次スコープ外で残置する（routes.rs は担当外）。session 側にも同じ serde 属性を
-/// 付与できれば手動 match を `serde_json::to_value` ベースへ置き換えて一元化できる。
+/// `opencode-session` 側にも同じ serde 属性が付与済みで、
+/// `opencode-server::routes` の wire 名は serde 由来の `serde_enum_name` へ集約済み。
 /// 本クレート側の変換は enum を直接 match しており、文字列の再変換は行わないため
 /// 二重変換は発生しない。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, Default)]

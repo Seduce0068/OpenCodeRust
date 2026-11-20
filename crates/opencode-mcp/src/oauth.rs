@@ -71,6 +71,12 @@ pub enum OAuthError {
     NoRefreshToken,
     #[error("Storage error: {0}")]
     Storage(#[from] std::io::Error),
+    /// auth store の読み書き失敗を型として伝播する。
+    ///
+    /// Display は種別のみ（トークン値・PKCE verifier・CSRF state は出さない）。
+    /// 詳細な原因は `std::error::Error::source()` から参照できる。
+    #[error("MCP auth store failure")]
+    AuthStore(#[from] auth::AuthStoreError),
 }
 
 /// Appends the RFC 8707 `resource` parameter to an authorization request when
@@ -212,14 +218,13 @@ impl McpOAuthManager {
                 let config = self.config.read().await;
                 (config.auth_url.clone(), config.token_url.clone())
             };
-            crate::auth::update_endpoints(
+            crate::auth::try_update_endpoints(
                 &self.mcp_name,
                 &auth_url,
                 &token_url,
                 Some(&self.server_url),
             )
-            .await
-            .map_err(OAuthError::Storage)?;
+            .await?;
         }
 
         if needs_client {
@@ -246,7 +251,7 @@ impl McpOAuthManager {
                 }
             }
 
-            crate::auth::update_client_info(
+            crate::auth::try_update_client_info(
                 &self.mcp_name,
                 crate::auth::OAuthClientInfo {
                     client_id: registered.client_id,
@@ -256,8 +261,7 @@ impl McpOAuthManager {
                 },
                 Some(&self.server_url),
             )
-            .await
-            .map_err(OAuthError::Storage)?;
+            .await?;
         }
 
         Ok(())
@@ -333,13 +337,10 @@ impl McpOAuthManager {
 
         let (url, csrf_state) = auth_request.set_pkce_challenge(pkce_challenge).url();
 
-        // Persist to disk for cross-restart resilience.
-        auth::update_code_verifier(&self.mcp_name, pkce_verifier.secret())
-            .await
-            .map_err(OAuthError::Storage)?;
-        auth::update_oauth_state(&self.mcp_name, csrf_state.secret())
-            .await
-            .map_err(OAuthError::Storage)?;
+        // Persist to disk for cross-restart resilience. A corrupt or unreadable
+        // store must abort the flow instead of silently dropping PKCE/CSRF state.
+        auth::try_update_code_verifier(&self.mcp_name, pkce_verifier.secret()).await?;
+        auth::try_update_oauth_state(&self.mcp_name, csrf_state.secret()).await?;
 
         // Also keep in memory for the fast path.
         {
@@ -361,8 +362,10 @@ impl McpOAuthManager {
             match pending.as_ref() {
                 Some(p) => (p.pkce_verifier.clone(), p.csrf_state.clone()),
                 None => {
-                    let entry = auth::get(&self.mcp_name)
-                        .await
+                    // No in-memory pending flow: recover verifier/state from disk.
+                    // A broken store is an error, never "no pending auth".
+                    let entry = auth::try_get(&self.mcp_name)
+                        .await?
                         .ok_or(OAuthError::NoPendingAuth)?;
                     let v = entry.code_verifier.ok_or(OAuthError::NoPendingAuth)?;
                     let s = entry.oauth_state.ok_or(OAuthError::NoPendingAuth)?;
@@ -407,9 +410,10 @@ impl McpOAuthManager {
 
         self.save_token_result(&token_result).await?;
 
-        // Clean up transient state.
-        auth::clear_code_verifier(&self.mcp_name).await.ok();
-        auth::clear_oauth_state(&self.mcp_name).await.ok();
+        // Clean up transient state. The clear operations are writes too; a
+        // failing store must surface instead of leaving stale PKCE/CSRF state.
+        auth::try_clear_code_verifier(&self.mcp_name).await?;
+        auth::try_clear_oauth_state(&self.mcp_name).await?;
         {
             let mut pending = self.pending.write().await;
             *pending = None;
@@ -419,8 +423,8 @@ impl McpOAuthManager {
     }
     /// Refresh an expired access token using the stored refresh token.
     pub async fn refresh_token(&self) -> Result<(), OAuthError> {
-        let entry = auth::get_for_url(&self.mcp_name, &self.server_url)
-            .await
+        let entry = auth::try_get_for_url(&self.mcp_name, &self.server_url)
+            .await?
             .ok_or(OAuthError::NoRefreshToken)?;
 
         let tokens = entry.tokens.ok_or(OAuthError::NoRefreshToken)?;
@@ -476,9 +480,7 @@ impl McpOAuthManager {
             }),
         };
 
-        auth::update_tokens(&self.mcp_name, tokens, Some(&self.server_url))
-            .await
-            .map_err(OAuthError::Storage)?;
+        auth::try_update_tokens(&self.mcp_name, tokens, Some(&self.server_url)).await?;
 
         Ok(())
     }
@@ -487,7 +489,7 @@ impl McpOAuthManager {
     /// Returns `None` if no tokens are stored (the caller should initiate the
     /// auth flow).
     pub async fn get_token(&self) -> Result<Option<String>, OAuthError> {
-        let entry = match auth::get_for_url(&self.mcp_name, &self.server_url).await {
+        let entry = match auth::try_get_for_url(&self.mcp_name, &self.server_url).await? {
             Some(e) => e,
             None => return Ok(None),
         };
@@ -507,7 +509,7 @@ impl McpOAuthManager {
                 if tokens.refresh_token.is_some() {
                     self.refresh_token().await?;
                     if let Some(refreshed) =
-                        auth::get_for_url(&self.mcp_name, &self.server_url).await
+                        auth::try_get_for_url(&self.mcp_name, &self.server_url).await?
                     {
                         if let Some(t) = refreshed.tokens {
                             return Ok(Some(t.access_token));
@@ -523,31 +525,61 @@ impl McpOAuthManager {
 
     /// Remove all stored OAuth credentials for this server.
     pub async fn remove_auth(&self) -> Result<(), OAuthError> {
-        auth::remove(&self.mcp_name)
-            .await
-            .map_err(OAuthError::Storage)?;
+        auth::try_remove(&self.mcp_name).await?;
         let mut pending = self.pending.write().await;
         *pending = None;
         Ok(())
     }
 
     /// Whether tokens exist on disk for this server + URL combination.
-    pub async fn has_stored_tokens(&self) -> bool {
-        auth::get_for_url(&self.mcp_name, &self.server_url)
-            .await
-            .and_then(|e| e.tokens)
-            .is_some()
+    ///
+    /// Fail-loud variant: a corrupt or unreadable store is reported as
+    /// [`OAuthError::AuthStore`] rather than being mistaken for "no tokens".
+    pub async fn try_has_stored_tokens(&self) -> Result<bool, OAuthError> {
+        Ok(auth::try_get_for_url(&self.mcp_name, &self.server_url)
+            .await?
+            .and_then(|entry| entry.tokens)
+            .is_some())
     }
 
-    /// Authentication status.
-    pub async fn auth_status(&self) -> AuthStatus {
-        match auth::get_for_url(&self.mcp_name, &self.server_url).await {
+    /// Compatibility wrapper for [`Self::try_has_stored_tokens`].
+    ///
+    /// 読み込み失敗はログへ残し `false` を返す（互換のための fail-open）。
+    /// 認可フロー判断には [`Self::try_has_stored_tokens`] を使うこと。
+    pub async fn has_stored_tokens(&self) -> bool {
+        match self.try_has_stored_tokens().await {
+            Ok(has_tokens) => has_tokens,
+            Err(error) => {
+                tracing::error!(%error, mcp_name = %self.mcp_name, "MCP stored-token check failed");
+                false
+            }
+        }
+    }
+
+    /// Authentication status, propagating auth store failures.
+    pub async fn try_auth_status(&self) -> Result<AuthStatus, OAuthError> {
+        let entry = auth::try_get_for_url(&self.mcp_name, &self.server_url).await?;
+        Ok(match entry {
             Some(entry) => match auth::is_token_expired(&entry) {
                 Some(true) => AuthStatus::Expired,
                 Some(false) => AuthStatus::Authenticated,
                 None => AuthStatus::NotAuthenticated,
             },
             None => AuthStatus::NotAuthenticated,
+        })
+    }
+
+    /// Compatibility wrapper for [`Self::try_auth_status`].
+    ///
+    /// 読み込み失敗はログへ残し [`AuthStatus::NotAuthenticated`] を返す。
+    /// 認可状態の判定には [`Self::try_auth_status`] を使うこと。
+    pub async fn auth_status(&self) -> AuthStatus {
+        match self.try_auth_status().await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(%error, mcp_name = %self.mcp_name, "MCP auth status read failed");
+                AuthStatus::NotAuthenticated
+            }
         }
     }
 
@@ -863,5 +895,201 @@ mod tests {
 
         let resource = manager.resource.read().await;
         assert_eq!(resource.as_deref(), Some("https://mcp.example.invalid/mcp"));
+    }
+
+    // --- fail-loud auth store regression tests -------------------------------
+    //
+    // These scenarios use no real credentials and no network I/O: `start_auth`
+    // and the callback's disk-recovery path fail before any token request.
+
+    use std::path::PathBuf;
+
+    const CORRUPT_STORE: &str = "{not valid json";
+
+    fn env_points_to(path: &std::path::Path) -> bool {
+        match std::env::var_os("OPENCODE_MCP_AUTH_FILE") {
+            Some(value) => std::path::Path::new(&value) == path,
+            None => false,
+        }
+    }
+
+    /// Redirects the auth store to an isolated temp file. `corrupt` seeds
+    /// unparsable JSON; otherwise an empty store is seeded. This mirrors the
+    /// isolation pattern used by `auth`'s own store tests.
+    struct TestAuthFile {
+        dir: PathBuf,
+        path: PathBuf,
+        corrupt: bool,
+    }
+
+    impl TestAuthFile {
+        fn new(label: &str, corrupt: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "opencode-mcp-oauth-{pid}-{label}",
+                pid = std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("mcp-auth.json");
+            Self { dir, path, corrupt }
+        }
+
+        /// (Re)installs the env var and the file contents before every attempt.
+        fn activate(&self) {
+            let contents = if self.corrupt { CORRUPT_STORE } else { "{}" };
+            std::fs::write(&self.path, contents).expect("seed auth store");
+            std::env::set_var("OPENCODE_MCP_AUTH_FILE", &self.path);
+        }
+    }
+
+    impl Drop for TestAuthFile {
+        fn drop(&mut self) {
+            // Never unset a value another test installed.
+            if env_points_to(self.path.as_path()) {
+                std::env::remove_var("OPENCODE_MCP_AUTH_FILE");
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `OPENCODE_MCP_AUTH_FILE` is process-global and `auth`'s tests use it as
+    /// well. Wait while it points elsewhere, and retry a scenario if another
+    /// test clobbers it mid-flight, so this regression test stays deterministic.
+    async fn wait_for_store_slot(store: &TestAuthFile) {
+        for _ in 0..200 {
+            match std::env::var_os("OPENCODE_MCP_AUTH_FILE") {
+                Some(value) if std::path::Path::new(&value) != store.path.as_path() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    async fn with_isolated_store<T, F, Fut>(store: &TestAuthFile, scenario: F) -> T
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        for _ in 0..20 {
+            wait_for_store_slot(store).await;
+            store.activate();
+            let result = scenario().await;
+            if env_points_to(store.path.as_path()) {
+                return result;
+            }
+        }
+        store.activate();
+        scenario().await
+    }
+
+    #[tokio::test]
+    async fn corrupt_auth_store_is_fail_loud() {
+        // (a) start_auth must not silently discard PKCE verifier / CSRF state.
+        {
+            let store = TestAuthFile::new("corrupt-start", true);
+            let manager = manager_with(dummy_config());
+            let err = with_isolated_store(&store, || manager.start_auth())
+                .await
+                .expect_err("start_auth must fail on a corrupt auth store");
+            assert!(
+                matches!(&err, OAuthError::AuthStore(_)),
+                "unexpected: {err}"
+            );
+            assert!(
+                manager.pending.read().await.is_none(),
+                "no transient state may be installed when persistence fails"
+            );
+        }
+
+        // (b) Callback path: pending is empty, so finish_auth recovers the
+        // verifier/state from disk. Corruption must fail the callback.
+        {
+            let store = TestAuthFile::new("corrupt-callback", true);
+            let manager = manager_with(dummy_config());
+            assert!(manager.pending.read().await.is_none());
+            let err =
+                with_isolated_store(&store, || manager.finish_auth("dummy-code", "dummy-state"))
+                    .await
+                    .expect_err("callback must fail on a corrupt auth store");
+            assert!(
+                matches!(&err, OAuthError::AuthStore(_)),
+                "unexpected: {err}"
+            );
+        }
+
+        // (c) Token reads and status queries must not round corruption to
+        // "no credentials".
+        {
+            let store = TestAuthFile::new("corrupt-queries", true);
+            let manager = manager_with(dummy_config());
+            let err = with_isolated_store(&store, || manager.get_token())
+                .await
+                .expect_err("get_token must fail on a corrupt auth store");
+            assert!(matches!(&err, OAuthError::AuthStore(_)));
+
+            let err = with_isolated_store(&store, || manager.try_has_stored_tokens())
+                .await
+                .expect_err("token check must fail on a corrupt auth store");
+            assert!(matches!(&err, OAuthError::AuthStore(_)));
+
+            let err = with_isolated_store(&store, || manager.try_auth_status())
+                .await
+                .expect_err("status check must fail on a corrupt auth store");
+            assert!(matches!(&err, OAuthError::AuthStore(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_auth_store_preserves_oauth_flow() {
+        let store = TestAuthFile::new("healthy", false);
+        let manager = manager_with(dummy_config());
+
+        let (url, verifier, state, stored_state, stored_verifier) =
+            with_isolated_store(&store, || async {
+                let url = manager.start_auth().await?;
+                let (verifier, state) = {
+                    let pending = manager.pending.read().await;
+                    let pending = pending.as_ref().expect("in-memory pending auth");
+                    (pending.pkce_verifier.clone(), pending.csrf_state.clone())
+                };
+                let stored_state = auth::try_get_oauth_state("dummy-server").await?;
+                let stored_verifier = auth::try_get("dummy-server")
+                    .await?
+                    .and_then(|entry| entry.code_verifier);
+                Ok::<_, OAuthError>((url, verifier, state, stored_state, stored_verifier))
+            })
+            .await
+            .expect("a healthy store must support the normal flow");
+
+        assert!(url.starts_with(DUMMY_AUTH_URL));
+        assert!(!verifier.is_empty());
+        assert!(!state.is_empty());
+        assert_eq!(stored_state.as_deref(), Some(state.as_str()));
+        assert_eq!(stored_verifier.as_deref(), Some(verifier.as_str()));
+    }
+
+    #[test]
+    fn auth_store_error_display_never_exposes_values() {
+        const SENTINEL: &str = "SENTINEL_DO_NOT_LEAK";
+        let io_error = auth::AuthStoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            SENTINEL,
+        ));
+        let json_error = auth::AuthStoreError::Json(
+            serde_json::from_str::<serde_json::Value>(SENTINEL)
+                .expect_err("the sentinel is not valid JSON"),
+        );
+
+        for source in [io_error, json_error] {
+            let err = OAuthError::from(source);
+            assert!(matches!(&err, OAuthError::AuthStore(_)));
+            assert_eq!(
+                err.to_string(),
+                "MCP auth store failure",
+                "error text must carry the failure type only"
+            );
+            assert!(!err.to_string().contains(SENTINEL));
+        }
     }
 }

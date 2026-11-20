@@ -49,9 +49,9 @@ pub struct MessageUsage {
 ///
 /// JSON 表現は小文字（`user` / `assistant` / `system` / `tool`）を正式とし、
 /// 旧 PascalCase（`User` 等）は `alias` で読み取り互換を維持する。
-/// `opencode-session` 側の `MessageRole` は別型のため同じ serde 属性を付与する
-/// 提案を親へ報告する（当スコープ外）。サーバの往復変換は enum を直接 match
-/// して文字列を経由しないため、session 側の wire 形式に依存しない。
+/// `opencode-session` 側にも同じ serde 属性が付与済みで、サーバの wire 名は
+/// serde 由来の `serde_enum_name` へ集約済み。サーバの往復変換は enum を直接
+/// match して文字列を経由しないため、session 側の wire 形式に依存しない。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
