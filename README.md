@@ -187,16 +187,21 @@ JSON schema:
 
 The existing `status` and `version` fields are kept for compatibility; the
 `healthy` field mirrors `status == "ok"` and was previously only present on
-`/global/health`. Both probes pass through the same authentication middleware
-as other routes, so send the startup Bearer token when authentication is
-enabled.
+`/global/health`. Liveness probes are deliberately exempt from the
+authentication middleware so the CLI and TUI can wait for startup without a
+token. Readiness probes and all other routes still require the startup Bearer
+token when authentication is enabled.
 
 #### Liveness
 
 `GET /health` (aliases: `GET /health/live`, `GET /global/health`) is a pure
 liveness probe. It always returns `200` with `status: "ok"` while the process
-can serve HTTP; it does not inspect the database. The CLI and TUI use it to
-wait for a local server to start:
+can serve HTTP; it does not inspect the database. These three paths match
+exactly (query strings are ignored), and none of them requires an
+`Authorization` header. Only these three root paths are exempt; the `/api`
+aliases (for example `/api/health`) still require authentication, so use the
+root paths for unauthenticated probes. The CLI and TUI use `/health` without a
+token to wait for a local server to start:
 
 ```bash
 curl -fsS http://127.0.0.1:3000/health
@@ -221,9 +226,11 @@ curl -fsS -o /dev/null -w '%{http_code}\n' \
   http://127.0.0.1:3000/health/ready
 ```
 
-Point load-balancer and orchestrator readiness gates at `/health/ready`, not
-at `/health`. A static `200` from `/health` no longer routes traffic to a
-server whose database is unavailable.
+Unlike liveness, `/health/ready` and `/global/ready` pass through the
+authentication middleware. Send `Authorization: Bearer <token>` when
+authentication is enabled. Point load-balancer and orchestrator readiness gates
+at `/health/ready`, not at `/health`. A static `200` from `/health` no longer
+routes traffic to a server whose database is unavailable.
 
 Replace the host and port with the values passed to `serve --hostname` and
 `--port`.
@@ -232,8 +239,9 @@ Replace the host and port with the values passed to `serve --hostname` and
 
 - Authentication is enabled by default. A random Bearer token (32 bytes,
   URL-safe base64) is generated at startup; send it on every request as
-  `Authorization: Bearer <token>`. The token value is masked in logs, and the
-  startup notice on stderr reports whether authentication is enabled.
+  `Authorization: Bearer <token>`, except for the liveness probes documented
+  above. The token value is masked in logs, and the startup notice on stderr
+  reports whether authentication is enabled.
 - The token is regenerated on every restart. Clients must refresh the
   `Authorization` header after restarting the server.
 - `OPENCODE_NO_AUTH` disables authentication only when set to `true`, `1`, or

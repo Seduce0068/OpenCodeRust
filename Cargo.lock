@@ -2461,6 +2461,7 @@ dependencies = [
  "glob",
  "regex",
  "tokio",
+ "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "walkdir",

@@ -895,6 +895,19 @@ impl InputRepository {
         Self { pool }
     }
 
+    /// 軽量な DB 生存確認（readiness probe 用）。
+    ///
+    /// `SELECT 1` の 1 クエリのみを発行し、キュー内容（prompt / metadata）を
+    /// 一切フェッチしないため、保留中プロンプトが溜まっていても O(1) で応答する。
+    /// プールクローズ・接続不可・DB ロック等の障害時は `Err` を返す。
+    pub async fn ping(&self) -> Result<(), DatabaseError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
     pub async fn enqueue(
         &self,
         session_id: &str,
@@ -1345,6 +1358,27 @@ mod message_repository_tests {
 mod input_repository_tests {
     use super::InputRepository;
     use crate::Database;
+
+    #[tokio::test]
+    async fn ping_succeeds_when_database_is_available() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = InputRepository::new(database.pool().clone());
+
+        repository.ping().await.expect("ping succeeds");
+    }
+
+    #[tokio::test]
+    async fn ping_fails_when_pool_is_closed() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let pool = database.pool().clone();
+        let repository = InputRepository::new(pool.clone());
+        pool.close().await;
+
+        assert!(
+            repository.ping().await.is_err(),
+            "ping must fail once the pool is closed"
+        );
+    }
 
     #[tokio::test]
     async fn queue_claim_and_restart_recovery_preserve_fifo() {

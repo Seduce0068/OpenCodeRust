@@ -5452,13 +5452,13 @@ async fn health() -> Json<HealthResponse> {
 /// Readiness probe。DB が利用可能かを実際のクエリで確認する。
 ///
 /// `ServerState` は DB プールを直接保持しないため、`pub(crate)` な
-/// `input_repo` 経由で `session_input` に対する SELECT を発行して ping とする。
-/// この SELECT はマイグレーション済みスキーマを前提とするため、
-/// 未初期化・接続不可・ロック・破損のいずれでも失敗する。
+/// `input_repo` 経由で軽量な `ping()`（`SELECT 1`）を発行する。
+/// キュー内容をフェッチしないため、保留中プロンプトが溜まっていても
+/// 応答は遅延せず、接続不可・プールクローズ・ロック等でのみ失敗する。
 /// 利用可能なら 200、それ以外は 503 を返す。
 async fn readiness(State(state): State<Arc<ServerState>>) -> Response {
     let db_ok = match &state.input_repo {
-        Some(repo) => match repo.list_pending_all().await {
+        Some(repo) => match repo.ping().await {
             Ok(_) => true,
             Err(_) => {
                 // エラー文字列をログへ載せず、失敗事実だけを記録する。
