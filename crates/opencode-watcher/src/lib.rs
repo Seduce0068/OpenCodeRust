@@ -261,6 +261,7 @@ impl FileWatcher {
         Ok(())
     }
 
+    /// すべての監視を停止し、登録済みパスとデバウンス情報を破棄する。
     pub fn stop(&self) {
         self.watched_paths.clear();
         *self.watcher.write() = None;
@@ -279,10 +280,12 @@ impl FileWatcher {
             .retain(|entry_path, _| !entry_path.starts_with(path));
     }
 
+    /// 現在登録されている監視パスの一覧を返す。
     pub fn watched_paths(&self) -> Vec<PathBuf> {
         self.watched_paths.iter().map(|p| p.clone()).collect()
     }
 
+    /// 指定パスが現在監視対象かどうかを返す。
     pub fn is_watching(&self, path: &Path) -> bool {
         self.watched_paths.contains(path)
     }
@@ -296,6 +299,7 @@ impl Drop for FileWatcher {
 
 static FILE_WATCHER: std::sync::OnceLock<Arc<FileWatcher>> = std::sync::OnceLock::new();
 
+/// プロセス共有の既定設定 `FileWatcher` を取得する（初回呼び出しで生成）。
 pub fn get_watcher() -> Arc<FileWatcher> {
     FILE_WATCHER
         .get_or_init(|| {
@@ -306,6 +310,7 @@ pub fn get_watcher() -> Arc<FileWatcher> {
         .clone()
 }
 
+/// 指定設定で共有 `FileWatcher` を初期化して返す（既に初期化済みなら既存を返す）。
 pub fn init_watcher(config: WatcherConfig) -> Arc<FileWatcher> {
     let watcher = Arc::new(FileWatcher::new(config).expect("Failed to create file watcher"));
     FILE_WATCHER.get_or_init(|| watcher.clone()).clone()

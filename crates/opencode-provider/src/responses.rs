@@ -1461,8 +1461,13 @@ impl OpenAIResponsesLanguageModel {
 
         let (tx, rx) = mpsc::channel::<Result<StreamEvent, ProviderError>>(256);
         tokio::spawn(async move {
-            let _ = tx.send(Ok(StreamEvent::Start)).await;
-            let _ = tx.send(Ok(StreamEvent::StartStep)).await;
+            // 受信側が既に切断されている場合は、上流を一切読まずに終了する。
+            if tx.send(Ok(StreamEvent::Start)).await.is_err() {
+                return;
+            }
+            if tx.send(Ok(StreamEvent::StartStep)).await.is_err() {
+                return;
+            }
 
             let tx = tx;
             let mut text_stream = text_stream;
@@ -1482,52 +1487,67 @@ impl OpenAIResponsesLanguageModel {
             let mut text_open = false;
             let mut service_tier: Option<String> = None;
 
-            while let Some(chunk_result) = text_stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(text) => text,
-                    Err(err) => {
-                        let _ = tx.send(Err(err)).await;
+            // text_stream.next() 単独では受信側が rx をドロップしても、
+            // 次のイベントかストリーム終了まで待ち続けてしまう。
+            // tx.closed() を競合させ、切断を検知したら即座に上流の読み取りを打ち切る。
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
                         return;
                     }
-                };
-                buffer.push_str(&chunk);
+                    next = text_stream.next() => {
+                        let Some(chunk_result) = next else {
+                            break;
+                        };
+                        let chunk = match chunk_result {
+                            Ok(text) => text,
+                            Err(err) => {
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
+                        };
+                        buffer.push_str(&chunk);
 
-                while let Some(frame) = drain_next_sse_frame(&mut buffer) {
-                    let Some(data) = extract_sse_data(&frame) else {
-                        continue;
-                    };
-                    if data == "[DONE]" {
-                        break;
-                    }
+                        while let Some(frame) = drain_next_sse_frame(&mut buffer) {
+                            let Some(data) = extract_sse_data(&frame) else {
+                                continue;
+                            };
+                            if data == "[DONE]" {
+                                break;
+                            }
 
-                    let parsed_value: Value = match serde_json::from_str(&data) {
-                        Ok(value) => value,
-                        Err(_) => continue,
-                    };
-                    if let Some(extractor) = stream_metadata_extractor.as_mut() {
-                        extractor.process_chunk(&parsed_value);
-                    }
+                            let parsed_value: Value = match serde_json::from_str(&data) {
+                                Ok(value) => value,
+                                Err(_) => continue,
+                            };
+                            if let Some(extractor) = stream_metadata_extractor.as_mut() {
+                                extractor.process_chunk(&parsed_value);
+                            }
 
-                    let parsed_chunk: ResponsesStreamChunk = serde_json::from_value(parsed_value)
-                        .unwrap_or(ResponsesStreamChunk::Unknown);
+                            let parsed_chunk: ResponsesStreamChunk =
+                                serde_json::from_value(parsed_value)
+                                    .unwrap_or(ResponsesStreamChunk::Unknown);
 
-                    for event in process_stream_chunk(
-                        parsed_chunk,
-                        &mut finish_reason,
-                        &mut usage,
-                        &mut logprobs,
-                        &mut response_id,
-                        &mut ongoing_tool_calls,
-                        &mut has_function_call,
-                        &mut active_reasoning,
-                        &mut current_reasoning_output_index,
-                        &mut reasoning_item_to_output_index,
-                        &mut current_text_id,
-                        &mut text_open,
-                        &mut service_tier,
-                    ) {
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
+                            for event in process_stream_chunk(
+                                parsed_chunk,
+                                &mut finish_reason,
+                                &mut usage,
+                                &mut logprobs,
+                                &mut response_id,
+                                &mut ongoing_tool_calls,
+                                &mut has_function_call,
+                                &mut active_reasoning,
+                                &mut current_reasoning_output_index,
+                                &mut reasoning_item_to_output_index,
+                                &mut current_text_id,
+                                &mut text_open,
+                                &mut service_tier,
+                            ) {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -2421,6 +2441,9 @@ mod runtime_tests {
     use async_trait::async_trait;
     use futures::stream;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     use crate::custom_fetch::{
         register_custom_fetch_proxy, unregister_custom_fetch_proxy, CustomFetchProxy,
@@ -2694,6 +2717,111 @@ mod runtime_tests {
             .any(|event| matches!(event, Ok(StreamEvent::Done))));
 
         unregister_custom_fetch_proxy("test-provider-stream");
+    }
+
+    /// 上流を永続的に保留し、初回ポールとドロップを Notify で通知するローカルモック。
+    /// ネットワークには送出せず、spawn タスクの生存をストリームのドロップで観測する。
+    struct HangingUpstream {
+        inner: stream::Pending<Result<String, ProviderError>>,
+        polled: Arc<Notify>,
+        dropped: Arc<Notify>,
+        announced_poll: bool,
+    }
+
+    impl Stream for HangingUpstream {
+        type Item = Result<String, ProviderError>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if !this.announced_poll {
+                this.announced_poll = true;
+                this.polled.notify_one();
+            }
+            Pin::new(&mut this.inner).poll_next(cx)
+        }
+    }
+
+    impl Drop for HangingUpstream {
+        fn drop(&mut self) {
+            self.dropped.notify_one();
+        }
+    }
+
+    struct HangingFetchProxy {
+        polled: Arc<Notify>,
+        dropped: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CustomFetchProxy for HangingFetchProxy {
+        async fn fetch(
+            &self,
+            _request: CustomFetchRequest,
+        ) -> Result<CustomFetchResponse, ProviderError> {
+            unreachable!("this regression test only exercises the streaming path")
+        }
+
+        async fn fetch_stream(
+            &self,
+            _request: CustomFetchRequest,
+        ) -> Result<CustomFetchStreamResponse, ProviderError> {
+            Ok(CustomFetchStreamResponse {
+                status: 200,
+                headers: HashMap::new(),
+                stream: Box::pin(HangingUpstream {
+                    inner: stream::pending(),
+                    polled: self.polled.clone(),
+                    dropped: self.dropped.clone(),
+                    announced_poll: false,
+                }),
+            })
+        }
+    }
+
+    /// 受信側が rx をドロップしたら、上流が保留中でも spawn タスクが即座に
+    /// 終了し、上流ストリームがドロップされること。
+    #[tokio::test]
+    async fn do_stream_stops_upstream_when_receiver_is_dropped() {
+        let polled = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        register_custom_fetch_proxy(
+            "test-provider-disconnect",
+            Arc::new(HangingFetchProxy {
+                polled: polled.clone(),
+                dropped: dropped.clone(),
+            }),
+        );
+
+        let model = OpenAIResponsesLanguageModel::new(
+            "gpt-5",
+            OpenAIResponsesConfig {
+                provider: "test-provider-disconnect".to_string(),
+                ..Default::default()
+            },
+        );
+        let stream = model
+            .do_stream(StreamOptions {
+                generate: GenerateOptions {
+                    prompt: vec![Message::user("hello".to_string())],
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("stream via hanging custom fetch proxy should start");
+
+        // タスクが text_stream.next() に入ってから rx をドロップする。
+        tokio::time::timeout(Duration::from_secs(2), polled.notified())
+            .await
+            .expect("spawn task should reach upstream read");
+
+        drop(stream);
+
+        // 切断検知が効かなければ、この待機はタイムアウトする。
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("spawn task should stop promptly after receiver is dropped");
+
+        unregister_custom_fetch_proxy("test-provider-disconnect");
     }
 
     #[test]
