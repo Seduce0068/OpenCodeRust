@@ -2137,6 +2137,190 @@ async fn handle_permission_request(
     }
 }
 
+/// セッション更新通知のキュー上限。
+///
+/// `Session` は全メッセージ履歴を含むため deep clone が高価であり、50ms 間隔の
+/// スナップショットを無制限に積むと消費者が遅れた際にメモリが際限なく増える。
+/// 最新状態のみが必要なので、通知はこの件数で coalesce する。
+const SESSION_UPDATE_QUEUE_CAPACITY: usize = 16;
+
+type LatestSessionSlot = Arc<std::sync::Mutex<Option<opencode_session::Session>>>;
+
+/// 最新スナップショット 1 件と、バウンドされた通知キューを保持する producer。
+///
+/// スロットを常に最新で上書きし、通知は `try_send` で送る。キューが満杯の場合は
+/// 通知を破棄するが、スロットの上書きによって古いスナップショットは coalesce
+/// され、消費者には常に最新状態が渡る。
+struct CoalescedSessionUpdates {
+    notify_tx: mpsc::Sender<()>,
+    latest: LatestSessionSlot,
+}
+
+impl CoalescedSessionUpdates {
+    fn new(capacity: usize) -> (Self, SessionUpdateReceiver) {
+        let (notify_tx, notify_rx) = mpsc::channel(capacity);
+        let latest: LatestSessionSlot = Arc::new(std::sync::Mutex::new(None));
+        (
+            Self {
+                notify_tx,
+                latest: Arc::clone(&latest),
+            },
+            SessionUpdateReceiver { notify_rx, latest },
+        )
+    }
+
+    /// 最新スナップショットを記録して消費者を起こす。
+    ///
+    /// 送信失敗時の挙動:
+    /// - `TrySendError::Full`: 未処理の通知が既にあるため新たな通知は送らず、
+    ///   スロットの上書きだけで最新状態を反映する（古いスナップショットを破棄）。
+    /// - `TrySendError::Closed` / 事前の `is_closed()`: 消費者が終了済みなので
+    ///   更新全体を破棄する。
+    ///
+    /// スロット・ログ・エラーにはトークン値やパスを書き込まない。
+    fn publish(&self, snapshot: &opencode_session::Session) {
+        if self.notify_tx.is_closed() {
+            return;
+        }
+        {
+            let mut latest = self
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *latest = Some(snapshot.clone());
+        }
+        match self.notify_tx.try_send(()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(())) => {
+                tracing::trace!("session update coalesced: notification queue full");
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::trace!("session update discarded: consumer closed");
+            }
+        }
+    }
+}
+
+/// [`CoalescedSessionUpdates`] の消費者側ハンドル。
+struct SessionUpdateReceiver {
+    notify_rx: mpsc::Receiver<()>,
+    latest: LatestSessionSlot,
+}
+
+impl SessionUpdateReceiver {
+    /// 次の通知を待ち、溜まった古い通知をまとめて読み捨ててから
+    /// 最新スナップショットを 1 件だけ返す。
+    async fn recv_latest(&mut self) -> Option<opencode_session::Session> {
+        loop {
+            self.notify_rx.recv().await?;
+            while self.notify_rx.try_recv().is_ok() {}
+            if let Some(snapshot) = self
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                return Some(snapshot);
+            }
+            // スロットが空なら次の通知を待つ（通常は起こらない）。
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_update_coalescing_tests {
+    use super::*;
+
+    fn marked_session(seq: u64) -> opencode_session::Session {
+        let mut session = opencode_session::Session::new("proj", ".");
+        session
+            .metadata
+            .insert("seq".to_string(), serde_json::json!(seq));
+        session
+    }
+
+    fn session_seq(session: &opencode_session::Session) -> u64 {
+        session
+            .metadata
+            .get("seq")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default()
+    }
+
+    /// 回帰ガード: 消费者が遅れても通知キューは上限を超えず、
+    /// 保留中スナップショットは最新 1 件だけになる。
+    #[tokio::test]
+    async fn notification_queue_is_bounded_and_holds_only_latest() {
+        const CAPACITY: usize = 4;
+        let (updates, receiver) = CoalescedSessionUpdates::new(CAPACITY);
+
+        for seq in 0..100 {
+            updates.publish(&marked_session(seq));
+        }
+
+        assert!(
+            receiver.notify_rx.len() <= CAPACITY,
+            "notification queue exceeded capacity"
+        );
+        assert_eq!(
+            receiver.notify_rx.len(),
+            CAPACITY,
+            "queue should saturate at its capacity"
+        );
+        let latest = receiver
+            .latest
+            .lock()
+            .expect("slot lock should not poison")
+            .as_ref()
+            .map(session_seq);
+        assert_eq!(latest, Some(99), "stale snapshots must be coalesced away");
+    }
+
+    /// 回帰ガード: 遅延後に消费者が取り出すのは最新スナップショットであり、
+    /// 古い通知はすべて読み捨てられる。
+    #[tokio::test]
+    async fn receiver_applies_only_latest_snapshot_after_lag() {
+        let (updates, mut receiver) = CoalescedSessionUpdates::new(2);
+
+        for seq in 0..8 {
+            updates.publish(&marked_session(seq));
+        }
+
+        let snapshot = receiver
+            .recv_latest()
+            .await
+            .expect("pending update should be delivered");
+        assert_eq!(session_seq(&snapshot), 7, "latest snapshot must win");
+        assert!(
+            receiver.notify_rx.try_recv().is_err(),
+            "older notifications must be drained"
+        );
+        assert!(
+            receiver
+                .latest
+                .lock()
+                .expect("slot lock should not poison")
+                .is_none(),
+            "slot must be empty after being consumed"
+        );
+
+        updates.publish(&marked_session(8));
+        let next = receiver
+            .recv_latest()
+            .await
+            .expect("new update should be delivered");
+        assert_eq!(session_seq(&next), 8);
+    }
+
+    /// 消費者終了後の publish は破棄され、パニックしない。
+    #[test]
+    fn publish_after_consumer_exit_is_discarded() {
+        let (updates, receiver) = CoalescedSessionUpdates::new(2);
+        drop(receiver);
+        updates.publish(&marked_session(0));
+    }
+}
+
 fn spawn_prompt_execution(
     task_state: Arc<ServerState>,
     session_id: String,
@@ -2286,11 +2470,10 @@ fn spawn_prompt_execution(
                 .insert("agent".to_string(), serde_json::json!(agent));
         }
 
-        let (update_tx, mut update_rx) =
-            tokio::sync::mpsc::unbounded_channel::<opencode_session::Session>();
+        let (updates, mut update_rx) = CoalescedSessionUpdates::new(SESSION_UPDATE_QUEUE_CAPACITY);
         let update_state = task_state.clone();
         let update_task = tokio::spawn(async move {
-            while let Some(snapshot) = update_rx.recv().await {
+            while let Some(snapshot) = update_rx.recv_latest().await {
                 let snapshot_id = snapshot.id.clone();
                 {
                     let mut sessions = update_state.sessions.lock().await;
@@ -2307,7 +2490,7 @@ fn spawn_prompt_execution(
             }
         });
         let update_hook: opencode_session::SessionUpdateHook = Arc::new(move |snapshot| {
-            let _ = update_tx.send(snapshot.clone());
+            updates.publish(snapshot);
         });
 
         // Create permission callback that uses the server's PermissionBroker.

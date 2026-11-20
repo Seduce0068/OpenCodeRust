@@ -12,12 +12,13 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use opencode_agent::{AgentExecutor, AgentInfo, AgentRegistry};
 use opencode_command::{CommandContext, CommandRegistry};
@@ -113,31 +114,290 @@ fn server_runtime_from_cli(overrides: ServerCliOverrides) -> ServerRuntimeConfig
     resolve_server_runtime_config(overrides, configured.as_ref())
 }
 
+/// 設定ファイルの更新検知に使うメタデータ（mtime とサイズ）。
+/// パスや設定値はログ・エラーへ一切出さない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigFileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+/// cwd に対して `load_config` が読み込む可能性のある設定ファイルの
+/// メタデータ集合。いずれかの mtime / サイズが変われば再ロードする。
+///
+/// `env` は `apply_env_overrides` / `load_from_env_content` が参照する環境
+/// 変数のハッシュ。値そのものは保持せず、デバッグ出力でもマスクする。
+#[derive(Clone, PartialEq, Eq, Default)]
+struct ConfigFingerprint {
+    files: Vec<(PathBuf, ConfigFileStamp)>,
+    env: Vec<(&'static str, Option<u64>)>,
+}
+
+impl std::fmt::Debug for ConfigFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env = self
+            .env
+            .iter()
+            .map(|(name, hash)| (*name, hash.map(|_| "<hashed>")))
+            .collect::<Vec<_>>();
+        f.debug_struct("ConfigFingerprint")
+            .field("files", &self.files)
+            .field("env", &env)
+            .finish()
+    }
+}
+
 /// プロセス全体で共有する設定キャッシュ。キーは設定読み込みに使った cwd。
 ///
-/// `load_config` は呼ぶたびに設定ファイルを読み直してパースするため、従来は
-/// 1 プロセス内で最大 11 回の二重パースが発生していた。cwd をキーにしている
-/// のは、`run` / `tui` / `acp` が起動後に `set_current_dir` で cwd を切り替え、
-/// その後の `load_config` が別の設定を返す従来挙動を維持するため。
-static CONFIG_CACHE: OnceLock<RwLock<HashMap<PathBuf, opencode_config::Config>>> = OnceLock::new();
+/// 値は (fingerprint, config)。`load_config` は呼ぶたびに設定ファイルを
+/// 読み直してパースするため、従来は 1 プロセス内で最大 11 回の二重パースが
+/// 発生していた。cwd をキーにしているのは、`run` / `tui` / `acp` が起動後に
+/// `set_current_dir` で cwd を切り替え、その後の `load_config` が別の設定を
+/// 返す従来挙動を維持するため。fingerprint により、同一プロセス内で設定
+/// ファイルが書き換えられた場合も再起動なしで再ロードされる。
+static CONFIG_CACHE: OnceLock<
+    RwLock<HashMap<PathBuf, (ConfigFingerprint, opencode_config::Config)>>,
+> = OnceLock::new();
 
-/// `cwd` に対応する設定を返す。初回のみ `load_config` で読み込み、以後は
-/// キャッシュをクローンして返す（設定ファイルの再パースを避ける）。
+/// `opencode-config` の `detect_worktree_stop` と同じ範囲（直近の `.git` まで）
+/// を計算する。見つからなければファイルシステムの最上位までを範囲にする。
+fn config_worktree_stop(start: &Path) -> PathBuf {
+    let mut current = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let mut topmost = current.clone();
+    loop {
+        if current.join(".git").exists() {
+            return current;
+        }
+        let Some(parent) = current.parent() else {
+            return topmost;
+        };
+        if parent == current {
+            return topmost;
+        }
+        topmost = parent.to_path_buf();
+        current = parent.to_path_buf();
+    }
+}
+
+fn stamp_config_file(
+    path: PathBuf,
+    seen: &mut std::collections::BTreeSet<PathBuf>,
+    files: &mut Vec<(PathBuf, ConfigFileStamp)>,
+) {
+    if !seen.insert(path.clone()) {
+        return;
+    }
+    // symlink はターゲットを解決したメタデータを使う。dotfiles 管理のように
+    // 設定ファイル自体が symlink でも、ターゲットの変更を検知できるようにする。
+    // ターゲットが存在しない symlink はリンク自体のメタデータで追跡する。
+    let Ok(meta) = fs::metadata(&path).or_else(|_| fs::symlink_metadata(&path)) else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    files.push((
+        path,
+        ConfigFileStamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        },
+    ));
+}
+
+/// `.opencode` ディレクトリ配下のファイル（agent / command / mode など）を
+/// 再帰的に stamp する（深さは上限を設け、リンクは追わない）。
+fn stamp_opencode_dir(
+    dir: &Path,
+    seen: &mut std::collections::BTreeSet<PathBuf>,
+    files: &mut Vec<(PathBuf, ConfigFileStamp)>,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            stamp_opencode_dir(&path, seen, files, depth + 1);
+        } else if file_type.is_file() {
+            stamp_config_file(path, seen, files);
+        }
+    }
+}
+
+/// `load_config` が参照する設定ソースのメタデータ集合を求める。
+/// プロジェクト設定（find_up と同範囲）、`.opencode` ディレクトリ、
+/// グローバル設定、`OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` / managed config を含む。
+fn config_fingerprint(cwd: &Path) -> ConfigFingerprint {
+    let mut files = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let start = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let stop = config_worktree_stop(&start);
+
+    // プロジェクト設定（opencode-config の find_up と同じ対象・優先順）。
+    for target in [
+        "opencode.jsonc",
+        "opencode.json",
+        ".opencode/opencode.jsonc",
+        ".opencode/opencode.json",
+    ] {
+        let mut current = start.clone();
+        loop {
+            stamp_config_file(current.join(target), &mut seen, &mut files);
+            if current == stop {
+                break;
+            }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            if parent == current {
+                break;
+            }
+            current = parent.to_path_buf();
+        }
+    }
+
+    // .opencode ディレクトリ配下の markdown 等。
+    let mut current = start.clone();
+    loop {
+        let opencode_dir = current.join(".opencode");
+        if opencode_dir.is_dir() {
+            stamp_opencode_dir(&opencode_dir, &mut seen, &mut files, 0);
+        }
+        if current == stop {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+
+    // グローバル設定（dirs::config_dir 相当 + HOME/.opencode）。
+    let mut global_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        global_dirs.push(PathBuf::from(xdg).join("opencode"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        global_dirs.push(home.join(".config/opencode"));
+        global_dirs.push(home.join("Library/Application Support/opencode"));
+        let home_opencode = home.join(".opencode");
+        if home_opencode.is_dir() {
+            stamp_opencode_dir(&home_opencode, &mut seen, &mut files, 0);
+        }
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        global_dirs.push(PathBuf::from(appdata).join("opencode"));
+    }
+    for dir in global_dirs {
+        for name in ["opencode.jsonc", "opencode.json"] {
+            stamp_config_file(dir.join(name), &mut seen, &mut files);
+        }
+    }
+
+    // 明示指定の設定ファイル／ディレクトリと managed config。
+    if let Some(path) = std::env::var_os("OPENCODE_CONFIG") {
+        stamp_config_file(PathBuf::from(path), &mut seen, &mut files);
+    }
+    if let Some(dir) = std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+    {
+        stamp_opencode_dir(&dir, &mut seen, &mut files, 0);
+    }
+    let managed = std::env::var_os("OPENCODE_TEST_MANAGED_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                PathBuf::from("/Library/Application Support/opencode")
+            } else if cfg!(target_os = "windows") {
+                std::env::var_os("ProgramData")
+                    .map(|p| PathBuf::from(p).join("opencode"))
+                    .unwrap_or_else(|| PathBuf::from("C:\\ProgramData\\opencode"))
+            } else {
+                PathBuf::from("/etc/opencode")
+            }
+        });
+    if managed.is_dir() {
+        stamp_opencode_dir(&managed, &mut seen, &mut files, 0);
+    }
+
+    // `load_from_env_content` / `apply_env_overrides` が参照する環境変数。
+    // 値そのものは保持せずハッシュだけを比較することで、プロセス内での
+    // 変更を再ロード検知しつつ、秘密情報をログ・エラーへ出さない。
+    let env = [
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_PERMISSION",
+        "OPENCODE_DISABLE_AUTOCOMPACT",
+        "OPENCODE_DISABLE_PRUNE",
+    ]
+    .into_iter()
+    .map(|name| {
+        let hash = std::env::var_os(name).map(|value| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        });
+        (name, hash)
+    })
+    .collect();
+
+    ConfigFingerprint { files, env }
+}
+
+/// 指定 cwd の設定キャッシュを明示的に破棄する。
+/// 設定更新経路からも呼べる無効化手段として公開する。
+pub(crate) fn invalidate_config_cache(cwd: &Path) {
+    if let Some(cache) = CONFIG_CACHE.get() {
+        cache.write().unwrap_or_else(|e| e.into_inner()).remove(cwd);
+    }
+}
+
+/// `cwd` に対応する設定を返す。初回、または設定ファイルの mtime / サイズが
+/// 変化したときのみ `load_config` で読み直し、それ以外はキャッシュを
+/// クローンして返す（設定ファイルの再パースを避ける）。
 ///
 /// 読み込みエラーはキャッシュしないため、`?` で失敗する呼び出し箇所は
 /// 従来どおり元の `anyhow::Error`（コンテキストチェーン含む）を伝播する。
 fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
+    let fingerprint = config_fingerprint(cwd);
     let cache = CONFIG_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(config) = cache.read().unwrap_or_else(|e| e.into_inner()).get(cwd) {
-        return Ok(config.clone());
+    {
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+        match guard.get(cwd) {
+            Some((cached_fingerprint, config)) if cached_fingerprint == &fingerprint => {
+                return Ok(config.clone())
+            }
+            _ => {}
+        }
     }
+
+    // 古いエントリを明示的に破棄してから再ロードする。
+    invalidate_config_cache(cwd);
 
     let config = load_config(cwd)?;
     cache
         .write()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(cwd.to_path_buf(), config.clone());
+        .insert(cwd.to_path_buf(), (fingerprint, config.clone()));
     Ok(config)
+}
+
+/// `config` サブコマンド用。キャッシュを完全にバイパスして `load_config` の
+/// 生のロード結果を返す（表示は常にファイルの現状を反映する）。
+fn load_config_for_display(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
+    load_config(cwd)
 }
 
 /// One-time, startup-only migration of the legacy global TOML config.
@@ -3735,7 +3995,8 @@ async fn handle_session_command(action: SessionCommands) -> anyhow::Result<()> {
 
 async fn show_config() -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
-    let config = config_for(&current_dir)?;
+    // `config` は常にファイルの現状を表示するためキャッシュをバイパスする。
+    let config = load_config_for_display(&current_dir)?;
 
     println!("\n╔══════════════════════════════════════════╗");
     println!("║         Configuration                      ║");
@@ -4117,7 +4378,9 @@ async fn handle_debug_command(action: DebugCommands) -> anyhow::Result<()> {
         }
         DebugCommands::Config => {
             let cwd = std::env::current_dir()?;
-            let config = config_for(&cwd)?;
+            // `config` サブコマンドと同じ生ロード経路を使い、キャッシュを
+            // バイパスして常にファイル・環境の現状を表示する。
+            let config = load_config_for_display(&cwd)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
         }
         DebugCommands::Skill => {
@@ -7236,5 +7499,203 @@ mod tests {
             Database::database_path().display().to_string(),
             "`db path` must follow OPENCODE_DATA_DIR exactly as Database does"
         );
+    }
+
+    // --- CONFIG_CACHE の mtime/サイズ差分検知と config 表示の回帰テスト -----
+
+    static CONFIG_CACHE_TEST_SEQ: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn temp_config_project(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "opencoderust_config_cache_{}_{}_{}",
+            tag,
+            std::process::id(),
+            CONFIG_CACHE_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp config project");
+        dir
+    }
+
+    #[test]
+    fn config_for_reloads_after_config_file_change() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+
+        let dir = temp_config_project("reload");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let file = dir.join("opencode.json");
+        fs::write(&file, r#"{"model":"cache-test-model-one"}"#).expect("write initial config");
+
+        let first = config_for(&dir).expect("initial config_for");
+        assert_eq!(first.model.as_deref(), Some("cache-test-model-one"));
+
+        // 内容長を変えて mtime/サイズの差分を確実に作る。
+        fs::write(&file, r#"{"model":"cache-test-model-two-longer"}"#).expect("rewrite config");
+
+        let second = config_for(&dir).expect("config_for after change");
+        assert_eq!(
+            second.model.as_deref(),
+            Some("cache-test-model-two-longer"),
+            "config_for must reload when the config file changes"
+        );
+
+        // 変更が無ければキャッシュが返り、同じ値で安定していること。
+        let third = config_for(&dir).expect("config_for unchanged");
+        assert_eq!(third.model.as_deref(), Some("cache-test-model-two-longer"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_display_loader_returns_raw_value_after_file_change() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+
+        let dir = temp_config_project("display");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let file = dir.join("opencode.json");
+        fs::write(&file, r#"{"model":"display-old"}"#).expect("write initial config");
+
+        // 先にキャッシュを古い値で温める。
+        let warmed = config_for(&dir).expect("warm cache");
+        assert_eq!(warmed.model.as_deref(), Some("display-old"));
+
+        fs::write(&file, r#"{"model":"display-new-value"}"#).expect("rewrite config");
+
+        // `config` サブコマンドが使う表示用ローダはキャッシュを通さず生値を返す。
+        let raw = load_config_for_display(&dir).expect("raw config load");
+        assert_eq!(
+            raw.model.as_deref(),
+            Some("display-new-value"),
+            "display loader must bypass the cache and show the current file value"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn config_for_reloads_after_env_fingerprint_change() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        let _restore_content = RestoreEnv(
+            "OPENCODE_CONFIG_CONTENT",
+            std::env::var_os("OPENCODE_CONFIG_CONTENT"),
+        );
+        let _restore_disable = RestoreEnv(
+            "OPENCODE_DISABLE_AUTOCOMPACT",
+            std::env::var_os("OPENCODE_DISABLE_AUTOCOMPACT"),
+        );
+
+        let dir = temp_config_project("env-fingerprint");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        fs::write(dir.join("opencode.json"), r#"{"model":"env-base"}"#)
+            .expect("write initial config");
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        std::env::remove_var("OPENCODE_DISABLE_AUTOCOMPACT");
+
+        let first = config_for(&dir).expect("initial config_for");
+        assert_eq!(first.model.as_deref(), Some("env-base"));
+
+        // プロセス内で inline config を差し替えると、ファイルが同一でも再ロードする。
+        std::env::set_var(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"model":"env-inline-longer"}"#,
+        );
+        let second = config_for(&dir).expect("config_for after env change");
+        assert_eq!(
+            second.model.as_deref(),
+            Some("env-inline-longer"),
+            "config_for must reload when OPENCODE_CONFIG_CONTENT changes in-process"
+        );
+
+        // OPENCODE_DISABLE_* の変更も fingerprint に反映される。
+        std::env::set_var("OPENCODE_DISABLE_AUTOCOMPACT", "true");
+        let third = config_for(&dir).expect("config_for after disable flag change");
+        assert_eq!(
+            third.compaction.as_ref().and_then(|c| c.auto),
+            Some(false),
+            "config_for must reload when OPENCODE_DISABLE_AUTOCOMPACT changes in-process"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// dotfiles 管理では設定ファイル自体が symlink になる。ターゲットの
+    /// 変更を stamp で検知できなければキャッシュが古い値を返し続ける。
+    #[cfg(unix)]
+    #[test]
+    fn config_for_reloads_when_symlink_target_changes() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+
+        let dir = temp_config_project("symlink-target");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let target = dir.join("dotfiles-opencode.json");
+        fs::write(&target, r#"{"model":"symlink-target-one"}"#).expect("write symlink target");
+        let link = dir.join("opencode.json");
+        symlink(&target, &link).expect("create config symlink");
+
+        let first = config_for(&dir).expect("initial config_for via symlink");
+        assert_eq!(first.model.as_deref(), Some("symlink-target-one"));
+
+        // symlink 自体は不変でも、ターゲットの内容が変われば再ロードする。
+        fs::write(&target, r#"{"model":"symlink-target-two-longer"}"#)
+            .expect("rewrite symlink target");
+        let second = config_for(&dir).expect("config_for after symlink target change");
+        assert_eq!(
+            second.model.as_deref(),
+            Some("symlink-target-two-longer"),
+            "config_for must reload when a symlink target changes"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_config_cache_forces_reload() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+
+        let dir = temp_config_project("invalidate");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let file = dir.join("opencode.json");
+        fs::write(&file, r#"{"model":"invalidate-before"}"#).expect("write initial config");
+
+        let first = config_for(&dir).expect("initial config_for");
+        assert_eq!(first.model.as_deref(), Some("invalidate-before"));
+
+        fs::write(&file, r#"{"model":"invalidate-after-longer"}"#).expect("rewrite config");
+
+        // 明示的な無効化手段でも再ロードできることを固定する。
+        invalidate_config_cache(&dir);
+        let reloaded = config_for(&dir).expect("config_for after invalidate");
+        assert_eq!(reloaded.model.as_deref(), Some("invalidate-after-longer"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
