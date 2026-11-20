@@ -7,6 +7,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::branding::{APP_SHORT_NAME, APP_TAGLINE, APP_VERSION_DATE};
 use crate::components::{Logo, Prompt};
@@ -235,10 +236,14 @@ impl HomeView {
         // Right: branding + date version
         let version_text = format!("{} {}", APP_SHORT_NAME, APP_VERSION_DATE);
 
-        // Calculate padding
-        let left_len = dir_text.len();
-        let mid_len = mcp_text.as_ref().map(|(_, l)| l.len() + 4).unwrap_or(0);
-        let right_len = version_text.len();
+        // Calculate padding by display width, not UTF-8 byte length: full-width
+        // characters occupy two terminal columns while using three bytes.
+        let left_len = UnicodeWidthStr::width(dir_text.as_str());
+        let mid_len = mcp_text
+            .as_ref()
+            .map(|(_, l)| UnicodeWidthStr::width(l.as_str()) + 4)
+            .unwrap_or(0);
+        let right_len = UnicodeWidthStr::width(version_text.as_str());
         let total_content = left_len + mid_len + right_len;
         let available = content_area.width as usize;
 
@@ -261,8 +266,11 @@ impl HomeView {
             ));
         }
 
-        // Right-align version
-        let used: usize = spans.iter().map(|s| s.content.len()).sum();
+        // Right-align version using the same display-width basis.
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
         let right_padding = available.saturating_sub(used + right_len);
         spans.push(Span::raw(" ".repeat(right_padding)));
         spans.push(Span::styled(
@@ -541,6 +549,47 @@ mod tests {
 
             assert!(text.contains("⊙"), "MCP status dot missing");
             assert!(text.contains("1 MCP"), "connected count missing");
+        });
+    }
+
+    #[test]
+    fn footer_measures_full_width_directory_by_display_width() {
+        with_isolated_context(|context| {
+            let version = format!("{} {}", APP_SHORT_NAME, APP_VERSION_DATE);
+
+            // TestBackend のバッファは全角 1 文字を 1 セルとして保持するため、
+            // 文字列の先頭から version までの文字数でセル列位置を比較する。
+            fn version_column(row: &str, version: &str) -> usize {
+                let byte_idx = row.find(version).expect("version present in footer");
+                row[..byte_idx].chars().count()
+            }
+
+            let view = HomeView::new(Arc::clone(&context));
+
+            // 表示幅 40 の ASCII と全角（バイト長は 60）で配置が変わらないことを確認する。
+            *context.directory.write() = "a".repeat(40);
+            let ascii = render_to_string(80, 30, |frame| {
+                view.render(frame, Rect::new(0, 0, 80, 30));
+            });
+            *context.directory.write() = "日".repeat(20);
+            let wide = render_to_string(80, 30, |frame| {
+                view.render(frame, Rect::new(0, 0, 80, 30));
+            });
+
+            let ascii_row = ascii
+                .lines()
+                .find(|line| line.contains(APP_VERSION_DATE))
+                .expect("ASCII footer row");
+            let wide_row = wide
+                .lines()
+                .find(|line| line.contains(APP_VERSION_DATE))
+                .expect("full-width footer row");
+
+            assert_eq!(
+                version_column(ascii_row, &version),
+                version_column(wide_row, &version),
+                "full-width directory must be measured by display width, not byte length"
+            );
         });
     }
 

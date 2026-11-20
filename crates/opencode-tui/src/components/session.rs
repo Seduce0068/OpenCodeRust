@@ -348,9 +348,9 @@ impl SessionView {
 
             let mut title_line_spans = vec![title_span];
             if let Some(right_text) = context_and_cost {
-                let right_text_len = right_text.len();
+                let right_text_len = UnicodeWidthStr::width(right_text.as_str());
                 let available = area.width as usize;
-                let title_display_len = title.len() + 3; // " # " prefix
+                let title_display_len = UnicodeWidthStr::width(title) + 3; // " # " prefix
                 if available > title_display_len + right_text_len + 2 {
                     let padding = available.saturating_sub(title_display_len + right_text_len + 2);
                     title_line_spans.push(Span::raw(" ".repeat(padding)));
@@ -475,8 +475,11 @@ impl SessionView {
             ));
         }
 
-        let right_text_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
-        let dir_len = directory.len();
+        let right_text_len: usize = right_spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let dir_len = UnicodeWidthStr::width(directory.as_str());
         let available = area.width as usize;
         let mut line_spans = vec![Span::styled(
             directory,
@@ -1460,6 +1463,7 @@ fn mcp_status_footer_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn is_gutter_span_detects_borders() {
@@ -1564,6 +1568,35 @@ mod tests {
         view.scroll_offset = usize::MAX;
         view.last_messages_area = Some(Rect::new(0, 0, 40, 10));
         assert!(!view.handle_click(0, 5));
+    }
+
+    #[test]
+    fn footer_right_aligns_status_using_display_width_for_full_width_directory() {
+        let context = Arc::new(AppContext::new());
+        // 時間依存のヒントを無効化し、右側スパンを決定的にする。
+        *context.has_connected_provider.write() = true;
+        // 表示幅 50 / バイト長 75: バイト長で測ると右端配置の条件を誤って満たさなくなる。
+        *context.directory.write() = "日".repeat(25);
+        let view = SessionView::new(Arc::clone(&context), "ses_fullwidth".to_string());
+
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        terminal
+            .draw(|frame| view.render_session_footer(frame, Rect::new(0, 0, 80, 1)))
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80)
+            .map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol()).unwrap_or(" "))
+            .collect();
+        let byte_idx = row.find("/status").expect("right status must stay visible");
+        // TestBackend のバッファは全角 1 文字を 1 セルとして保持する。
+        let column = row[..byte_idx].chars().count();
+        assert_eq!(
+            column + "/status".chars().count(),
+            80,
+            "footer status must be right-aligned by display width"
+        );
     }
 
     #[test]

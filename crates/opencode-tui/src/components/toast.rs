@@ -4,12 +4,19 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
 
 const TRANSITION_MS: u64 = 120;
 const SLIDE_OFFSET_COLS: u16 = 4;
 const MIN_FADE_ALPHA: f32 = 0.45;
+const MAX_TOAST_HEIGHT: u16 = 6;
+const MIN_TOAST_HEIGHT: u16 = 3;
+// 2 columns for the left/right borders plus 2 columns of spare room.
+const TOAST_WIDTH_OVERHEAD: u16 = 4;
+// Vertical padding kept below the text so it does not stick to the border.
+const TOAST_HEIGHT_OVERHEAD: u16 = 2;
 
 pub struct Toast {
     message: Option<String>,
@@ -105,10 +112,8 @@ impl Toast {
         if width == 0 {
             return 0;
         }
-        let text_width = usize::from(width.saturating_sub(4)).max(1);
-        let lines = msg.chars().count().div_ceil(text_width).max(1) as u16;
-        // 2 for vertical padding/border room.
-        (lines + 2).clamp(3, 6)
+        let lines = wrapped_line_count(msg, text_width_for(width));
+        (lines + TOAST_HEIGHT_OVERHEAD).clamp(MIN_TOAST_HEIGHT, MAX_TOAST_HEIGHT)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -125,7 +130,13 @@ impl Toast {
             let panel_bg = blend_colors(theme.background, theme.background_panel, fade_alpha);
             let border_color = blend_colors(theme.background_panel, border_color, fade_alpha);
 
-            let paragraph = Paragraph::new(msg.clone())
+            // Keep the rendered text within the height budget returned by
+            // `desired_height`. Overflow is an intentional ellipsis rather
+            // than a silent clip performed by the terminal buffer.
+            let max_content_lines =
+                usize::from(MAX_TOAST_HEIGHT.saturating_sub(TOAST_HEIGHT_OVERHEAD)).max(1);
+            let shown = fit_message(msg, text_width_for(area.width), max_content_lines);
+            let paragraph = Paragraph::new(shown)
                 .style(Style::default().fg(text_color).bg(panel_bg))
                 .block(
                     Block::default()
@@ -156,6 +167,46 @@ impl Default for Toast {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Usable text width after reserving room for the side borders and padding.
+fn text_width_for(width: u16) -> usize {
+    usize::from(width.saturating_sub(TOAST_WIDTH_OVERHEAD)).max(1)
+}
+
+/// Count wrapped lines using terminal display columns, not Unicode scalar
+/// values. Full-width (e.g. CJK) characters occupy two columns, so counting
+/// `chars()` underestimates the height and clips the message tail.
+fn wrapped_line_count(msg: &str, text_width: usize) -> u16 {
+    let lines = UnicodeWidthStr::width(msg).div_ceil(text_width).max(1);
+    // Clamp before the u16 cast so an extremely long message cannot wrap
+    // around during conversion.
+    lines.min(usize::from(MAX_TOAST_HEIGHT)) as u16
+}
+
+/// Trim `msg` to at most `max_lines * text_width` display columns, appending
+/// `…` when trimming actually happens. Trimming stops on char boundaries so a
+/// wide character is never split in half.
+fn fit_message(msg: &str, text_width: usize, max_lines: usize) -> String {
+    let budget = text_width.saturating_mul(max_lines);
+    if UnicodeWidthStr::width(msg) <= budget {
+        return msg.to_string();
+    }
+
+    let ellipsis = "…";
+    let limit = budget.saturating_sub(UnicodeWidthStr::width(ellipsis));
+    let mut result = String::new();
+    let mut used = 0usize;
+    for ch in msg.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        if used.saturating_add(ch_width) > limit {
+            break;
+        }
+        result.push(ch);
+        used += ch_width;
+    }
+    result.push_str(ellipsis);
+    result
 }
 
 fn progress_ratio(elapsed_ms: u64, total_ms: u64) -> f32 {
@@ -267,5 +318,54 @@ mod tests {
         assert_eq!(color_to_rgb(Color::Black), (0, 0, 0));
         assert_eq!(color_to_rgb(Color::Red), (205, 49, 49));
         assert_eq!(color_to_rgb(Color::Green), (13, 188, 121));
+    }
+
+    #[test]
+    fn desired_height_measures_full_width_chars_by_display_width() {
+        let mut wide = Toast::new();
+        let mut narrow = Toast::new();
+        let wide_msg = "あ".repeat(40); // display width 80
+        let narrow_msg = "a".repeat(40); // display width 40
+        wide.show(ToastVariant::Info, &wide_msg, 3000);
+        narrow.show(ToastVariant::Info, &narrow_msg, 3000);
+        // width 24 -> text_width 20 -> wide: ceil(80/20)=4 lines, narrow: 2 lines.
+        assert_eq!(wide.desired_height(24), 6);
+        assert_eq!(narrow.desired_height(24), 4);
+        assert!(wide.desired_height(24) > narrow.desired_height(24));
+    }
+
+    #[test]
+    fn desired_height_empty_message_and_zero_width() {
+        let toast = Toast::new();
+        assert_eq!(toast.desired_height(24), 0);
+
+        let mut toast = Toast::new();
+        toast.show(ToastVariant::Info, "hello", 3000);
+        assert_eq!(toast.desired_height(0), 0);
+        assert_eq!(toast.desired_height(24), 3);
+    }
+
+    #[test]
+    fn desired_height_never_exceeds_max() {
+        let mut toast = Toast::new();
+        let long = "あ".repeat(500);
+        toast.show(ToastVariant::Info, &long, 3000);
+        assert_eq!(toast.desired_height(24), MAX_TOAST_HEIGHT);
+    }
+
+    #[test]
+    fn fit_message_truncates_on_char_boundary_with_ellipsis() {
+        let msg = "あ".repeat(100); // display width 200
+        let fitted = fit_message(&msg, 20, 4); // budget 80
+        assert!(fitted.ends_with('…'));
+        assert!(UnicodeWidthStr::width(fitted.as_str()) <= 80);
+        // The ellipsis replaces the tail; no partial wide char is produced.
+        assert!(fitted.chars().all(|c| c == 'あ' || c == '…'));
+    }
+
+    #[test]
+    fn fit_message_keeps_text_within_budget_unchanged() {
+        let msg = "あ".repeat(10); // display width 20
+        assert_eq!(fit_message(&msg, 20, 4), msg);
     }
 }
