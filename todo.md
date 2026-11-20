@@ -326,6 +326,8 @@ status: current
 
 ## 完了
 
+- [x] **[health/ping/logwarn 3 件]** 認証除外・O(1) readiness・失敗可視化
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[ログ/health 2 件]** 一意名と世代保持、liveness/readiness 分離
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[R4 残存 4 件]** stream redact・serde 集約・OAuth fail-loud・折返し
@@ -613,12 +615,14 @@ status: current
 
 ## メモ
 
-- 2026-11-20 R4 残存（ログ/health の修正時、記録のみ）: /health 系は認証
-  middleware の対象で CLI の起動待ちが Bearer を送らないため、既定設定では
-  401 になりうる（liveness の認証除外または CLI 側のトークン送信が必要、
-  両方 scope 外）。readiness の DB ping が list_pending_all の全件フェッチで
-  あり、軽量 ping メソッドは repository.rs 側の追加が必要。削除失敗が
-  黙って無視され、保持世代数が守られないことを運用者が検知できない。
+- 2026-11-20 R4 残存（ログ/health の修正時）: 3 件とも次ラウンドで対応済み
+  （liveness の認証除外・InputRepository::ping() による O(1) readiness・
+  削除失敗の WARN と失敗数返却）。
+- 2026-11-20 R4 残存（health/ping/logwarn の修正時、記録のみ）: /api 配下の
+  liveness エイリアスは認証除外されない旨を README へ明記（ルート 3 パスのみ
+  無認証）。無認証 liveness が CARGO_PKG_VERSION を公開すること、
+  CLI 起動待ちテストが 1 回の TCP read に完全なリクエスト行を期待すること
+  （仮説・再現根拠なし）は未対応。
 - 2026-11-20 R4 残存（high 11 件の修正時）: SSE 経路の生エラー漏洩は
   safe_prompt_failure_client_info 経由で修正済み。decode_stream_error の
   message 非 redact、MCP OAuth 本線の fail-open、question のクリック判定、
