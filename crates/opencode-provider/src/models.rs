@@ -7,6 +7,10 @@ use tokio::sync::RwLock;
 
 pub const MODELS_DEV_URL: &str = "https://models.dev";
 
+/// リモート JSON / ローカルキャッシュの最大バイト数（8 MiB）。
+/// 改ざんされたエンドポイントやキャッシュによるメモリ枯渇を防ぐ。
+pub const MAX_REMOTE_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 取得失敗を短時間だけキャッシュする TTL（外部 API への連打を防ぐ）。
 pub const DEFAULT_MODELS_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -162,6 +166,12 @@ impl ModelsRegistry {
     }
 
     async fn load(&self) -> ModelsData {
+        if let Ok(meta) = tokio::fs::metadata(&self.cache_path).await {
+            if meta.len() > MAX_REMOTE_JSON_BYTES {
+                tracing::warn!("models.dev cache exceeds size limit; ignoring");
+                return self.fetch().await;
+            }
+        }
         if let Ok(content) = tokio::fs::read_to_string(&self.cache_path).await {
             if let Ok(parsed) = serde_json::from_str::<ModelsData>(&content) {
                 let mut data = self.data.write().await;
@@ -196,7 +206,15 @@ impl ModelsRegistry {
             .await
         {
             Ok(response) if response.status().is_success() => {
-                if let Ok(text) = response.text().await {
+                let bytes = response.bytes().await.ok();
+                let within_limit = bytes
+                    .as_ref()
+                    .is_some_and(|body| body.len() as u64 <= MAX_REMOTE_JSON_BYTES);
+                if !within_limit {
+                    tracing::warn!("models.dev response exceeds size limit; ignoring");
+                }
+                let text = bytes.and_then(|body| String::from_utf8(body.to_vec()).ok());
+                if let Some(text) = text {
                     if let Ok(parsed) = serde_json::from_str::<ModelsData>(&text) {
                         let _ = tokio::fs::write(&self.cache_path, &text).await;
                         let mut data = self.data.write().await;
@@ -461,6 +479,11 @@ mod tests {
         assert!(over.cache_read.is_none());
         assert!(over.cache_write.is_none());
         assert!(over.context_over_200k.is_none());
+    }
+
+    #[test]
+    fn remote_json_byte_limit_is_eight_mib() {
+        assert_eq!(MAX_REMOTE_JSON_BYTES, 8 * 1024 * 1024);
     }
 
     #[test]

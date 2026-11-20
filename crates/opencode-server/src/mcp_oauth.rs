@@ -90,6 +90,13 @@ pub struct McpServerInfo {
     pub oauth_status: Option<McpOAuthStatus>,
 }
 
+/// Maximum number of log entries retained in memory for each MCP server.
+///
+/// The per-server log is a bounded ring buffer: older entries are discarded
+/// once this limit is reached so a long-running session cannot accumulate
+/// logs without limit.
+pub const MAX_LOG_ENTRIES: usize = 200;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerLogEntry {
     pub timestamp: String,
@@ -199,12 +206,15 @@ impl McpOAuthManager {
             level: level.into(),
             message: message.into(),
         };
-        self.logs
-            .write()
-            .await
-            .entry(server_name.to_string())
-            .or_default()
-            .push(entry);
+        let mut logs = self.logs.write().await;
+        let entries = logs.entry(server_name.to_string()).or_default();
+        entries.push(entry);
+        // Ring buffer: drop the oldest entries so the per-server Vec stays
+        // bounded even after long-running sessions with frequent events.
+        let overflow = entries.len().saturating_sub(MAX_LOG_ENTRIES);
+        if overflow > 0 {
+            entries.drain(..overflow);
+        }
     }
 
     pub async fn has_server(&self, server_name: &str) -> bool {
@@ -643,12 +653,14 @@ impl McpOAuthManager {
         server_name: &str,
     ) -> Result<Vec<McpServerLogEntry>, McpOAuthError> {
         self.managed_server(server_name).await?;
-        Ok(self
-            .logs
-            .read()
-            .await
+        let logs = self.logs.read().await;
+        Ok(logs
             .get(server_name)
-            .cloned()
+            .map(|entries| {
+                // Only clone the newest window, never the entire stored Vec.
+                let start = entries.len().saturating_sub(MAX_LOG_ENTRIES);
+                entries[start..].to_vec()
+            })
             .unwrap_or_default())
     }
 
@@ -681,8 +693,10 @@ impl McpOAuthManager {
         // manager that keeps being injected into a fresh client.
         self.clients.remove_oauth_manager(server_name).await;
 
-        self.log_event(server_name, "info", "OAuth state removed")
-            .await;
+        // Drop the per-server log as part of logout. Keeping it would retain
+        // stale entries indefinitely, and appending a "state removed" entry
+        // would leave memory behind after every logout.
+        self.logs.write().await.remove(server_name);
 
         if let Some(managed) = self.servers.read().await.get(server_name).cloned() {
             let mut info = self
@@ -1829,6 +1843,164 @@ mod tests {
             .await
             .expect_err("unknown server has no logs");
         assert!(matches!(error, McpOAuthError::ServerNotFound(_)));
+    }
+
+    /// The stored Vec itself must stay bounded, not just the value returned by
+    /// `get_logs`, otherwise memory still grows without limit.
+    #[tokio::test]
+    async fn log_event_bounds_per_server_log() {
+        const EXTRA: usize = 25;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        // `add_server` already logged one entry; push well past the cap.
+        for index in 0..(MAX_LOG_ENTRIES + EXTRA) {
+            manager
+                .log_event("remote", "info", format!("entry-{index}"))
+                .await;
+        }
+
+        {
+            let logs = manager.logs.read().await;
+            assert_eq!(
+                logs.get("remote").map(Vec::len),
+                Some(MAX_LOG_ENTRIES),
+                "per-server log must be a bounded ring buffer"
+            );
+        }
+
+        let logs = manager
+            .get_logs("remote")
+            .await
+            .expect("registered server has logs");
+        assert_eq!(logs.len(), MAX_LOG_ENTRIES);
+        // The oldest entries were drained and the newest kept in order.
+        assert!(
+            !logs
+                .iter()
+                .any(|entry| entry.message == "Server registered"),
+            "the oldest entry must be evicted"
+        );
+        assert_eq!(
+            logs.first().expect("log entries").message,
+            format!("entry-{EXTRA}")
+        );
+        assert_eq!(
+            logs.last().expect("log entries").message,
+            format!("entry-{}", MAX_LOG_ENTRIES + EXTRA - 1)
+        );
+    }
+
+    /// Defense in depth: even if the stored Vec were larger than the cap,
+    /// `get_logs` must clone only the newest window.
+    #[tokio::test]
+    async fn get_logs_returns_only_the_newest_window() {
+        const EXTRA: usize = 10;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        // Seed directly to exercise the slicing independently of `log_event`.
+        {
+            let mut logs = manager.logs.write().await;
+            let entries = logs.entry("remote".to_string()).or_default();
+            for index in 0..(MAX_LOG_ENTRIES + EXTRA) {
+                entries.push(McpServerLogEntry {
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    level: "info".to_string(),
+                    message: format!("seeded-{index}"),
+                });
+            }
+        }
+
+        let logs = manager
+            .get_logs("remote")
+            .await
+            .expect("registered server has logs");
+        assert_eq!(logs.len(), MAX_LOG_ENTRIES);
+        assert_eq!(
+            logs.first().expect("log entries").message,
+            format!("seeded-{EXTRA}")
+        );
+        assert_eq!(
+            logs.last().expect("log entries").message,
+            format!("seeded-{}", MAX_LOG_ENTRIES + EXTRA - 1)
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_oauth_clears_per_server_log() {
+        let _guard = auth_store_lock();
+        let auth_file = temp_auth_file("logout-logs");
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+        {
+            let mut states = manager.oauth_states.write().await;
+            states.insert(
+                "remote".to_string(),
+                McpOAuthState {
+                    server_name: "remote".to_string(),
+                    authorization_url: "https://idp.example.com/authorize".to_string(),
+                    client_id: None,
+                    status: McpOAuthStatus::Pending,
+                },
+            );
+        }
+        manager.log_event("remote", "info", "before logout").await;
+        assert!(!manager
+            .get_logs("remote")
+            .await
+            .expect("logs before logout")
+            .is_empty());
+
+        assert!(manager.remove_oauth("remote").await);
+
+        assert!(
+            manager
+                .get_logs("remote")
+                .await
+                .expect("server still exists after logout")
+                .is_empty(),
+            "logout must clear the per-server log"
+        );
+        assert!(!manager.logs.read().await.contains_key("remote"));
+
+        let _ = std::fs::remove_file(&auth_file);
     }
 
     #[tokio::test]
