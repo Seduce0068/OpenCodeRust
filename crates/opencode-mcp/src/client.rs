@@ -114,6 +114,10 @@ pub const DEFAULT_STARTUP_MS: u64 = 30_000;
 pub const DEFAULT_CATALOG_MS: u64 = 30_000;
 pub const DEFAULT_EXECUTION_MS: u64 = 43_200_000;
 
+/// Protocol revision sent by default and used when a caller selects the
+/// unimplemented `auto` negotiation mode.
+const LEGACY_PROTOCOL_REVISION: &str = "2025-11-25";
+
 impl McpTimeouts {
     pub fn uniform(millis: u64) -> Self {
         Self {
@@ -180,7 +184,7 @@ impl McpClient {
             initialized: RwLock::new(false),
             capabilities: RwLock::new(None),
             tool_registry,
-            protocol_version: "2025-11-25".to_string(),
+            protocol_version: LEGACY_PROTOCOL_REVISION.to_string(),
             startup_timeout_ms: DEFAULT_STARTUP_MS,
             catalog_timeout_ms: DEFAULT_CATALOG_MS,
             execution_timeout_ms: DEFAULT_EXECUTION_MS,
@@ -203,8 +207,21 @@ impl McpClient {
     }
 
     /// Sets the MCP protocol revision to negotiate during `initialize`.
+    ///
+    /// `auto` and `legacy` are advertised aliases, but the negotiation/selection
+    /// logic was never implemented. Raw-string callers (e.g. the HTTP config
+    /// API) can still send either one, so normalize both to the legacy revision
+    /// with a value-free warning before any `initialize` request is built.
     pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
-        self.protocol_version = version.into();
+        let version = version.into();
+        self.protocol_version = if version == "auto" || version == "legacy" {
+            tracing::warn!(
+                "mcp.protocol auto/legacy mode is unimplemented; normalizing to the legacy protocol (value not logged)"
+            );
+            LEGACY_PROTOCOL_REVISION.to_string()
+        } else {
+            version
+        };
         self
     }
 
@@ -1111,6 +1128,33 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use tokio::time::{sleep, Duration};
+
+    /// The unimplemented `auto` mode must never reach `initialize` as a raw
+    /// protocolVersion, whether it came from config or the HTTP config API.
+    #[test]
+    fn with_protocol_version_normalizes_auto_to_legacy() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_protocol_version("auto");
+        assert_eq!(client.protocol_version, LEGACY_PROTOCOL_REVISION);
+    }
+
+    /// The HTTP config API accepts the documented `legacy` alias as a raw
+    /// string. It must be normalized before becoming a wire protocolVersion;
+    /// otherwise `initialize` sends a value no server understands.
+    #[test]
+    fn with_protocol_version_normalizes_legacy_alias_from_http_config_api() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_protocol_version("legacy");
+        assert_eq!(client.protocol_version, LEGACY_PROTOCOL_REVISION);
+    }
+
+    /// An explicit newer revision must be passed through unchanged.
+    #[test]
+    fn with_protocol_version_preserves_explicit_new_revision() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_protocol_version("2026-07-28");
+        assert_eq!(client.protocol_version, "2026-07-28");
+    }
 
     struct MockTransport {
         messages: Mutex<VecDeque<(Duration, Option<JsonRpcMessage>)>>,

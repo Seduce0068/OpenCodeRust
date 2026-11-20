@@ -778,30 +778,52 @@ pub enum McpServerConfig {
 }
 
 /// MCP protocol version negotiation mode.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+///
+/// The former `auto` choice is intentionally not a variant: its
+/// capability-negotiation probe/fallback was never implemented, so selecting
+/// it could never activate the newer revision. For backward compatibility the
+/// legacy `"auto"` spelling is still accepted while deserializing and is
+/// normalized to [`McpProtocol::Legacy`] with a value-free warning.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum McpProtocol {
     /// Speak up to protocol revision 2025-11-25 (default).
     #[default]
     Legacy,
-    /// Intended to probe for 2026-07-28 and fall back to legacy, but the
-    /// probe/fallback is not implemented: `revision()` currently returns the
-    /// same legacy revision as [`McpProtocol::Legacy`].
-    Auto,
     /// Require protocol revision 2026-07-28.
     #[serde(rename = "2026-07-28")]
     V20260728,
 }
 
+impl<'de> Deserialize<'de> for McpProtocol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "2026-07-28" => Ok(Self::V20260728),
+            "auto" => {
+                // Accepted only so existing configs keep loading. The warning
+                // is static: never echo the configured value into logs.
+                tracing::warn!(
+                    "mcp.protocol auto mode is unimplemented; normalizing to the legacy protocol (value not logged)"
+                );
+                Ok(Self::Legacy)
+            }
+            _ => Err(serde::de::Error::custom(
+                "unsupported mcp.protocol value (value not logged); expected legacy or 2026-07-28",
+            )),
+        }
+    }
+}
+
 impl McpProtocol {
     /// The protocol revision string to send in `initialize`.
-    ///
-    /// [`McpProtocol::Auto`] currently returns the legacy revision, because
-    /// the capability-negotiation probe/fallback is not implemented. Only an
-    /// explicit [`McpProtocol::V20260728`] selects the newer revision.
     pub fn revision(&self) -> &'static str {
         match self {
-            McpProtocol::Legacy | McpProtocol::Auto => "2025-11-25",
+            McpProtocol::Legacy => "2025-11-25",
             McpProtocol::V20260728 => "2026-07-28",
         }
     }
@@ -2109,11 +2131,40 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// `auto` is no longer a schema choice: it is accepted only for backward
+    /// compatibility and normalized to `Legacy` while loading a config.
     #[test]
-    fn mcp_protocol_revision_legacy_and_auto_share_legacy_revision() {
-        assert_eq!(McpProtocol::Legacy.revision(), "2025-11-25");
-        assert_eq!(McpProtocol::Auto.revision(), "2025-11-25");
-        assert_eq!(McpProtocol::V20260728.revision(), "2026-07-28");
+    fn mcp_protocol_auto_is_normalized_to_legacy() {
+        let direct: McpProtocol = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(direct, McpProtocol::Legacy);
+        assert_eq!(direct.revision(), "2025-11-25");
+
+        // The same normalization applies through the server config field that
+        // `opencode-server` reads when building the runtime MCP configuration.
+        let server: McpServer =
+            serde_json::from_str(r#"{"command":["mcp-server"],"protocol":"auto"}"#).unwrap();
+        assert_eq!(server.protocol, Some(McpProtocol::Legacy));
+        assert_eq!(
+            server.protocol.map(|p| p.revision().to_string()),
+            Some("2025-11-25".to_string())
+        );
+    }
+
+    /// An explicitly requested newer revision must survive deserialization
+    /// unchanged, including the revision string handed to `initialize`.
+    #[test]
+    fn mcp_protocol_explicit_2026_07_28_is_preserved() {
+        let direct: McpProtocol = serde_json::from_str("\"2026-07-28\"").unwrap();
+        assert_eq!(direct, McpProtocol::V20260728);
+        assert_eq!(direct.revision(), "2026-07-28");
+
+        let server: McpServer =
+            serde_json::from_str(r#"{"command":["mcp-server"],"protocol":"2026-07-28"}"#).unwrap();
+        assert_eq!(server.protocol, Some(McpProtocol::V20260728));
+        assert_eq!(
+            server.protocol.map(|p| p.revision().to_string()),
+            Some("2026-07-28".to_string())
+        );
     }
 
     #[test]
