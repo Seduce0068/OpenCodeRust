@@ -1,3 +1,13 @@
+//! File watcher foundation: path registration, debounced event coalescing and
+//! broadcast delivery of file change events.
+//!
+//! # 現状の配線状況
+//!
+//! 現状は未配線（workspace member のみ）。ルート `Cargo.toml` の workspace
+//! members に列挙されているだけで、他のクレートから依存されていないため、
+//! 現行の実行系からは利用されない。この状態は意図的なもので、配線は別途の
+//! 作業として扱う。本次変更ではコードの挙動を一切変更しない。
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

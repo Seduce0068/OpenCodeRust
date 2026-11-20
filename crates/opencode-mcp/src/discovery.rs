@@ -84,13 +84,189 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// reqwest / url のエラー文字列から URL の userinfo と credential クエリ値を伏せる。
+///
+/// エラー本文には `https://user:pass@host/...?api_key=...` のような完全 URL が
+/// 入り得る。`Status.url` や `Http` / `Parse` の message へ格納する前に必ず通す。
+/// 依存を増やさないため regex を使わず、区切り文字を基準にした最小走査で処理する。
+fn sanitize_error_text(input: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    const SECRET_KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "api-key",
+        "x-api-key",
+        "x-auth-token",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "authorization",
+        "signature",
+        "secret",
+        "password",
+        "token",
+        "key",
+        "code",
+        "sig",
+    ];
+
+    fn is_edge(byte: u8) -> bool {
+        byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'"' | b'\''
+                    | b'<'
+                    | b'>'
+                    | b'('
+                    | b')'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'&'
+                    | b'?'
+                    | b'#'
+                    | b':'
+                    | b'@'
+            )
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        // scheme://user:pass@host -> scheme://host
+        if bytes[index].is_ascii_alphabetic() {
+            let mut scheme_end = index;
+            while scheme_end < bytes.len()
+                && (bytes[scheme_end].is_ascii_alphanumeric()
+                    || matches!(bytes[scheme_end], b'+' | b'-' | b'.'))
+            {
+                scheme_end += 1;
+            }
+            if bytes
+                .get(scheme_end..)
+                .is_some_and(|tail| tail.starts_with(b"://"))
+            {
+                let authority_start = scheme_end + 3;
+                let mut authority_end = authority_start;
+                while authority_end < bytes.len()
+                    && !matches!(
+                        bytes[authority_end],
+                        b'/' | b'?'
+                            | b'#'
+                            | b' '
+                            | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'\''
+                            | b'<'
+                            | b'>'
+                            | b')'
+                            | b','
+                            | b';'
+                    )
+                {
+                    authority_end += 1;
+                }
+                if let Some(at) = input[authority_start..authority_end].rfind('@') {
+                    out.push_str(&input[index..authority_start]);
+                    index = authority_start + at + 1;
+                    continue;
+                }
+                out.push_str(&input[index..authority_start]);
+                index = authority_start;
+                continue;
+            }
+        }
+
+        // Bearer <value> -> Bearer <redacted>
+        if index == 0 || is_edge(bytes[index - 1]) {
+            let rest = &input[index..];
+            if rest.len() >= 6 && rest.as_bytes()[..6].eq_ignore_ascii_case(b"bearer") {
+                let after = index + 6;
+                if bytes.get(after) == Some(&b' ') {
+                    out.push_str(&input[index..after]);
+                    let mut value_end = after + 1;
+                    while value_end < bytes.len() && !is_edge(bytes[value_end]) {
+                        value_end += 1;
+                    }
+                    out.push_str(REDACTED);
+                    index = value_end;
+                    continue;
+                }
+            }
+        }
+
+        // key=value -> key=<redacted>
+        let mut key_end = index;
+        while key_end < bytes.len()
+            && (bytes[key_end].is_ascii_alphanumeric() || matches!(bytes[key_end], b'_' | b'-'))
+        {
+            key_end += 1;
+        }
+        if key_end > index && bytes.get(key_end) == Some(&b'=') {
+            let key = input[index..key_end].to_ascii_lowercase();
+            if SECRET_KEYS.contains(&key.as_str()) {
+                out.push_str(&input[index..=key_end]);
+                out.push_str(REDACTED);
+                let mut value_end = key_end + 1;
+                while value_end < bytes.len()
+                    && !matches!(
+                        bytes[value_end],
+                        b'&' | b'#'
+                            | b' '
+                            | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'\''
+                            | b'<'
+                            | b'>'
+                            | b','
+                            | b';'
+                            | b')'
+                    )
+                {
+                    value_end += 1;
+                }
+                index = value_end;
+                continue;
+            }
+        }
+
+        let ch = input[index..].chars().next().expect("non-empty suffix");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// `Status.url` へ格納する URL から userinfo と credential クエリ値を落とす。
+fn redact_url(raw: &str) -> String {
+    let without_userinfo = match url::Url::parse(raw) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => raw.to_string(),
+    };
+    sanitize_error_text(&without_userinfo)
+}
+
 /// Builds the well-known URL for `base` with `suffix` appended to the path.
 ///
 /// For `https://host/path` and suffix `.well-known/oauth-protected-resource`
 /// this returns `https://host/.well-known/oauth-protected-resource/path`, which
 /// is the RFC 9728 form used for resources with a path component.
 pub fn well_known_url(base: &str, suffix: &str) -> Result<String, DiscoveryError> {
-    let url = url::Url::parse(base).map_err(|e| DiscoveryError::Url(e.to_string()))?;
+    let url = url::Url::parse(base)
+        .map_err(|e| DiscoveryError::Url(sanitize_error_text(&e.to_string())))?;
     let mut result = url.clone();
     let mut path = format!("/{suffix}");
     let trimmed = url.path().trim_end_matches('/');
@@ -100,6 +276,9 @@ pub fn well_known_url(base: &str, suffix: &str) -> Result<String, DiscoveryError
     result.set_path(&path);
     result.set_query(None);
     result.set_fragment(None);
+    // query/fragment だけでなく userinfo も落とす（トークン値の混入を防ぐ）。
+    let _ = result.set_username("");
+    let _ = result.set_password(None);
     Ok(result.to_string())
 }
 
@@ -108,11 +287,14 @@ pub fn well_known_url(base: &str, suffix: &str) -> Result<String, DiscoveryError
 /// Used as the fallback for servers that publish the metadata document at the
 /// host root instead of the RFC 9728 path-qualified location.
 pub fn well_known_url_root(base: &str, suffix: &str) -> Result<String, DiscoveryError> {
-    let url = url::Url::parse(base).map_err(|e| DiscoveryError::Url(e.to_string()))?;
+    let url = url::Url::parse(base)
+        .map_err(|e| DiscoveryError::Url(sanitize_error_text(&e.to_string())))?;
     let mut result = url.clone();
     result.set_path(&format!("/{suffix}"));
     result.set_query(None);
     result.set_fragment(None);
+    let _ = result.set_username("");
+    let _ = result.set_password(None);
     Ok(result.to_string())
 }
 
@@ -125,12 +307,12 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|e| DiscoveryError::Http(e.to_string()))?;
+        .map_err(|e| DiscoveryError::Http(sanitize_error_text(&e.to_string())))?;
 
     if !response.status().is_success() {
         return Err(DiscoveryError::Status {
             status: response.status().as_u16(),
-            url: url.to_string(),
+            url: redact_url(url),
         });
     }
 
@@ -139,7 +321,7 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
         .await
         .map_err(|e| DiscoveryError::Parse {
             context: context.to_string(),
-            message: e.to_string(),
+            message: sanitize_error_text(&e.to_string()),
         })
 }
 
@@ -213,12 +395,12 @@ pub async fn register_client(
         .json(&body)
         .send()
         .await
-        .map_err(|e| DiscoveryError::Http(e.to_string()))?;
+        .map_err(|e| DiscoveryError::Http(sanitize_error_text(&e.to_string())))?;
 
     if !response.status().is_success() {
         return Err(DiscoveryError::Status {
             status: response.status().as_u16(),
-            url: registration_endpoint.to_string(),
+            url: redact_url(registration_endpoint),
         });
     }
 
@@ -227,7 +409,7 @@ pub async fn register_client(
         .await
         .map_err(|e| DiscoveryError::Parse {
             context: "client registration response".to_string(),
-            message: e.to_string(),
+            message: sanitize_error_text(&e.to_string()),
         })
 }
 
@@ -376,6 +558,75 @@ mod tests {
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));
         assert!(url.contains("/path"));
+    }
+
+    #[test]
+    fn well_known_urls_drop_userinfo() {
+        let url = well_known_url(
+            "https://svc-user:s3cr3t@host.example/mcp?token=abc123#frag",
+            ".well-known/oauth-protected-resource",
+        )
+        .unwrap();
+        assert!(!url.contains("svc-user"), "userinfo leaked: {url}");
+        assert!(!url.contains("s3cr3t"), "password leaked: {url}");
+        assert!(!url.contains('@'), "userinfo separator leaked: {url}");
+        assert!(url.starts_with("https://host.example/"), "{url}");
+
+        let root = well_known_url_root(
+            "https://svc-user:s3cr3t@host.example/mcp",
+            ".well-known/oauth-protected-resource",
+        )
+        .unwrap();
+        assert!(!root.contains("svc-user"), "userinfo leaked: {root}");
+        assert!(!root.contains("s3cr3t"), "password leaked: {root}");
+        assert!(!root.contains('@'), "userinfo separator leaked: {root}");
+    }
+
+    #[test]
+    fn redact_url_removes_userinfo_and_credential_query_values() {
+        let redacted =
+            redact_url("https://svc-user:s3cr3t@host.example/path?api_key=abc123&page=2");
+        assert!(
+            !redacted.contains("svc-user"),
+            "userinfo leaked: {redacted}"
+        );
+        assert!(!redacted.contains("s3cr3t"), "password leaked: {redacted}");
+        assert!(
+            !redacted.contains("abc123"),
+            "query token leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains('@'),
+            "userinfo separator leaked: {redacted}"
+        );
+        assert!(redacted.contains("host.example"), "{redacted}");
+    }
+
+    #[test]
+    fn sanitize_error_text_redacts_reqwest_style_url() {
+        let raw = "error sending request for url (https://svc-user:s3cr3t@host.example/mcp?token=abc123): bearer badvalue";
+        let sanitized = sanitize_error_text(raw);
+        assert!(
+            !sanitized.contains("svc-user"),
+            "userinfo leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("s3cr3t"),
+            "password leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("abc123"),
+            "query token leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("badvalue"),
+            "bearer leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains('@'),
+            "userinfo separator leaked: {sanitized}"
+        );
+        assert!(sanitized.contains("host.example"), "{sanitized}");
     }
 
     #[test]
@@ -735,6 +986,28 @@ mod tests {
             body_json.get("scope").is_none(),
             "scope must be omitted when there are no scopes"
         );
+    }
+
+    #[tokio::test]
+    async fn register_client_status_error_does_not_expose_userinfo() {
+        ensure_no_proxy();
+        let mock = MockServer::spawn(vec![canned("403 Forbidden", "denied")]);
+        let base = mock.base_url.clone();
+        let endpoint = format!(
+            "http://svc-user:s3cr3t@{}/register",
+            base.trim_start_matches("http://")
+        );
+
+        let error = register_client(&endpoint, "http://127.0.0.1:19876/callback", &[])
+            .await
+            .expect_err("403 must fail");
+        let shown = error.to_string();
+
+        assert!(!shown.contains("svc-user"), "userinfo leaked: {shown}");
+        assert!(!shown.contains("s3cr3t"), "password leaked: {shown}");
+        assert!(!shown.contains('@'), "userinfo separator leaked: {shown}");
+        assert!(shown.contains("127.0.0.1"), "host must stay: {shown}");
+        assert_eq!(mock.requests().len(), 1);
     }
 
     #[tokio::test]
