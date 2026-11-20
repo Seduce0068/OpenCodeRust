@@ -227,27 +227,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **`OPENCODE_DISABLE_*` が値を問わず is_ok() で無効化される**
-  — `loader.rs:1535-1542` / CONFIG-ENV-FLAG-ISOK / 高
-- [ ] **OPENCODE_PERMISSION の不正 JSON が無警告で無視され managed より後に適用**
-  — `loader.rs:1487-1497` / CONFIG-PERMISSION-ENV-FAILOPEN / 高
-- [ ] **権限プロンプトの Enter 暗黙 approve と question 未選択確定**
-  — `app.rs:393-397,413-417`, `permission.rs:265-269` / UX-01 / 高
-- [ ] **auth login のトークン入力が端末にエコーされる**
-  — `cli/main.rs:3734-3738` / UX-05 / 高
-- [ ] **InternalError が内部エラー文字列をそのまま 500 ボディへ露出**
-  — `error.rs:25-26,65-70` / UX-06 / 高
-- [ ] **server の CORS/認証回帰 8 件が loopback bind 失敗時に false green**
-  — `server.rs:2497-2520` / TQ-01 / 高
-- [ ] **/api エイリアス整合テストが bind 失敗時に false green**
-  — `routes.rs:6578-6588` / TQ-02 / 高
-- [ ] **/stream が prompt_locks を迂回し並行プロンプトで更新が失われる**
-  — `routes.rs:1353-1401,2266-2268` / R1-CONC-01 / 高
-- [ ] **abort がキュー項目の processing 状態と次項目起動を放置**
-  — `routes.rs:1958-1968,2408-2421` / R1-CONC-02 / 高
-- [ ] **PluginSystem::trigger が await 中に RwLock ガードを保持しデッドロック**
-  — `plugin/lib.rs:181-214` / R1-CONC-03 / 高
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -345,6 +324,8 @@ status: current
 
 ## 完了
 
+- [x] **[新 discovery high 10 件]** env/500/stream/権限/plugin
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[CORS 分離/Renovate 2 件]** ServerState 単位化と依存グループ化
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[permission Always/TLS 2 件]** 動的 allow と rustls 統一
@@ -618,6 +599,9 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（high 10 件の修正時、記録のみ）: stream_message の
+  AbortHandle 登録が spawn 後で、極短命タスクでは終了済みハンドルが残り得る
+  （AbortHandle::new_pair で先に登録する設計判断が必要）。
 - 2026-11-20 cross-skill 集約（swarm83、4 担当・38 件、観点: 並行性 /
   テスト品質 / UX / 設定運用）: high 10 / 中 26 / 低 2 を追記。親が high 4 件
   （DISABLE_* の is_ok、stream の prompt_locks 未取得、plugin trigger の
