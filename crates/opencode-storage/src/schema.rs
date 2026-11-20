@@ -4,7 +4,8 @@
 // ============================================================================
 
 /// Sessions table - stores session metadata
-pub const CREATE_SESSIONS_TABLE: &str = r#"
+#[cfg(test)]
+pub(crate) const CREATE_SESSIONS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -57,7 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// [`MIGRATE_SESSION_METADATA`] を実行する。新規 DB は ALTER で列を得るが、
 /// `user_version` により ALL_MIGRATIONS は初回のみ走るため二重追加にならない。
 /// 正規スキーマ（metadata 列を含む）は [`CREATE_SESSIONS_TABLE`] を参照。
-pub const CREATE_SESSIONS_TABLE_LEGACY: &str = r#"
+pub(crate) const CREATE_SESSIONS_TABLE_LEGACY: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -107,7 +108,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// 新規 DB で "duplicate column name: metadata" になるため、この ALTER を使う。
 /// 旧 DB への再実行時は `database.rs` の PRAGMA 判定で既存列をスキップする
 /// （v3 以降のバージョンアップでこの ALTER が二重に走らないようにするため）。
-pub const MIGRATE_SESSION_METADATA: &str = "ALTER TABLE sessions ADD COLUMN metadata TEXT;";
+pub(crate) const MIGRATE_SESSION_METADATA: &str = "ALTER TABLE sessions ADD COLUMN metadata TEXT;";
 
 /// Messages table - ベースライン DDL（v3 の metadata / usage 列を含まない）。
 ///
@@ -116,7 +117,7 @@ pub const MIGRATE_SESSION_METADATA: &str = "ALTER TABLE sessions ADD COLUMN meta
 /// 新規 DB で「列を持つ CREATE」と ALTER を両方走らせると
 /// "duplicate column name" になるため、基底は旧形のままにする。
 /// 正規スキーマ（新列を含む）は [`CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE`]。
-pub const CREATE_MESSAGES_TABLE: &str = r#"
+pub(crate) const CREATE_MESSAGES_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -146,7 +147,8 @@ CREATE TABLE IF NOT EXISTS messages (
 ///
 /// 参考用の定義であり、`ALL_MIGRATIONS` には載せない（上記ベースライン + ALTER で
 /// 新規／旧 DB の両方を同じ形へ移行するため）。
-pub const CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE: &str = r#"
+#[cfg(test)]
+pub(crate) const CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -178,13 +180,13 @@ CREATE TABLE IF NOT EXISTS messages (
 "#;
 
 /// v3: 既存 messages テーブルへメッセージ単位の metadata 列を追加する。
-pub const MIGRATE_MESSAGES_METADATA: &str = "ALTER TABLE messages ADD COLUMN metadata TEXT;";
+pub(crate) const MIGRATE_MESSAGES_METADATA: &str = "ALTER TABLE messages ADD COLUMN metadata TEXT;";
 
 /// v3: 既存 messages テーブルへメッセージ単位の usage 列を追加する。
-pub const MIGRATE_MESSAGES_USAGE: &str = "ALTER TABLE messages ADD COLUMN usage TEXT;";
+pub(crate) const MIGRATE_MESSAGES_USAGE: &str = "ALTER TABLE messages ADD COLUMN usage TEXT;";
 
 /// Parts table - stores message parts (text, tool calls, etc.)
-pub const CREATE_PARTS_TABLE: &str = r#"
+pub(crate) const CREATE_PARTS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS parts (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL,
@@ -225,7 +227,7 @@ CREATE TABLE IF NOT EXISTS parts (
 "#;
 
 /// Todos table - stores session todos
-pub const CREATE_TODOS_TABLE: &str = r#"
+pub(crate) const CREATE_TODOS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS todos (
     session_id TEXT NOT NULL,
     todo_id TEXT NOT NULL,
@@ -242,7 +244,7 @@ CREATE TABLE IF NOT EXISTS todos (
 "#;
 
 /// Permissions table - stores project-level permissions
-pub const CREATE_PERMISSIONS_TABLE: &str = r#"
+pub(crate) const CREATE_PERMISSIONS_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS permissions (
     project_id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
@@ -252,7 +254,7 @@ CREATE TABLE IF NOT EXISTS permissions (
 "#;
 
 /// Session shares table - stores share info for sessions
-pub const CREATE_SESSION_SHARES_TABLE: &str = r#"
+pub(crate) const CREATE_SESSION_SHARES_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS session_shares (
     session_id TEXT PRIMARY KEY,
     id TEXT NOT NULL,
@@ -265,7 +267,7 @@ CREATE TABLE IF NOT EXISTS session_shares (
 "#;
 
 /// Create indexes for better query performance
-pub const CREATE_INDEXES: &str = r#"
+pub(crate) const CREATE_INDEXES: &str = r#"
 -- Session indexes
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);
@@ -287,7 +289,8 @@ CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
 "#;
 
 /// Session input table - stores durable admission inbox
-pub const CREATE_SESSION_INPUT_TABLE: &str = r#"
+#[cfg(test)]
+pub(crate) const CREATE_SESSION_INPUT_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS session_input (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -299,7 +302,7 @@ CREATE TABLE IF NOT EXISTS session_input (
 );
 "#;
 
-pub const CREATE_SESSION_INPUT_TABLE_WITH_METADATA: &str = r#"
+pub(crate) const CREATE_SESSION_INPUT_TABLE_WITH_METADATA: &str = r#"
 CREATE TABLE IF NOT EXISTS session_input (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -313,16 +316,16 @@ CREATE TABLE IF NOT EXISTS session_input (
 "#;
 
 /// Adds execution metadata to existing inboxes without relying on table recreation.
-pub const MIGRATE_SESSION_INPUT_METADATA: &str =
+pub(crate) const MIGRATE_SESSION_INPUT_METADATA: &str =
     "ALTER TABLE session_input ADD COLUMN metadata TEXT;";
 
-pub const IDX_SESSION_INPUT: &str = r#"
+pub(crate) const IDX_SESSION_INPUT: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_session_input_session ON session_input(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_input_status ON session_input(status);
 "#;
 
 /// All migration statements to run
-pub const ALL_MIGRATIONS: &[&str] = &[
+pub(crate) const ALL_MIGRATIONS: &[&str] = &[
     CREATE_SESSIONS_TABLE_LEGACY,
     MIGRATE_SESSION_METADATA,
     CREATE_MESSAGES_TABLE,

@@ -130,6 +130,12 @@ impl ConfigLoader {
         Ok(())
     }
 
+    /// Load project-level config files, including `.opencode/opencode.json{,c}`.
+    ///
+    /// This is the single reader of `.opencode` config JSON. `load_all`'s
+    /// `.opencode` directory scan only handles commands, agents, modes and
+    /// plugins; loading the same config files there as well would merge them
+    /// twice, duplicate `config_paths`, and emit duplicate warnings.
     pub fn load_project<P: AsRef<Path>>(&mut self, project_dir: P) -> Result<()> {
         let input = project_dir.as_ref();
         let start_dir = if input.is_dir() {
@@ -153,6 +159,24 @@ impl ConfigLoader {
             let found = find_up(target, &start_dir, &stop_dir);
             for path in found.into_iter().rev() {
                 self.load_from_file(path)?;
+            }
+        }
+
+        // find-up は worktree ルートで止まるため、HOME/.opencode と
+        // OPENCODE_CONFIG_DIR は明示的に読み込む（旧 load_all 走査の分を吸収）。
+        let mut extra_dirs = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            extra_dirs.push(home.join(".opencode"));
+        }
+        if let Ok(config_dir) = env::var("OPENCODE_CONFIG_DIR") {
+            extra_dirs.push(PathBuf::from(config_dir));
+        }
+        for dir in extra_dirs {
+            for target in ["opencode.jsonc", "opencode.json"] {
+                let path = dir.join(target);
+                if path.exists() && !self.config_paths.contains(&path) {
+                    self.load_from_file(path)?;
+                }
             }
         }
 
@@ -181,8 +205,10 @@ impl ConfigLoader {
     /// Merge order (TS parity):
     /// 1. Global config (~/.config/opencode/opencode.json{,c})
     /// 2. Custom config (OPENCODE_CONFIG)
-    /// 3. Project config (opencode.json{,c})
-    /// 4. .opencode directories (agents, commands, plugins, modes, config)
+    /// 3. Project config (opencode.json{,c} and .opencode/opencode.json{,c},
+    ///    both read exclusively by `load_project`'s find-up scan)
+    /// 4. .opencode directories (agents, commands, plugins, modes only; config
+    ///    JSON is already owned by `load_project` and is not reloaded here)
     /// 5. Inline config (OPENCODE_CONFIG_CONTENT)
     /// 6. OPENCODE_* environment overrides (OPENCODE_PERMISSION,
     ///    OPENCODE_DISABLE_*). Applied before managed config so that managed
@@ -196,15 +222,13 @@ impl ConfigLoader {
         self.load_from_env()?;
         self.load_project(project_dir)?;
 
-        // Scan .opencode directories
+        // Scan .opencode directories for commands, agents, modes and plugins.
+        // `.opencode/opencode.json{,c}` are intentionally NOT loaded here:
+        // `load_project` already read them from every directory in the project
+        // hierarchy. Re-reading them would merge twice, duplicate `config_paths`
+        // and emit duplicate warnings (including `{env:}` warnings).
         let directories = collect_opencode_directories(project_dir);
         for dir in &directories {
-            // Load config files from .opencode dirs
-            for ext in &["opencode.jsonc", "opencode.json"] {
-                let path = dir.join(ext);
-                self.load_from_file(&path)?;
-            }
-
             // Load commands, agents, modes from markdown files
             let commands = load_commands_from_dir(dir);
             if !commands.is_empty() {
@@ -274,9 +298,11 @@ impl ConfigLoader {
         // Apply legacy field migrations, plugin dedup, provider normalization.
         apply_post_load_transforms(&mut self.config);
 
+        // Log only the count: config paths can contain user identifiers and
+        // must not be emitted to logs.
         eprintln!(
-            "[OpenCode Config] Loaded config files: {:?}",
-            self.config_paths
+            "[OpenCode Config] Loaded {} config files",
+            self.config_paths.len()
         );
 
         Ok(self.config.clone())
@@ -287,8 +313,9 @@ impl ConfigLoader {
     /// 1. Remote .well-known/opencode (org defaults) -- lowest priority
     /// 2. Global config (~/.config/opencode/opencode.json{,c})
     /// 3. Custom config (OPENCODE_CONFIG)
-    /// 4. Project config (opencode.json{,c})
-    /// 5. .opencode directories
+    /// 4. Project config (opencode.json{,c} and .opencode/opencode.json{,c},
+    ///    read only by `load_project`)
+    /// 5. .opencode directories (agents, commands, plugins, modes only)
     /// 6. Inline config (OPENCODE_CONFIG_CONTENT)
     /// 7. OPENCODE_* environment overrides (below managed config)
     /// 8. Managed config directory (enterprise, highest priority)
@@ -2345,6 +2372,48 @@ mod tests {
             cfg.instructions,
             vec!["root.md".to_string(), "child.md".to_string()]
         );
+    }
+
+    /// Regression: `.opencode/opencode.json{,c}` must be loaded exactly once by
+    /// `load_all`. `load_project` is the sole reader of those files; the
+    /// `.opencode` directory scan must not load them again, otherwise
+    /// `config_paths` gets duplicate entries and warnings (including undefined
+    /// `{env:}` warnings) fire twice. No token value or path appears in the
+    /// assertion messages.
+    #[test]
+    fn load_all_records_dot_opencode_config_path_only_once() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TestDir::new("opencode_config_no_dup_paths");
+        let root = temp.path.join("repo");
+        let dot = root.join(".opencode");
+        fs::create_dir_all(&dot).unwrap();
+        // Stop find-up here so the result cannot depend on an ancestor config.
+        fs::create_dir_all(root.join(".git")).unwrap();
+
+        let config_path = dot.join("opencode.jsonc");
+        fs::write(&config_path, r#"{ "model": "dot-model", "theme": "dark" }"#).unwrap();
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader.load_all(&root).unwrap();
+
+        let hits = loader
+            .config_paths()
+            .iter()
+            .filter(|path| path.as_path() == config_path.as_path())
+            .count();
+        assert_eq!(hits, 1, "the .opencode config must be loaded exactly once");
+
+        let mut seen = std::collections::HashSet::new();
+        for path in loader.config_paths() {
+            assert!(
+                seen.insert(path),
+                "config_paths must not contain duplicate entries"
+            );
+        }
+
+        // The single load still participates in the merged config as before.
+        assert_eq!(loader.config().model.as_deref(), Some("dot-model"));
+        assert_eq!(loader.config().theme.as_deref(), Some("dark"));
     }
 
     #[test]
