@@ -268,26 +268,19 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **Bedrock の autoload 判定と Provider 生成で認証方式が不一致**
-  — `bootstrap.rs:553-581,2217-2241` / P-08
-- [ ] **CodeMode の timeoutMs がホストツール呼び出しを拘束できない**
-  — `tools.rs:78-82` / CM-HOST-TIMEOUT
-- [ ] **local-llm がリクエストを直列処理し 300 秒間キャンセル不能**
-  — `local-llm/main.rs:168-198` / LLM-SERIAL
-- [ ] **ADR-0002 の always が永続化されず毎回プロンプトが出る**
-  — `adr-0002:66`, `routes.rs:2012-2020` / ADR2-ALWAYS
-
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
 - [ ] **per-instance ServerState と process-global な CORS/plugin/fetch-proxy 状態が矛盾**
   — — `server.rs:491-516,996` / R1-AR03 / 中
 - [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
   — `renovate.json:3-5` / R1-DP02 / 中
-- [ ] **reqwest 既定 feature で rustls と native-tls が二重搭載**
-  — `Cargo.toml:85`, `Cargo.lock:3493-3538` / R1-DP04 / 中
 
 ## 完了
 
+- [x] **[permission Always/TLS 2 件]** 動的 allow と rustls 統一
+  （2026-11-20、swarm-coding R1-R6）
+- [x] **[重複整理 3 件]** Bedrock/CodeMode/local-llm の完了を反映
+  （2026-11-20、親が実コードで確認）
 - [x] **[rotation/LazyLock/corpus 4 件]** API 提供・標準化・コーパス拡張
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[plugin/provider 3 件]** symlink 防御・モデル決定性・EOF 終了
@@ -555,6 +548,10 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 指摘（permission Always/TLS の修正時、記録のみ）:
+  PermissionRequest.always（再利用候補パターン）が動的 allow の記録に使われず
+  patterns（具体値）のみが記録される。UI が always をどう提示するかはローカルに
+  契約が無く未確認。安全側の機能劣化であり、設計契約の確定が必要。
 - 2026-11-20 R4 指摘（rotation/LazyLock/corpus の修正時）: 2 件とも対応済み。
   rotate_provider_key の doc comment に「HTTP 経路へ未配線」を明記し、
   AGENTS.md のクレート数も 21 に追随。once_cell / lazy_static は syntax.rs と
