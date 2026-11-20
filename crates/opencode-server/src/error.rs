@@ -5,6 +5,44 @@ use axum::{
 };
 use serde_json::json;
 
+/// 内部エラーの詳細を tracing ログへ出す前に、パスとトークンらしい値を伏せる。
+///
+/// クライアントには汎用メッセージと相関 ID だけを返し、内部詳細はログへ残す。
+/// その際にファイルパス（`/...` / `C:\...` / URL）や認証トークン値がログへ
+/// 流出しないよう、該当する単語を `<redacted>` に置換する。
+fn redact_sensitive_detail(detail: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    let mut words: Vec<&str> = Vec::new();
+    let mut redact_next = false;
+    for word in detail.split_whitespace() {
+        let trimmed = word.trim_matches(|c: char| matches!(c, ',' | ';' | ')' | ']'));
+        let key = trimmed
+            .split(['=', ':'])
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .to_ascii_lowercase();
+        let is_secret_key = matches!(
+            key.as_str(),
+            "token" | "secret" | "password" | "authorization" | "bearer" | "api_key" | "apikey"
+        );
+        let looks_like_path = trimmed.contains('/') || trimmed.contains('\\');
+        let looks_like_token = trimmed.len() >= 24
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '='));
+        // 機微キーを含む語は「値が 24 文字未満」でも漏洩し得るため、
+        // 現在語そのものも伏せる。後続語は redact_next で長さに関わらず伏せる。
+        if redact_next || is_secret_key || looks_like_path || looks_like_token {
+            words.push(REDACTED);
+        } else {
+            words.push(word);
+        }
+        redact_next = is_secret_key;
+    }
+    words.join(" ")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("Session not found: {0}")]
@@ -36,38 +74,53 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // 4 要素目は「レガシーなトップレベル `message` を残すか」のフラグ。
+        // 4 要素目は「レガシーなトップレベル `message` を残すか」のフラグ、
+        // 5 要素目は InternalError の相関 ID（他バリアントは None）。
         // 共通スキーマは `{"error":{"message","type"}}` だが、旧 401 レスポンスは
         // `{"error":"unauthorized","message":"..."}` を返していた。互換性のため
         // `Unauthorized` のみトップレベル `message` も併記する。旧 `error` の文字列値
         // "unauthorized" は `error.type` へ移行して保持する（詳細は report 参照）。
-        let (status, message, error_type, include_legacy_message) = match self {
+        let (status, message, error_type, include_legacy_message, correlation_id) = match self {
             ApiError::SessionNotFound(id) => (
                 StatusCode::NOT_FOUND,
                 format!("Session not found: {}", id),
                 "session_not_found",
                 false,
+                None,
             ),
-            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg, "not_found", false),
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg, "bad_request", false),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg, "not_found", false, None),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg, "bad_request", false, None),
             ApiError::ProviderError(msg) => (
                 StatusCode::BAD_GATEWAY,
                 format!("Provider error: {}", msg),
                 "provider_error",
                 false,
+                None,
             ),
             ApiError::InvalidRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid request: {}", msg),
                 "invalid_request",
                 false,
+                None,
             ),
-            ApiError::InternalError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Internal error: {}", msg),
-                "internal_error",
-                false,
-            ),
+            // 内部詳細はボディへ出さず、相関 ID 付きで tracing ログへ残す。
+            // ログにもパス / トークン値が出ないよう redact してから記録する。
+            ApiError::InternalError(msg) => {
+                let correlation_id = uuid::Uuid::new_v4().to_string();
+                tracing::error!(
+                    correlation_id = %correlation_id,
+                    detail = %redact_sensitive_detail(&msg),
+                    "internal error"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_owned(),
+                    "internal_error",
+                    false,
+                    Some(correlation_id),
+                )
+            }
             ApiError::Unauthorized(msg) => (
                 StatusCode::UNAUTHORIZED,
                 if msg.is_empty() {
@@ -77,6 +130,7 @@ impl IntoResponse for ApiError {
                 },
                 "unauthorized",
                 true,
+                None,
             ),
         };
 
@@ -88,6 +142,14 @@ impl IntoResponse for ApiError {
                     "type": error_type
                 },
                 "message": message
+            })
+        } else if let Some(correlation_id) = correlation_id {
+            json!({
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "correlation_id": correlation_id
+                }
             })
         } else {
             json!({
@@ -181,14 +243,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_error_maps_to_500() {
-        assert_response(
-            ApiError::InternalError("boom".to_owned()),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "Internal error: boom",
-        )
-        .await;
+    async fn internal_error_maps_to_500_without_internal_detail() {
+        // 回帰ガード: 内部メッセージはボディへ出ず、汎用メッセージ＋相関 ID のみ。
+        let response = ApiError::InternalError("boom".to_owned()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "internal_error");
+        assert_eq!(body["error"]["message"], "Internal server error");
+        let correlation_id = body["error"]["correlation_id"]
+            .as_str()
+            .expect("correlation id must be returned");
+        assert!(
+            uuid::Uuid::parse_str(correlation_id).is_ok(),
+            "correlation id must be a UUID: {correlation_id}"
+        );
+        assert!(!body.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn internal_error_never_leaks_paths_or_tokens_to_body() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let response = ApiError::InternalError(format!(
+            "read /home/user/.secrets/auth.json with token={secret} failed"
+        ))
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = body.to_string();
+        assert!(!text.contains("/home/user"), "path must not leak: {text}");
+        assert!(!text.contains("auth.json"), "path must not leak: {text}");
+        assert!(!text.contains(secret), "token value must not leak: {text}");
+    }
+
+    #[test]
+    fn redacted_internal_detail_hides_paths_and_token_values() {
+        let redacted = redact_sensitive_detail(
+            "read /home/user/.secrets/auth.json with token=sk-abcdefghijklmnopqrstuvwxyz012345 failed",
+        );
+        assert!(!redacted.contains("/home/user"), "{redacted}");
+        assert!(!redacted.contains("auth.json"), "{redacted}");
+        assert!(
+            !redacted.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+            "{redacted}"
+        );
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        // 無害な詳細はログに残る（トレース可能性を維持）。
+        assert_eq!(
+            redact_sensitive_detail("find_text scan task failed: JoinError"),
+            "find_text scan task failed: JoinError"
+        );
+    }
+
+    #[test]
+    fn redacted_internal_detail_hides_inline_secret_key_values() {
+        // 回帰ガード (R4): "token=abc123" のようにキーと値が同一語にある場合、
+        // 値が 24 文字未満でもキー語自体を <redacted> に置換する。
+        let redacted = redact_sensitive_detail("provider rejected token=abc123 request");
+        assert!(!redacted.contains("abc123"), "{redacted}");
+        assert!(!redacted.contains("token"), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+    }
+
+    #[test]
+    fn redacted_internal_detail_hides_bearer_header_and_short_values() {
+        // 回帰ガード (R4): "Authorization: Bearer xyz" のトークン値と、
+        // 24 文字未満の機微値をログへ出さない。
+        let redacted = redact_sensitive_detail("Authorization: Bearer xyz was rejected");
+        assert!(!redacted.contains("xyz"), "{redacted}");
+        assert!(!redacted.contains("Authorization"), "{redacted}");
+        assert!(!redacted.contains("Bearer"), "{redacted}");
+
+        let redacted = redact_sensitive_detail("secret hunter2 leaked");
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+
+        let redacted = redact_sensitive_detail("password: short2 failed");
+        assert!(!redacted.contains("short2"), "{redacted}");
     }
 
     #[tokio::test]

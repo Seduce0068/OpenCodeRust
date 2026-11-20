@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::api::{
     ApiClient, McpStatusInfo, MessageInfo, QuestionRequestInfo, SessionInfo, SessionRevertInfo,
@@ -68,6 +68,53 @@ fn should_insert_paste_into_prompt(
 /// これにより Ctrl+A などのアプリ共通キーバインドをモーダルが横取りしない。
 fn is_plain_shortcut(key: KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// 権限プロンプトのキー入力をアクションへ変換する。
+///
+/// Enter / Esc は暗黙 approve を避け、既定で Deny（fail-safe）にする。
+/// Allow は明示的な `y` / `a` でのみ発動する。
+fn permission_action_for_key(key: KeyEvent) -> Option<PermissionAction> {
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => Some(PermissionAction::Deny),
+        KeyCode::Char('y') if is_plain_shortcut(key) => Some(PermissionAction::Approve),
+        KeyCode::Char('n') if is_plain_shortcut(key) => Some(PermissionAction::Deny),
+        KeyCode::Char('a') if is_plain_shortcut(key) => Some(PermissionAction::ApproveAlways),
+        _ => None,
+    }
+}
+
+/// raw mode の解除を保証する RAII ガード（エラー時も端末状態を戻す）。
+struct TerminalRawModeGuard;
+
+impl Drop for TerminalRawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// 秘密情報入力のキー処理結果。
+enum SecretInputStep {
+    Continue,
+    Submit,
+    Cancel,
+}
+
+/// エコーオフ入力の 1 キーを処理する。Enter で確定、Esc / Backspace を扱う。
+fn apply_secret_key(secret: &mut String, code: KeyCode) -> SecretInputStep {
+    match code {
+        KeyCode::Char(c) => {
+            secret.push(c);
+            SecretInputStep::Continue
+        }
+        KeyCode::Backspace => {
+            secret.pop();
+            SecretInputStep::Continue
+        }
+        KeyCode::Enter => SecretInputStep::Submit,
+        KeyCode::Esc => SecretInputStep::Cancel,
+        _ => SecretInputStep::Continue,
+    }
 }
 
 /// A question request received from the server.
@@ -369,6 +416,57 @@ impl App {
         Ok(())
     }
 
+    /// 端末エコーを無効化して 1 行の秘密情報（トークン）を読み取る。
+    ///
+    /// 対話端末でない、または raw mode を開始できない場合は `Ok(None)` を返し、
+    /// 呼び出し側は `--token` / 環境変数の案内へフォールバックする。
+    /// 入力値はログ・エラーへ一切含めない。
+    pub fn read_secret_from_terminal(prompt: &str) -> anyhow::Result<Option<String>> {
+        if !io::stdin().is_terminal() {
+            return Ok(None);
+        }
+
+        print!("{}", prompt);
+        io::stdout().flush()?;
+
+        if crossterm::terminal::enable_raw_mode().is_err() {
+            println!();
+            return Ok(None);
+        }
+
+        let outcome: anyhow::Result<Option<String>> = {
+            let _guard = TerminalRawModeGuard;
+            let mut secret = String::new();
+            loop {
+                match crossterm::event::read() {
+                    Ok(CrosstermEvent::Key(key)) if key.kind != KeyEventKind::Release => {
+                        // raw mode では Ctrl+C がシグナルにならないため明示的にキャンセル扱い。
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c'))
+                        {
+                            break Ok(None);
+                        }
+                        match apply_secret_key(&mut secret, key.code) {
+                            SecretInputStep::Continue => {}
+                            SecretInputStep::Submit => {
+                                break Ok(Some(secret.trim().to_string()));
+                            }
+                            SecretInputStep::Cancel => break Ok(None),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        break Err(anyhow::anyhow!("Failed to read terminal input: {}", error));
+                    }
+                }
+            }
+        };
+
+        // エコーオフでは Enter が改行を表示しないため、raw mode 解除後に改行を出す。
+        println!();
+        outcome
+    }
+
     /// Reply to a permission request, surfacing delivery failures to the user.
     fn reply_permission(&mut self, id: &str, decision: &str) {
         if let Some(client) = self.context.get_api_client() {
@@ -389,33 +487,25 @@ impl App {
             Event::Key(key) => {
                 // Handle inline permission prompt before dialogs
                 if self.permission_prompt.is_open {
-                    match key.code {
-                        KeyCode::Enter => {
-                            if let Some(request) = self.permission_prompt.approve() {
-                                self.reply_permission(&request.id, "once");
+                    // Enter/Esc は暗黙 approve せず既定で Deny（fail-safe）。
+                    if let Some(action) = permission_action_for_key(*key) {
+                        match action {
+                            PermissionAction::Approve => {
+                                if let Some(request) = self.permission_prompt.approve() {
+                                    self.reply_permission(&request.id, "once");
+                                }
+                            }
+                            PermissionAction::Deny => {
+                                if let Some(request) = self.permission_prompt.deny() {
+                                    self.reply_permission(&request.id, "reject");
+                                }
+                            }
+                            PermissionAction::ApproveAlways => {
+                                if let Some(request) = self.permission_prompt.approve_always() {
+                                    self.reply_permission(&request.id, "always");
+                                }
                             }
                         }
-                        KeyCode::Char('y') if is_plain_shortcut(*key) => {
-                            if let Some(request) = self.permission_prompt.approve() {
-                                self.reply_permission(&request.id, "once");
-                            }
-                        }
-                        KeyCode::Char('n') if is_plain_shortcut(*key) => {
-                            if let Some(request) = self.permission_prompt.deny() {
-                                self.reply_permission(&request.id, "reject");
-                            }
-                        }
-                        KeyCode::Char('a') if is_plain_shortcut(*key) => {
-                            if let Some(request) = self.permission_prompt.approve_always() {
-                                self.reply_permission(&request.id, "always");
-                            }
-                        }
-                        KeyCode::Esc => {
-                            if let Some(request) = self.permission_prompt.deny() {
-                                self.reply_permission(&request.id, "reject");
-                            }
-                        }
-                        _ => {}
                     }
                     return Ok(());
                 }
@@ -429,7 +519,8 @@ impl App {
                             self.question_prompt.toggle_selected();
                         }
                         KeyCode::Enter => {
-                            if let Some(answer) = self.question_prompt.confirm() {
+                            // 未選択時は confirm_selected() が None を返し、送信しない。
+                            if let Some(answer) = self.question_prompt.confirm_selected() {
                                 self.submit_question_answer(answer);
                             }
                         }
@@ -4575,6 +4666,76 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::CONTROL | KeyModifiers::ALT
         )));
+    }
+
+    #[test]
+    fn permission_enter_and_esc_default_to_deny() {
+        let plain = KeyModifiers::empty();
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Enter, plain)),
+            Some(PermissionAction::Deny)
+        );
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Esc, plain)),
+            Some(PermissionAction::Deny)
+        );
+        // Allow / Always allow は明示キーでのみ発動する。
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Char('y'), plain)),
+            Some(PermissionAction::Approve)
+        );
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Char('n'), plain)),
+            Some(PermissionAction::Deny)
+        );
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Char('a'), plain)),
+            Some(PermissionAction::ApproveAlways)
+        );
+    }
+
+    #[test]
+    fn permission_shortcuts_ignore_ctrl_modifier() {
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Char('y'), ctrl)),
+            None
+        );
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Char('a'), ctrl)),
+            None
+        );
+        assert_eq!(
+            permission_action_for_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::empty())),
+            None
+        );
+    }
+
+    #[test]
+    fn secret_input_processing_handles_backspace_submit_and_cancel() {
+        let mut secret = String::new();
+        assert!(matches!(
+            apply_secret_key(&mut secret, KeyCode::Char('t')),
+            SecretInputStep::Continue
+        ));
+        assert!(matches!(
+            apply_secret_key(&mut secret, KeyCode::Char('x')),
+            SecretInputStep::Continue
+        ));
+        assert_eq!(secret, "tx");
+        assert!(matches!(
+            apply_secret_key(&mut secret, KeyCode::Backspace),
+            SecretInputStep::Continue
+        ));
+        assert_eq!(secret, "t");
+        assert!(matches!(
+            apply_secret_key(&mut secret, KeyCode::Enter),
+            SecretInputStep::Submit
+        ));
+        assert!(matches!(
+            apply_secret_key(&mut secret, KeyCode::Esc),
+            SecretInputStep::Cancel
+        ));
     }
 
     #[test]

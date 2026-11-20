@@ -197,17 +197,26 @@ impl PluginSystem {
     }
 
     pub async fn trigger(&self, context: HookContext) -> Vec<HookResult> {
-        let hooks = self.hooks.read().await;
-        let mut results = Vec::new();
+        // 読み取りロックはスナップショットを作るためだけに保持する。
+        // ハンドラ実行中にロックを保持すると register/remove の write ロック待ちで
+        // デッドロックするため、Arc だけをクローンしてガードを先に drop する。
+        let snapshot: Vec<Arc<Hook>> = {
+            let hooks = self.hooks.read().await;
+            hooks
+                .get(&context.event)
+                .map(|hook_list| {
+                    hook_list
+                        .iter()
+                        .filter(|hook| hook.enabled)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
 
-        if let Some(hook_list) = hooks.get(&context.event) {
-            for hook in hook_list {
-                if !hook.enabled {
-                    continue;
-                }
-                let result = (hook.handler)(context.clone()).await;
-                results.push(result);
-            }
+        let mut results = Vec::with_capacity(snapshot.len());
+        for hook in snapshot {
+            results.push((hook.handler)(context.clone()).await);
         }
 
         results
@@ -397,6 +406,99 @@ mod tests {
         assert_eq!(
             payload.get("prompt").and_then(|v| v.as_str()),
             Some("override")
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_releases_read_lock_before_running_handlers() {
+        // ハンドラ内から write ロックを要する remove を呼ぶ。旧実装では
+        // trigger が read ロックを保持したまま await するためデッドロックする。
+        let system = Arc::new(PluginSystem::new());
+        let system_for_hook = Arc::clone(&system);
+        system
+            .register(Hook::new("reentrant", HookEvent::ToolCall, move |_ctx| {
+                let system = Arc::clone(&system_for_hook);
+                async move {
+                    system.remove(&HookEvent::ToolCall, "reentrant").await;
+                    Ok(())
+                }
+            }))
+            .await;
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            system.trigger(HookContext::new(HookEvent::ToolCall)),
+        )
+        .await
+        .expect("trigger must not hold the read lock while a handler takes the write lock");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert!(!system
+            .list()
+            .await
+            .iter()
+            .any(|(_, name, _)| name == "reentrant"));
+    }
+
+    #[tokio::test]
+    async fn trigger_snapshot_is_stable_when_handler_registers_a_hook() {
+        let system = Arc::new(PluginSystem::new());
+        let system_for_hook = Arc::clone(&system);
+        system
+            .register(Hook::new("first", HookEvent::MessageSent, move |_ctx| {
+                let system = Arc::clone(&system_for_hook);
+                async move {
+                    system
+                        .register(Hook::new("late", HookEvent::MessageSent, |_ctx| async {
+                            Ok::<(), HookError>(())
+                        }))
+                        .await;
+                    Ok(())
+                }
+            }))
+            .await;
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            system.trigger(HookContext::new(HookEvent::MessageSent)),
+        )
+        .await
+        .expect("register from a handler must not deadlock");
+
+        // 実行中に登録したフックは今回の実行には含まれない（スナップショット）。
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(system.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn trigger_keeps_priority_order_and_skips_disabled_hooks() {
+        let system = PluginSystem::new();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (name, priority, enabled) in [("low", 0, true), ("high", 10, true), ("off", 100, false)]
+        {
+            let order = Arc::clone(&order);
+            let observed = name.to_string();
+            system
+                .register(
+                    Hook::new(name, HookEvent::SessionStart, move |_ctx| {
+                        order.lock().unwrap().push(observed.clone());
+                        async { Ok(()) }
+                    })
+                    .with_priority(priority)
+                    .enabled(enabled),
+                )
+                .await;
+        }
+
+        let results = system
+            .trigger(HookContext::new(HookEvent::SessionStart))
+            .await;
+        assert_eq!(results.len(), 2, "disabled hooks must be skipped");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["high".to_string(), "low".to_string()]
         );
     }
 }

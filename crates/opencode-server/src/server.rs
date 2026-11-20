@@ -509,6 +509,9 @@ pub struct ServerState {
     /// セッションごとの実行中プロンプトタスクのキャンセルハンドル。
     /// `prompt_locks` により 1 セッション同時 1 本だけが登録される。
     pub(crate) running_prompt_tasks: StdMutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// 実行中プロンプトがキュー由来の場合のキュー項目 ID。
+    /// abort 時に項目を終端化するため、`running_prompt_tasks` と同じセッション単位で管理する。
+    pub(crate) running_prompt_queue_ids: StdMutex<HashMap<String, String>>,
     /// セッションごとの実行状態（旧プロセス共有 static `SESSION_RUN_STATUS`）。
     pub(crate) session_run_status: TokioRwLock<HashMap<String, routes::SessionRunStatus>>,
     /// セッションごとのプロンプト直列化ロック（旧プロセス共有 static `PROMPT_LOCKS`）。
@@ -550,6 +553,7 @@ impl ServerState {
             tui_response_queue: Mutex::new(VecDeque::new()),
             tui_response_notify: Notify::new(),
             running_prompt_tasks: StdMutex::new(HashMap::new()),
+            running_prompt_queue_ids: StdMutex::new(HashMap::new()),
             session_run_status: TokioRwLock::new(HashMap::new()),
             prompt_locks: TokioRwLock::new(HashMap::new()),
             project_metadata: TokioRwLock::new(HashMap::new()),
@@ -589,6 +593,33 @@ impl ServerState {
             true
         } else {
             false
+        }
+    }
+
+    /// 実行中プロンプトに対応するキュー項目 ID を登録する。
+    pub(crate) fn register_prompt_queue_id(&self, session_id: String, queue_id: String) {
+        self.running_prompt_queue_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id, queue_id);
+    }
+
+    /// abort 時にキュー項目 ID を取り出す（取り出し後は登録を解除する）。
+    pub(crate) fn take_prompt_queue_id(&self, session_id: &str) -> Option<String> {
+        self.running_prompt_queue_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id)
+    }
+
+    /// 終了したタスクのキュー項目 ID を削除する。後続タスクの登録は残す。
+    pub(crate) fn clear_prompt_queue_id(&self, session_id: &str, queue_id: &str) {
+        let mut ids = self
+            .running_prompt_queue_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ids.get(session_id).is_some_and(|id| id == queue_id) {
+            ids.remove(session_id);
         }
     }
 
@@ -2494,16 +2525,12 @@ mod tests {
         .expect("http exchange should not hang")
     }
 
-    async fn start_test_server(
-        app: axum::Router,
-    ) -> Option<(SocketAddr, tokio::task::JoinHandle<()>)> {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) => {
-                eprintln!("SKIPPED: loopback bind unavailable ({err})");
-                return None;
-            }
-        };
+    async fn start_test_server(app: axum::Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        // loopback bind 失敗時にテストをスキップすると false green になるため、
+        // 失敗時は明示的に失敗させる（R2 回帰ガード）。
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed in tests; skipping hides failures");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
             // 本番と同じく ConnectInfo を注入し、client_ip 経路もテストで通す。
@@ -2516,7 +2543,7 @@ mod tests {
                 eprintln!("test server stopped: {err}");
             }
         });
-        Some((addr, server))
+        (addr, server)
     }
 
     fn auth_test_app(state: Arc<ServerState>) -> axum::Router {
@@ -2546,9 +2573,7 @@ mod tests {
         let app = axum::Router::new()
             .route("/session", axum::routing::get(|| async { "ok" }))
             .layer(state.cors_layer());
-        let Some((addr, server)) = start_test_server(app).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(app).await;
 
         let request = concat!(
             "OPTIONS /session HTTP/1.1\r\n",
@@ -2710,9 +2735,7 @@ mod tests {
         let disabled_state = Arc::new(ServerState::new());
         std::env::set_var("OPENCODE_NO_AUTH", "0");
         let app = auth_test_app(disabled_state);
-        let Some((addr, server)) = start_test_server(app).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(app).await;
         let (status, _, _) = http_exchange(addr, request).await;
         assert_eq!(
             status,
@@ -2726,9 +2749,7 @@ mod tests {
         let enabled_state = Arc::new(ServerState::new());
         std::env::set_var("OPENCODE_NO_AUTH", "1");
         let app = auth_test_app(enabled_state);
-        let Some((addr, server)) = start_test_server(app).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(app).await;
         let (status, _, _) = http_exchange(addr, request).await;
         assert_eq!(
             status,
@@ -2752,9 +2773,7 @@ mod tests {
         let state = Arc::new(ServerState::new());
         let token = state.auth_token.clone().expect("generated token");
         let app = auth_test_app(state);
-        let Some((addr, server)) = start_test_server(app).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(app).await;
 
         let request = "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         let (status, _, body) = http_exchange(addr, request).await;
@@ -2788,9 +2807,7 @@ mod tests {
         let mut state = ServerState::new();
         let token = state.auth_token.take().expect("generated token");
         let app = auth_test_app(Arc::new(state));
-        let Some((addr, server)) = start_test_server(app).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(app).await;
 
         let request = "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         let (status, _, body) = http_exchange(addr, request).await;
@@ -2820,9 +2837,7 @@ mod tests {
         let state = Arc::new(ServerState::new());
         let token = state.auth_token.clone().expect("generated token");
         let app = auth_test_app(state);
-        let Some((addr, server)) = start_test_server(app).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(app).await;
 
         let request = format!(
             "GET /protected HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -2898,6 +2913,26 @@ mod tests {
     }
 
     #[test]
+    fn start_test_server_fails_instead_of_skipping_on_bind_error() {
+        // 回帰ガード: bind 失敗時に None を返してテストを黙って通す（false green）ことを禁止。
+        let source = include_str!("server.rs");
+        assert!(
+            source.contains(".expect(\"loopback bind must succeed in tests"),
+            "loopback bind failure must fail the test"
+        );
+        assert!(
+            !source.contains("eprintln!(\"SKIPPED"),
+            "silent skip must be removed"
+        );
+        assert!(
+            !source.contains(
+                "async fn start_test_server(\n        app: axum::Router,\n    ) -> Option<"
+            ),
+            "test server helper must not return Option"
+        );
+    }
+
+    #[test]
     fn server_wires_connect_info_and_records_client_ip() {
         let source = include_str!("server.rs");
         let connect_info_calls = source
@@ -2933,9 +2968,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_echoes_supplied_request_id_header() {
-        let Some((addr, server)) = start_test_server(request_id_test_app()).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(request_id_test_app()).await;
         let request = concat!(
             "GET /ping HTTP/1.1\r\n",
             "Host: 127.0.0.1\r\n",
@@ -2954,9 +2987,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_returns_generated_uuid_when_request_id_is_absent() {
-        let Some((addr, server)) = start_test_server(request_id_test_app()).await else {
-            return;
-        };
+        let (addr, server) = start_test_server(request_id_test_app()).await;
         let request = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         let (status, headers, _) = http_exchange(addr, request).await;
         assert_eq!(status, StatusCode::OK);

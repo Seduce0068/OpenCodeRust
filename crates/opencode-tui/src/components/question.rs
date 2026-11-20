@@ -31,6 +31,13 @@ pub struct QuestionRequest {
     pub options: Vec<QuestionOption>,
 }
 
+/// 選択式 question のキーヒント。未選択時は Enter を受け付けないことを明示する。
+pub const CHOICE_KEY_HINT: &str =
+    "Up/Down to navigate, Space to toggle, Enter to confirm (after selection), Esc to cancel";
+
+/// テキスト question のキーヒント。Esc でキャンセルできることを明示する。
+pub const TEXT_KEY_HINT: &str = "Type your answer, Enter to confirm, Esc to cancel";
+
 pub struct QuestionPrompt {
     current_question: Option<QuestionRequest>,
     pub is_open: bool,
@@ -175,6 +182,30 @@ impl QuestionPrompt {
         Some(answers)
     }
 
+    /// 明示的な回答が存在するか。選択式ではいずれかの選択、テキストでは
+    /// 空白以外の入力を要求する（未選択時の Enter を無効化するため）。
+    pub fn has_explicit_answer(&self) -> bool {
+        let Some(question) = &self.current_question else {
+            return false;
+        };
+        if question.question_type == QuestionType::Text {
+            !self.text_input.trim().is_empty()
+        } else {
+            self.selected_options.iter().any(|selected| *selected)
+        }
+    }
+
+    /// 未選択時に Enter を無効化する `confirm`。
+    ///
+    /// 回答が無い場合は prompt を開いたまま `None` を返すため、呼び出し側は
+    /// 回答を送信せず待機する。キャンセルは Esc（呼び出し側の `close`）で行う。
+    pub fn confirm_selected(&mut self) -> Option<Vec<String>> {
+        if !self.has_explicit_answer() {
+            return None;
+        }
+        self.confirm()
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) {
         if !self.is_open {
             return;
@@ -245,7 +276,7 @@ impl QuestionPrompt {
             }
             content.push(Line::from(""));
             content.push(Line::from(Span::styled(
-                "Up/Down to navigate, Space to toggle, Enter to confirm",
+                CHOICE_KEY_HINT,
                 Style::default().fg(theme.text_muted),
             )));
         } else {
@@ -263,7 +294,7 @@ impl QuestionPrompt {
             content.push(Line::from(Span::styled(input_display, input_style)));
             content.push(Line::from(""));
             content.push(Line::from(Span::styled(
-                "Type your answer and press Enter",
+                TEXT_KEY_HINT,
                 Style::default().fg(theme.text_muted),
             )));
         }
@@ -379,5 +410,62 @@ mod tests {
     fn confirm_returns_none_when_no_question_is_pending() {
         let mut prompt = QuestionPrompt::new();
         assert_eq!(prompt.confirm(), None);
+    }
+
+    #[test]
+    fn confirm_selected_ignores_enter_until_a_choice_is_made() {
+        let mut prompt = QuestionPrompt::new();
+        prompt.ask(choice_question(QuestionType::SingleChoice));
+        assert!(!prompt.has_explicit_answer());
+        assert_eq!(prompt.confirm_selected(), None);
+        // Enter が無効でも prompt は開いたまま（Esc でキャンセルできる）。
+        assert!(prompt.is_open);
+        assert!(prompt.current().is_some());
+
+        prompt.toggle_selected();
+        assert!(prompt.has_explicit_answer());
+        assert_eq!(prompt.confirm_selected(), Some(vec!["Yes".to_string()]));
+        assert!(!prompt.is_open);
+    }
+
+    #[test]
+    fn confirm_selected_ignores_unselected_multiple_choice() {
+        let mut prompt = QuestionPrompt::new();
+        prompt.ask(choice_question(QuestionType::MultipleChoice));
+        assert_eq!(prompt.confirm_selected(), None);
+        assert!(prompt.is_open);
+
+        prompt.move_down();
+        prompt.toggle_selected();
+        assert_eq!(prompt.confirm_selected(), Some(vec!["No".to_string()]));
+    }
+
+    #[test]
+    fn confirm_selected_ignores_blank_text_input() {
+        let mut prompt = QuestionPrompt::new();
+        prompt.ask(QuestionRequest {
+            id: "qst_text".to_string(),
+            question: "Name?".to_string(),
+            question_type: QuestionType::Text,
+            options: Vec::new(),
+        });
+        assert_eq!(prompt.confirm_selected(), None);
+        prompt.type_char(' ');
+        assert_eq!(prompt.confirm_selected(), None);
+        assert!(prompt.is_open);
+
+        for c in "answer".chars() {
+            prompt.type_char(c);
+        }
+        assert_eq!(prompt.confirm_selected(), Some(vec!["answer".to_string()]));
+        assert!(!prompt.is_open);
+    }
+
+    #[test]
+    fn question_key_hints_advertise_enter_after_selection_and_esc_cancel() {
+        assert!(CHOICE_KEY_HINT.contains("Enter to confirm (after selection)"));
+        assert!(CHOICE_KEY_HINT.contains("Esc to cancel"));
+        assert!(TEXT_KEY_HINT.contains("Enter to confirm"));
+        assert!(TEXT_KEY_HINT.contains("Esc to cancel"));
     }
 }

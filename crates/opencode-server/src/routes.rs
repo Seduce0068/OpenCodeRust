@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex, OnceCell, RwLock};
@@ -463,6 +464,43 @@ async fn get_session(
     Ok(Json(session_to_info(session)))
 }
 
+/// 削除されるセッションのキュー項目を終端化する（冪等）。
+///
+/// 実行中項目の登録を取り出して failed にし、未着手項目もすべて failed にする。
+/// 登録を取り出すことで、後続の `PromptTaskCleanup::drop` が回収（＝再生成）を
+/// 行わないようにもなる。DB エラー詳細はログへ出さない（パス等を含み得るため）。
+async fn terminalize_queue_for_deleted_session(state: &ServerState, session_id: &str) {
+    let Some(repo) = state.input_repo.as_ref() else {
+        return;
+    };
+    if let Some(queue_id) = state.take_prompt_queue_id(session_id) {
+        if repo.mark_as_failed(&queue_id).await.is_err() {
+            tracing::warn!(
+                input_id = %queue_id,
+                "failed terminalizing running queued prompt on session deletion"
+            );
+        }
+    }
+    match repo.list_pending(session_id).await {
+        Ok(pending) => {
+            for input in pending {
+                if repo.mark_as_failed(&input.id).await.is_err() {
+                    tracing::warn!(
+                        input_id = %input.id,
+                        "failed terminalizing pending queued prompt on session deletion"
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                session_id = %session_id,
+                "failed listing queued prompts on session deletion"
+            );
+        }
+    }
+}
+
 async fn delete_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -473,6 +511,9 @@ async fn delete_session(
         .await
         .delete(&id)
         .ok_or_else(|| ApiError::SessionNotFound(id.clone()))?;
+    // 削除済みセッションの生成を止める。abort とキュー終端化は冪等。
+    state.abort_prompt_task(&id);
+    terminalize_queue_for_deleted_session(&state, &id).await;
     state.session_run_status.write().await.remove(&id);
     state.prompt_locks.write().await.remove(&id);
     persist_sessions_if_enabled(&state).await;
@@ -1350,6 +1391,49 @@ async fn send_sse_event(
     }
 }
 
+/// ストリームの共通終端処理。
+///
+/// 正常終了・クライアント切断の両分岐から呼び、受け取り済みの
+/// `final_text` / `pending_tool_calls` を漏れなくセッションへ永続化する。
+/// 実行状態の Idle 復帰は呼び出し側が行う（既存の源码ガード契約を維持）。
+async fn finalize_stream_message(
+    state: &Arc<ServerState>,
+    session_id: &str,
+    msg_id: &str,
+    final_text: String,
+    pending_tool_calls: HashMap<String, PendingToolCall>,
+    stream_failed: Option<String>,
+) {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            if let Some(message) = session.get_message_mut(msg_id) {
+                if !final_text.is_empty() {
+                    message.add_text(final_text);
+                }
+                for (id, pending) in pending_tool_calls {
+                    let name = pending.name.unwrap_or_else(|| "unknown_tool".to_string());
+                    let parsed_input = serde_json::from_str::<serde_json::Value>(&pending.input)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": pending.input }));
+                    let call_id = if id.is_empty() {
+                        format!("call_{}", uuid::Uuid::new_v4().simple())
+                    } else {
+                        id
+                    };
+                    message.add_tool_call(call_id, name, parsed_input);
+                }
+                if let Some(error) = stream_failed {
+                    if message.parts.is_empty() {
+                        message.add_text(format!("Stream error: {}", error));
+                    }
+                }
+            }
+            session.touch();
+        }
+    }
+    persist_sessions_if_enabled(state).await;
+}
+
 async fn stream_message(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<String>,
@@ -1360,6 +1444,19 @@ async fn stream_message(
     let (provider, provider_id, model_id) =
         resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)?;
     drop(config);
+
+    // `/prompt`（spawn_prompt_execution）と同じセッション単位ロックを、
+    // セッション更新の前からストリーム完了まで保持する。OwnedMutexGuard を使う
+    // のは、ガードを spawn 先へ 'static で移し、ハンドラがすぐ Sse を返せるようにするため。
+    // これにより並行経路での更新が失われない。
+    let run_lock = {
+        let mut locks = state.prompt_locks.write().await;
+        locks
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let run_guard = run_lock.lock_owned().await;
 
     let (provider_messages, msg_id, selected_variant) = {
         let mut sessions = state.sessions.lock().await;
@@ -1400,6 +1497,9 @@ async fn stream_message(
         )
     };
 
+    // 実行中ステータスも /prompt と同じ経路で更新する（abort が状態を戻せるようにする）。
+    set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+
     let variant = selected_variant.clone();
     let temperature = temperature_for_model(&model_id).or(Some(0.7));
     let top_p = top_p_for_model(&model_id);
@@ -1422,7 +1522,19 @@ async fn stream_message(
     let stream_session_id = session_id.clone();
     let stream_msg_id = msg_id.clone();
 
-    tokio::spawn(async move {
+    let stream_task = tokio::spawn(async move {
+        // /prompt と同じ後始末（AbortHandle 登録済みタスクの解除）を行う。
+        // キュー項目は持たないため、キュー回収は行わない。
+        let _cleanup = PromptTaskCleanup {
+            state: stream_state.clone(),
+            session_id: stream_session_id.clone(),
+            task_id: tokio::task::id(),
+            queue_id: None,
+            claimed: Arc::new(AtomicBool::new(false)),
+            queue_finalized: Arc::new(AtomicBool::new(true)),
+        };
+        // ハンドラで取得したセッション単位ロックを完了まで保持する。
+        let _run_guard = run_guard;
         send_sse_event(
             &tx,
             "message_start",
@@ -1653,43 +1765,33 @@ async fn stream_message(
             }
             None => {
                 // クライアント切断を検知。`chat_stream` の future は select! により
-                // ドロップ済み。ストリームは消費していないが、select! より前に
-                // add_user_message / add_assistant_message でセッションを変更済み
-                // （両者が touch() を呼ぶ）ため、永続化してからリターンする。
-                persist_sessions_if_enabled(&stream_state).await;
+                // ドロップ済み。ここまでに受け取った final_text / pending_tool_calls を
+                // 正常経路と同じ finalize ヘルパで永続化してからリターンする。
+                finalize_stream_message(
+                    &stream_state,
+                    &stream_session_id,
+                    &stream_msg_id,
+                    final_text,
+                    pending_tool_calls,
+                    stream_failed,
+                )
+                .await;
+                set_session_run_status(&stream_state, &stream_session_id, SessionRunStatus::Idle)
+                    .await;
                 return;
             }
         }
 
-        {
-            let mut sessions = stream_state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&stream_session_id) {
-                if let Some(message) = session.get_message_mut(&stream_msg_id) {
-                    if !final_text.is_empty() {
-                        message.add_text(final_text);
-                    }
-                    for (id, pending) in pending_tool_calls {
-                        let name = pending.name.unwrap_or_else(|| "unknown_tool".to_string());
-                        let parsed_input =
-                            serde_json::from_str::<serde_json::Value>(&pending.input)
-                                .unwrap_or_else(|_| serde_json::json!({ "raw": pending.input }));
-                        let call_id = if id.is_empty() {
-                            format!("call_{}", uuid::Uuid::new_v4().simple())
-                        } else {
-                            id
-                        };
-                        message.add_tool_call(call_id, name, parsed_input);
-                    }
-                    if let Some(error) = stream_failed {
-                        if message.parts.is_empty() {
-                            message.add_text(format!("Stream error: {}", error));
-                        }
-                    }
-                }
-                session.touch();
-            }
-        }
-        persist_sessions_if_enabled(&stream_state).await;
+        finalize_stream_message(
+            &stream_state,
+            &stream_session_id,
+            &stream_msg_id,
+            final_text,
+            pending_tool_calls,
+            stream_failed,
+        )
+        .await;
+        set_session_run_status(&stream_state, &stream_session_id, SessionRunStatus::Idle).await;
 
         send_sse_event(
             &tx,
@@ -1709,6 +1811,9 @@ async fn stream_message(
         )
         .await;
     });
+
+    // /prompt と同じくセッション単位で AbortHandle を登録し、abort からも止められるようにする。
+    state.register_prompt_task(session_id, stream_task.abort_handle());
 
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
@@ -1793,15 +1898,55 @@ struct QueuedPromptRequest {
 
 /// プロンプトタスクの終了時に `ServerState` のキャンセルハンドルを後始末する。
 /// 正常終了・早期 return・abort のいずれの経路でも Drop が走る。
+///
+/// キュー由来のタスクが中断された場合は、キュー項目を failed へ終端化し、
+/// 次のキュー投入を再スケジュールする（abort 経路と同じ回収処理）。
 struct PromptTaskCleanup {
     state: Arc<ServerState>,
     session_id: String,
     task_id: tokio::task::Id,
+    queue_id: Option<String>,
+    /// `claim_pending` に成功したか。未 claim ならキュー項目は pending のままなので触らない。
+    claimed: Arc<AtomicBool>,
+    /// 通常の終端処理（promote / failed + 次キュー起動）が済んだか。
+    queue_finalized: Arc<AtomicBool>,
 }
 
 impl Drop for PromptTaskCleanup {
     fn drop(&mut self) {
         self.state.clear_prompt_task(&self.session_id, self.task_id);
+        let Some(queue_id) = self.queue_id.clone() else {
+            return;
+        };
+        // キュー回収は「running_prompt_queue_ids から ID を取り出した側だけ」が行う
+        // 単発フラグ方式（abort と Drop の二重回収を防ぐ）。
+        if !self.claimed.load(Ordering::Acquire) || self.queue_finalized.load(Ordering::Acquire) {
+            self.state
+                .clear_prompt_queue_id(&self.session_id, &queue_id);
+            return;
+        }
+        match self.state.take_prompt_queue_id(&self.session_id) {
+            Some(id) if id == queue_id => {
+                // 自分の ID を取得した＝回収担当。Drop は同期なのでランタイムへ引き継ぐ。
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    tracing::warn!(input_id = %queue_id, "no tokio runtime for queued prompt cleanup");
+                    return;
+                };
+                let state = self.state.clone();
+                let session_id = self.session_id.clone();
+                handle.spawn(async move {
+                    recover_interrupted_queued_prompt(state, session_id, Some(queue_id)).await;
+                });
+            }
+            Some(other) => {
+                // 後続タスクの登録を誤って取り出したので元に戻す。
+                self.state
+                    .register_prompt_queue_id(self.session_id.clone(), other);
+            }
+            None => {
+                // abort / delete_session 側が先に取り出して回収担当となっている。
+            }
+        }
     }
 }
 
@@ -1925,11 +2070,19 @@ fn spawn_prompt_execution(
     };
     let register_state = task_state.clone();
     let task_session_id = session_id.clone();
+    let registered_queue_id = queue_id.clone();
+    // Drop 経路のキュー回収用フラグ。claim 成功後にのみ回収対象となり、
+    // 通常の終端処理が済んだら finalized を立てて二重処理を防ぐ。
+    let queue_claimed = Arc::new(AtomicBool::new(false));
+    let queue_finalized = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn(async move {
         let _cleanup = PromptTaskCleanup {
             state: task_state.clone(),
             session_id: session_id.clone(),
             task_id: tokio::task::id(),
+            queue_id: queue_id.clone(),
+            claimed: queue_claimed.clone(),
+            queue_finalized: queue_finalized.clone(),
         };
         let run_lock = {
             let mut locks = task_state.prompt_locks.write().await;
@@ -1958,7 +2111,9 @@ fn spawn_prompt_execution(
             match input_repo.claim_pending(queue_id).await {
                 // claim 成功でプロンプトは処理へ進む。以降の次項目起動は
                 // リセット用 wrapper を通るため retry_attempt は引き継がない。
-                Ok(true) => {}
+                Ok(true) => {
+                    queue_claimed.store(true, Ordering::Release);
+                }
                 Ok(false) => return,
                 Err(error) => {
                     tracing::error!(%queue_id, retry_attempt, %error, "failed claiming queued prompt");
@@ -1980,6 +2135,7 @@ fn spawn_prompt_execution(
                 }
             }
             if queue_id.is_some() {
+                queue_finalized.store(true, Ordering::Release);
                 spawn_next_queued_prompt(task_state.clone(), session_id.clone());
             }
             return;
@@ -2294,9 +2450,14 @@ fn spawn_prompt_execution(
                     tracing::error!(%queue_id, %error, "failed marking queued prompt failed");
                 }
             }
+            // Drop 経路の回収をここで無効化してから次キューを起動する。
+            queue_finalized.store(true, Ordering::Release);
             spawn_next_queued_prompt(task_state.clone(), session_id.clone());
         }
     });
+    if let Some(queue_id) = registered_queue_id {
+        register_state.register_prompt_queue_id(task_session_id.clone(), queue_id);
+    }
     register_state.register_prompt_task(task_session_id, task.abort_handle());
 }
 
@@ -2403,6 +2564,30 @@ fn retry_queued_prompts(state: Arc<ServerState>, session_id: String, attempt: u3
     });
 }
 
+/// 中断されたキュー項目を failed へ終端化し、次のキュー投入を再スケジュールする。
+///
+/// abort 経路と `PromptTaskCleanup::drop` 経路の両方から呼ばれるが、実際に
+/// 回収を行うのは `running_prompt_queue_ids` から ID を取り出した側 1 つだけ
+/// （単発フラグ）。冪等性は `mark_as_failed` の
+/// `status IN ('pending','processing')` 条件と、`spawn_prompt_execution` の
+/// `claim_pending` の原子性により担保される。
+async fn recover_interrupted_queued_prompt(
+    state: Arc<ServerState>,
+    session_id: String,
+    queue_id: Option<String>,
+) {
+    if let (Some(queue_id), Some(input_repo)) = (queue_id.as_deref(), state.input_repo.as_ref()) {
+        if let Err(error) = input_repo.mark_as_failed(queue_id).await {
+            tracing::error!(input_id = %queue_id, %error, "failed terminalizing interrupted queued prompt");
+        }
+    }
+    // 削除済みセッションでは次キューを起動しない（生成の再開を防ぐ）。
+    let session_exists = state.sessions.lock().await.get(&session_id).is_some();
+    if session_exists {
+        spawn_next_queued_prompt(state, session_id);
+    }
+}
+
 /// セッションの実行中プロンプトをキャンセルし、実行状態を Idle に戻す。
 /// レスポンスの形は従来どおり `aborted: true` を維持する。
 async fn abort_running_prompt(
@@ -2415,9 +2600,17 @@ async fn abort_running_prompt(
             return Err(ApiError::SessionNotFound(session_id.to_string()));
         }
     }
+    // キュー項目 ID の取り出しを単発フラグとして使う。取得できた側だけが回収し、
+    // タスク側の Drop は取り出し失敗を以て回収済みと判断してスキップする。
+    // ID が無い（キュー由来でない／既に回収済み）場合は何も再スケジュールしない。
+    let queue_id = state.take_prompt_queue_id(session_id);
     let found = state.abort_prompt_task(session_id);
     set_session_run_status(state, session_id, SessionRunStatus::Idle).await;
     tracing::info!(session_id = %session_id, task_found = found, "session abort requested");
+    if let Some(queue_id) = queue_id {
+        recover_interrupted_queued_prompt(state.clone(), session_id.to_string(), Some(queue_id))
+            .await;
+    }
     Ok(Json(serde_json::json!({ "aborted": true })))
 }
 
@@ -5875,6 +6068,67 @@ mod mapping_tests {
 }
 
 #[cfg(test)]
+mod stream_message_serialization_tests {
+    fn source_fn_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("function must exist in source");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("function closing brace");
+        &rest[..end]
+    }
+
+    #[test]
+    fn stream_message_serializes_with_prompt_and_registers_abort_handle() {
+        let source = include_str!("routes.rs");
+        let body = source_fn_body(source, "async fn stream_message(");
+        assert!(
+            body.contains("state.prompt_locks"),
+            "stream must share the per-session lock used by /prompt: {body}"
+        );
+        assert!(
+            body.contains("lock_owned()"),
+            "guard must own the lock so it can move into the stream task: {body}"
+        );
+        assert!(
+            body.contains("register_prompt_task("),
+            "abort handle must be registered: {body}"
+        );
+        assert!(body.contains("SessionRunStatus::Busy"), "{body}");
+        assert!(body.contains("SessionRunStatus::Idle"), "{body}");
+        assert!(
+            body.contains(".get_mut(&session_id)"),
+            "session update must use the get_mut path: {body}"
+        );
+        assert!(
+            !body.contains("sessions.update("),
+            "clone+update path must not be used: {body}"
+        );
+    }
+
+    #[test]
+    fn stream_task_holds_run_guard_and_cleans_up() {
+        let source = include_str!("routes.rs");
+        let body = source_fn_body(source, "async fn stream_message(");
+        assert!(body.contains("let _run_guard = run_guard;"), "{body}");
+        assert!(body.contains("PromptTaskCleanup"), "{body}");
+    }
+
+    #[test]
+    fn disconnect_and_normal_paths_share_finalize_helper() {
+        let source = include_str!("routes.rs");
+        let body = source_fn_body(source, "async fn stream_message(");
+        assert_eq!(
+            body.matches("finalize_stream_message(").count(),
+            2,
+            "both the disconnect branch and the normal path must call the shared helper: {body}"
+        );
+        let helper = source_fn_body(source, "async fn finalize_stream_message(");
+        assert!(helper.contains("add_text(final_text)"), "{helper}");
+        assert!(helper.contains("add_tool_call"), "{helper}");
+        assert!(helper.contains("persist_sessions_if_enabled"), "{helper}");
+    }
+}
+
+#[cfg(test)]
 mod abort_tests {
     use super::*;
 
@@ -5945,6 +6199,294 @@ mod abort_tests {
             .await
             .expect_err("unknown session must be rejected");
         assert!(matches!(error, ApiError::SessionNotFound(_)));
+    }
+
+    async fn state_with_queued_input() -> (
+        Arc<ServerState>,
+        String,
+        opencode_storage::InputRepository,
+        opencode_storage::Database,
+    ) {
+        let mut state = ServerState::new();
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.create("default", ".");
+            let stored: opencode_types::Session =
+                serde_json::from_value(serde_json::to_value(&session).expect("session serializes"))
+                    .expect("session converts to stored form");
+            let session_repo = opencode_storage::SessionRepository::new(db.pool().clone());
+            session_repo
+                .create(&stored)
+                .await
+                .expect("stored session must exist for the foreign key");
+            session.id.clone()
+        };
+        let repo = opencode_storage::InputRepository::new(db.pool().clone());
+        state.input_repo = Some(repo.clone());
+        (Arc::new(state), session_id, repo, db)
+    }
+
+    #[tokio::test]
+    async fn abort_finalizes_queued_item_and_reschedules_idempotently() {
+        let (state, session_id, repo, _db) = state_with_queued_input().await;
+        let input = repo
+            .enqueue(&session_id, "queued prompt", Some("queue"), None)
+            .await
+            .expect("enqueue should succeed");
+        assert!(repo.claim_pending(&input.id).await.expect("claim succeeds"));
+        state.register_prompt_queue_id(session_id.clone(), input.id.clone());
+        let task = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id.clone(), task.abort_handle());
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+
+        let response = abort_prompt(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("abort should succeed");
+        assert_eq!(response.0["aborted"], true);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task should stop after abort");
+        assert!(outcome.unwrap_err().is_cancelled());
+
+        // 同じ回収を再実行しても終端状態は変わらない（冪等）。
+        recover_interrupted_queued_prompt(
+            state.clone(),
+            session_id.clone(),
+            Some(input.id.clone()),
+        )
+        .await;
+        assert!(
+            !repo
+                .claim_pending(&input.id)
+                .await
+                .expect("claim after abort"),
+            "aborted queued item must be terminalized"
+        );
+        assert!(state.take_prompt_queue_id(&session_id).is_none());
+        assert!(state
+            .session_run_status
+            .read()
+            .await
+            .get(&session_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_cleanup_finalizes_claimed_queue_item_when_interrupted() {
+        let (state, session_id, repo, _db) = state_with_queued_input().await;
+        let input = repo
+            .enqueue(&session_id, "queued prompt", Some("queue"), None)
+            .await
+            .expect("enqueue should succeed");
+        assert!(repo.claim_pending(&input.id).await.expect("claim succeeds"));
+        // 実際の実行タスクと同じくキュー ID を登録しておく。abort 側が先に
+        // 取り出さない限り、Drop が単発フラグを取得して回収する。
+        state.register_prompt_queue_id(session_id.clone(), input.id.clone());
+
+        let task_id = tokio::spawn(async { tokio::task::id() })
+            .await
+            .expect("task id");
+        let cleanup = PromptTaskCleanup {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            queue_id: Some(input.id.clone()),
+            claimed: Arc::new(AtomicBool::new(true)),
+            queue_finalized: Arc::new(AtomicBool::new(false)),
+        };
+        drop(cleanup);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !repo
+                .claim_pending(&input.id)
+                .await
+                .expect("claim after cleanup"),
+            "interrupted queued item must be terminalized by cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_cleanup_leaves_unclaimed_queue_item_pending() {
+        let (state, session_id, repo, _db) = state_with_queued_input().await;
+        let input = repo
+            .enqueue(&session_id, "queued prompt", Some("queue"), None)
+            .await
+            .expect("enqueue should succeed");
+
+        let task_id = tokio::spawn(async { tokio::task::id() })
+            .await
+            .expect("task id");
+        let cleanup = PromptTaskCleanup {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            queue_id: Some(input.id.clone()),
+            claimed: Arc::new(AtomicBool::new(false)),
+            queue_finalized: Arc::new(AtomicBool::new(false)),
+        };
+        drop(cleanup);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            repo.claim_pending(&input.id).await.expect("still pending"),
+            "unclaimed queued item must stay pending (not terminalized)"
+        );
+    }
+
+    /// R4 回帰: 回収はキュー ID を取り出した側だけが行う単発フラグ方式であること。
+    #[test]
+    fn abort_recovery_is_single_shot() {
+        let source = include_str!("routes.rs");
+        let start = source
+            .find("async fn abort_running_prompt(")
+            .expect("abort function must exist");
+        let abort_body = &source[start..];
+        let abort_body = &abort_body[..abort_body
+            .find("\n}\n")
+            .expect("abort function closing brace")];
+        assert!(
+            abort_body.contains("if let Some(queue_id) = queue_id"),
+            "abort must recover only when it won the queue-id take: {abort_body}"
+        );
+
+        let start = source
+            .find("impl Drop for PromptTaskCleanup")
+            .expect("cleanup impl must exist");
+        let drop_body = &source[start..];
+        let drop_body = &drop_body[..drop_body.find("\n}\n").expect("cleanup impl closing brace")];
+        assert!(
+            drop_body.contains("take_prompt_queue_id"),
+            "cleanup must skip recovery when abort already took the id: {drop_body}"
+        );
+    }
+
+    /// R4 回帰: 最初の abort の回収後に登録された実タスクを、
+    /// 後続の abort が確実にキャンセルできること。
+    #[tokio::test]
+    async fn subsequent_abort_cancels_the_real_task() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id.clone()
+        };
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+
+        let first = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id.clone(), first.abort_handle());
+        let _ = abort_prompt(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("first abort should succeed");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first task should stop");
+        assert!(outcome.unwrap_err().is_cancelled());
+
+        // 回収後に新しい実タスクが登録された状況を模擬する。
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+        let second = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id.clone(), second.abort_handle());
+
+        let _ = abort_prompt(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("second abort should succeed");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second task should stop");
+        assert!(
+            outcome.unwrap_err().is_cancelled(),
+            "subsequent abort must cancel the real task"
+        );
+        assert!(state
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    /// R4 回帰: セッション削除が実行中タスクを止め、キューを終端化すること（冪等）。
+    #[tokio::test]
+    async fn delete_session_aborts_task_and_terminalizes_queue() {
+        let (state, session_id, repo, _db) = state_with_queued_input().await;
+        let running = repo
+            .enqueue(&session_id, "running", Some("queue"), None)
+            .await
+            .expect("enqueue running prompt");
+        repo.claim_pending(&running.id)
+            .await
+            .expect("claim running prompt");
+        state.register_prompt_queue_id(session_id.clone(), running.id.clone());
+        let task = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id.clone(), task.abort_handle());
+        let pending = repo
+            .enqueue(&session_id, "pending", Some("queue"), None)
+            .await
+            .expect("enqueue pending prompt");
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+
+        let response = delete_session(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("delete should succeed");
+        assert_eq!(response.0["deleted"], true);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("running task should stop on deletion");
+        assert!(outcome.unwrap_err().is_cancelled());
+        assert!(
+            !repo
+                .claim_pending(&running.id)
+                .await
+                .expect("claim after deletion"),
+            "running queued item must be terminalized"
+        );
+        assert!(
+            !repo
+                .claim_pending(&pending.id)
+                .await
+                .expect("claim after deletion"),
+            "pending queued items must be terminalized too"
+        );
+        assert!(state.take_prompt_queue_id(&session_id).is_none());
+        // 冪等: 二重削除は SessionNotFound で安全に失敗する。
+        let error = delete_session(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect_err("second delete must fail safely");
+        assert!(matches!(error, ApiError::SessionNotFound(_)));
+    }
+
+    #[test]
+    fn abort_and_cleanup_both_recover_interrupted_queue_items() {
+        let source = include_str!("routes.rs");
+        let start = source
+            .find("async fn abort_running_prompt(")
+            .expect("abort function must exist");
+        let abort_body = &source[start..];
+        let abort_body = &abort_body[..abort_body
+            .find("\n}\n")
+            .expect("abort function closing brace")];
+        assert!(
+            abort_body.contains("recover_interrupted_queued_prompt"),
+            "abort must finalize queued item and reschedule: {abort_body}"
+        );
+        assert!(
+            abort_body.contains("take_prompt_queue_id"),
+            "abort must take the running queue id: {abort_body}"
+        );
+
+        let start = source
+            .find("impl Drop for PromptTaskCleanup")
+            .expect("cleanup impl must exist");
+        let drop_body = &source[start..];
+        let drop_body = &drop_body[..drop_body.find("\n}\n").expect("cleanup impl closing brace")];
+        assert!(
+            drop_body.contains("recover_interrupted_queued_prompt"),
+            "cleanup must finalize queued item and reschedule: {drop_body}"
+        );
+        assert!(
+            drop_body.contains("queue_finalized"),
+            "cleanup must skip already finalized items: {drop_body}"
+        );
     }
 }
 
@@ -6540,6 +7082,20 @@ mod api_alias_tests {
         let _app = router();
     }
 
+    #[test]
+    fn api_alias_routing_test_does_not_skip_on_bind_failure() {
+        // 回帰ガード: bind 失敗時に return して黙って成功する（false green）ことを禁止。
+        let source = include_str!("routes.rs");
+        assert!(
+            source.contains(".expect(\"loopback bind must succeed in tests"),
+            "bind failure must fail the test"
+        );
+        assert!(
+            !source.contains("eprintln!(\"SKIPPED"),
+            "silent skip must be removed"
+        );
+    }
+
     /// ループバックのテストサーバへ素の HTTP/1.1 GET を送り、(status, body) を返す。
     ///
     /// tower が workspace から削除済みのため `ServiceExt::oneshot` は使えず、
@@ -6578,15 +7134,10 @@ mod api_alias_tests {
     #[tokio::test]
     async fn api_alias_routes_reach_same_handlers() {
         let app = router().with_state(Arc::new(ServerState::new()));
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) => {
-                // CI / サンドボックスで loopback bind が不可な場合、テストが黙って
-                // 成功する（false green）と見逃されるため、目立つマーカーを出す。
-                eprintln!("SKIPPED: api alias routing test requires loopback bind ({err})");
-                return;
-            }
-        };
+        // loopback bind 失敗時に return すると false green になるため失敗させる。
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed in tests; skipping hides failures");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
