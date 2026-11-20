@@ -223,6 +223,29 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **SessionStatus の serde wire 値が PascalCase で DB/API と不一致**
+  — `session.rs:82-94` / R1-NEW-WIRE-01 / 高
+- [ ] **MessageRole に serde rename が無く lowercase 形式が読めない**
+  — `message.rs:23-33` / R1-NEW-WIRE-02 / 高
+- [ ] **types と session の同名型が JSON 往復で usage 等を沈黙して失う**
+  — `server.rs:875-880` / R1-NEW-WIRE-05 / 高
+- [ ] **.cargo/audit.toml の ignore 2 件が現行 lock と不一致（stale suppression）**
+  — `.cargo/audit.toml:7-23` / R1-NEW-DEPS-01 / 高
+- [ ] **opencode-tool の lsp feature が未配線で README と実挙動が矛盾**
+  — `tool/Cargo.toml:12-13` / R1-NEW-DEPS-02 / 高
+- [ ] **Google の API キーが URL クエリからエラー文字列へ漏洩**
+  — `google.rs:186-200` / R1-NEW-ERR-01 / 高
+- [ ] **prompt 失敗エラーが無 redact でログと会話へ二重流出**
+  — `routes.rs:2381-2408` / R1-NEW-ERR-02 / 高
+- [ ] **AgentExecutor が型付き ProviderError を String へ平坦化し retry 情報を失う**
+  — `executor.rs:12-28` / R1-NEW-ERR-03 / 中高
+- [ ] **MCP 認証ストアの読取/JSON 失敗が空 HashMap として黙って扱われる**
+  — `mcp/auth.rs:75-86` / R1-NEW-ERR-04 / 中高
+- [ ] **ダイアログ検索行に水平スクロールが無く長い入力のカーソルが消える**
+  — `command_palette.rs:415-430` / R1-RENDER-01 / 高
+- [ ] **インラインモーダルに wrap が無く承認対象テキストが右端で切れる**
+  — `permission.rs:254-289`, `question.rs:245-325` / R1-RENDER-02 / 高
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -267,6 +290,51 @@ status: current
     優先度判断は未実施。voice (G-07) は外部送信を伴うため採用には別途合意が必要
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
+
+- [ ] **TodoStatus/Priority の serde と `parse_*` が往復非対称**
+  — `todo.rs:30-107` / WIRE-03
+- [ ] **AgentColor::Custom だけ externally tagged で JSON 形状が混在**
+  — `agent.rs:9-28` / WIRE-04
+- [ ] **SessionInfo が status/usage/metadata を落とし status 値も二重化**
+  — `routes.rs:194-281` / WIRE-06
+- [ ] **MessageRepository が parts しか保存せず metadata/usage が DB 往復で失われる**
+  — `repository.rs:446-500` / WIRE-07
+- [ ] **Session.metadata が DB 保存されるが起動時復元で常に空** — `server.rs:843` / WIRE-08
+- [ ] **usage_total_cost にトークン数を書き復元で 0.0 へ戻す**
+  — `repository.rs:229-235` / WIRE-09
+- [ ] **SessionMessage.metadata に serde(default) が無く旧 JSON が読めない**
+  — `message.rs:6-20` / WIRE-10
+- [ ] **rust-version 1.97 が 21 member crate に継承されていない**
+  — `Cargo.toml:36-43` / DEPS-03
+- [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
+  — `tui/Cargo.toml:25` / DEPS-04
+- [ ] **opencode-core の tempfile がテスト専用なのに通常依存**
+  — `core/Cargo.toml:18` / DEPS-05
+- [ ] **README の Requirements に MSRV 1.97 と C ツールチェーンが無い**
+  — `README.md:32-42` / DEPS-06
+- [ ] **Oauth 一時状態削除の Result が .ok() で破棄される** — `oauth.rs:410-412` / ERR-05
+- [ ] **既存認証ファイルの 0600 強制が best-effort で失敗が握り潰される** — `auth.rs:89-99` / ERR-06
+- [ ] **ストリーム再符号化で ApiErrorWithSource がプレーン ApiError に退化**
+  — `llm.rs:205-254` / ERR-07
+- [ ] **ツールエラー文字列がプラグインとログへ無 redact で渡る** — `registry.rs:132-140` / ERR-08
+- [ ] **MCP discovery エラーが userinfo を含む URL を保持**
+  — `discovery.rs:21-33` / ERR-09
+- [ ] **npm インストールが piped stdio のまま status() で待ちデッドロック**
+  — `loader.rs:365-377` / ERR-10
+- [ ] **Home/Session フッタのパディングがバイト長で全角で位置がずれる**
+  — `home.rs:239-267`, `session.rs:351-486` / RENDER-03
+- [ ] **sidebar の truncate_text が文字数基準で呼出側は表示幅を渡す**
+  — `sidebar.rs:607-620` / RENDER-04
+- [ ] **AlertDialog の高さが明示改行数から算出され長文が切れる** — `alert.rs:107-141` / RENDER-05
+- [ ] **Markdown 表の列幅が無制限で枠構造が壊れる** — `markdown/renderer.rs:83-119` / RENDER-06
+- [ ] **wrap_spans が幅 2 文字を満杯行へ置き領域より広い行を生成**
+  — `session.rs:1230-1256` / RENDER-07
+- [ ] **Toast の desired_height が文字数基準で全角メッセージが切れる**
+  — `toast.rs:101-111` / RENDER-08
+- [ ] **ui::layout::centered が height>100 でアンダーフロー**
+  — `ui/layout.rs:19-37` / RENDER-09
+- [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
+  — `server.rs:1037` / 既知残存
 
 - [ ] **ログにローテーション・保持・サイズ上限が無く同一秒起動で truncate**
   — `logging.rs:458-465` / LOG-NO-ROTATION
@@ -566,6 +634,11 @@ status: current
 
 ## メモ
 
+- 2026-11-20 cross-skill 集約（swarm88、4 担当・36 件、観点: wire 形式 /
+  レンダリング / エラー伝播 / 依存 feature）: high 11 / 中 25 を追記。親が
+  high 4 件（audit.toml の stale ignore・LSP feature 未配線・Google の key=・
+  SessionStatus の PascalCase）を read で事実確認。前回観点（並行 / テスト品質 /
+  UX / 設定運用）とは重複しないよう既知対応をプロンプトに明示した。
 - 2026-11-20 R4 残存（テスト品質 8 件の修正時、記録のみ）: constant_time_eq の
   戻り値検証では定数時間性（短絡の有無）を検出できないため、テスト名とコメントを
   検証内容に合わせて改名し、実装・レビューで担保する方針へ変更した。
@@ -831,7 +904,7 @@ status: current
   ls-tree/削除を行わない」フローは未固定。checkout 実行を注入する fixture で
   ファイル残存を検証するテストが別タスク候補。
 - M-11 R4 の low 指摘（2026-11-19、記録のみ）: 既存 reassemble 系テストは
-  SseLineBuffer と各 parse_* を直接呼ぶだけで try_unfold の pending/exhausted
+  SseLineBuffer と各 `parse_*` を直接呼ぶだけで try_unfold の pending/exhausted
   キューイングを通さない。vertex/together/vercel/xai には UTF-8 途中分割/CRLF の
   再組立テストが無い（他 12 ファイルにはある）。共通 `bytes_stream` モック
   ハーネスの整備を推奨。
