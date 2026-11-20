@@ -647,22 +647,54 @@ impl ProviderRegistry {
         self.provider_info.get(id)
     }
 
+    /// Provider IDs in a deterministic, `BTreeMap`-like order.
+    ///
+    /// `providers` is a `HashMap`, whose iteration order is randomized per
+    /// process. Every model-resolution path must go through this helper so a
+    /// model ID shared by several providers always resolves to the same one.
+    /// Config providers are also stored in a `HashMap`, so no explicit config
+    /// order is currently available; lexicographic ID order is the documented
+    /// deterministic fallback. If a config layer later exposes an explicit
+    /// order, it can be layered into this helper without touching callers.
+    fn ordered_provider_ids(&self) -> Vec<&String> {
+        let mut ids: Vec<&String> = self.providers.keys().collect();
+        ids.sort();
+        ids
+    }
+
     pub fn list(&self) -> Vec<Arc<dyn Provider>> {
-        self.providers.values().cloned().collect()
+        self.ordered_provider_ids()
+            .into_iter()
+            .filter_map(|id| self.providers.get(id).cloned())
+            .collect()
     }
 
     pub fn list_providers(&self) -> Vec<&ProviderInfo> {
-        self.provider_info.values().collect()
+        self.ordered_provider_ids()
+            .into_iter()
+            .filter_map(|id| self.provider_info.get(id))
+            .collect()
     }
 
     pub fn list_models(&self) -> Vec<ModelInfo> {
-        self.providers.values().flat_map(|p| p.models()).collect()
+        self.ordered_provider_ids()
+            .into_iter()
+            .filter_map(|id| self.providers.get(id))
+            .flat_map(|provider| {
+                let mut models = provider.models();
+                models.sort_by(|a, b| a.id.cmp(&b.id));
+                models
+            })
+            .collect()
     }
 
+    /// Find a model by its bare ID, scanning providers in deterministic order.
     pub fn find_model(&self, model_id: &str) -> Option<(String, ModelInfo)> {
-        for (provider_id, provider) in &self.providers {
-            if let Some(model) = provider.get_model(model_id) {
-                return Some((provider_id.clone(), model.clone()));
+        for provider_id in self.ordered_provider_ids() {
+            if let Some(provider) = self.providers.get(provider_id) {
+                if let Some(model) = provider.get_model(model_id) {
+                    return Some((provider_id.to_string(), model.clone()));
+                }
             }
         }
         None
@@ -719,6 +751,114 @@ pub fn create_default_registry() -> ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    /// Minimal `Provider` implementation for registry resolution tests.
+    /// `chat` / `chat_stream` are never called and deliberately contain no
+    /// credential-like values.
+    struct StubProvider {
+        id: &'static str,
+        models: Vec<ModelInfo>,
+    }
+
+    #[async_trait]
+    impl Provider for StubProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn name(&self) -> &str {
+            self.id
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            self.models.clone()
+        }
+
+        fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+            self.models.iter().find(|model| model.id == id)
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            Err(ProviderError::ApiError(
+                "stub provider does not implement chat".to_string(),
+            ))
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<StreamResult, ProviderError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn registry_with_duplicate_model() -> ProviderRegistry {
+        let mut registry = ProviderRegistry::new();
+        // Register in reverse lexicographic order: HashMap iteration and
+        // registration order must not influence resolution.
+        for (provider_id, model_name) in
+            [("z-provider", "Z Provider"), ("a-provider", "A Provider")]
+        {
+            registry.register(StubProvider {
+                id: provider_id,
+                models: vec![ModelInfo {
+                    id: "gpt-4o".to_string(),
+                    name: model_name.to_string(),
+                    provider: provider_id.to_string(),
+                    context_window: 128_000,
+                    max_output_tokens: 16_384,
+                    supports_vision: false,
+                    supports_tools: false,
+                    cost_per_million_input: 0.0,
+                    cost_per_million_output: 0.0,
+                }],
+            });
+        }
+        registry
+    }
+
+    #[test]
+    fn find_model_is_deterministic_for_shared_model_ids() {
+        let registry = registry_with_duplicate_model();
+
+        for _ in 0..32 {
+            let (provider_id, model) = registry
+                .find_model("gpt-4o")
+                .expect("shared model should resolve");
+            assert_eq!(provider_id, "a-provider");
+            assert_eq!(model.name, "A Provider");
+        }
+    }
+
+    #[test]
+    fn parse_model_string_resolves_bare_names_through_find_model() {
+        let registry = registry_with_duplicate_model();
+
+        for _ in 0..32 {
+            assert_eq!(
+                registry.parse_model_string("gpt-4o"),
+                Some(("a-provider".to_string(), "gpt-4o".to_string()))
+            );
+        }
+        assert_eq!(
+            registry.parse_model_string("z-provider/gpt-4o"),
+            Some(("z-provider".to_string(), "gpt-4o".to_string()))
+        );
+    }
+
+    #[test]
+    fn registry_listing_uses_deterministic_provider_order() {
+        let registry = registry_with_duplicate_model();
+
+        let ids: Vec<&str> = registry
+            .list_providers()
+            .iter()
+            .map(|info| info.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a-provider", "z-provider"]);
+
+        let providers = registry.list();
+        let listed: Vec<&str> = providers.iter().map(|p| p.id()).collect();
+        assert_eq!(listed, vec!["a-provider", "z-provider"]);
+    }
 
     #[test]
     fn test_overflow_detection_anthropic() {

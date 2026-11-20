@@ -1522,6 +1522,40 @@ impl ProviderBootstrapState {
         self.providers.get(provider_id)
     }
 
+    /// Provider IDs in a deterministic, `BTreeMap`-like order.
+    ///
+    /// `providers` is a `HashMap` (and config providers are stored in a
+    /// `HashMap` as well), so there is no explicit config order available.
+    /// Sorting by ID is the deterministic fallback used by every resolution
+    /// path below; a future ordered config source can be layered in here.
+    fn ordered_provider_ids(&self) -> Vec<&String> {
+        let mut ids: Vec<&String> = self.providers.keys().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Model IDs of a provider in deterministic, `BTreeMap`-like order.
+    fn ordered_model_ids(provider: &ProviderState) -> Vec<&String> {
+        let mut ids: Vec<&String> = provider.models.keys().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Resolve a bare model ID across all providers in deterministic order.
+    ///
+    /// Used to complete `parse_model` results for slash-less model strings,
+    /// where the whole string lands in `provider_id` and `model_id` is empty.
+    pub fn find_model_by_id(&self, model_id: &str) -> Option<(String, ProviderModel)> {
+        for provider_id in self.ordered_provider_ids() {
+            if let Some(provider) = self.providers.get(provider_id) {
+                if let Some(model) = provider.models.get(model_id) {
+                    return Some((provider_id.to_string(), model.clone()));
+                }
+            }
+        }
+        None
+    }
+
     /// Get a model by provider ID and model ID, with fuzzy matching on failure.
     pub fn get_model(
         &self,
@@ -1529,7 +1563,7 @@ impl ProviderBootstrapState {
         model_id: &str,
     ) -> Result<&ProviderModel, BootstrapError> {
         let provider = self.providers.get(provider_id).ok_or_else(|| {
-            let available: Vec<String> = self.providers.keys().cloned().collect();
+            let available: Vec<String> = self.ordered_provider_ids().into_iter().cloned().collect();
             let suggestions = fuzzy_match(provider_id, &available, 3);
             BootstrapError::ModelNotFound {
                 provider_id: provider_id.to_string(),
@@ -1539,7 +1573,10 @@ impl ProviderBootstrapState {
         })?;
 
         provider.models.get(model_id).ok_or_else(|| {
-            let available: Vec<String> = provider.models.keys().cloned().collect();
+            let available: Vec<String> = Self::ordered_model_ids(provider)
+                .into_iter()
+                .cloned()
+                .collect();
             let suggestions = fuzzy_match(model_id, &available, 3);
             BootstrapError::ModelNotFound {
                 provider_id: provider_id.to_string(),
@@ -1552,10 +1589,13 @@ impl ProviderBootstrapState {
     /// Find the closest matching model for a provider given a list of query strings.
     pub fn closest(&self, provider_id: &str, queries: &[&str]) -> Option<(String, String)> {
         let provider = self.providers.get(provider_id)?;
+        // Model IDs must be sorted: `provider.models` is a HashMap, so raw
+        // iteration would pick an arbitrary match for overlapping queries.
+        let model_ids = Self::ordered_model_ids(provider);
         for query in queries {
-            for model_id in provider.models.keys() {
+            for model_id in &model_ids {
                 if model_id.contains(query) {
-                    return Some((provider_id.to_string(), model_id.clone()));
+                    return Some((provider_id.to_string(), (*model_id).clone()));
                 }
             }
         }
@@ -1571,6 +1611,15 @@ impl ProviderBootstrapState {
         // If config specifies a small model, use it
         if let Some(model_str) = config_small_model {
             let parsed = parse_model(model_str);
+            if parsed.model_id.is_empty() {
+                // Slash-less config value: `parse_model` puts the whole string
+                // into `provider_id` and leaves `model_id` empty. Complete it
+                // with a deterministic cross-provider lookup instead of
+                // matching against the empty ID.
+                return self
+                    .find_model_by_id(&parsed.provider_id)
+                    .map(|(_provider_id, model)| model);
+            }
             return self
                 .get_model(&parsed.provider_id, &parsed.model_id)
                 .ok()
@@ -1606,9 +1655,8 @@ impl ProviderBootstrapState {
             for item in &priority {
                 if provider_id == "amazon-bedrock" {
                     let cross_region_prefixes = ["global.", "us.", "eu."];
-                    let candidates: Vec<&String> = provider
-                        .models
-                        .keys()
+                    let candidates: Vec<&String> = Self::ordered_model_ids(provider)
+                        .into_iter()
                         .filter(|m| m.contains(item))
                         .collect();
 
@@ -1640,7 +1688,7 @@ impl ProviderBootstrapState {
                         return provider.models.get(*unprefixed).cloned();
                     }
                 } else {
-                    for model_id in provider.models.keys() {
+                    for model_id in Self::ordered_model_ids(provider) {
                         if model_id.contains(item) {
                             return provider.models.get(model_id).cloned();
                         }
@@ -1693,7 +1741,21 @@ impl ProviderBootstrapState {
         recent: &[(String, String)],
     ) -> Option<ParsedModel> {
         if let Some(model_str) = config_model {
-            return Some(parse_model(model_str));
+            let parsed = parse_model(model_str);
+            if parsed.model_id.is_empty() {
+                // Slash-less config value: complete it via the same
+                // deterministic cross-provider lookup used by get_small_model.
+                // If no provider exposes that bare ID, returning `parsed` would
+                // hand back an empty model_id; report an unresolved config by
+                // returning None instead so callers can fall back safely.
+                return self
+                    .find_model_by_id(&parsed.provider_id)
+                    .map(|(provider_id, model)| ParsedModel {
+                        provider_id,
+                        model_id: model.id,
+                    });
+            }
+            return Some(parsed);
         }
 
         // Check recent models
@@ -1708,8 +1770,9 @@ impl ProviderBootstrapState {
             }
         }
 
-        // Fall back to first provider, sorted models
-        let provider = self.providers.values().next()?;
+        // Fall back to the first provider in deterministic order, sorted models
+        let first_provider_id = self.ordered_provider_ids().first()?.to_string();
+        let provider = self.providers.get(&first_provider_id)?;
         let mut models: Vec<ProviderModel> = provider.models.values().cloned().collect();
         Self::sort_models(&mut models);
         let model = models.first()?;
@@ -3040,6 +3103,136 @@ mod tests {
         ProviderBootstrapState {
             providers,
             model_loaders: HashSet::new(),
+        }
+    }
+
+    /// Two providers expose the same model ID; registration / HashMap order
+    /// must not influence which provider wins.
+    fn bootstrap_state_with_duplicate_models() -> ProviderBootstrapState {
+        let mut providers = HashMap::new();
+        for provider_id in ["z-provider", "a-provider"] {
+            let mut model = provider_model("gpt-4o");
+            model.provider_id = provider_id.to_string();
+            providers.insert(
+                provider_id.to_string(),
+                ProviderState {
+                    id: provider_id.to_string(),
+                    name: provider_id.to_string(),
+                    source: "test".to_string(),
+                    env: vec![],
+                    key: None,
+                    options: HashMap::new(),
+                    models: HashMap::from([("gpt-4o".to_string(), model)]),
+                },
+            );
+        }
+        ProviderBootstrapState {
+            providers,
+            model_loaders: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn find_model_by_id_is_deterministic_for_shared_model_ids() {
+        let state = bootstrap_state_with_duplicate_models();
+
+        for _ in 0..32 {
+            let (provider_id, model) = state
+                .find_model_by_id("gpt-4o")
+                .expect("shared model should resolve");
+            assert_eq!(provider_id, "a-provider");
+            assert_eq!(model.provider_id, "a-provider");
+        }
+        assert!(state.find_model_by_id("absent-model").is_none());
+    }
+
+    #[test]
+    fn get_small_model_resolves_slashless_config_value() {
+        let state = bootstrap_state_with_duplicate_models();
+
+        for _ in 0..32 {
+            let small = state
+                .get_small_model("z-provider", Some("gpt-4o"))
+                .expect("bare small_model name should resolve");
+            assert_eq!(small.id, "gpt-4o");
+            assert_eq!(small.provider_id, "a-provider");
+        }
+        assert!(state
+            .get_small_model("z-provider", Some("absent-model"))
+            .is_none());
+    }
+
+    #[test]
+    fn default_model_resolves_slashless_config_value_and_fallback_is_sorted() {
+        let state = bootstrap_state_with_duplicate_models();
+
+        let from_config = state
+            .default_model(Some("gpt-4o"), &[])
+            .expect("bare default model name should resolve");
+        assert_eq!(from_config.provider_id, "a-provider");
+        assert_eq!(from_config.model_id, "gpt-4o");
+
+        // No config / recent entry: fall back to the first provider in sorted order.
+        let fallback = state.default_model(None, &[]).expect("fallback model");
+        assert_eq!(fallback.provider_id, "a-provider");
+    }
+
+    #[test]
+    fn default_model_returns_none_for_unresolved_slashless_config_value() {
+        let state = bootstrap_state_with_duplicate_models();
+
+        // スラッシュなしでどのプロバイダにも存在しない ID は、空 model_id の
+        // Some ではなく None を返す（回帰: 未解決設定の誤放置を防ぐ）。
+        assert!(
+            state.default_model(Some("absent-model"), &[]).is_none(),
+            "未解決のスラッシュなし指定は None になるべき"
+        );
+        assert!(
+            state.default_model(Some(""), &[]).is_none(),
+            "空文字列の指定も None になるべき"
+        );
+        assert!(
+            state.default_model(Some("a-provider/"), &[]).is_none(),
+            "空 model_id を持つスラッシュ区切り指定も None になるべき"
+        );
+
+        // 解決できるスラッシュなし指定は従来どおり解決される。
+        let resolved = state
+            .default_model(Some("gpt-4o"), &[])
+            .expect("解決可能なスラッシュなし指定");
+        assert_eq!(resolved.provider_id, "a-provider");
+        assert_eq!(resolved.model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn closest_uses_sorted_model_ids_for_overlapping_queries() {
+        let mut models = HashMap::new();
+        for model_id in ["gpt-4o-mini", "gpt-4o"] {
+            let mut model = provider_model(model_id);
+            model.provider_id = "p".to_string();
+            models.insert(model_id.to_string(), model);
+        }
+        let state = ProviderBootstrapState {
+            providers: HashMap::from([(
+                "p".to_string(),
+                ProviderState {
+                    id: "p".to_string(),
+                    name: "p".to_string(),
+                    source: "test".to_string(),
+                    env: vec![],
+                    key: None,
+                    options: HashMap::new(),
+                    models,
+                },
+            )]),
+            model_loaders: HashSet::new(),
+        };
+
+        for _ in 0..32 {
+            assert_eq!(
+                state.closest("p", &["gpt-4o"]),
+                Some(("p".to_string(), "gpt-4o".to_string()))
+            );
         }
     }
 

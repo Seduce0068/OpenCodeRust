@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -44,6 +46,24 @@ pub enum PluginLoaderError {
 
     #[error("plugin path is not absolute and cannot be converted to a file URL: {0:?}")]
     InvalidPluginPath(PathBuf),
+
+    /// A cache path we are about to write to or launch is a symlink. We never
+    /// follow it, and we never print the symlink target (which could embed a
+    /// credential-bearing path); only the rejected cache path is reported.
+    #[error("refusing to use symlinked plugin script path: {0:?}")]
+    ScriptIsSymlink(PathBuf),
+
+    #[error("plugin script path is not a regular file: {0:?}")]
+    ScriptNotRegularFile(PathBuf),
+
+    /// A cache directory we are about to use is itself a symlink. We never
+    /// follow it, and we never print the symlink target (which could embed a
+    /// credential-bearing path); only the rejected cache path is reported.
+    #[error("refusing to use symlinked cache directory: {0:?}")]
+    CacheDirIsSymlink(PathBuf),
+
+    #[error("plugin script failed content verification: {0:?}")]
+    ScriptVerificationFailed(PathBuf),
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +77,9 @@ pub struct PluginLoader {
     hook_system: Arc<PluginSystem>,
     runtime: JsRuntime,
     host_script_path: PathBuf,
+    /// Scripts this loader wrote into the shared cache, with the hash of the
+    /// immutable embedded content they must still match at launch time.
+    trusted_scripts: StdRwLock<Vec<TrustedScript>>,
 }
 
 impl PluginLoader {
@@ -68,16 +91,20 @@ impl PluginLoader {
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("opencode");
-        std::fs::create_dir_all(&cache_dir)?;
+        ensure_secure_cache_dir(&cache_dir)?;
 
         let host_script_path = cache_dir.join("plugin-host.ts");
-        std::fs::write(&host_script_path, HOST_SCRIPT)?;
+        write_script_atomic(&host_script_path, HOST_SCRIPT.as_bytes())?;
 
         Ok(Self {
             clients: RwLock::new(Vec::new()),
             auth_bridges: RwLock::new(HashMap::new()),
             hook_system: Arc::new(PluginSystem::new()),
             runtime,
+            trusted_scripts: StdRwLock::new(vec![TrustedScript {
+                path: host_script_path.clone(),
+                expected_hash: script_hash(HOST_SCRIPT.as_bytes()),
+            }]),
             host_script_path,
         })
     }
@@ -101,6 +128,20 @@ impl PluginLoader {
 
         if !npm_specs.is_empty() {
             self.install_npm_packages(&npm_specs).await?;
+        }
+
+        // Verify every script we placed in the shared cache immediately before
+        // any subprocess is launched. The cache may be writable by other users,
+        // so a pre-existing symlink or a post-write swap must abort startup
+        // rather than hand arbitrary TypeScript to a `--allow-all` runtime.
+        {
+            let trusted = self
+                .trusted_scripts
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for script in trusted.iter() {
+                verify_script(&script.path, script.expected_hash)?;
+            }
         }
 
         // Spawn each plugin
@@ -166,13 +207,28 @@ impl PluginLoader {
             .join("opencode")
             .join("plugins")
             .join("builtin");
-        std::fs::create_dir_all(&cache_dir)?;
+        ensure_secure_cache_dir(&cache_dir)?;
 
         let codex_path = cache_dir.join("builtin-codex-auth.ts");
-        std::fs::write(&codex_path, BUILTIN_CODEX_AUTH)?;
+        write_script_atomic(&codex_path, BUILTIN_CODEX_AUTH.as_bytes())?;
 
         let copilot_path = cache_dir.join("builtin-copilot-auth.ts");
-        std::fs::write(&copilot_path, BUILTIN_COPILOT_AUTH)?;
+        write_script_atomic(&copilot_path, BUILTIN_COPILOT_AUTH.as_bytes())?;
+
+        {
+            let mut trusted = self
+                .trusted_scripts
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            trusted.push(TrustedScript {
+                path: codex_path.clone(),
+                expected_hash: script_hash(BUILTIN_CODEX_AUTH.as_bytes()),
+            });
+            trusted.push(TrustedScript {
+                path: copilot_path.clone(),
+                expected_hash: script_hash(BUILTIN_COPILOT_AUTH.as_bytes()),
+            });
+        }
 
         let specs = vec![file_url(&codex_path)?, file_url(&copilot_path)?];
         self.load_all(&specs, context).await
@@ -297,7 +353,10 @@ impl PluginLoader {
             "private": true,
             "dependencies": deps,
         });
-        std::fs::write(&pkg_json, serde_json::to_string_pretty(&pkg).unwrap())?;
+        // package.json も共有キャッシュ上の書き込み対象なので、スクリプトと同じ
+        // symlink 拒否・create_new・0600・atomic rename の経路に統一する。
+        let pkg_bytes = serde_json::to_string_pretty(&pkg).unwrap();
+        write_script_atomic(&pkg_json, pkg_bytes.as_bytes())?;
 
         // Run install
         let install_cmd = self.runtime.install_command();
@@ -327,6 +386,170 @@ impl PluginLoader {
             .join("opencode")
             .join("plugins")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Secure cache writing / verification helpers
+// ---------------------------------------------------------------------------
+
+/// A script this loader wrote to the shared cache and can verify at launch.
+struct TrustedScript {
+    path: PathBuf,
+    /// SHA-256 digest of the immutable embedded content this file must match.
+    expected_hash: [u8; 32],
+}
+
+/// Create `dir` and, on Unix, force it to `0700` — also correcting the mode of
+/// a pre-existing directory. `~/.cache/opencode` may be group/world writable,
+/// which would let another user replace cached scripts between our write and
+/// the subprocess launch. A directory path that is itself a symlink is
+/// rejected: `create_dir_all` would happily follow one, so it must be checked
+/// through `symlink_metadata` (which never follows the final component).
+/// Windows keeps the previous `create_dir_all` behavior.
+fn ensure_secure_cache_dir(dir: &Path) -> Result<(), PluginLoaderError> {
+    std::fs::create_dir_all(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(PluginLoaderError::CacheDirIsSymlink(dir.to_path_buf()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// SHA-256 of the script content. The expected value is derived from an
+/// immutable `include_str!` constant in this binary, so a match proves the
+/// on-disk script is the one we generated; there is no attacker-writable hash
+/// table to tamper with. A cryptographic digest is used instead of a 64-bit
+/// FNV-1a so a targeted collision cannot be crafted cheaply.
+fn script_hash(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Monotonic, process-unique suffix for temp file names.
+fn unique_temp_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Replace `dest` with `temp` atomically where the platform allows it.
+#[cfg(unix)]
+fn replace_cached_file(temp: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, dest)
+}
+
+/// `std::fs::rename` cannot replace an existing destination on Windows, so the
+/// target entry is removed first. `remove_file` removes the symlink itself and
+/// never follows it.
+#[cfg(not(unix))]
+fn replace_cached_file(temp: &Path, dest: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(dest).is_ok() {
+        std::fs::remove_file(dest)?;
+    }
+    std::fs::rename(temp, dest)
+}
+
+/// Write `content` to `path` without ever following a symlink at `path`:
+/// reject a pre-existing symlink, write to a `create_new` temp file in the same
+/// directory (`0600` on Unix), then atomically rename it into place. The rename
+/// replaces the directory entry itself, so even a race after the check cannot
+/// turn this into a write through a symlink.
+fn write_script_atomic(path: &Path, content: &[u8]) -> Result<(), PluginLoaderError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Err(PluginLoaderError::ScriptIsSymlink(path.to_path_buf()));
+            }
+            if !file_type.is_file() {
+                return Err(PluginLoaderError::ScriptNotRegularFile(path.to_path_buf()));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("plugin-script");
+    let temp = parent.join(format!(".{file_name}.tmp-{}", unique_temp_suffix()));
+
+    let result = write_temp_then_replace(&temp, path, content);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Write to the fresh temp path (never an existing entry) and swap it into
+/// place. Kept separate so `write_script_atomic` can clean up on any failure.
+fn write_temp_then_replace(
+    temp: &Path,
+    dest: &Path,
+    content: &[u8],
+) -> Result<(), PluginLoaderError> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(temp)?;
+    file.write_all(content)?;
+    file.flush()?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    replace_cached_file(temp, dest)?;
+    Ok(())
+}
+
+/// Immediately before launch, confirm `path` is still our regular file (not a
+/// symlink) and still has the exact content hash we wrote. Any mismatch aborts
+/// startup instead of handing arbitrary TypeScript to a `--allow-all` runtime.
+/// No file content is logged — only the cache path is reported on failure.
+fn verify_script(path: &Path, expected_hash: [u8; 32]) -> Result<(), PluginLoaderError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Err(PluginLoaderError::ScriptIsSymlink(path.to_path_buf()));
+    }
+    if !file_type.is_file() {
+        return Err(PluginLoaderError::ScriptNotRegularFile(path.to_path_buf()));
+    }
+    let bytes = std::fs::read(path)?;
+    if script_hash(&bytes) != expected_hash {
+        return Err(PluginLoaderError::ScriptVerificationFailed(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build an encoded, local `file://` URL for a plugin path.
@@ -969,5 +1192,172 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_dir_is_created_with_0700_and_existing_perms_are_corrected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_temp_dir("cache-perms");
+        let dir = base.join("nested").join("opencode");
+        std::fs::create_dir_all(&dir).expect("一時キャッシュディレクトリを作成できる");
+        // 既存ディレクトリが他ユーザーから書ける状態を模擬する。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+            .expect("権限を設定できる");
+
+        ensure_secure_cache_dir(&dir).expect("セキュアなキャッシュディレクトリを準備できる");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("メタデータを読める")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "既存ディレクトリも 0700 に是正されるべき");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_secure_cache_dir_rejects_symlink_directory() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_temp_dir("cache-dir-symlink");
+        let real = base.join("real-cache");
+        let alias = base.join("alias-cache");
+        std::fs::create_dir_all(&real).expect("実ディレクトリを作成できる");
+        symlink(&real, &alias).expect("symlink を作成できる");
+
+        let err = ensure_secure_cache_dir(&alias).unwrap_err();
+        assert!(
+            matches!(err, PluginLoaderError::CacheDirIsSymlink(_)),
+            "symlink ディレクトリは拒否されるべき: {err}"
+        );
+        // symlink の先（実ディレクトリ）に chmod などの副作用が及ばないこと。
+        let target_is_symlink = std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        assert!(target_is_symlink, "拒否された symlink 自体は残るべき");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_script_atomic_rejects_preexisting_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_temp_dir("script-symlink");
+        let target = dir.join("victim.ts");
+        let script = dir.join("plugin-host.ts");
+        std::fs::write(&target, b"do-not-touch").expect("ターゲットを作成できる");
+        symlink(&target, &script).expect("symlink を作成できる");
+
+        let err = write_script_atomic(&script, b"malicious").unwrap_err();
+        assert!(
+            matches!(err, PluginLoaderError::ScriptIsSymlink(_)),
+            "symlink は拒否されるべき: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&target)
+                .expect("ターゲットを読める")
+                .as_slice(),
+            &b"do-not-touch"[..],
+            "symlink のターゲットは変更されないべき"
+        );
+        assert!(
+            std::fs::symlink_metadata(&script)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "拒否された symlink 自体は残るべき"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_script_atomic_places_file_with_0600_and_no_temp_leftover() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir("script-atomic");
+        let script = dir.join("plugin-host.ts");
+        // 既存の通常ファイルが atomic に置き換わることも確認する。
+        std::fs::write(&script, b"old content").expect("既存ファイルを作成できる");
+
+        write_script_atomic(&script, b"new content").expect("スクリプトを原子配置できる");
+
+        assert_eq!(
+            std::fs::read(&script).unwrap().as_slice(),
+            &b"new content"[..]
+        );
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "スクリプトは 0600 であるべき");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルが残った: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_script_detects_tampering_and_symlink() {
+        let dir = unique_temp_dir("script-verify");
+        let script = dir.join("builtin.ts");
+        let content = b"const ok = true;";
+        write_script_atomic(&script, content).expect("スクリプトを配置できる");
+        let expected = script_hash(content);
+
+        verify_script(&script, expected).expect("改ざん前は検証を通過する");
+
+        std::fs::write(&script, b"const evil = true;").expect("改ざんできる");
+        assert!(matches!(
+            verify_script(&script, expected),
+            Err(PluginLoaderError::ScriptVerificationFailed(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = dir.join("elsewhere.ts");
+            std::fs::write(&target, content).expect("ターゲットを作成できる");
+            std::fs::remove_file(&script).expect("ファイルを削除できる");
+            symlink(&target, &script).expect("symlink を作成できる");
+            assert!(matches!(
+                verify_script(&script, expected),
+                Err(PluginLoaderError::ScriptIsSymlink(_))
+            ));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_hash_changes_with_content_and_length() {
+        assert_ne!(script_hash(b"a"), script_hash(b"b"));
+        assert_ne!(script_hash(b"ab"), script_hash(b"ba"));
+        assert_ne!(script_hash(b"a"), script_hash(b"a\0"));
+        assert_eq!(script_hash(b"same"), script_hash(b"same"));
+    }
+
+    #[test]
+    fn script_hash_is_sha256_not_fnv1a() {
+        // SHA-256("abc") の既知ベクタ。64-bit FNV-1a に戻っていないことを固定する。
+        let expected: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(script_hash(b"abc"), expected);
+        let empty: [u8; 32] = Sha256::digest(b"").into();
+        assert_eq!(script_hash(b""), empty);
     }
 }
