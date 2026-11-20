@@ -186,7 +186,7 @@ Replace the host and port with the values passed to `serve --hostname` and
 
 ## Repository structure
 
-The complete 22-crate map and major execution paths are documented in
+The complete 21-crate map and major execution paths are documented in
 [`docs/architecture.md`](docs/architecture.md).
 
 - `crates/opencode-cli` – CLI entrypoint (binary: `opencoderust`)

@@ -373,6 +373,9 @@ shadowingできる。
   `new URLSearchParams(init)` と `get` / `getAll` / `has` / `set` / `append` /
   `delete` / `toString` / `size` を提供する。
 
+これら拡張と `String.normalize` は差分コーパスの
+`regexp-url-normalize` groupでも検証する (Validation参照)。
+
 ## Tool boundary
 
 `tools` は `ToolHost` に解決される参照で、`tools.ns.tool` 形式のパスを
@@ -465,7 +468,8 @@ shadowingできる。
   `split("")` / `replaceAll("")` の境界はJavaScriptと一致しない
 - `Error` は `name` / `message` を持つbranded valueで、upstreamのplain object
   のように任意propertyを追加・変更できない
-- upstream parity test suiteの完全移植 (依存不要な差分コーパスは実装済み)
+- upstream parity test suiteの完全移植 (依存不要な差分コーパスに加え、
+  RegExp / URL / URLSearchParams / String.normalize のケースも収録済み)
 
 ## Validation
 
@@ -474,10 +478,17 @@ cargo test -p opencode-codemode
 markdownlint docs/opencode-codemode.md
 ```
 
-`tests/parity_corpus.rs` は依存不要なstdlib・coercion・operatorの差分
-コーパス (`tests/parity_cases.json`) を実行する。期待値はNode.jsで生成し、
-UTC固定Date・plain-object Errorなどupstream固有の差分をレビューして
-除外している。
+`tests/parity_corpus.rs` は `tests/parity_cases.json` の差分コーパスを実行する。
+2つのtestがあり、groupを持たない依存不要ケース (stdlib・coercion・operator)
+と `regexp-url-normalize` groupの依存利用ケースを個別に検証する。
+
+- 依存不要ケース: 期待値はNode.jsで生成し、UTC固定Date・plain-object Error
+  などupstream固有の差分をレビューして除外している。
+- `regexp-url-normalize` group: RegExpのlookaround / backreference、
+  URL / URLSearchParams、String.normalize を対象とする。Node.js生成の
+  fixtureが無いため、期待値はECMAScript・WHATWG URL・UAX #15の仕様から
+  手動で設定し、Rust実装の出力を期待値に転用していない。根拠は
+  `tests/parity_corpus.rs` のモジュールコメントを参照。
 
 ## References
 

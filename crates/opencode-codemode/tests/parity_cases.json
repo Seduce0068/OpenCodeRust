@@ -8053,5 +8053,120 @@
         1
       ]
     ]
+  },
+  {
+    "expr": "'abc 123 def'.match(/([0-9]+)(?= def)/)[1]",
+    "expected": "123",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'abc 123'.match(/([0-9]+)(?! x)/)[1]",
+    "expected": "123",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'abc 123'.match(/(?<=abc )([0-9]+)/)[1]",
+    "expected": "123",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'aabb'.match(/([a-z])\\1/)[0]",
+    "expected": "aa",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "/[0-9]+(?= def)/.test('abc 123 def')",
+    "expected": true,
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "/[0-9]+(?= xyz)/.test('abc 123 def')",
+    "expected": false,
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'abc 123'.match(/(?<num>[0-9]+)/).groups.num",
+    "expected": "123",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URL('https://example.com:8080/path?q=1#frag').href",
+    "expected": "https://example.com:8080/path?q=1#frag",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URL('https://example.com:8080/path?q=1#frag').host",
+    "expected": "example.com:8080",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URL('/path', 'https://example.com').href",
+    "expected": "https://example.com/path",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URL('https://example.com/path?q=1#frag').search",
+    "expected": "?q=1",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URL('https://example.com/path?q=1#frag').hash",
+    "expected": "#frag",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URL('https://example.com/path').toString()",
+    "expected": "https://example.com/path",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URLSearchParams('a=1&b=2').get('b')",
+    "expected": "2",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URLSearchParams('a=1&a=2').getAll('a').join(',')",
+    "expected": "1,2",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "new URLSearchParams('a=1&b=2').toString()",
+    "expected": "a=1&b=2",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "(() => { const p = new URLSearchParams('a=1'); p.append('a', '2'); return p.toString(); })()",
+    "expected": "a=1&a=2",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "(() => { const u = new URL('https://example.com/path?q=1'); u.searchParams.set('q', '99'); return u.search; })()",
+    "expected": "?q=99",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'a\\u0301'.normalize('NFC')",
+    "expected": "á",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'á'.normalize('NFD')",
+    "expected": "a\u0301",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "'a\\u0301'.normalize()",
+    "expected": "á",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "\"\\ufb01\".normalize('NFKC')",
+    "expected": "fi",
+    "group": "regexp-url-normalize"
+  },
+  {
+    "expr": "(() => { try { 'abc'.normalize('NFX'); return 'no'; } catch (e) { return e.name; } })()",
+    "expected": "RangeError",
+    "group": "regexp-url-normalize"
   }
 ]

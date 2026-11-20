@@ -340,11 +340,10 @@ mod tests {
     use super::*;
     use crate::context::{McpServerStatus, Session};
     use crate::theme::Theme;
-    use once_cell::sync::Lazy;
     use ratatui::{backend::TestBackend, Terminal};
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// OPENCODE_STATE_DIR を一時ディレクトリへ切り替えて AppContext を構築する。
     /// prompt.rs のテストと同じ方式で、履歴・frecency・stash の実状態との接触を避ける。
