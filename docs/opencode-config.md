@@ -67,8 +67,10 @@ current shape, so a config round-trips without losing either.
 
 The current-schema `mcp.servers` wrapper is unwrapped into the runtime `mcp`
 map: `disabled` is inverted to `enabled`, `command` accepts a string or an argv
-array, and `headers` / `environment` / `oauth: false` are carried over. The
-per-operation `timeout` object and `cwd` are not mapped yet.
+array, and `headers` / `environment` / `oauth: false` / `cwd` are carried over.
+The `cwd` value is forwarded to the local MCP subprocess (see
+[ALIGNMENT](../ALIGNMENT.md)). The per-operation `timeout` object is not
+mapped yet.
 
 The following keys are accepted but not mapped to runtime behaviour yet
 (see [MAPPING](../MAPPING.md)):

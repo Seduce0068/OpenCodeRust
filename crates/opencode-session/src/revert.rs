@@ -101,10 +101,13 @@ impl RevertManager {
         if let Some(mut rev) = revert {
             let existing_snapshot = session.revert.as_ref().and_then(|r| r.snapshot.clone());
 
-            rev.snapshot = Some(
-                existing_snapshot
-                    .unwrap_or_else(|| Snapshot::track(&self.worktree).unwrap_or_default()),
-            );
+            // Snapshot::track の失敗を空文字スナップショットへ変換して保存すると、
+            // 復元不可能な revert 状態が残る。失敗は伝播させ、状態を書き込まない。
+            let snapshot = match existing_snapshot {
+                Some(snapshot) => snapshot,
+                None => Snapshot::track(&self.worktree)?,
+            };
+            rev.snapshot = Some(snapshot);
 
             if let Some(ref snapshot) = rev.snapshot {
                 let diffs = Snapshot::diff(&self.worktree, snapshot)?;
@@ -491,6 +494,40 @@ mod tests {
             revert.snapshot.as_deref(),
             Some(bad_snapshot.as_str()),
             "the snapshot reference must remain available for retry"
+        );
+    }
+
+    /// Snapshot::track が失敗した場合、空ハッシュを状態保存せずエラーを伝播すること。
+    #[test]
+    fn revert_propagates_track_failure_without_saving_empty_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // 通常ファイルはスナップショット用ディレクトリをホストできないため、
+        // Snapshot::track が確実に失敗する。
+        let worktree = temp.path().join("not-a-directory");
+        std::fs::write(&worktree, "not a directory").expect("write file");
+
+        let mut manager = SessionManager::new();
+        let session = manager.create("project", worktree.to_string_lossy().to_string());
+        let session_id = session.id.clone();
+        let message = crate::SessionMessage::user(&session_id, "text");
+        let message_id = message.id.clone();
+        manager.update_message(&session_id, message);
+
+        let revert_manager = RevertManager::new(worktree);
+        let result = revert_manager.revert(
+            &RevertInput {
+                session_id: session_id.clone(),
+                message_id,
+                part_id: None,
+            },
+            &mut manager,
+        );
+
+        assert!(result.is_err(), "track failure must be propagated as Err");
+        let updated = manager.get(&session_id).expect("session exists");
+        assert!(
+            updated.revert.is_none(),
+            "no revert state (especially an empty snapshot) may be saved on track failure"
         );
     }
 
