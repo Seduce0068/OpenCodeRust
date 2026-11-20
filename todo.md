@@ -278,18 +278,9 @@ status: current
 
 - [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
   — `tui/Cargo.toml:25` / DEPS-04
-- [ ] **Home/Session フッタのパディングがバイト長で全角で位置がずれる**
-  — `home.rs:239-267`, `session.rs:351-486` / RENDER-03
-- [ ] **sidebar の truncate_text が文字数基準で呼出側は表示幅を渡す**
-  — `sidebar.rs:607-620` / RENDER-04
-- [ ] **AlertDialog の高さが明示改行数から算出され長文が切れる** — `alert.rs:107-141` / RENDER-05
 - [ ] **Markdown 表の列幅が無制限で枠構造が壊れる** — `markdown/renderer.rs:83-119` / RENDER-06
 - [ ] **wrap_spans が幅 2 文字を満杯行へ置き領域より広い行を生成**
   — `session.rs:1230-1256` / RENDER-07
-- [ ] **Toast の desired_height が文字数基準で全角メッセージが切れる**
-  — `toast.rs:101-111` / RENDER-08
-- [ ] **ui::layout::centered が height>100 でアンダーフロー**
-  — `ui/layout.rs:19-37` / RENDER-09
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
@@ -306,6 +297,8 @@ status: current
 
 ## 完了
 
+- [x] **[TUI 表示幅 5 件]** 全角幅計算・centered 境界・toast 省略
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin/tool/mcp 4 件]** hook redact・userinfo 除去・npm 排水
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定階層/retryable 3 件]** .opencode 維持・schema 非公開・retry 保持
