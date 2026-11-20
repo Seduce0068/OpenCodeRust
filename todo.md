@@ -276,12 +276,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **CLI CONFIG_CACHE に無効化手段が無く設定変更が永続的に反映されない**
-  — `cli/main.rs:55-67` / CFG-005
-- [ ] **mcp.protocol auto が legacy と同一 revision で probe 未実装**
-  — `schema.rs:775-789` / CFG-009
-- [ ] **セッション更新 Hook が unbounded_channel で全 Session clone を送る**
-  — `routes.rs:2260` / RES-02
 - [ ] **lsp feature 経由の公開 API に doc が無い** — `tool/lsp_tool.rs:12-38` / API-05
 - [ ] **3 crate（codemode/local-llm/watcher）がどこからも依存されず孤立**
   — `Cargo.toml:3-25` / API-06
@@ -327,6 +321,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定キャッシュ/protocol/hook 3 件]** fingerprint・正規化・coalescing
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース/ドキュメント 7 件]** 回収・再帰上限・履歴スナップショット
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[storage/mcp 5 件]** metadata/cost 往復・v3 移行・権限 fail-closed
@@ -626,6 +622,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（設定キャッシュ/protocol/hook の修正時、記録のみ）:
+  config_for の read→load→write に TOCTOU があり、同一 cwd の並行呼び出しで
+  load_config が重複実行され得る（結果の整合性は保たれる）。担当外ドキュメント
+  （CHANGELOG/MAPPING/investigation-final-report）に McpProtocol::Auto / probe
+  未実装の古い記述が残る。
 - 2026-11-21 実装メモ（リソース/ドキュメントの修正時）: task 担当が
   executor.rs の子 ToolContext が extra 空で作り直される旨を指摘。親が
   AgentExecutor に subagent_depth を追加し、SubsessionState 経由で子へ +1
