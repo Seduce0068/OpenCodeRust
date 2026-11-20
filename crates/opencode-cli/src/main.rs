@@ -626,6 +626,21 @@ enum GithubCommands {
         token: Option<String>,
     },
 }
+
+/// tracing の stdout 出力可否を決める純粋関数。
+///
+/// TUI は alternate screen を汚すため抑制する。さらに `run --format json` は
+/// stdout を JSON Lines 契約（1 行 1 JSON イベント）として公開するため、
+/// コマンド種別が Run かつ format=Json のときも print を抑制する。
+/// `is_tui` 判定は TUI 側の用途で維持したまま、ここでは print 引数のみを絞る。
+fn tracing_print_enabled(cli_command: &Option<Commands>, is_tui: bool) -> bool {
+    let run_json_output = matches!(
+        cli_command,
+        Some(Commands::Run { format, .. }) if matches!(format, RunOutputFormat::Json)
+    );
+    !is_tui && !run_json_output
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -644,18 +659,23 @@ async fn main() -> anyhow::Result<()> {
         &cli.command,
         Some(Commands::Tui { .. }) | Some(Commands::Attach { .. }) | None
     );
+    // R4-03: `run --format json` は stdout を JSON Lines 専用にする契約のため、
+    // TUI でなくても tracing の print を抑制しファイル／stderr 経路へ逃がす。
+    // is_tui 判定自体は TUI 用途で維持したまま、print 引数のみを追加で絞る。
+    let tracing_print = tracing_print_enabled(&cli.command, is_tui);
     let cwd = std::env::current_dir().ok();
     let startup_log_level = cwd
         .as_ref()
         .and_then(|cwd| config_for(cwd).ok())
         .and_then(|config| config.log_level);
-    // 非 TUI は print=true のため log_dir は init_tracing 側で早期 return され不使用。
-    // TUI のファイルログは cwd 直下に置かず、init_tracing のユーザー専用既定
+    // print=true（非 TUI かつ `run --format json` ではない）の場合は log_dir は
+    // init_tracing 側で早期 return され不使用。
+    // TUI／JSON run のファイルログは cwd 直下に置かず、init_tracing のユーザー専用既定
     // ディレクトリ (XDG_STATE_HOME / $HOME/.local/state 配下) を使うため None を渡す。
     // cwd は上の config 読み込み用に維持する。
     // 第 2 戻り値 (WorkerGuard) を main のローカルとして保持し、終了時にフラッシュさせる。
     let (_log_path, _log_guard) =
-        opencode_util::init_tracing(startup_log_level.as_deref(), None, !is_tui);
+        opencode_util::init_tracing(startup_log_level.as_deref(), None, tracing_print);
 
     match cli.command {
         Some(Commands::Tui {
@@ -943,7 +963,8 @@ async fn run_tui(
         server_url
     };
 
-    let selected_session = resolve_requested_session(continue_last, session, fork).await?;
+    let selected_session =
+        resolve_requested_session(&base_url, continue_last, session, fork).await?;
     std::env::set_var("OPENCODE_TUI_BASE_URL", &base_url);
     // attach -p/--password を TUI 側へ secret として渡す。値はログ・エラーへ出さない。
     set_tui_auth_token_env(&password);
@@ -1007,7 +1028,19 @@ mod password_env_tests {
     }
 }
 
+/// `tui --fork` のベース ID が解決できているかを検証する。
+///
+/// `--session` / `--continue` からベース ID が取れない場合は、黙って新規
+/// セッションへフォールバックさせず明示的なエラーにする。
+fn ensure_fork_base_id(selected: Option<&str>, fork: bool) -> anyhow::Result<()> {
+    if fork && selected.is_none() {
+        anyhow::bail!("--fork requires a resolvable base session via --session or --continue");
+    }
+    Ok(())
+}
+
 async fn resolve_requested_session(
+    base_url: &str,
     continue_last: bool,
     session: Option<String>,
     fork: bool,
@@ -1027,10 +1060,17 @@ async fn resolve_requested_session(
         None
     };
 
-    if fork && selected.is_some() {
-        eprintln!(
-            "Note: --fork for TUI session attach is not fully wired yet; using base session."
-        );
+    // --fork はベースが解決できない時点で新規セッションへ落とさず失敗させる。
+    ensure_fork_base_id(selected.as_deref(), fork)?;
+
+    // --fork はベースセッションへ接続するだけにせず、TUI が使うサーバへ
+    // 実際に fork リクエストを送る。失敗時は黙ってフォールバックしない。
+    if let Some(ref base_id) = selected {
+        if fork {
+            let client = reqwest::Client::new();
+            let forked_id = fork_session_via_server(&client, base_url, base_id).await?;
+            return Ok(Some(forked_id));
+        }
     }
 
     Ok(selected)
@@ -1217,6 +1257,28 @@ struct RemoteStreamEvent {
     tool_name: Option<String>,
 }
 
+/// ベースセッションをサーバ側で fork し、新しいセッション ID を返す。
+///
+/// `run --attach --fork` と `tui --fork` で同じサーバ契約
+/// (`POST /session/{id}/fork`) を共有する。トークンやパスワードは
+/// リクエスト本文・ログ・エラーへ一切含めない。
+async fn fork_session_via_server(
+    client: &reqwest::Client,
+    base_url: &str,
+    base_id: &str,
+) -> anyhow::Result<String> {
+    let fork_endpoint = server_url(base_url, &format!("/session/{}/fork", base_id));
+    let forked: RemoteSessionInfo = parse_http_json(
+        client
+            .post(fork_endpoint)
+            .json(&serde_json::json!({ "message_id": null }))
+            .send()
+            .await?,
+    )
+    .await?;
+    Ok(forked.id)
+}
+
 async fn resolve_remote_session(
     client: &reqwest::Client,
     base_url: &str,
@@ -1241,16 +1303,7 @@ async fn resolve_remote_session(
 
     if let Some(base_id) = base_id {
         if fork {
-            let fork_endpoint = server_url(base_url, &format!("/session/{}/fork", base_id));
-            let forked: RemoteSessionInfo = parse_http_json(
-                client
-                    .post(fork_endpoint)
-                    .json(&serde_json::json!({ "message_id": null }))
-                    .send()
-                    .await?,
-            )
-            .await?;
-            return Ok(forked.id);
+            return fork_session_via_server(client, base_url, &base_id).await;
         }
         return Ok(base_id);
     }
@@ -1274,6 +1327,7 @@ async fn maybe_share_remote_session(
     base_url: &str,
     session_id: &str,
     share_requested: bool,
+    format: RunOutputFormat,
 ) -> anyhow::Result<()> {
     let auto_share_env = std::env::var("OPENCODE_AUTO_SHARE")
         .ok()
@@ -1291,7 +1345,154 @@ async fn maybe_share_remote_session(
     let share_endpoint = server_url(base_url, &format!("/session/{}/share", session_id));
     let shared: RemoteShareInfo =
         parse_http_json(client.post(share_endpoint).send().await?).await?;
-    println!("~  {}", shared.url);
+    // JSON モードでは素の `~  <url>` を stdout に出さず、ストリームイベントと
+    // 同じ JSON 行契約で共有 URL を構造化して emit する。
+    println!(
+        "{}",
+        share_url_output_line(session_id, &shared.url, &format)
+    );
+    Ok(())
+}
+
+/// ローカル実行の JSON モードで使う sessionID（永続セッションを伴わないための固定値）。
+const LOCAL_JSON_SESSION_ID: &str = "local";
+
+/// 1 イベントを JSON 行として組み立てる。
+///
+/// `consume_remote_sse` の JSON モードと同じく `type` / `timestamp` / `sessionID`
+/// を先頭に置き、イベント固有フィールドを続ける（フィールド衝突時は固有側が勝つ）。
+fn build_stream_event_json(
+    session_id: &str,
+    timestamp_ms: i64,
+    event_type: &str,
+    fields: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "type".to_string(),
+        serde_json::Value::String(event_type.to_string()),
+    );
+    output.insert("timestamp".to_string(), serde_json::json!(timestamp_ms));
+    output.insert(
+        "sessionID".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    for (key, value) in fields {
+        output.insert(key, value);
+    }
+    serde_json::Value::Object(output)
+}
+
+/// 共有 URL の出力行を組み立てる純粋関数。
+///
+/// JSON モードでは `build_stream_event_json` を通した JSON 行だけを返し、
+/// 既存の `~  <url>` 形式は返さない（stdout の JSON Lines 契約を守るため）。
+/// JSON 行には共有 URL と共通フィールドのみを含め、トークン／パスワードは
+/// 一切含めない。
+fn share_url_output_line(session_id: &str, url: &str, format: &RunOutputFormat) -> String {
+    if matches!(format, RunOutputFormat::Json) {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+        build_stream_event_json(
+            session_id,
+            chrono::Utc::now().timestamp_millis(),
+            "share",
+            fields,
+        )
+        .to_string()
+    } else {
+        format!("~  {}", url)
+    }
+}
+
+/// Rust の enum variant 名を snake_case のイベント名へ変換する。
+fn stream_event_variant_to_type(name: &str) -> String {
+    let mut converted = String::new();
+    for (index, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() {
+            if index > 0 {
+                converted.push('_');
+            }
+            converted.extend(ch.to_lowercase());
+        } else {
+            converted.push(ch);
+        }
+    }
+    converted
+}
+
+/// ローカルの `StreamEvent` を (event_type, fields) へ変換する。
+///
+/// 代表的なイベントは `consume_remote_sse` が出す名前
+/// (`message_delta` / `message_end` / `tool_call_start` / `error`) に揃え、
+/// それ以外は variant 名の snake_case を使う。
+fn stream_event_json_parts(
+    event: &StreamEvent,
+) -> (String, serde_json::Map<String, serde_json::Value>) {
+    let mut fields = serde_json::Map::new();
+    let event_type = match event {
+        StreamEvent::TextDelta(text) => {
+            fields.insert(
+                "content".to_string(),
+                serde_json::Value::String(text.clone()),
+            );
+            "message_delta".to_string()
+        }
+        StreamEvent::ToolCallStart { id, name } => {
+            fields.insert("id".to_string(), serde_json::Value::String(id.clone()));
+            fields.insert(
+                "tool_name".to_string(),
+                serde_json::Value::String(name.clone()),
+            );
+            "tool_call_start".to_string()
+        }
+        StreamEvent::Error(message) => {
+            fields.insert(
+                "error".to_string(),
+                serde_json::Value::String(message.clone()),
+            );
+            "error".to_string()
+        }
+        StreamEvent::Done | StreamEvent::Finish => "message_end".to_string(),
+        other => {
+            let serialized = serde_json::to_value(other).unwrap_or(serde_json::Value::Null);
+            match serialized {
+                serde_json::Value::Object(map) => {
+                    if let Some((variant, payload)) = map.into_iter().next() {
+                        match payload {
+                            serde_json::Value::Object(inner) => fields = inner,
+                            serde_json::Value::Null => {}
+                            data => {
+                                fields.insert("data".to_string(), data);
+                            }
+                        }
+                        stream_event_variant_to_type(&variant)
+                    } else {
+                        "event".to_string()
+                    }
+                }
+                _ => "event".to_string(),
+            }
+        }
+    };
+    (event_type, fields)
+}
+
+/// ローカルストリームの 1 イベントを JSON 行として stdout へ emit する。
+fn emit_local_stream_event_json(event: &StreamEvent) -> anyhow::Result<()> {
+    let (event_type, fields) = stream_event_json_parts(event);
+    println!(
+        "{}",
+        build_stream_event_json(
+            LOCAL_JSON_SESSION_ID,
+            chrono::Utc::now().timestamp_millis(),
+            &event_type,
+            fields,
+        )
+    );
     Ok(())
 }
 
@@ -1322,30 +1523,23 @@ async fn consume_remote_sse(
             .unwrap_or_else(|| "message".to_string());
 
         if matches!(format, RunOutputFormat::Json) {
-            let mut output = serde_json::Map::new();
-            output.insert(
-                "type".to_string(),
-                serde_json::Value::String(event_type.clone()),
-            );
-            output.insert(
-                "timestamp".to_string(),
-                serde_json::json!(chrono::Utc::now().timestamp_millis()),
-            );
-            output.insert(
-                "sessionID".to_string(),
-                serde_json::Value::String(session_id.to_string()),
-            );
-            match parsed {
-                serde_json::Value::Object(map) => {
-                    for (k, v) in map {
-                        output.insert(k, v);
-                    }
-                }
+            let fields = match parsed {
+                serde_json::Value::Object(map) => map,
                 other => {
-                    output.insert("data".to_string(), other);
+                    let mut map = serde_json::Map::new();
+                    map.insert("data".to_string(), other);
+                    map
                 }
-            }
-            println!("{}", serde_json::Value::Object(output));
+            };
+            println!(
+                "{}",
+                build_stream_event_json(
+                    session_id,
+                    chrono::Utc::now().timestamp_millis(),
+                    &event_type,
+                    fields,
+                )
+            );
             return Ok(());
         }
 
@@ -1431,7 +1625,7 @@ async fn run_non_interactive_attach(
     let client = reqwest::Client::new();
     let session_id =
         resolve_remote_session(&client, &base_url, continue_last, session, fork, title).await?;
-    maybe_share_remote_session(&client, &base_url, &session_id, share).await?;
+    maybe_share_remote_session(&client, &base_url, &session_id, share, format.clone()).await?;
 
     let content = if let Some(command_name) = command {
         if input.trim().is_empty() {
@@ -1538,22 +1732,39 @@ async fn run_non_interactive(
         input = rendered;
     }
 
+    let json_output = matches!(format, RunOutputFormat::Json);
     if input.trim().is_empty() {
+        // JSON モードで対話ループへ入るとプロンプト ("> ") が stdout を汚すため、
+        // メッセージ必須を明示する（サイレントにテキスト出力しない）。
+        if json_output {
+            anyhow::bail!("--format json requires a non-empty message");
+        }
         let (provider, model_id) = parse_model_and_provider(model);
-        return run_chat_session(model_id, provider, agent_name, None, false).await;
+        return run_chat_session(model_id, provider, agent_name, None, false, format).await;
     }
 
     let (provider, model_id) = parse_model_and_provider(model);
-    run_chat_session(model_id, provider, agent_name, Some(input.clone()), true).await?;
+    run_chat_session(
+        model_id,
+        provider,
+        agent_name,
+        Some(input.clone()),
+        true,
+        format.clone(),
+    )
+    .await?;
 
-    if matches!(format, RunOutputFormat::Json) {
+    if json_output {
+        let mut fields = serde_json::Map::new();
+        fields.insert("input".to_string(), serde_json::Value::String(input));
         println!(
             "{}",
-            serde_json::json!({
-                "type": "completed",
-                "timestamp": chrono::Utc::now().timestamp_millis(),
-                "input": input
-            })
+            build_stream_event_json(
+                LOCAL_JSON_SESSION_ID,
+                chrono::Utc::now().timestamp_millis(),
+                "completed",
+                fields,
+            )
         );
     }
 
@@ -1566,7 +1777,9 @@ async fn run_chat_session(
     agent_name: String,
     initial_prompt: Option<String>,
     single_shot: bool,
+    format: RunOutputFormat,
 ) -> anyhow::Result<()> {
+    let json_output = matches!(format, RunOutputFormat::Json);
     let current_dir = std::env::current_dir()?;
     let config = config_for(&current_dir)?;
 
@@ -1614,16 +1827,19 @@ async fn run_chat_session(
         agent_info = agent_info.with_model(model_id.clone(), provider_id);
     }
 
-    println!("\n╔══════════════════════════════════════════╗");
-    println!("║        OpenCode Interactive Mode         ║");
-    println!("╚══════════════════════════════════════════╝");
-    println!();
-    println!("  Model: {}", model.as_deref().unwrap_or("auto"));
-    println!("  Agent: {}", agent_name);
-    println!("  Directory: {}", current_dir.display());
-    println!();
-    println!("  Commands: exit, quit, help, clear");
-    println!();
+    // JSON モードではバナーを stdout に出さない（JSON 行のみを emit する）。
+    if !json_output {
+        println!("\n╔══════════════════════════════════════════╗");
+        println!("║        OpenCode Interactive Mode         ║");
+        println!("╚══════════════════════════════════════════╝");
+        println!();
+        println!("  Model: {}", model.as_deref().unwrap_or("auto"));
+        println!("  Agent: {}", agent_name);
+        println!("  Directory: {}", current_dir.display());
+        println!();
+        println!("  Commands: exit, quit, help, clear, /clear");
+        println!();
+    }
 
     let mut executor = AgentExecutor::new(
         agent_info.clone(),
@@ -1652,8 +1868,10 @@ async fn run_chat_session(
     }
 
     if let Some(prompt_text) = initial_prompt {
-        println!("User: {}", prompt_text);
-        process_message(&mut executor, &prompt_text).await?;
+        if !json_output {
+            println!("User: {}", prompt_text);
+        }
+        process_message(&mut executor, &prompt_text, &format).await?;
         if single_shot {
             return Ok(());
         }
@@ -1683,7 +1901,8 @@ async fn run_chat_session(
             continue;
         }
 
-        if input == "clear" {
+        if is_clear_command(input) {
+            clear_executor_conversation(&mut executor);
             println!("Conversation cleared.\n");
             continue;
         }
@@ -1720,7 +1939,7 @@ async fn run_chat_session(
             continue;
         }
 
-        match process_message(&mut executor, input).await {
+        match process_message(&mut executor, input, &format).await {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("\nError: {}", e);
@@ -1731,9 +1950,40 @@ async fn run_chat_session(
     Ok(())
 }
 
-async fn process_message(executor: &mut AgentExecutor, input: &str) -> anyhow::Result<()> {
-    print!("\nAssistant: ");
-    io::stdout().flush()?;
+/// 対話ループでクリアを意味する入力。`clear` と `/clear` の両表記を受理する。
+fn is_clear_command(input: &str) -> bool {
+    matches!(input, "clear" | "/clear")
+}
+
+/// `/clear` の実体: システムプロンプトを保持したまま会話履歴を実際に消去する。
+///
+/// `AgentExecutor` の既存 pub API（`conversation` / `conversation_mut` と
+/// `Conversation::with_system_prompt`）のみを使い、main.rs 内で完結させる。
+fn clear_executor_conversation(executor: &mut AgentExecutor) {
+    let system_prompt = executor
+        .conversation()
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, opencode_agent::MessageRole::System))
+        .map(|message| message.content.clone());
+
+    let cleared = match system_prompt {
+        Some(prompt) => opencode_agent::Conversation::with_system_prompt(prompt),
+        None => opencode_agent::Conversation::new(),
+    };
+    *executor.conversation_mut() = cleared;
+}
+
+async fn process_message(
+    executor: &mut AgentExecutor,
+    input: &str,
+    format: &RunOutputFormat,
+) -> anyhow::Result<()> {
+    let json_output = matches!(format, RunOutputFormat::Json);
+    if !json_output {
+        print!("\nAssistant: ");
+        io::stdout().flush()?;
+    }
 
     let stream = executor.execute_streaming(input.to_string()).await?;
 
@@ -1741,6 +1991,27 @@ async fn process_message(executor: &mut AgentExecutor, input: &str) -> anyhow::R
     let mut full_response = String::new();
 
     while let Some(event) = stream.next().await {
+        // JSON モードでは全 StreamEvent を JSON 行として emit する。
+        // プレーンテキストの "Assistant: " / テキスト片 / ツール表示は出さない。
+        if json_output {
+            match &event {
+                Ok(stream_event) => {
+                    let is_done = matches!(stream_event, StreamEvent::Done);
+                    emit_local_stream_event_json(stream_event)?;
+                    if is_done {
+                        break;
+                    }
+                }
+                // executor 側のエラーは StreamEvent ではないため stdout の JSON 行には混ぜず、
+                // 従来どおり stderr の診断として扱う。
+                Err(error) => {
+                    eprintln!("Error: {}", error);
+                    break;
+                }
+            }
+            continue;
+        }
+
         match event {
             Ok(StreamEvent::TextDelta(text)) => {
                 print!("{}", text);
@@ -1766,7 +2037,9 @@ async fn process_message(executor: &mut AgentExecutor, input: &str) -> anyhow::R
         }
     }
 
-    println!("\n");
+    if !json_output {
+        println!("\n");
+    }
     Ok(())
 }
 
@@ -2017,18 +2290,26 @@ async fn load_plugin_auth_store(config: &opencode_config::Config) -> HashMap<Str
     auth_store
 }
 
+/// ヘルプのスラッシュコマンド一覧。`clear` も受け付けるが、他コマンドと
+/// 表記を揃えるため `/clear` を主表記として表示する。
+const SLASH_COMMAND_HELP_LINES: &[&str] = &[
+    "  /clear       - Clear conversation history (alias: clear)",
+    "  /models      - List all available models",
+    "  /model <id>  - Switch to a specific model",
+    "  /providers   - List configured providers",
+];
+
 fn show_help() {
     println!();
     println!("Available commands:");
     println!("  exit, quit   - End the session");
     println!("  help         - Show this help message");
-    println!("  clear        - Clear conversation history");
     println!("  stats        - Show session statistics");
     println!();
-    println!("Model commands:");
-    println!("  /models      - List all available models");
-    println!("  /model <id>  - Switch to a specific model");
-    println!("  /providers   - List configured providers");
+    println!("Slash commands:");
+    for line in SLASH_COMMAND_HELP_LINES {
+        println!("{}", line);
+    }
     println!();
     println!("Tips:");
     println!("  - Use --model to specify a model (e.g., --model claude-sonnet-4)");
@@ -2532,6 +2813,18 @@ fn format_stats_total_cost(total_cost: Option<f64>) -> String {
     }
 }
 
+/// 実コストが永続化されていない場合に表示する注記。
+///
+/// `None` / 非有限値のときは「tokens only」であることを明示し、
+/// トークン数をコストとして誤読させない。有限値があるときは注記不要。
+fn stats_cost_note(total_cost: Option<f64>) -> Option<&'static str> {
+    if total_cost.is_some_and(|cost| cost.is_finite()) {
+        None
+    } else {
+        Some("(tokens only: cost persistence is not implemented)")
+    }
+}
+
 async fn handle_stats_command(
     days: Option<i64>,
     tools_limit: Option<usize>,
@@ -2622,6 +2915,9 @@ async fn handle_stats_command(
         "Total Cost: {}",
         format_stats_total_cost(persisted_total_cost)
     );
+    if let Some(note) = stats_cost_note(persisted_total_cost) {
+        println!("{}", note);
+    }
     println!(
         "Tokens: input={} output={} reasoning={} cache_read={} cache_write={}",
         total_input, total_output, total_reasoning, total_cache_read, total_cache_write
@@ -6298,5 +6594,241 @@ mod tests {
                 vec!["model-a".to_string()]
             );
         }
+
+        #[tokio::test]
+        async fn clear_removes_executor_history_and_keeps_system_prompt() {
+            let (registry, _seen, agent, tools) = fixture();
+            let mut executor = AgentExecutor::new(agent, registry, tools)
+                .with_system_prompt("keep this system prompt");
+
+            let _stream = executor
+                .execute_streaming("hello".to_string())
+                .await
+                .expect("baseline stream");
+            assert!(
+                executor.conversation().messages.len() > 1,
+                "user message must be recorded before /clear"
+            );
+
+            clear_executor_conversation(&mut executor);
+
+            let messages = &executor.conversation().messages;
+            assert_eq!(
+                messages.len(),
+                1,
+                "/clear must actually clear the executor conversation"
+            );
+            assert!(matches!(
+                messages[0].role,
+                opencode_agent::MessageRole::System
+            ));
+            assert_eq!(messages[0].content, "keep this system prompt");
+        }
+    }
+
+    // --- R2 CLI 中優先の回帰テスト -------------------------------------------
+
+    #[test]
+    fn run_format_json_is_accepted_without_attach() {
+        let cli =
+            Cli::try_parse_from(["opencoderust", "run", "--format", "json", "hello"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Run {
+                format: RunOutputFormat::Json,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn local_json_event_uses_remote_contract_shape() {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "content".to_string(),
+            serde_json::Value::String("hi".to_string()),
+        );
+        let event = build_stream_event_json("local", 1234, "message_delta", fields);
+        assert_eq!(event["type"], "message_delta");
+        assert_eq!(event["timestamp"], 1234);
+        assert_eq!(event["sessionID"], "local");
+        assert_eq!(event["content"], "hi");
+    }
+
+    #[test]
+    fn local_stream_events_map_to_remote_event_names() {
+        let (kind, fields) = stream_event_json_parts(&StreamEvent::TextDelta("abc".into()));
+        assert_eq!(kind, "message_delta");
+        assert_eq!(fields["content"], "abc");
+
+        let (kind, fields) = stream_event_json_parts(&StreamEvent::ToolCallStart {
+            id: "t-1".to_string(),
+            name: "bash".to_string(),
+        });
+        assert_eq!(kind, "tool_call_start");
+        assert_eq!(fields["id"], "t-1");
+        assert_eq!(fields["tool_name"], "bash");
+
+        let (kind, fields) = stream_event_json_parts(&StreamEvent::Error("boom".into()));
+        assert_eq!(kind, "error");
+        assert_eq!(fields["error"], "boom");
+
+        for event in [StreamEvent::Done, StreamEvent::Finish] {
+            let (kind, fields) = stream_event_json_parts(&event);
+            assert_eq!(kind, "message_end");
+            assert!(fields.is_empty());
+        }
+
+        // 未知/その他の variant は snake_case の種別とペイロードを落とさない。
+        let (kind, fields) = stream_event_json_parts(&StreamEvent::ReasoningStart {
+            id: "r-1".to_string(),
+        });
+        assert_eq!(kind, "reasoning_start");
+        assert_eq!(fields["id"], "r-1");
+    }
+
+    #[test]
+    fn stats_note_states_tokens_only_when_cost_is_unavailable() {
+        assert_eq!(
+            stats_cost_note(None),
+            Some("(tokens only: cost persistence is not implemented)")
+        );
+        assert!(stats_cost_note(Some(f64::NAN)).is_some());
+        assert_eq!(stats_cost_note(Some(1.25)), None);
+    }
+
+    #[tokio::test]
+    async fn tui_fork_posts_to_server_and_uses_forked_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept fork request");
+            let mut request = [0u8; 2048];
+            let read = socket.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("POST /session/base-1/fork "),
+                "fork must POST to the base session endpoint: {request}"
+            );
+
+            let body = r#"{"id":"forked-99","parent_id":"base-1"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write fork response");
+        });
+
+        let client = reqwest::Client::new();
+        let forked = fork_session_via_server(&client, &base_url, "base-1")
+            .await
+            .expect("fork request must succeed");
+        assert_eq!(forked, "forked-99");
+        server.await.expect("server task");
+    }
+
+    // --- R4 指摘 4 件の回帰テスト ---------------------------------------------
+
+    #[test]
+    fn clear_accepts_plain_and_slash_forms() {
+        assert!(is_clear_command("clear"));
+        assert!(is_clear_command("/clear"));
+        assert!(!is_clear_command("clear all"));
+        assert!(!is_clear_command("/clears"));
+        assert!(!is_clear_command("/models"));
+    }
+
+    #[test]
+    fn help_lists_slash_clear_aligned_with_other_slash_commands() {
+        assert!(
+            SLASH_COMMAND_HELP_LINES
+                .iter()
+                .any(|line| line.contains("/clear")),
+            "help must document /clear"
+        );
+        assert!(
+            SLASH_COMMAND_HELP_LINES
+                .iter()
+                .all(|line| line.starts_with("  /")),
+            "slash commands must share one notation"
+        );
+        let description_columns: Vec<usize> = SLASH_COMMAND_HELP_LINES
+            .iter()
+            .map(|line| line.find(" - ").expect("help line must have a description"))
+            .collect();
+        assert!(
+            description_columns
+                .iter()
+                .all(|col| *col == description_columns[0]),
+            "slash help descriptions must be aligned"
+        );
+    }
+
+    #[test]
+    fn run_format_json_disables_tracing_stdout_print() {
+        let json_cli =
+            Cli::try_parse_from(["opencoderust", "run", "--format", "json", "hi"]).unwrap();
+        assert!(!tracing_print_enabled(&json_cli.command, false));
+
+        let default_cli = Cli::try_parse_from(["opencoderust", "run", "hi"]).unwrap();
+        assert!(tracing_print_enabled(&default_cli.command, false));
+
+        // TUI 判定そのものは従来どおり維持する。
+        assert!(!tracing_print_enabled(&default_cli.command, true));
+        assert!(!tracing_print_enabled(&None, true));
+    }
+
+    #[test]
+    fn remote_share_json_line_is_structured_and_never_prints_tilde() {
+        let url = "https://example.invalid/s/abc123";
+        let json_line = share_url_output_line("session-1", url, &RunOutputFormat::Json);
+        assert!(
+            !json_line.starts_with("~"),
+            "JSON mode must not emit `~  <url>`"
+        );
+        assert!(!json_line.contains("~  "));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_line).expect("share line must be valid JSON");
+        assert_eq!(parsed["type"], "share");
+        assert_eq!(parsed["sessionID"], "session-1");
+        assert_eq!(parsed["url"], url);
+        assert!(parsed["timestamp"].is_number());
+        assert_eq!(
+            parsed.as_object().expect("object event").len(),
+            4,
+            "no extra fields (token/password) may leak into the JSON line"
+        );
+        assert!(!json_line.contains("password"));
+        assert!(!json_line.contains("token"));
+
+        let plain = share_url_output_line("session-1", url, &RunOutputFormat::Default);
+        assert_eq!(plain, format!("~  {}", url));
+    }
+
+    #[test]
+    fn tui_fork_without_base_id_fails_explicitly() {
+        assert!(ensure_fork_base_id(Some("base-1"), true).is_ok());
+        assert!(ensure_fork_base_id(None, false).is_ok());
+        let err = ensure_fork_base_id(None, true).expect_err("fork without base must fail");
+        assert!(err.to_string().contains("--fork"));
+    }
+
+    #[tokio::test]
+    async fn resolve_requested_session_fork_without_base_never_creates_new_session() {
+        // ベース ID が無い fork はリクエストを送らず即失敗する（新規セッションへ落ちない）。
+        let err = resolve_requested_session("http://127.0.0.1:1", false, None, true)
+            .await
+            .expect_err("fork without base must fail");
+        assert!(err.to_string().contains("--fork"));
     }
 }

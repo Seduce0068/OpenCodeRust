@@ -109,13 +109,14 @@ session 単位の FIFO で item を claim し、queue ID を user message ID と
 
 ## 検証
 
-workspace 全体の標準検証コマンド:
+CI の `extra_gates`（`.github/workflows/ci.yml`）と同じ 4 コマンド:
 
 ```bash
-cargo fmt --all -- --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo check --workspace --all-features --all-targets --locked
+cargo test --workspace --all-features --all-targets --locked
+cargo clippy --workspace --all-features --all-targets --locked -- \
+  -D warnings -D clippy::undocumented_unsafe_blocks
+cargo build --workspace --release --locked
 ```
 
 ## 文書案内

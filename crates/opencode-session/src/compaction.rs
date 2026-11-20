@@ -470,12 +470,10 @@ When constructing the summary, try to stick to this template:
             finish: None,
         };
 
-        // Persist the assistant message if session ops are available.
-        // A failure here is returned to the caller: no compaction is reported
-        // as successful before its summary message has been persisted.
-        if let Some(ops) = session_ops {
-            ops.update_message(assistant_info.clone()).await?;
-        }
+        // The assistant summary message is intentionally NOT persisted here.
+        // Doing so before the LLM call left an incomplete `summary: true`
+        // message behind whenever the call failed or produced no text. It is
+        // written together with the summary part in the success branch below.
 
         // TS: const compacting = await Plugin.trigger("experimental.session.compacting", ...)
         // Fire the plugin hook and collect context / prompt override.
@@ -565,8 +563,14 @@ When constructing the summary, try to stick to this template:
                     return Ok(CompactionResult::Stop);
                 }
 
-                // Persist the generated summary as the assistant text part.
+                // Persist the summary message only after a valid LLM result.
+                // On failure nothing is written, so no incomplete summary:true
+                // message can remain. Persistence failures are still propagated
+                // with `?` before CompactionResult is reported.
                 if let Some(ops) = session_ops {
+                    ops.update_message(assistant_info.clone()).await?;
+
+                    // Persist the generated summary as the assistant text part.
                     let now_part = Utc::now().timestamp_millis();
                     let mut metadata = HashMap::new();
                     metadata.insert("summary".to_string(), serde_json::json!(true));
@@ -1020,6 +1024,8 @@ mod tests {
         model: ModelInfo,
         stream_events: Vec<StreamEvent>,
         last_request: Arc<Mutex<Option<ChatRequest>>>,
+        /// Set by failure-path tests so `chat_stream` fails immediately.
+        fail_chat_stream: bool,
     }
 
     impl MockProvider {
@@ -1042,6 +1048,14 @@ mod tests {
                     StreamEvent::Done,
                 ],
                 last_request: Arc::new(Mutex::new(None)),
+                fail_chat_stream: false,
+            }
+        }
+
+        fn failing(model_id: &str) -> Self {
+            Self {
+                fail_chat_stream: true,
+                ..Self::new(model_id, 8192, 1024, "unused")
             }
         }
 
@@ -1079,6 +1093,9 @@ mod tests {
         }
 
         async fn chat_stream(&self, request: ChatRequest) -> Result<StreamResult, ProviderError> {
+            if self.fail_chat_stream {
+                return Err(ProviderError::ApiError("forced LLM failure".to_string()));
+            }
             *self.last_request.lock().await = Some(request);
             Ok(Box::pin(stream::iter(
                 self.stream_events
@@ -1526,6 +1543,54 @@ mod tests {
             _ => false,
         });
         assert!(has_completed_summary_message);
+    }
+
+    /// LLM 呼び出しが失敗した場合、不完全な summary:true メッセージを残さないこと。
+    #[tokio::test]
+    async fn test_process_does_not_persist_summary_message_when_llm_call_fails() {
+        let engine = CompactionEngine::default();
+        let provider = Arc::new(MockProvider::failing("mock-model"));
+        let ops = MockSessionOps::default();
+        let input = make_input("mock-model", None, None);
+
+        let result = engine
+            .process(input, provider, Some(&ops))
+            .await
+            .expect("an LLM failure is reported as Stop, not an Err");
+        assert_eq!(result, CompactionResult::Stop);
+
+        assert!(
+            ops.message_updates().await.is_empty(),
+            "no summary message may be persisted when the LLM call fails"
+        );
+        assert!(
+            ops.part_updates().await.is_empty(),
+            "no summary part may be persisted when the LLM call fails"
+        );
+    }
+
+    /// LLM が空文字を返した場合も要約メッセージを残さないこと。
+    #[tokio::test]
+    async fn test_process_does_not_persist_summary_message_for_empty_summary() {
+        let engine = CompactionEngine::default();
+        let provider = Arc::new(MockProvider::new("mock-model", 8192, 1024, ""));
+        let ops = MockSessionOps::default();
+        let input = make_input("mock-model", None, None);
+
+        let result = engine
+            .process(input, provider, Some(&ops))
+            .await
+            .expect("an empty summary is reported as Stop, not an Err");
+        assert_eq!(result, CompactionResult::Stop);
+
+        assert!(
+            ops.message_updates().await.is_empty(),
+            "an empty summary must not be persisted as a summary:true message"
+        );
+        assert!(
+            ops.part_updates().await.is_empty(),
+            "an empty summary must not be persisted as a text part"
+        );
     }
 
     #[tokio::test]

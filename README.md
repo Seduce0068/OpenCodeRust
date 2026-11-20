@@ -137,6 +137,53 @@ Global config default path:
 
 See: `docs/opencode-config.md`
 
+## Operations
+
+### Logging
+
+- Log level resolution: config `log_level` (when set) -> `RUST_LOG` -> `info`.
+  Use `RUST_LOG` (for example `RUST_LOG=debug`) to raise verbosity without
+  editing config files.
+- TUI sessions write logs to a file. Non-TUI commands (`run`, `serve`, and
+  other subcommands) print to stdout/stderr and do not create a log file.
+- Default log directory (Unix): `$XDG_STATE_HOME/opencode/logs`, or
+  `$HOME/.local/state/opencode/logs` when `XDG_STATE_HOME` is unset. If `HOME`
+  is unavailable too, `./.opencode/logs` is used. Each launch writes a
+  timestamped `<YYYY-MM-DDTHHMMSS>.log` file.
+- Log files are created with mode `0600`; pre-existing files with looser
+  permissions are corrected to `0600` on open. If a log file cannot be opened,
+  events fall back to stderr instead of being silently dropped.
+- If a log file is missing or unreadable, check the directory above (or the
+  path reported at startup) and set `XDG_STATE_HOME` explicitly to redirect
+  logs to a known location. Buffered entries are flushed when the process
+  exits normally.
+
+### Health check
+
+`GET /health` returns `{"status":"ok","version":"<version>"}`. The CLI uses
+this same endpoint to wait for a local server to become ready, so it also
+works as a liveness probe:
+
+```bash
+curl -fsS http://127.0.0.1:3000/health
+```
+
+Replace the host and port with the values passed to `serve --hostname` and
+`--port`.
+
+### Authentication
+
+- Authentication is enabled by default. A random Bearer token (32 bytes,
+  URL-safe base64) is generated at startup; send it on every request as
+  `Authorization: Bearer <token>`. The token value is masked in logs, and the
+  startup notice on stderr reports whether authentication is enabled.
+- The token is regenerated on every restart. Clients must refresh the
+  `Authorization` header after restarting the server.
+- `OPENCODE_NO_AUTH` disables authentication only when set to `true`, `1`, or
+  `yes` (case-insensitive, trimmed). Any other value, including unset, keeps
+  authentication enabled (fail-closed). Do not disable it outside local
+  development.
+
 ## Repository structure
 
 The complete 22-crate map and major execution paths are documented in

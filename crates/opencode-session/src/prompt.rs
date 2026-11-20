@@ -1705,7 +1705,7 @@ impl SessionPrompt {
             return Ok(());
         }
 
-        let subsessions = Arc::new(Mutex::new(Self::load_persisted_subsessions(session)));
+        let subsessions = Arc::new(Mutex::new(Self::load_persisted_subsessions(session)?));
         let default_model = format!("{}:{}", provider_id, model_id);
         let ctx = Self::with_persistent_subsession_callbacks(
             ctx,
@@ -1774,13 +1774,20 @@ impl SessionPrompt {
             .unwrap_or_default()
     }
 
-    fn load_persisted_subsessions(session: &Session) -> HashMap<String, PersistedSubsession> {
-        session
-            .metadata
-            .get("subsessions")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default()
+    /// Load persisted subsessions from session metadata.
+    ///
+    /// A present-but-unparseable value is a corruption error, not "no
+    /// subsessions": silently substituting an empty map used to let the caller
+    /// erase the key on the next save. Propagate the failure instead. The error
+    /// text deliberately contains neither the stored value nor any path.
+    fn load_persisted_subsessions(
+        session: &Session,
+    ) -> anyhow::Result<HashMap<String, PersistedSubsession>> {
+        let Some(value) = session.metadata.get("subsessions") else {
+            return Ok(HashMap::new());
+        };
+        serde_json::from_value(value.clone())
+            .map_err(|_| anyhow::anyhow!("persisted subsessions metadata is invalid"))
     }
 
     fn save_persisted_subsessions(
@@ -1788,7 +1795,22 @@ impl SessionPrompt {
         subsessions: &HashMap<String, PersistedSubsession>,
     ) {
         if subsessions.is_empty() {
-            session.metadata.remove("subsessions");
+            // An empty in-memory map is not by itself proof that the persisted
+            // key should be deleted. Only remove a key whose stored value is a
+            // valid, empty map; never erase an unparseable value that could not
+            // be loaded (explicit clear vs. silent loss).
+            let known_empty = session
+                .metadata
+                .get("subsessions")
+                .map(|value| {
+                    serde_json::from_value::<HashMap<String, PersistedSubsession>>(value.clone())
+                        .map(|persisted| persisted.is_empty())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            if known_empty {
+                session.metadata.remove("subsessions");
+            }
             return;
         }
         if let Ok(value) = serde_json::to_value(subsessions) {
@@ -2146,7 +2168,7 @@ impl SessionPrompt {
 
         let mut results: Vec<(usize, String, bool, String, String)> = Vec::new();
         let tool_registry = Arc::new(opencode_tool::create_default_registry().await);
-        let mut persisted = Self::load_persisted_subsessions(session);
+        let mut persisted = Self::load_persisted_subsessions(session)?;
         let default_model = format!("{}:{}", provider_id, model_id);
         let user_text = session.messages[last_user_idx].get_text();
 
@@ -4426,10 +4448,68 @@ mod tests {
         );
 
         SessionPrompt::save_persisted_subsessions(&mut session, &map);
-        let loaded = SessionPrompt::load_persisted_subsessions(&session);
+        let loaded = SessionPrompt::load_persisted_subsessions(&session)
+            .expect("round-tripped subsessions must parse");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded["task_explore_1"].agent, "explore");
         assert_eq!(loaded["task_explore_1"].history.len(), 1);
+    }
+
+    /// 壊れた subsessions メタデータは空 Map ではなくエラーとして扱われ、
+    /// エラー文に保存値やパスが露出しないこと。
+    #[test]
+    fn persisted_subsessions_load_propagates_parse_failure() {
+        let mut session = Session::new("proj", ".");
+        let corrupted = serde_json::json!({ "task_broken": { "agent": 42 } });
+        session
+            .metadata
+            .insert("subsessions".to_string(), corrupted.clone());
+
+        let err = SessionPrompt::load_persisted_subsessions(&session)
+            .expect_err("corrupted metadata must not be silently treated as empty");
+        assert!(
+            !err.to_string().contains("task_broken"),
+            "stored values must not leak into errors"
+        );
+        assert_eq!(
+            session.metadata.get("subsessions"),
+            Some(&corrupted),
+            "a failed load must leave the persisted key untouched"
+        );
+    }
+
+    /// 空 Map を渡しても、パース不能な既存キーは削除されないこと。
+    #[test]
+    fn persisted_subsessions_save_empty_keeps_unparseable_metadata() {
+        let mut session = Session::new("proj", ".");
+        let corrupted = serde_json::json!({ "task_broken": { "agent": 42 } });
+        session
+            .metadata
+            .insert("subsessions".to_string(), corrupted.clone());
+
+        SessionPrompt::save_persisted_subsessions(&mut session, &HashMap::new());
+
+        assert_eq!(
+            session.metadata.get("subsessions"),
+            Some(&corrupted),
+            "an empty map alone must never justify deleting persisted subsessions"
+        );
+    }
+
+    /// 正当な空 Map（明示的な clear）は従来どおりキーを削除すること。
+    #[test]
+    fn persisted_subsessions_save_empty_clears_known_empty_metadata() {
+        let mut session = Session::new("proj", ".");
+        session
+            .metadata
+            .insert("subsessions".to_string(), serde_json::json!({}));
+
+        SessionPrompt::save_persisted_subsessions(&mut session, &HashMap::new());
+
+        assert!(
+            !session.metadata.contains_key("subsessions"),
+            "an explicitly empty map may still clear the key"
+        );
     }
 
     #[test]

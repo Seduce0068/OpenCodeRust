@@ -71,12 +71,14 @@ fn test_session_forked_title() {
 #[test]
 fn test_session_touch_updates_timestamp() {
     let mut session = Session::new("test-project", "/test/directory");
-    let original_time = session.time.updated;
+    // Set a known past value (epoch ms) so the assertion does not depend on
+    // wall-clock timing or a sleep.
+    session.time.updated = 0;
+    let old = session.time.updated;
 
-    std::thread::sleep(std::time::Duration::from_millis(10));
     session.touch();
 
-    assert!(session.time.updated >= original_time);
+    assert!(session.time.updated > old);
 }
 
 #[test]
