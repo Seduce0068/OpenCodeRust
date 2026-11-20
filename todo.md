@@ -270,13 +270,10 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
-- [ ] **per-instance ServerState と process-global な CORS/plugin/fetch-proxy 状態が矛盾**
-  — — `server.rs:491-516,996` / R1-AR03 / 中
-- [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
-  — `renovate.json:3-5` / R1-DP02 / 中
-
 ## 完了
 
+- [x] **[CORS 分離/Renovate 2 件]** ServerState 単位化と依存グループ化
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[permission Always/TLS 2 件]** 動的 allow と rustls 統一
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[重複整理 3 件]** Bedrock/CodeMode/local-llm の完了を反映
@@ -548,6 +545,11 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 指摘（CORS/Renovate の修正時、記録のみ）: LEGACY_CORS_SEED は
+  process-global static のまま残存（起動時シード専用、ServerState 生成後に
+  pub fn set_cors_whitelist を再呼び出しても既存インスタンスには反映されない旨を
+  doc に明記済み）。CLI 側の直接呼び出し移行は scope 外。
+  plugin init_global / fetch-proxy も process-global のまま。
 - 2026-11-20 R4 指摘（permission Always/TLS の修正時、記録のみ）:
   PermissionRequest.always（再利用候補パターン）が動的 allow の記録に使われず
   patterns（具体値）のみが記録される。UI が always をどう提示するかはローカルに
