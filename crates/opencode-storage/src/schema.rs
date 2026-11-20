@@ -105,11 +105,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 /// 新規／旧 DB のどちらでも起動時マイグレーション経由で列を保証する。
 /// `CREATE_SESSIONS_TABLE`（metadata 列入り）を ALL_MIGRATIONS に入れると
 /// 新規 DB で "duplicate column name: metadata" になるため、この ALTER を使う。
-/// `MIGRATE_SESSION_INPUT_METADATA` と異なり `database.rs` の PRAGMA 判定には
-/// 依存しない。
+/// 旧 DB への再実行時は `database.rs` の PRAGMA 判定で既存列をスキップする
+/// （v3 以降のバージョンアップでこの ALTER が二重に走らないようにするため）。
 pub const MIGRATE_SESSION_METADATA: &str = "ALTER TABLE sessions ADD COLUMN metadata TEXT;";
 
-/// Messages table - stores message metadata
+/// Messages table - ベースライン DDL（v3 の metadata / usage 列を含まない）。
+///
+/// `ALL_MIGRATIONS` ではこの CREATE の直後に
+/// [`MIGRATE_MESSAGES_METADATA`] / [`MIGRATE_MESSAGES_USAGE`] を実行する。
+/// 新規 DB で「列を持つ CREATE」と ALTER を両方走らせると
+/// "duplicate column name" になるため、基底は旧形のままにする。
+/// 正規スキーマ（新列を含む）は [`CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE`]。
 pub const CREATE_MESSAGES_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -135,6 +141,47 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 "#;
+
+/// 正規の messages スキーマ（メッセージ単位の metadata / usage を含む）。
+///
+/// 参考用の定義であり、`ALL_MIGRATIONS` には載せない（上記ベースライン + ALTER で
+/// 新規／旧 DB の両方を同じ形へ移行するため）。
+pub const CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE: &str = r#"
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+
+    -- Provider/model info
+    provider_id TEXT,
+    model_id TEXT,
+
+    -- Token usage
+    tokens_input INTEGER DEFAULT 0,
+    tokens_output INTEGER DEFAULT 0,
+    tokens_reasoning INTEGER DEFAULT 0,
+    tokens_cache_read INTEGER DEFAULT 0,
+    tokens_cache_write INTEGER DEFAULT 0,
+    cost REAL DEFAULT 0.0,
+
+    -- Complete message data (JSON)
+    data TEXT,
+
+    -- v3: メッセージ単位の任意メタデータ (JSON object) と使用量 (JSON object)。
+    -- 旧行は NULL となり、読み取り側で空 HashMap / None として扱う。
+    metadata TEXT,
+    usage TEXT,
+
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+"#;
+
+/// v3: 既存 messages テーブルへメッセージ単位の metadata 列を追加する。
+pub const MIGRATE_MESSAGES_METADATA: &str = "ALTER TABLE messages ADD COLUMN metadata TEXT;";
+
+/// v3: 既存 messages テーブルへメッセージ単位の usage 列を追加する。
+pub const MIGRATE_MESSAGES_USAGE: &str = "ALTER TABLE messages ADD COLUMN usage TEXT;";
 
 /// Parts table - stores message parts (text, tool calls, etc.)
 pub const CREATE_PARTS_TABLE: &str = r#"
@@ -279,6 +326,8 @@ pub const ALL_MIGRATIONS: &[&str] = &[
     CREATE_SESSIONS_TABLE_LEGACY,
     MIGRATE_SESSION_METADATA,
     CREATE_MESSAGES_TABLE,
+    MIGRATE_MESSAGES_METADATA,
+    MIGRATE_MESSAGES_USAGE,
     CREATE_PARTS_TABLE,
     CREATE_TODOS_TABLE,
     CREATE_PERMISSIONS_TABLE,
@@ -602,6 +651,58 @@ mod tests {
         );
     }
 
+    /// messages の metadata / usage は正規 CREATE に宣言しつつ、
+    /// ALL_MIGRATIONS ではベースライン CREATE + ALTER の 2 段で適用する
+    /// （sessions.metadata と同じ方式。新規 DB での二重追加を避ける）。
+    #[test]
+    fn messages_metadata_and_usage_are_declared_canonically_and_migrated_at_startup() {
+        assert!(CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE.contains("metadata TEXT"));
+        assert!(CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE.contains("usage TEXT"));
+        assert!(!CREATE_MESSAGES_TABLE.contains("metadata TEXT"));
+        assert!(!CREATE_MESSAGES_TABLE.contains("usage TEXT"));
+
+        let canonical_columns = declared_columns(table_statement(
+            CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE,
+            "messages",
+        ));
+        assert!(canonical_columns.contains(&"metadata"));
+        assert!(canonical_columns.contains(&"usage"));
+
+        assert!(ALL_MIGRATIONS.contains(&CREATE_MESSAGES_TABLE));
+        assert!(!ALL_MIGRATIONS.contains(&CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE));
+        assert_eq!(
+            MIGRATE_MESSAGES_METADATA,
+            "ALTER TABLE messages ADD COLUMN metadata TEXT;"
+        );
+        assert_eq!(
+            MIGRATE_MESSAGES_USAGE,
+            "ALTER TABLE messages ADD COLUMN usage TEXT;"
+        );
+        assert!(ALL_MIGRATIONS.contains(&MIGRATE_MESSAGES_METADATA));
+        assert!(ALL_MIGRATIONS.contains(&MIGRATE_MESSAGES_USAGE));
+
+        let create_index = ALL_MIGRATIONS
+            .iter()
+            .position(|statement| *statement == CREATE_MESSAGES_TABLE)
+            .expect("baseline messages CREATE is in ALL_MIGRATIONS");
+        let metadata_index = ALL_MIGRATIONS
+            .iter()
+            .position(|statement| *statement == MIGRATE_MESSAGES_METADATA)
+            .expect("messages metadata ALTER is in ALL_MIGRATIONS");
+        let usage_index = ALL_MIGRATIONS
+            .iter()
+            .position(|statement| *statement == MIGRATE_MESSAGES_USAGE)
+            .expect("messages usage ALTER is in ALL_MIGRATIONS");
+        assert!(
+            create_index < metadata_index && metadata_index < usage_index,
+            "ALTER はベースライン CREATE の後に実行されること"
+        );
+        assert_eq!(
+            count(&migrations_ddl(), "CREATE TABLE IF NOT EXISTS messages ("),
+            1
+        );
+    }
+
     #[test]
     fn schema_ddl_does_not_manage_user_version() {
         // user_version の記録は database.rs の SCHEMA_VERSION が担う。
@@ -611,6 +712,8 @@ mod tests {
         for statement in ALL_MIGRATIONS
             .iter()
             .chain(std::iter::once(&MIGRATE_SESSION_INPUT_METADATA))
+            .chain(std::iter::once(&MIGRATE_MESSAGES_METADATA))
+            .chain(std::iter::once(&MIGRATE_MESSAGES_USAGE))
         {
             assert!(
                 !statement.to_ascii_lowercase().contains("user_version"),

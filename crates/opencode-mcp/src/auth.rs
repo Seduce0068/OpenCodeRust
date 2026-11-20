@@ -8,6 +8,44 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 
+/// 権限是正失敗の安全な詳細。
+///
+/// 生の [`std::io::Error`] を保持すると `source()` や `From` 変換先の
+/// `Display` に OS エラーの生メッセージ（シークレットやパスを含みうる）が
+/// 流出するため、ファイル名（basename のみ）と [`std::io::ErrorKind`] だけを残す。
+#[derive(Debug)]
+pub struct PermissionsFailure {
+    file_name: String,
+    kind: std::io::ErrorKind,
+}
+
+impl PermissionsFailure {
+    fn new(file_name: &str, kind: std::io::ErrorKind) -> Self {
+        Self {
+            file_name: file_name.to_owned(),
+            kind,
+        }
+    }
+
+    /// ファイル名（フルパスではない）を返す。
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    /// OS エラーの種別を返す（生メッセージは保持しない）。
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for PermissionsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not secure '{}' ({:?})", self.file_name, self.kind)
+    }
+}
+
+impl std::error::Error for PermissionsFailure {}
+
 /// auth store の読み込み失敗。
 ///
 /// 以前は I/O エラーと JSON 破損を「空の store」へ丸めて fail-open していた。
@@ -19,6 +57,12 @@ pub enum AuthStoreError {
     Io(#[from] std::io::Error),
     #[error("failed to parse MCP auth store: {0}")]
     Json(#[from] serde_json::Error),
+    /// 既存の認証ファイルを 0600 へ是正できず、読み込みを拒否した場合。
+    ///
+    /// `source()` も含めファイル名と `ErrorKind` 以外の情報（OS の生メッセージ、
+    /// フルパス、トークン値）は一切出さない。
+    #[error("MCP auth store permissions could not be secured; refusing to load credentials")]
+    PermissionsNotSecured(#[source] PermissionsFailure),
 }
 
 impl From<AuthStoreError> for std::io::Error {
@@ -26,6 +70,12 @@ impl From<AuthStoreError> for std::io::Error {
         match error {
             AuthStoreError::Io(io_error) => io_error,
             AuthStoreError::Json(json_error) => std::io::Error::other(json_error),
+            // 生の OS エラーを引き継ぐと固定文言の意味が無くなるため、
+            // 変換先も固定文言の PermissionDenied にマッピングする。
+            AuthStoreError::PermissionsNotSecured(_) => std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "MCP auth store permissions could not be secured",
+            ),
         }
     }
 }
@@ -97,6 +147,9 @@ fn auth_file_path() -> PathBuf {
 ///
 /// I/O エラー・JSON 破損を空 store へ丸めず [`AuthStoreError`] として返す。
 /// 新規コードはこの関数（または `try_*` 公開 API）を使うこと。
+///
+/// Unix では既存ファイルを 0600 へ是正し、是正できない場合は
+/// [`AuthStoreError::PermissionsNotSecured`] として fail-closed で拒否する。
 async fn read_all() -> Result<HashMap<String, AuthEntry>, AuthStoreError> {
     let path = auth_file_path();
     // 未作成ファイルは初回状態なので空 store として扱う。破損や権限エラーは
@@ -107,17 +160,19 @@ async fn read_all() -> Result<HashMap<String, AuthEntry>, AuthStoreError> {
         Err(error) => return Err(AuthStoreError::Io(error)),
     };
     // On Unix, tighten a pre-existing over-permissive store on access.
-    // This is best-effort and never changes the read result.
+    // 是正できない場合は fail-closed として読み込みを拒否する（warn も併発）。
     #[cfg(unix)]
-    tighten_permissions(&path).await;
+    tighten_permissions(&path).await?;
     Ok(serde_json::from_str(&contents)?)
 }
 
-/// 既存シグネチャ互換のラッパ。
+/// 既存シグネチャ互換の**非推奨**ラッパ（fail-open）。
 ///
-/// 旧呼び出し側がコンパイルを続けられるように残すが、失敗を黙って飲まずに
-/// `tracing::error!` へ残す（fail-open の検知可能性を担保）。新規コードは
-/// [`read_all`] もしくは `try_*` API を使うこと。
+/// 旧呼び出し側がコンパイルを続けられるように残すが、読み込み失敗時は
+/// 空 store を返す **fail-open** 動作である。失敗は `tracing::error!` へ残すが、
+/// 認証状態を失いうるため新規コードは絶対に使わないこと。
+/// 代わりに [`read_all`] もしくは `try_*` API を使うこと。
+#[deprecated(note = "fail-open: 失敗時に空 store を返す。read_all / try_* を使うこと")]
 pub async fn read_all_or_default() -> HashMap<String, AuthEntry> {
     match read_all().await {
         Ok(data) => data,
@@ -131,16 +186,42 @@ pub async fn read_all_or_default() -> HashMap<String, AuthEntry> {
     }
 }
 
-/// Bring an existing credential file back to owner-only permissions (Unix).
+/// 権限是正の失敗を warn に残しつつ、fail-closed のエラーを組み立てる。
+///
+/// ログ・エラー・`source()` にはファイル名と `ErrorKind` のみを含め、
+/// フルパス・OS の生メッセージ・トークン値は出さない。
 #[cfg(unix)]
-async fn tighten_permissions(path: &std::path::Path) {
+fn permissions_failure(path: &std::path::Path, error: std::io::Error) -> AuthStoreError {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mcp-auth.json");
+    let kind = error.kind();
+    tracing::warn!(
+        file = %file_name,
+        kind = ?kind,
+        "failed to tighten MCP auth store permissions; refusing to load credentials"
+    );
+    AuthStoreError::PermissionsNotSecured(PermissionsFailure::new(file_name, kind))
+}
+
+/// Bring an existing credential file back to owner-only permissions (Unix).
+///
+/// 是正できない場合は [`AuthStoreError::PermissionsNotSecured`] を返し、
+/// 呼び出し側の `read_all` が fail-closed で読み込みを拒否する。
+#[cfg(unix)]
+async fn tighten_permissions(path: &std::path::Path) -> Result<(), AuthStoreError> {
     use std::os::unix::fs::PermissionsExt;
 
-    if let Ok(meta) = fs::metadata(path).await {
-        if meta.permissions().mode() & 0o777 != 0o600 {
-            let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
-        }
+    let meta = fs::metadata(path)
+        .await
+        .map_err(|error| permissions_failure(path, error))?;
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|error| permissions_failure(path, error))?;
     }
+    Ok(())
 }
 
 /// Write the entire auth store to disk (creates parent dirs as needed).
@@ -234,9 +315,11 @@ pub async fn try_get(mcp_name: &str) -> Result<Option<AuthEntry>, AuthStoreError
     Ok(read_all().await?.get(mcp_name).cloned())
 }
 
-/// Get the auth entry for a given MCP server name (compatibility wrapper).
+/// Get the auth entry for a given MCP server name (非推奨の互換ラッパ・fail-open)。
 ///
-/// 読み込み失敗はログへ残し `None` を返す。新規コードは [`try_get`] を使うこと。
+/// 読み込み失敗はログへ残し `None` を返す **fail-open** 動作である。
+/// 認証情報を失いうるため新規コードは使用禁止。代わりに [`try_get`] を使うこと。
+#[deprecated(note = "fail-open: 失敗時に None を返す。try_get を使うこと")]
 pub async fn get(mcp_name: &str) -> Option<AuthEntry> {
     try_get(mcp_name).await.unwrap_or_else(|error| {
         tracing::error!(%error, mcp_name, "MCP auth entry read failed");
@@ -258,14 +341,16 @@ pub async fn try_get_for_url(
     })
 }
 
-/// Compatibility wrapper for [`try_get_for_url`].
-pub async fn get_for_url(mcp_name: &str, server_url: &str) -> Option<AuthEntry> {
-    try_get_for_url(mcp_name, server_url)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, mcp_name, "MCP auth entry read for URL failed");
-            None
-        })
+/// 非推奨の互換ラッパ。[`try_get_for_url`] へ委譲し、読み込み失敗を `Err` として伝播する。
+///
+/// 以前は失敗を飲んで `None` を返す fail-open だったが、credential の
+/// 誤放棄を防ぐため fail-loud に変更した。新規コードは [`try_get_for_url`] を使うこと。
+#[deprecated(note = "try_get_for_url を使うこと（読み込み失敗を Err として伝播する）")]
+pub async fn get_for_url(
+    mcp_name: &str,
+    server_url: &str,
+) -> Result<Option<AuthEntry>, AuthStoreError> {
+    try_get_for_url(mcp_name, server_url).await
 }
 
 /// Persist an auth entry, propagating store read/write failures.
@@ -432,12 +517,13 @@ pub async fn try_get_oauth_state(mcp_name: &str) -> Result<Option<String>, AuthS
     Ok(try_get(mcp_name).await?.and_then(|entry| entry.oauth_state))
 }
 
-/// Compatibility wrapper for [`try_get_oauth_state`].
-pub async fn get_oauth_state(mcp_name: &str) -> Option<String> {
-    try_get_oauth_state(mcp_name).await.unwrap_or_else(|error| {
-        tracing::error!(%error, mcp_name, "MCP OAuth state read failed");
-        None
-    })
+/// 非推奨の互換ラッパ。[`try_get_oauth_state`] へ委譲し、読み込み失敗を `Err` として伝播する。
+///
+/// 以前は失敗を飲んで `None` を返す fail-open だったが、PKCE state の
+/// 誤放棄を防ぐため fail-loud に変更した。新規コードは [`try_get_oauth_state`] を使うこと。
+#[deprecated(note = "try_get_oauth_state を使うこと（読み込み失敗を Err として伝播する）")]
+pub async fn get_oauth_state(mcp_name: &str) -> Result<Option<String>, AuthStoreError> {
+    try_get_oauth_state(mcp_name).await
 }
 
 /// Clear the stored OAuth state, propagating failures.
@@ -476,6 +562,7 @@ pub fn is_token_expired(entry: &AuthEntry) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -569,6 +656,52 @@ mod tests {
             .permissions()
             .mode()
             & 0o777
+    }
+
+    /// 回帰ガード: 権限是正失敗時に fail-closed で拒否し、
+    /// Display / source() / From 変換後のいずれにも原因やパスを漏らさない。
+    #[cfg(unix)]
+    #[test]
+    fn permission_tightening_failure_fails_closed_without_leaking() {
+        const SENTINEL: &str = "SENTINEL_DO_NOT_LEAK";
+        let path = std::path::Path::new("/tmp/mcp-auth.json");
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, SENTINEL);
+
+        let failure = permissions_failure(path, error);
+        assert!(matches!(&failure, AuthStoreError::PermissionsNotSecured(_)));
+        let text = failure.to_string();
+        assert!(
+            !text.contains(SENTINEL),
+            "error must not embed the OS cause"
+        );
+        assert!(!text.contains("/tmp"), "error must not embed the path");
+
+        // source() にも生の OS エラー（SENTINEL）やパスを出さない。
+        let source = failure
+            .source()
+            .expect("PermissionsNotSecured must keep a safe source");
+        let source_text = source.to_string();
+        assert!(
+            !source_text.contains(SENTINEL),
+            "source must not embed the OS cause"
+        );
+        assert!(
+            !source_text.contains("/tmp"),
+            "source must not embed the path"
+        );
+
+        // From<AuthStoreError> for std::io::Error も固定文言へマッピングする。
+        let io_error: std::io::Error = failure.into();
+        let io_text = io_error.to_string();
+        assert!(
+            !io_text.contains(SENTINEL),
+            "converted io::Error must not embed the OS cause"
+        );
+        assert!(
+            !io_text.contains("/tmp"),
+            "converted io::Error must not embed the path"
+        );
+        assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(unix)]
@@ -707,6 +840,7 @@ mod tests {
     }
 
     /// 回帰ガード: JSON 破損を空 store へ丸めず fail-loud にすること。
+    #[allow(deprecated)]
     async fn scenario_corrupt_store_fails_loud() {
         let tmp = TempAuthFile::new("corrupt");
         tmp.activate();
@@ -719,8 +853,11 @@ mod tests {
             .is_err());
         assert!(try_get_oauth_state("server").await.is_err());
         assert!(try_set("server", entry(None), None).await.is_err());
-        // 互換ラッパは落ちずに空を返す（失敗は tracing::error! に残る）。
+        // 残した互換ラッパは fail-open（ログへ残して空を返す）。
         assert!(get("server").await.is_none());
+        // 読み取り系の互換ラッパは try_* へ委譲し、Err を伝播する（fail-open ではない）。
+        assert!(get_for_url("server", "https://example.com").await.is_err());
+        assert!(get_oauth_state("server").await.is_err());
     }
 
     /// 回帰ガード: I/O エラーも fail-loud に伝播すること。
