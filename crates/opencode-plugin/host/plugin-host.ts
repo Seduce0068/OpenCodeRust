@@ -87,30 +87,110 @@ function encodeResponse(response: JsonRpcResponse): Uint8Array {
   return encoder.encode(header + body);
 }
 
+// ---------------------------------------------------------------------------
+// stdin EOF tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal view of the Node stdin readable stream used by the framing reader.
+ * `process.stdin` is cast to this so the host stays runtime-agnostic (Node and
+ * Deno's node-compat both expose on/once/off). Kept conservative for
+ * `deno check`: no runtime-specific types leak into the checked surface.
+ */
+interface StdinSource {
+  read(size: number): Uint8Array | null;
+  once(event: string, cb: () => void): void;
+  on(event: string, cb: () => void): void;
+  off(event: string, cb: () => void): void;
+  readonly readableEnded?: boolean;
+}
+
+/**
+ * True once stdin has emitted "end" or "close". Kept for the process lifetime
+ * so readExact can tell "no buffered data right now" (read() === null) apart
+ * from a real end-of-stream. Before this existed, readExact waited only on
+ * "readable"; at EOF that event never fires again, so the main loop never
+ * reached its normal `msg === null` exit and the child stayed alive waiting
+ * for Rust's kill_on_drop.
+ */
+let stdinEnded = false;
+let eofWatchInstalled = false;
+
+function stdinAsSource(): StdinSource {
+  return process.stdin as unknown as StdinSource;
+}
+
+/** Subscribe to the EOF signals exactly once. */
+function installEofWatch(reader: StdinSource): void {
+  if (eofWatchInstalled) return;
+  eofWatchInstalled = true;
+  const markEnded = () => {
+    stdinEnded = true;
+  };
+  reader.on("end", markEnded);
+  reader.on("close", markEnded);
+}
+
 /**
  * Read exactly `n` bytes from stdin.
+ *
+ * On EOF the returned slice is shorter than `n` (possibly empty). An empty
+ * slice is the explicit EOF signal consumed by readMessage(), which maps it to
+ * null so the main loop exits normally instead of hanging on "readable".
+ *
+ * Static verification note: this file is embedded via include_str!() and has
+ * no TS-side test harness; the parent validates it with `deno check`. No
+ * token or code value is ever logged here.
  */
 async function readExact(n: number): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let remaining = n;
 
-  const reader = process.stdin as unknown as {
-    read(size: number): Uint8Array | null;
-    once(event: string, cb: () => void): void;
-  };
+  const reader = stdinAsSource();
+  installEofWatch(reader);
 
   while (remaining > 0) {
+    // EOF already observed (event-driven or via the stream's own flag).
+    if (stdinEnded || reader.readableEnded) {
+      stdinEnded = true;
+      break;
+    }
+
     const chunk: Uint8Array | null = reader.read(remaining);
     if (chunk !== null) {
+      if (chunk.length === 0) {
+        // Some runtimes report EOF with an empty buffer instead of null.
+        stdinEnded = true;
+        break;
+      }
       chunks.push(chunk);
       remaining -= chunk.length;
-    } else {
-      await new Promise<void>((resolve) => reader.once("readable", resolve));
+      continue;
     }
+
+    // read() === null means "no buffered data", not necessarily EOF. Wait for
+    // either more data or an EOF signal; awaiting only "readable" is the
+    // original hang. The stdinEnded re-check closes the race where EOF fired
+    // between read() and listener registration.
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        reader.off("readable", done);
+        reader.off("end", done);
+        reader.off("close", done);
+        resolve();
+      };
+      reader.once("readable", done);
+      reader.once("end", done);
+      reader.once("close", done);
+      if (stdinEnded) done();
+    });
   }
 
-  if (chunks.length === 1) return chunks[0];
-  const result = new Uint8Array(n);
+  const received = chunks.reduce((sum, c) => sum + c.length, 0);
+  if (received === 0) return new Uint8Array(0); // EOF signal for readMessage
+  const first = chunks[0];
+  if (chunks.length === 1 && first !== undefined && received === n) return first;
+  const result = new Uint8Array(received);
   let offset = 0;
   for (const c of chunks) {
     result.set(c, offset);
@@ -140,6 +220,9 @@ async function readMessage(): Promise<JsonRpcRequest | null> {
 
   const contentLength = parseInt(match[1], 10);
   const body = await readExact(contentLength);
+  // A short body means stdin ended mid-frame. Map it to EOF (null) so the main
+  // loop takes the normal exit path instead of throwing on a partial body.
+  if (body.length < contentLength) return null;
 
   const parsed: unknown = JSON.parse(decoder.decode(body));
   const record =
