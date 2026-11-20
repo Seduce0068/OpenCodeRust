@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opencode_plugin::{HookContext, HookEvent};
 use serde::{Deserialize, Serialize};
@@ -150,21 +151,17 @@ pub struct MessageForPrune {
 /// Session.updatePart() calls from the TS source so the engine can be
 /// tested independently.
 ///
-/// # Static dispatch only (not object safe)
+/// # `Send` futures and object safety
 ///
-/// This trait deliberately uses `async fn` with `#[allow(async_fn_in_trait)]`
-/// and is consumed only through generic bounds (`S: SessionOps`) in
-/// `process`, `create`, `prune_session`, and `run_compaction`. `dyn SessionOps`
-/// is intentionally unsupported: making it object safe requires
-/// `#[async_trait]`, which in turn requires moving `async-trait` from
-/// `[dev-dependencies]` to `[dependencies]` in this crate's `Cargo.toml`.
+/// This trait uses `#[async_trait]`, so every method returns a boxed
+/// `Future + Send`. Callers can move those futures across threads (e.g. via
+/// `tokio::spawn`) without relying on the concrete implementation, and the
+/// trait can be consumed through either generic bounds (`S: SessionOps`) in
+/// `process`, `create`, `prune_session`, and `run_compaction`, or a
+/// `dyn SessionOps` trait object.
 ///
-/// The futures returned by these methods are not guaranteed `Send` by the
-/// trait itself. Under static dispatch the concrete implementation's future
-/// determines `Send`-ness; callers that move these futures across threads
-/// (e.g. `tokio::spawn`) must use a `SessionOps` implementation whose futures
-/// are `Send`.
-#[allow(async_fn_in_trait)]
+/// Implementations must also be annotated with `#[async_trait]`.
+#[async_trait]
 pub trait SessionOps: Send + Sync {
     /// Fetch all messages (with parts) for a session.
     async fn messages(&self, session_id: &str) -> anyhow::Result<Vec<MessageWithParts>>;
@@ -1122,6 +1119,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl SessionOps for MockSessionOps {
         async fn messages(&self, _session_id: &str) -> anyhow::Result<Vec<MessageWithParts>> {
             Ok(vec![])
@@ -1597,6 +1595,7 @@ mod tests {
     async fn test_process_propagates_persistence_failure() {
         struct FailingSessionOps;
 
+        #[async_trait]
         impl SessionOps for FailingSessionOps {
             async fn messages(&self, _session_id: &str) -> anyhow::Result<Vec<MessageWithParts>> {
                 Ok(vec![])

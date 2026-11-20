@@ -28,8 +28,16 @@ OpenCodeRust サーバモード（`opencoderust serve`）はローカル開発�
 
 ### 1. Bearer トークン認証必須化
 
-- 起動時に 32 バイト乱数トークン生成、ログ出力
+- 起動時に 32 バイト乱数トークンを生成し `ServerState.auth_token` に保持する
+- 起動ログには `redact_token()` が返す固定マスク `[REDACTED]` のみを出力し、
+  トークン値・先頭 prefix・長さはいずれも残さない
 - `Authorization: Bearer <token>` ヘッダー必須
+- トークン値の取得経路（ログからは取得できない）:
+  - 生成値はサーバプロセスのメモリ上（`ServerState.auth_token`）のみに存在し、
+    ファイルやエンドポイントへの永続化・公開は行わない
+  - CLI/TUI は `attach -p/--password` で受け取った値を
+    `OPENCODE_TUI_AUTH_TOKEN` 環境変数で子プロセスへ渡し、TUI 起動時に
+    読み取った直後に環境変数を削除する
 - 環境変数 `OPENCODE_NO_AUTH` で明示的に無効化可能（開発用のみ）:
   - 無効化とみなす値は `1` / `true` / `yes` のみ（大小文字無視・前後空白除去）
   - 未設定・空文字・`0` / `false`・不正値は認証有効（fail-closed）
@@ -76,12 +84,18 @@ OpenCodeRust サーバモード（`opencoderust serve`）はローカル開発�
 
 ## Consequences
 
-- 既存スクリプトはトークン取得・ヘッダー付与必要
+- 起動ログは固定マスク `[REDACTED]` のみを出し、トークン値は残らないため、
+  ログをスクレイプしてトークンを得る既存スクリプトは動作しない
+- トークンは起動プロセスのメモリと CLI/TUI の
+  `OPENCODE_TUI_AUTH_TOKEN` 受け渡し経路のみに存在する。外部クライアントは
+  運用者が安全に渡した値を `Authorization: Bearer <token>` ヘッダーへ付与し、
+  自身もログへ出力しない
 - `OPENCODE_NO_AUTH` による無効化は非推奨・本番禁止を明記
 - Tauri/Web 連携は既存オリジン維持で互換性確保
 
 ## Links
 
 - [ADR-0000: プロジェクト憲章](20260115-rust-reimplementation-charter.md)
-- 実装: `server.rs:72-101, 525-563, 1109-1245, 1294-1329`（CORS 判定と
+- 実装: `server.rs` の `generate_auth_token` / `ServerState` / `cors_layer` /
+  `is_allowed_origin` / `redact_token` / `auth_middleware`（CORS 判定と
   `cors_layer` は `ServerState` のメソッドとして再配置済み）

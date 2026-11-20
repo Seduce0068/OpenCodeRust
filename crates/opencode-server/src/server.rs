@@ -482,9 +482,10 @@ pub(crate) fn sync_custom_fetch_proxy(
 pub struct ServerState {
     pub sessions: Mutex<SessionManager>,
     pub(crate) config: TokioRwLock<AppConfig>,
-    /// 起動時に構築された provider レジストリ。
-    /// 認証キーローテーション後の差し替え状況は `rotate_provider_key` の NOTE を参照。
-    pub providers: ProviderRegistry,
+    /// provider レジストリ。`&ServerState` を取る HTTP ハンドラからも差し替えられる
+    /// よう interior mutability を持たせる（`patch_config` の再 bootstrap と
+    /// 認証キーローテーションで使用）。
+    pub providers: RwLock<ProviderRegistry>,
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
     pub auth_token: Option<String>,
@@ -541,7 +542,7 @@ impl ServerState {
         Self {
             sessions: Mutex::new(SessionManager::new()),
             config: TokioRwLock::new(AppConfig::default()),
-            providers: ProviderRegistry::new(),
+            providers: RwLock::new(ProviderRegistry::new()),
             auth_manager: Arc::new(AuthManager::new()),
             event_bus: tx,
             auth_token: Some(auth_token),
@@ -658,7 +659,7 @@ impl ServerState {
         // `build_initial_provider_registry` に集約する。401/429 ローテーション後の
         // 再 bootstrap は `build_provider_registry_from_auth` を使う（下記 NOTE 参照）。
         let initial_registry = state.build_initial_provider_registry().await;
-        state.providers = initial_registry;
+        state.replace_provider_registry(initial_registry);
         let db = Database::new().await?;
         let pool = db.pool().clone();
         state.session_repo = Some(SessionRepository::new(pool.clone()));
@@ -718,7 +719,7 @@ impl ServerState {
     }
 
     /// 現在の `state.config` と `AuthManager.list()` から `ProviderRegistry` を
-    /// 作り直す（ローテーション後の再 bootstrap 経路）。
+    /// 作り直す（PATCH 後の再 bootstrap とローテーション後の再 bootstrap 経路）。
     ///
     /// キー値や provider の応答本文は受け取らず、ログにも出さない。
     pub async fn build_provider_registry_from_auth(&self) -> ProviderRegistry {
@@ -728,19 +729,24 @@ impl ServerState {
         create_registry_from_bootstrap_config(&bootstrap_config, &auth_store)
     }
 
-    // NOTE(R2 主実行 / R4 残存 medium) — 現状は「API 提供のみ・未配線」。
-    // provider の HTTP 401/429 は routes.rs の provider 呼び出し側
-    // (`state.providers.get_provider(...) -> provider.chat/stream`) と
-    // opencode-provider クレート内で検出されるが、いずれも本タスクの書き込み
-    // 担当パス (`crates/opencode-server/src/server.rs`) の外側にある。
-    // また `ServerState.providers` は `ProviderRegistry` の値フィールドで
-    // interior mutability がなく、`&ServerState` を取る HTTP ハンドラからは
-    // 差し替えられない（差し替えにはフィールド型の変更と routes.rs の
-    // 呼び出し側修正が必要）。
-    // よって本ヘルパは「ローテーションを実行し、新しいアクティブ認証を反映した
-    // レジストリを返す API」として提供し、実呼び出しの配線は担当外変更として残す。
-    // 未配線でも受け取るのは provider_id と StatusCode のみで、
-    // トークン値・provider 応答本文をログ/エラーへ出す経路は存在しない。
+    /// 新しいレジストリで `ServerState.providers` を差し替える。
+    /// `&ServerState` からのみ呼ばれ、トークン値は受け取らない。
+    pub fn replace_provider_registry(&self, registry: ProviderRegistry) {
+        let mut current = self
+            .providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = registry;
+    }
+
+    // NOTE(R2 主実行) — `patch_config` は永続化後に
+    // `build_provider_registry_from_auth()` と本差し替えを呼ぶよう配線済み。
+    // provider の HTTP 401/429 自動ローテーションは routes.rs の provider
+    // 呼び出し側（`state.providers.read()...get_provider(...)`）と
+    // opencode-provider クレート内の検出に依存し、本メソッドは API としてのみ
+    // 提供する（自動発火の配線は担当外）。いずれにせよ受け取るのは
+    // provider_id と StatusCode のみで、トークン値・provider 応答本文を
+    // ログ/エラーへ出す経路は存在しない。
 
     /// provider の 401/429 でキーをローテーションする API（現状は HTTP 経路へ未配線）。
     ///
@@ -1273,18 +1279,85 @@ fn stored_session_from_session(session: &opencode_session::Session) -> opencode_
     }
 }
 
-/// Convert opencode_config::ProviderConfig map to bootstrap ConfigProvider map.
+/// Convert both opencode_config provider maps to a bootstrap ConfigProvider map.
+///
+/// `ConfigLoader::load_all` normally folds the current-schema `providers` map
+/// into the runtime `provider` map before the server sees it. A PATCH merges
+/// straight into `state.config` without re-running the loader, so both
+/// spellings can reach this function. Mirror the loader's rules: legacy
+/// `provider` wins on an id conflict, and current-schema entries are normalized
+/// the same way before the bootstrap conversion.
 fn convert_config_providers_for_bootstrap(
     config: &opencode_config::Config,
-) -> std::collections::HashMap<String, BootstrapConfigProvider> {
-    let Some(ref providers) = config.provider else {
-        return std::collections::HashMap::new();
-    };
+) -> HashMap<String, BootstrapConfigProvider> {
+    let mut converted: HashMap<String, BootstrapConfigProvider> = HashMap::new();
 
-    providers
-        .iter()
-        .map(|(id, provider)| (id.clone(), provider_to_bootstrap(provider)))
-        .collect()
+    if let Some(providers) = &config.provider {
+        for (id, provider) in providers {
+            let normalized = normalize_provider_for_bootstrap(provider.clone());
+            converted.insert(id.clone(), provider_to_bootstrap(&normalized));
+        }
+    }
+
+    if let Some(providers) = &config.providers {
+        for (id, provider) in providers {
+            if converted.contains_key(id) {
+                // Same-id conflict: the legacy `provider` map keeps its
+                // historical priority, matching `normalize_provider_configs`.
+                continue;
+            }
+            let normalized = normalize_provider_for_bootstrap(provider.clone());
+            converted.insert(id.clone(), provider_to_bootstrap(&normalized));
+        }
+    }
+
+    converted
+}
+
+/// Mirror of `opencode_config::loader::normalize_provider_config`: flatten the
+/// current-schema fields into the ones consumed by `provider_to_bootstrap`.
+/// Values are only moved between fields; no value is ever logged or returned.
+fn normalize_provider_for_bootstrap(
+    mut provider: opencode_config::ProviderConfig,
+) -> opencode_config::ProviderConfig {
+    if provider.npm.is_none() {
+        provider.npm = provider.package.take();
+    } else {
+        provider.package = None;
+    }
+
+    if let Some(settings) = provider.settings.take() {
+        for (key, value) in settings {
+            let target = match key.as_str() {
+                "baseURL" | "baseUrl" | "base_url" | "api" => &mut provider.base_url,
+                "apiKey" | "api_key" => &mut provider.api_key,
+                _ => {
+                    provider
+                        .options
+                        .get_or_insert_with(HashMap::new)
+                        .insert(key, value);
+                    continue;
+                }
+            };
+            if target.is_none() {
+                *target = value.as_str().map(ToString::to_string);
+            }
+        }
+    }
+
+    for (key, value) in [
+        ("headers", provider.headers.take()),
+        ("compatibility", provider.compatibility.take()),
+    ] {
+        if let Some(values) = value {
+            provider.options.get_or_insert_with(HashMap::new).insert(
+                key.to_string(),
+                serde_json::Value::Object(values.into_iter().collect()),
+            );
+        }
+    }
+
+    provider
 }
 
 fn provider_to_bootstrap(provider: &opencode_config::ProviderConfig) -> BootstrapConfigProvider {
@@ -2006,6 +2079,58 @@ pub async fn run_server_with_state(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn convert_config_providers_reads_both_spellings_and_normalizes() {
+        // テスト専用のダミー値。ログ・エラーへは出さない。
+        let config = AppConfig {
+            provider: Some(HashMap::from([(
+                "legacy".to_string(),
+                opencode_config::schema::ProviderConfig {
+                    api_key: Some("dummy-legacy-key".to_string()),
+                    ..Default::default()
+                },
+            )])),
+            providers: Some(HashMap::from([
+                (
+                    "added_by_patch".to_string(),
+                    opencode_config::schema::ProviderConfig {
+                        settings: Some(HashMap::from([(
+                            "apiKey".to_string(),
+                            serde_json::json!("dummy-patched-key"),
+                        )])),
+                        package: Some("@ai-sdk/openai-compatible".to_string()),
+                        base_url: Some("https://example.test/v1".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "legacy".to_string(),
+                    opencode_config::schema::ProviderConfig {
+                        api_key: Some("dummy-shadowed-key".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let converted = convert_config_providers_for_bootstrap(&config);
+        assert!(converted.contains_key("added_by_patch"));
+
+        // 同一 id の衝突では legacy `provider` map が優先される（loader と同規則）。
+        let legacy = converted.get("legacy").expect("legacy provider");
+        let legacy_options = legacy.options.as_ref().expect("legacy options");
+        assert_eq!(legacy_options["apiKey"], "dummy-legacy-key");
+
+        // current-schema の settings.apiKey / baseURL / package が
+        // loader の normalize_provider_config と同じく平坦化される。
+        let added = converted.get("added_by_patch").expect("patched provider");
+        assert_eq!(added.npm.as_deref(), Some("@ai-sdk/openai-compatible"));
+        let options = added.options.as_ref().expect("patched options");
+        assert_eq!(options["apiKey"], "dummy-patched-key");
+        assert_eq!(options["baseURL"], "https://example.test/v1");
+    }
 
     #[test]
     fn session_id_from_path_extracts_only_session_routes() {

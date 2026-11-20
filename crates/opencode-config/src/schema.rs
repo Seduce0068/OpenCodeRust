@@ -1442,6 +1442,65 @@ fn merge_option_map_deep_values<T: DeepMerge>(
     }
 }
 
+/// Merge the two provider spellings from a higher-precedence layer.
+///
+/// `provider` (legacy) and `providers` (current) name the same config section.
+/// When one layer uses one spelling for an id and another layer uses the other
+/// spelling, the higher-precedence (`source`) layer must win. Leaving both
+/// entries in place would let `normalize_provider_configs` unconditionally
+/// prefer the legacy spelling, so a global `provider.x` could shadow a project
+/// `providers.x` -- the opposite of the documented layer precedence.
+///
+/// On a conflict only the key name and the two source spellings are logged;
+/// provider values can contain credentials and must never reach the logs.
+fn merge_provider_maps(
+    target_provider: &mut Option<HashMap<String, ProviderConfig>>,
+    target_providers: &mut Option<HashMap<String, ProviderConfig>>,
+    source_provider: Option<HashMap<String, ProviderConfig>>,
+    mut source_providers: Option<HashMap<String, ProviderConfig>>,
+) {
+    // A single source layer that defines both spellings for one id keeps the
+    // historical legacy-wins policy used by `normalize_provider_configs`.
+    if let (Some(current), Some(legacy)) = (source_providers.as_mut(), source_provider.as_ref()) {
+        current.retain(|id, _| !legacy.contains_key(id));
+    }
+
+    // An incoming legacy entry beats an accumulated current-schema entry.
+    if let (Some(incoming), Some(accumulated)) =
+        (source_provider.as_ref(), target_providers.as_mut())
+    {
+        for id in incoming.keys() {
+            if accumulated.remove(id).is_some() {
+                tracing::warn!(
+                    key = %id,
+                    lower_source = "providers",
+                    higher_source = "provider",
+                    "provider config spelling conflict; higher-precedence layer wins"
+                );
+            }
+        }
+    }
+
+    // An incoming current-schema entry beats an accumulated legacy entry.
+    if let (Some(incoming), Some(accumulated)) =
+        (source_providers.as_ref(), target_provider.as_mut())
+    {
+        for id in incoming.keys() {
+            if accumulated.remove(id).is_some() {
+                tracing::warn!(
+                    key = %id,
+                    lower_source = "provider",
+                    higher_source = "providers",
+                    "provider config spelling conflict; higher-precedence layer wins"
+                );
+            }
+        }
+    }
+
+    merge_option_map_deep_values(target_provider, source_provider);
+    merge_option_map_deep_values(target_providers, source_providers);
+}
+
 fn merge_option_map_overwrite_values<T>(
     target: &mut Option<HashMap<String, T>>,
     source: Option<HashMap<String, T>>,
@@ -2003,11 +2062,17 @@ impl Config {
         merge_option_replace(&mut self.small_model, other.small_model);
         merge_option_replace(&mut self.default_agent, other.default_agent);
         merge_option_replace(&mut self.username, other.username);
+        merge_option_replace(&mut self.timezone, other.timezone);
         merge_option_replace(&mut self.permissions, other.permissions);
+        merge_option_map_deep_values(&mut self.agents, other.agents);
         merge_option_deep(&mut self.mode, other.mode);
         merge_option_deep(&mut self.agent, other.agent);
-        merge_option_map_deep_values(&mut self.provider, other.provider);
-        merge_option_map_deep_values(&mut self.providers, other.providers);
+        merge_provider_maps(
+            &mut self.provider,
+            &mut self.providers,
+            other.provider,
+            other.providers,
+        );
         merge_option_deep(&mut self.mcp, other.mcp);
         merge_option_deep(&mut self.formatter, other.formatter);
         merge_option_deep(&mut self.lsp, other.lsp);
@@ -2755,5 +2820,124 @@ mod tests {
         for key in ["policies", "worktree", "update", "commands", "plugins"] {
             assert!(!known.contains(&key), "{key} must stay unmapped");
         }
+    }
+
+    /// Regression: `timezone` and `agents` used to be absent from `Config::merge`,
+    /// so every layer above the first silently dropped them.
+    #[test]
+    fn merges_timezone_and_agents_across_multiple_layers() {
+        let mut base: Config = serde_json::from_str(
+            r#"{
+                "timezone": "UTC",
+                "agents": {
+                    "reviewer": {"prompt": "base prompt", "model": "base-model"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let middle: Config = serde_json::from_str(
+            r#"{
+                "agents": {
+                    "reviewer": {"description": "middle description"},
+                    "research": {"mode": "subagent"}
+                }
+            }"#,
+        )
+        .unwrap();
+        base.merge(middle);
+
+        let top: Config = serde_json::from_str(
+            r#"{
+                "timezone": "Asia/Tokyo",
+                "agents": {
+                    "reviewer": {"prompt": "top prompt"}
+                }
+            }"#,
+        )
+        .unwrap();
+        base.merge(top);
+
+        assert_eq!(base.timezone.as_deref(), Some("Asia/Tokyo"));
+        let agents = base.agents.expect("agents");
+        let reviewer = agents.get("reviewer").expect("reviewer");
+        assert_eq!(reviewer.prompt.as_deref(), Some("top prompt"));
+        assert_eq!(reviewer.model.as_deref(), Some("base-model"));
+        assert_eq!(reviewer.description.as_deref(), Some("middle description"));
+        let research = agents.get("research").expect("research");
+        assert!(matches!(research.mode, Some(AgentMode::Subagent)));
+    }
+
+    /// Regression: a global legacy `provider.x` must not shadow a project
+    /// current-schema `providers.x` once normalization runs later in the loader.
+    #[test]
+    fn higher_layer_current_spelling_wins_over_lower_layer_legacy_spelling() {
+        let mut base: Config = serde_json::from_str(
+            r#"{"provider":{"x":{"name":"global-name","api_key":"global-value"}}}"#,
+        )
+        .unwrap();
+        let overlay: Config = serde_json::from_str(
+            r#"{"providers":{"x":{"name":"project-name","npm":"project-pkg"}}}"#,
+        )
+        .unwrap();
+
+        base.merge(overlay);
+
+        assert!(
+            base.provider
+                .as_ref()
+                .is_none_or(|map| !map.contains_key("x")),
+            "lower-precedence legacy entry must be removed so it cannot shadow"
+        );
+        let winner = base
+            .providers
+            .as_ref()
+            .and_then(|map| map.get("x"))
+            .expect("project providers.x");
+        assert_eq!(winner.name.as_deref(), Some("project-name"));
+        assert_eq!(winner.npm.as_deref(), Some("project-pkg"));
+    }
+
+    /// Symmetric case: global `providers.x` vs project `provider.x`.
+    #[test]
+    fn higher_layer_legacy_spelling_wins_over_lower_layer_current_spelling() {
+        let mut base: Config =
+            serde_json::from_str(r#"{"providers":{"x":{"name":"global-name"}}}"#).unwrap();
+        let overlay: Config = serde_json::from_str(
+            r#"{"provider":{"x":{"name":"project-name","base_url":"https://project"}}}"#,
+        )
+        .unwrap();
+
+        base.merge(overlay);
+
+        let winner = base
+            .provider
+            .as_ref()
+            .and_then(|map| map.get("x"))
+            .expect("project provider.x");
+        assert_eq!(winner.name.as_deref(), Some("project-name"));
+        assert_eq!(winner.base_url.as_deref(), Some("https://project"));
+        assert!(
+            base.providers
+                .as_ref()
+                .is_none_or(|map| !map.contains_key("x")),
+            "lower-precedence current-schema entry must not linger"
+        );
+    }
+
+    /// Same-spelling entries still deep-merge (no conflict is reported).
+    #[test]
+    fn same_spelling_provider_entries_still_deep_merge() {
+        let mut base: Config =
+            serde_json::from_str(r#"{"provider":{"x":{"base_url":"https://old"}}}"#).unwrap();
+        let overlay: Config =
+            serde_json::from_str(r#"{"provider":{"x":{"api_key":"new-value"}}}"#).unwrap();
+
+        base.merge(overlay);
+
+        let provider = base.provider.unwrap().remove("x").unwrap();
+        assert_eq!(provider.base_url.as_deref(), Some("https://old"));
+        assert_eq!(provider.api_key.as_deref(), Some("new-value"));
+        assert!(base.providers.is_none());
     }
 }
