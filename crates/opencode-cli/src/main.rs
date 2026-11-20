@@ -1847,7 +1847,7 @@ async fn run_chat_session(
         tool_registry.clone(),
     );
 
-    // Build model-specific system prompt + environment context (TS parity: SystemPrompt.provider + SystemPrompt.environment)
+    // Build model-specific system prompt and environment context for this provider.
     {
         let (model_api_id, provider_id) = match &agent_info.model {
             Some(m) => (m.model_id.clone(), m.provider_id.clone()),
@@ -2299,6 +2299,18 @@ const SLASH_COMMAND_HELP_LINES: &[&str] = &[
     "  /providers   - List configured providers",
 ];
 
+/// 対話ヘルプのヒント。`--provider` は存在しないため `--model` の
+/// `<provider>/<model>` 形式を案内し、`--prompt` は TUI 専用と明記する。
+const INTERACTIVE_HELP_TIPS: &[&str] = &[
+    "  - Use --model <provider>/<model> to select a model (e.g. anthropic/claude-sonnet-4)",
+    "  - Use --prompt to send an initial message (TUI only)",
+];
+
+/// 実装内部の比較対象（parity 等）や実装言語に触れず、利用者に起きる挙動だけを伝える。
+const MODEL_REFRESH_NOTICE: &str = "Note: model cache refresh is not available yet; providers are loaded from the current environment.";
+const URL_LOGIN_UNSUPPORTED_NOTICE: &str = "Well-known URL login is not supported yet. Use `opencode auth login <provider> --token ...` instead.";
+const OPENAPI_TITLE: &str = "OpenCode API";
+
 fn show_help() {
     println!();
     println!("Available commands:");
@@ -2312,9 +2324,9 @@ fn show_help() {
     }
     println!();
     println!("Tips:");
-    println!("  - Use --model to specify a model (e.g., --model claude-sonnet-4)");
-    println!("  - Use --provider to specify a provider (anthropic, openai)");
-    println!("  - Use --prompt to send an initial message");
+    for line in INTERACTIVE_HELP_TIPS {
+        println!("{}", line);
+    }
     println!();
 }
 
@@ -3411,7 +3423,7 @@ async fn handle_generate_command() -> anyhow::Result<()> {
     let spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "OpenCode Rust Rewrite API",
+            "title": OPENAPI_TITLE,
             "version": env!("CARGO_PKG_VERSION")
         },
         "paths": paths
@@ -3426,9 +3438,7 @@ async fn list_models(
     verbose: bool,
 ) -> anyhow::Result<()> {
     if refresh {
-        eprintln!(
-            "Note: model cache refresh is parsed for parity, but Rust rewrite currently loads providers directly from runtime env."
-        );
+        eprintln!("{}", MODEL_REFRESH_NOTICE);
     }
 
     let current_dir = std::env::current_dir()?;
@@ -3730,9 +3740,7 @@ async fn handle_auth_command(action: AuthCommands) -> anyhow::Result<()> {
             };
 
             if provider.starts_with("http://") || provider.starts_with("https://") {
-                anyhow::bail!(
-                    "Well-known URL login is not fully wired in Rust CLI yet. Use `opencode auth login <provider> --token ...` for now."
-                );
+                anyhow::bail!("{}", URL_LOGIN_UNSUPPORTED_NOTICE);
             }
 
             let Some(env_var) = provider_env_var(&provider) else {
@@ -5645,7 +5653,7 @@ async fn generate_agent_response(
 
     let mut executor = AgentExecutor::new(agent_info.clone(), provider_registry, tool_registry);
 
-    // Build model-specific system prompt + environment context (TS parity)
+    // Build model-specific system prompt and environment context.
     {
         let (model_api_id, provider_id) = match &agent_info.model {
             Some(m) => (m.model_id.clone(), m.provider_id.clone()),
@@ -6133,6 +6141,35 @@ mod tests {
         let cmd = Cli::command();
         assert_eq!(cmd.get_name(), "opencoderust");
         assert!(cmd.get_about().is_some());
+    }
+
+    #[test]
+    fn interactive_help_uses_provider_model_form_and_marks_prompt_tui_only() {
+        let tips = INTERACTIVE_HELP_TIPS.join("\n");
+        assert!(
+            tips.contains("--model <provider>/<model>"),
+            "help must show the accepted model form: {tips}"
+        );
+        assert!(tips.contains("TUI only"), "--prompt is TUI only: {tips}");
+        assert!(!tips.contains("--provider"), "no such flag: {tips}");
+    }
+
+    #[test]
+    fn user_facing_notices_avoid_internal_implementation_terms() {
+        for notice in [
+            MODEL_REFRESH_NOTICE,
+            URL_LOGIN_UNSUPPORTED_NOTICE,
+            OPENAPI_TITLE,
+        ] {
+            let lower = notice.to_ascii_lowercase();
+            assert!(!lower.contains("parity"), "{notice}");
+            assert!(!lower.contains("rust rewrite"), "{notice}");
+            assert!(!lower.contains("rust cli"), "{notice}");
+            assert!(!lower.contains("not fully wired"), "{notice}");
+        }
+        // 代替手段は案内するが、トークン値らしき文字列は出さない。
+        assert!(URL_LOGIN_UNSUPPORTED_NOTICE.contains("--token"));
+        assert!(!URL_LOGIN_UNSUPPORTED_NOTICE.contains("sk-"));
     }
 
     #[test]

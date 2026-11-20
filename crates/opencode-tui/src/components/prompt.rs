@@ -91,6 +91,8 @@ pub struct Prompt {
     mode: PromptMode,
     interrupt_press_count: u8,
     last_interrupt_time: Option<Instant>,
+    /// Ctrl+X の leader キー入力待ち中か（app から同期される）。
+    leader_active: bool,
 }
 
 impl Prompt {
@@ -180,6 +182,7 @@ impl Prompt {
             mode: PromptMode::Normal,
             interrupt_press_count: 0,
             last_interrupt_time: None,
+            leader_active: false,
         };
         prompt.recompute_suggestions();
         prompt
@@ -1009,11 +1012,35 @@ impl Prompt {
             .min(PROMPT_MAX_INPUT_LINES)
     }
 
+    /// App の leader キー状態をプロンプトのステータス行へ反映する。
+    pub fn set_leader_active(&mut self, active: bool) {
+        self.leader_active = active;
+    }
+
     fn render_status_line(&self, theme: &Theme) -> Line<'static> {
+        // leader 待機中はセッション状態より優先して案内を出す。
+        if self.leader_active {
+            return self.leader_hint_line(theme);
+        }
         if let Some(status) = self.current_session_status() {
             return self.status_line_for_session(status, theme);
         }
         self.hint_line(theme)
+    }
+
+    /// `command_list` バインドを leader キーとして配線し、次のキー候補を表示する。
+    fn leader_hint_line(&self, theme: &Theme) -> Line<'static> {
+        let keybind = self.context.keybind.read();
+        let leader = keybind.print("command_list");
+        drop(keybind);
+
+        Line::from(vec![
+            Span::styled(
+                format!("{} then n/l/m/a/t/b/s/q/u/r", leader),
+                Style::default().fg(theme.warning),
+            ),
+            Span::styled("  Esc to cancel", Style::default().fg(theme.text_muted)),
+        ])
     }
 
     fn current_session_status(&self) -> Option<SessionStatus> {
@@ -1103,7 +1130,6 @@ impl Prompt {
         let keybind = self.context.keybind.read();
         let variant_cycle = keybind.print("variant_cycle");
         let agent_cycle = keybind.print("agent_cycle");
-        let command_list = keybind.print("command_list");
         drop(keybind);
 
         let mut spans = Vec::new();
@@ -1118,12 +1144,6 @@ impl Prompt {
         spans.push(Span::styled(agent_cycle, Style::default().fg(theme.text)));
         spans.push(Span::styled(
             " agents",
-            Style::default().fg(theme.text_muted),
-        ));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(command_list, Style::default().fg(theme.text)));
-        spans.push(Span::styled(
-            " commands",
             Style::default().fg(theme.text_muted),
         ));
         Line::from(spans)
@@ -1661,6 +1681,34 @@ mod tests {
             assert!(prompt.has_completion_candidates());
             prompt.set_input(String::new());
             assert!(!prompt.has_completion_candidates());
+        });
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn leader_wait_is_shown_in_prompt_status_line() {
+        with_isolated_prompt(|mut prompt| {
+            let theme = Theme::default();
+
+            prompt.set_leader_active(true);
+            let waiting = line_text(&prompt.render_status_line(&theme));
+            assert!(
+                waiting
+                    .to_lowercase()
+                    .contains("ctrl+x then n/l/m/a/t/b/s/q/u/r"),
+                "leader keys must be spelled out: {waiting}"
+            );
+            assert!(waiting.contains("Esc to cancel"));
+
+            prompt.set_leader_active(false);
+            let idle = line_text(&prompt.render_status_line(&theme));
+            assert!(!idle.contains("then n/l/m/a/t/b/s/q/u/r"));
         });
     }
 }

@@ -13,13 +13,30 @@ use opencode_lsp::LspClientRegistry;
 
 pub type Metadata = HashMap<String, serde_json::Value>;
 
-static FILE_LOCKS: std::sync::OnceLock<Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>> =
+/// ファイルロックのレジストリ。
+///
+/// `Weak` で保持するため、呼び出し側が `Arc` を手放したエントリは
+/// `prune_dead_file_locks` で回収できる。以前は `Arc` を残し続けていたため、
+/// ツール入力のユニークパスを渡し続けると無限に成長していた。
+type FileLockMap = HashMap<String, std::sync::Weak<Mutex<()>>>;
+
+static FILE_LOCKS: std::sync::OnceLock<Arc<std::sync::Mutex<FileLockMap>>> =
     std::sync::OnceLock::new();
 
-fn get_file_locks() -> Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> {
+fn get_file_locks() -> Arc<std::sync::Mutex<FileLockMap>> {
     FILE_LOCKS
         .get_or_init(|| Arc::new(std::sync::Mutex::new(HashMap::new())))
         .clone()
+}
+
+/// 最後の強参照が消えたエントリをマップから取り除く。
+///
+/// `with_file_lock` の呼び出し中は `Arc` が必ず 1 つ以上生きているため、
+/// 実行中・待機中の filepath が誤って削除されることはない。
+/// filepath 自身はログにもエラーにも出さない。
+fn prune_dead_file_locks(locks: &std::sync::Mutex<FileLockMap>) {
+    let mut guard = locks.lock().unwrap();
+    guard.retain(|_, weak| weak.strong_count() > 0);
 }
 
 pub async fn with_file_lock<F, Fut, T>(filepath: &str, f: F) -> T
@@ -27,17 +44,34 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
-    let lock = {
+    let lock: Arc<Mutex<()>> = {
         let locks = get_file_locks();
         let mut locks_guard = locks.lock().unwrap();
-        locks_guard
-            .entry(filepath.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        match locks_guard.get(filepath).and_then(|weak| weak.upgrade()) {
+            Some(existing) => existing,
+            None => {
+                let created = Arc::new(Mutex::new(()));
+                locks_guard.insert(filepath.to_string(), Arc::downgrade(&created));
+                created
+            }
+        }
     };
 
-    let _guard = lock.lock().await;
-    f().await
+    // `lock` をガード取得後も `f().await` が終わるまで保持する。
+    // これにより待機者がいる間に prune が走っても weak は死なず、
+    // 同じ filepath の呼び出しは引き続き同じ Mutex を共有する。
+    let guard = lock.lock().await;
+
+    let locks = get_file_locks();
+    prune_dead_file_locks(&locks);
+
+    let result = f().await;
+    // 最後のイテレーションでもエントリが残らないよう、guard と Arc を
+    // 解放してからもう一度 prune する。
+    drop(guard);
+    drop(lock);
+    prune_dead_file_locks(&locks);
+    result
 }
 
 /// Parse an optional boolean argument. A missing or `null` value keeps
@@ -1039,5 +1073,74 @@ mod tests {
 
         let plain = ToolError::with_suggestions("missing", &[]);
         assert_eq!(plain.to_string(), "File not found: missing");
+    }
+
+    fn count_file_lock_entries(prefix: &str) -> usize {
+        get_file_locks()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .count()
+    }
+
+    /// 多数のユニーク filepath を渡しても FILE_LOCKS が無限成長しない回帰テスト。
+    #[tokio::test]
+    async fn file_locks_do_not_grow_for_unique_filepaths() {
+        let namespace = format!("leak-regression-{}", uuid::Uuid::new_v4());
+        assert_eq!(count_file_lock_entries(&namespace), 0);
+
+        for index in 0..256 {
+            let path = format!("{namespace}/{index}");
+            with_file_lock(&path, || async {}).await;
+        }
+
+        assert_eq!(
+            count_file_lock_entries(&namespace),
+            0,
+            "dead lock entries must be pruned after guard release"
+        );
+    }
+
+    /// 同じ filepath の待機者がいる間に prune が走っても、
+    /// 全呼び出しが同じ Mutex を共有し相互排他が維持されること。
+    #[tokio::test]
+    async fn concurrent_file_locks_stay_exclusive_while_pruning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let path = format!("shared-lock-{}", uuid::Uuid::new_v4());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            let completed = Arc::clone(&completed);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(async move {
+                with_file_lock(&path, || async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+            }));
+        }
+        for task in tasks {
+            task.await.expect("lock task must not panic");
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 8);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "all callers for one filepath must share a single mutex"
+        );
+        assert_eq!(count_file_lock_entries(&path), 0);
     }
 }

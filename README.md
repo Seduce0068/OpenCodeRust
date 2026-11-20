@@ -122,6 +122,16 @@ Subcommand help:
 ./target/debug/opencoderust session --help
 ```
 
+## Keyboard and input
+
+The TUI does not support text entry through an IME (input method editor).
+To enter Japanese or other non-ASCII text, copy it to the clipboard first
+and paste it into the prompt with `Ctrl+V`.
+
+`Ctrl+X` is a leader key: press it, then one of `n` / `l` / `m` / `a` /
+`t` / `b` / `s` / `q` / `u` / `r`. The prompt status line lists the
+available keys while it waits for the next key. Press `Esc` to cancel.
+
 ## Configuration
 
 Configuration is merged from the following paths in priority order (searched upward):
