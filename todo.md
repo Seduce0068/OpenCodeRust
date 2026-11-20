@@ -289,25 +289,16 @@ status: current
 
 - [ ] **CLI CONFIG_CACHE に無効化手段が無く設定変更が永続的に反映されない**
   — `cli/main.rs:55-67` / CFG-005
-- [ ] **experimental.mcp_timeout がマージされるだけで実行時に参照されない**
-  — `schema.rs:1396` / CFG-007
-- [ ] **トップレベル env マップがサブプロセスへ適用されない dead 設定** — `schema.rs:275` / CFG-008
 - [ ] **mcp.protocol auto が legacy と同一 revision で probe 未実装**
   — `schema.rs:775-789` / CFG-009
 - [ ] **セッション更新 Hook が unbounded_channel で全 Session clone を送る**
   — `routes.rs:2260` / RES-02
-- [ ] **opencode-server の glob re-export で DTO とドメイン型が同名衝突**
-  — `server/lib.rs:29-35` / API-04
 - [ ] **lsp feature 経由の公開 API に doc が無い** — `tool/lsp_tool.rs:12-38` / API-05
 - [ ] **3 crate（codemode/local-llm/watcher）がどこからも依存されず孤立**
   — `Cargo.toml:3-25` / API-06
 - [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
   — `session/todo.rs:441` / API-10
 
-- [ ] **TodoStatus/Priority の serde と `parse_*` が往復非対称**
-  — `todo.rs:30-107` / WIRE-03
-- [ ] **AgentColor::Custom だけ externally tagged で JSON 形状が混在**
-  — `agent.rs:9-28` / WIRE-04
 - [ ] **SessionInfo が status/usage/metadata を落とし status 値も二重化**
   — `routes.rs:194-281` / WIRE-06
 - [ ] **MessageRepository が parts しか保存せず metadata/usage が DB 往復で失われる**
@@ -315,14 +306,10 @@ status: current
 - [ ] **Session.metadata が DB 保存されるが起動時復元で常に空** — `server.rs:843` / WIRE-08
 - [ ] **usage_total_cost にトークン数を書き復元で 0.0 へ戻す**
   — `repository.rs:229-235` / WIRE-09
-- [ ] **SessionMessage.metadata に serde(default) が無く旧 JSON が読めない**
-  — `message.rs:6-20` / WIRE-10
 - [ ] **rust-version 1.97 が 21 member crate に継承されていない**
   — `Cargo.toml:36-43` / DEPS-03
 - [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
   — `tui/Cargo.toml:25` / DEPS-04
-- [ ] **opencode-core の tempfile がテスト専用なのに通常依存**
-  — `core/Cargo.toml:18` / DEPS-05
 - [ ] **README の Requirements に MSRV 1.97 と C ツールチェーンが無い**
   — `README.md:32-42` / DEPS-06
 - [ ] **Oauth 一時状態削除の Result が .ok() で破棄される** — `oauth.rs:410-412` / ERR-05
@@ -362,6 +349,8 @@ status: current
 
 ## 完了
 
+- [x] **[config/wire/glob 7 件]** env 配線・serde 対称化・連鎖置換
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース境界/ドキュメント 6 件]** 8 MiB 上限・ログ ring・ADR 追随
   （2026-11-21、swarm-coding R1-R6・制限プロファイル）
 - [x] **[config/API/ADR high 10 件]** マージ・再 bootstrap・境界整備
@@ -655,6 +644,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（config/wire/glob の修正時、記録のみ）: SSE の
+  todo.updated ペイロードは旧値のまま（TUI は GET /session/{id}/todo 経由のため
+  今回の退化は解消）。AgentColor::Custom("primary") 等組み込み名と衝突する
+  文字列は新 wire では Primary 等へ復元される（常時文字列化に内在する制約）。
 - 2026-11-21 検証メモ（リソース境界/ドキュメントの修正時）: workspace 全体の
   cargo test が初回のみ `secure_auth_store_behaviour` で failed（MCP auth file の
   env 競合）となったが、単体再実行と workspace 再実行で pass（flaky）。
