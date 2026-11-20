@@ -6,8 +6,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use opencode_plugin::{HookContext, HookEvent};
 use opencode_provider::{
-    get_model_context_limit, ChatRequest, Content, ImageUrl, Message, Provider, ProviderError,
-    StreamEvent, StreamUsage, ToolDefinition, ToolErrorKind as StreamToolErrorKind,
+    get_model_context_limit, ChatRequest, Content, ImageUrl, IsRetryable, Message, Provider,
+    ProviderError, StreamEvent, StreamUsage, ToolDefinition, ToolErrorKind as StreamToolErrorKind,
 };
 
 use crate::compaction::{CompactionConfig, CompactionEngine, ModelLimits, TokenUsage};
@@ -138,6 +138,17 @@ enum StructuredStreamError {
         status_code: u16,
         message: String,
     },
+    /// `ApiErrorWithSource` の再符号化形。source 自体は直列化できないため、
+    /// transient 判定の結果だけを `retryable` に載せて往復で保持する。
+    ApiErrorWithSource {
+        message: String,
+        retryable: bool,
+    },
+    /// `NetworkErrorWithSource` の再符号化形（判定結果の保持は API 側と同じ）。
+    NetworkErrorWithSource {
+        message: String,
+        retryable: bool,
+    },
     RateLimit,
     Timeout,
     NetworkError {
@@ -247,12 +258,22 @@ fn encode_stream_error(error: &ProviderError) -> String {
             status_code: *status_code,
             message: message.clone(),
         },
+        ProviderError::ApiErrorWithSource { message, .. } => {
+            StructuredStreamError::ApiErrorWithSource {
+                message: message.clone(),
+                // source を失っても reqwest 由来の transient 判定を保持する。
+                retryable: error.is_retryable().is_some(),
+            }
+        }
         ProviderError::RateLimit => StructuredStreamError::RateLimit,
         ProviderError::Timeout => StructuredStreamError::Timeout,
-        ProviderError::NetworkError(message)
-        | ProviderError::NetworkErrorWithSource { message, .. } => {
-            StructuredStreamError::NetworkError {
+        ProviderError::NetworkError(message) => StructuredStreamError::NetworkError {
+            message: message.clone(),
+        },
+        ProviderError::NetworkErrorWithSource { message, .. } => {
+            StructuredStreamError::NetworkErrorWithSource {
                 message: message.clone(),
+                retryable: error.is_retryable().is_some(),
             }
         }
         ProviderError::AuthError(message) => StructuredStreamError::AuthError {
@@ -261,8 +282,8 @@ fn encode_stream_error(error: &ProviderError) -> String {
         ProviderError::ContextOverflow(message) => StructuredStreamError::ContextOverflow {
             message: message.clone(),
         },
-        // source() チェーンは anyhow へ渡す時点で失われるため、利用者向け
-        // メッセージだけを保持して既存の文字列エラーと同じ扱いにする。
+        // source を保持しないバリアントは、利用者向けメッセージだけを
+        // 保持して既存の文字列エラーと同じ扱いにする。
         _ => StructuredStreamError::Other {
             message: error.to_string(),
         },
@@ -290,6 +311,9 @@ fn allowed_error_keys(kind: &str) -> Option<&'static [&'static str]> {
             "response_body",
         ]),
         "api_error_with_status" => Some(&["kind", "status_code", "message"]),
+        "api_error_with_source" | "network_error_with_source" => {
+            Some(&["kind", "message", "retryable"])
+        }
         "rate_limit" | "timeout" => Some(&["kind"]),
         "network_error" | "auth_error" | "context_overflow" | "other" => Some(&["kind", "message"]),
         _ => None,
@@ -341,6 +365,20 @@ fn decode_stream_error(payload: &str) -> Option<ProviderError> {
             message,
         } => {
             ProviderError::api_error_with_status(redact_stream_error_message(&message), status_code)
+        }
+        // source は直列化されないため、判定結果だけをマーカー化して復元する。
+        // これにより decode 後の is_retryable() が元の判定を再現する。
+        StructuredStreamError::ApiErrorWithSource { message, retryable } => {
+            ProviderError::api_error_with_restored_source(
+                redact_stream_error_message(&message),
+                retryable,
+            )
+        }
+        StructuredStreamError::NetworkErrorWithSource { message, retryable } => {
+            ProviderError::network_error_with_restored_source(
+                redact_stream_error_message(&message),
+                retryable,
+            )
         }
         StructuredStreamError::RateLimit => ProviderError::RateLimit,
         StructuredStreamError::Timeout => ProviderError::Timeout,
@@ -2873,6 +2911,124 @@ mod tests {
             !rendered.contains(secret),
             "raw payload must not leak into the normalized error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2: source 保持型エラーの retryable 再符号化往復
+    // -----------------------------------------------------------------------
+
+    /// `ApiErrorWithSource` の source に対する transient 判定が、
+    /// ストリーム再符号化を往復しても保持されること。
+    #[tokio::test]
+    async fn test_stream_error_round_trip_preserves_api_source_retryable() {
+        // loopback の閉じたポートへの connect 失敗のみを使い、外部ホストへ送信しない。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let transient_source = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("closed loopback port must fail to connect");
+
+        // 非一時 source の本文にはトークンとローカルパスを含め、漏洩も検証する。
+        let source_secret = "sk-source-only-1234";
+        let source_path = "/home/koppe/.secret/source-only";
+        let cases = [
+            (
+                ProviderError::api_error_with_source(
+                    "transient upstream failure",
+                    transient_source,
+                ),
+                true,
+            ),
+            (
+                ProviderError::api_error_with_source(
+                    "permanent upstream failure",
+                    std::io::Error::other(format!("key={source_secret} at {source_path}")),
+                ),
+                false,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.is_retryable().is_some(), expected);
+            let payload = encode_stream_error(&error);
+            assert!(
+                payload.contains(&format!("\"retryable\":{expected}")),
+                "envelope must carry the source classification"
+            );
+            // 失敗時もペイロード本文をアサーションへ埋め込まない（機微値の二次漏洩防止）。
+            assert!(
+                !payload.contains(source_secret) && !payload.contains(source_path),
+                "source body must never enter the envelope"
+            );
+
+            let decoded = decode_stream_error(&payload).expect("envelope must decode");
+            assert!(
+                matches!(decoded, ProviderError::ApiErrorWithSource { .. }),
+                "structured kind must survive round trip: {decoded:?}"
+            );
+            assert_eq!(
+                decoded.is_retryable().is_some(),
+                expected,
+                "retryable must survive encode/decode round trip"
+            );
+        }
+    }
+
+    /// `NetworkErrorWithSource` も structured kind として往復し、判定が保たれること。
+    #[test]
+    fn test_stream_error_round_trip_preserves_network_source_retryable() {
+        let error = ProviderError::network_error_with_source(
+            "downstream network failure",
+            std::io::Error::other("connection reset"),
+        );
+        assert!(error.is_retryable().is_some());
+
+        let payload = encode_stream_error(&error);
+        assert!(payload.contains("\"retryable\":true"));
+        let decoded = decode_stream_error(&payload).expect("envelope must decode");
+        assert!(
+            matches!(decoded, ProviderError::NetworkErrorWithSource { .. }),
+            "structured kind must survive round trip: {decoded:?}"
+        );
+        assert_eq!(decoded.is_retryable(), error.is_retryable());
+    }
+
+    /// 新しい kind でも retryable の型・必須性・余分フィールドが厳密に検証されること。
+    #[test]
+    fn test_decode_stream_error_validates_source_kind_payload() {
+        let base = serde_json::json!({
+            "_version": STRUCTURED_STREAM_ERROR_VERSION,
+            "error": {
+                "kind": "api_error_with_source",
+                "message": "request failed",
+                "retryable": true
+            }
+        });
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{base}");
+        assert!(decode_stream_error(&payload).is_some());
+
+        let mut missing = base.clone();
+        missing["error"]
+            .as_object_mut()
+            .expect("object")
+            .remove("retryable");
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{missing}");
+        assert!(decode_stream_error(&payload).is_none());
+
+        let mut extra = base.clone();
+        extra["error"]["source_debug"] = serde_json::json!("sk-leaked");
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{extra}");
+        assert!(decode_stream_error(&payload).is_none());
+
+        let mut wrong_type = base;
+        wrong_type["error"]["retryable"] = serde_json::json!("true");
+        let payload = format!("{STRUCTURED_STREAM_ERROR_MARKER}{wrong_type}");
+        assert!(decode_stream_error(&payload).is_none());
     }
 
     // -----------------------------------------------------------------------

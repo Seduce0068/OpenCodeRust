@@ -170,17 +170,42 @@ pub fn is_status_retryable(provider_id: &str, status_code: u16) -> bool {
     matches!(status_code, 429 | 500 | 502 | 503 | 504)
 }
 
+/// ストリーム再符号化で失われた source の transient 判定を保持するマーカー。
+///
+/// `ApiErrorWithSource` / `NetworkErrorWithSource` の source は
+/// `Box<dyn Error>` で直列化できない。再符号化時点の判定結果だけをこの
+/// マーカーへ変換して保持し、判定は [`source_is_transient_reqwest_error`]
+/// の単一経路に集約する。source 本文（URL / トークン / パス）は載せない。
+#[derive(Debug, thiserror::Error)]
+#[error("restored transient upstream source")]
+struct RestoredTransientSource;
+
+#[derive(Debug, thiserror::Error)]
+#[error("restored non-transient upstream source")]
+struct RestoredNonTransientSource;
+
 /// `ApiErrorWithSource` の下位エラーが reqwest の一時エラーかを判定する。
 ///
 /// `reqwest::Error` へ downcast し、`is_connect` / `is_timeout` / `is_request`
 /// のいずれかが真なら一時エラーとしてリトライ可とする。それ以外の
 /// （`std::io::Error` や HTTP ステータス由来の）エラーはリトライ可にしない。
+/// 再符号化から復元された場合はマーカーのみを見て判定する。
 fn source_is_transient_reqwest_error(
     source: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> bool {
-    source
-        .downcast_ref::<reqwest::Error>()
-        .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
+    source.downcast_ref::<RestoredTransientSource>().is_some()
+        || source
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
+}
+
+/// 再符号化ペイロードの `retryable` から復元用 source を組み立てる。
+fn boxed_restored_source(retryable: bool) -> Box<dyn std::error::Error + Send + Sync> {
+    if retryable {
+        Box::new(RestoredTransientSource)
+    } else {
+        Box::new(RestoredNonTransientSource)
+    }
 }
 
 static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -243,6 +268,26 @@ impl ProviderError {
         ProviderError::NetworkErrorWithSource {
             message: redact_credential_query_params(&message.into()),
             source: Box::new(source),
+        }
+    }
+
+    /// ストリーム再符号化から復元した API エラーを構築する。
+    ///
+    /// `retryable` は元の source に対する transient 判定の結果。実際の
+    /// source ではなく判定結果だけをマーカー化して保持するため、URL や
+    /// トークン・ローカルパスが `source()` チェーンへ残らない。
+    pub fn api_error_with_restored_source(message: impl Into<String>, retryable: bool) -> Self {
+        ProviderError::ApiErrorWithSource {
+            message: redact_credential_query_params(&message.into()),
+            source: boxed_restored_source(retryable),
+        }
+    }
+
+    /// ストリーム再符号化から復元したネットワークエラーを構築する。
+    pub fn network_error_with_restored_source(message: impl Into<String>, retryable: bool) -> Self {
+        ProviderError::NetworkErrorWithSource {
+            message: redact_credential_query_params(&message.into()),
+            source: boxed_restored_source(retryable),
         }
     }
 

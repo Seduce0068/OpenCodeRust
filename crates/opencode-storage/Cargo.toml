@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+# workspace 内部専用。schema 定数は pub(crate) であり外部 API を保証しない。
+publish = false
 
 [lints]
 workspace = true

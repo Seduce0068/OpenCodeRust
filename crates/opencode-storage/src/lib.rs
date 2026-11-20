@@ -12,13 +12,12 @@
 
 pub mod database;
 pub mod repository;
-pub mod schema;
+pub(crate) mod schema;
 
 pub use database::*;
 pub use repository::{
     InputRepository, MessageRepository, SessionRepository, TodoItem, TodoRepository,
 };
-pub use schema::*;
 
 use anyhow::Result;
 use sqlx::{Pool, Sqlite};
