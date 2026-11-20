@@ -326,6 +326,30 @@ impl PluginLoader {
         Ok(name.to_string())
     }
 
+    /// Run an install command with stdout and stderr discarded (`Stdio::null()`).
+    ///
+    /// The child never sees a pipe, so it can write an unlimited amount of
+    /// output without blocking on a full OS pipe buffer: `status()` cannot
+    /// deadlock the way piped stdio + `status()` would, and nothing is buffered
+    /// in memory the way `output()` would buffer it. Install output may contain
+    /// local paths or registry URLs, so it is neither retained nor logged; only
+    /// the exit status decides success, and only a fixed message is used on
+    /// failure (see `NpmInstall`).
+    async fn run_install_command(
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<std::process::ExitStatus, std::io::Error> {
+        let status = tokio::process::Command::new(command)
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await?;
+        Ok(status)
+    }
+
     /// Install npm packages into the shared cache directory.
     async fn install_npm_packages(&self, specs: &[&str]) -> Result<(), PluginLoaderError> {
         let npm_dir = self.npm_dir();
@@ -362,13 +386,7 @@ impl PluginLoader {
         let install_cmd = self.runtime.install_command();
         let install_args = self.runtime.install_args();
 
-        let status = tokio::process::Command::new(install_cmd)
-            .args(&install_args)
-            .current_dir(&npm_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .status()
-            .await?;
+        let status = Self::run_install_command(install_cmd, &install_args, &npm_dir).await?;
 
         if !status.success() {
             return Err(PluginLoaderError::NpmInstall(format!(
@@ -1359,5 +1377,43 @@ mod tests {
         assert_eq!(script_hash(b"abc"), expected);
         let empty: [u8; 32] = Sha256::digest(b"").into();
         assert_eq!(script_hash(b""), empty);
+    }
+
+    /// Regression: install output larger than the OS pipe buffer must not hang
+    /// and must not be accumulated in memory.
+    ///
+    /// The helper child writes well past the ~64 KiB pipe capacity to *both*
+    /// stdout and stderr. With piped stdio the child would block on write and
+    /// the wait would never return; `Stdio::null()` discards both streams as
+    /// they are written, so `status()` returns promptly and no bytes are
+    /// buffered. A timeout converts a regression into a failure instead of a
+    /// hung test. Only the exit status is asserted — output is never logged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_command_drains_large_output_without_deadlock() {
+        use std::time::Duration;
+
+        let args = vec![
+            "-c".to_string(),
+            concat!(
+                "head -c 262144 /dev/zero | tr '\\0' x >&2; ",
+                "head -c 262144 /dev/zero | tr '\\0' y"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            PluginLoader::run_install_command("sh", &args, &cwd),
+        )
+        .await
+        .expect("install-like command must finish; piped stdout/stderr must be drained")
+        .expect("helper command must spawn");
+
+        assert!(
+            status.success(),
+            "child must exit successfully once both pipes are drained"
+        );
     }
 }

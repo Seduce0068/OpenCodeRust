@@ -8,6 +8,40 @@ use opencode_plugin::{HookContext, HookEvent};
 /// Tools that should not appear in suggestion lists when a tool is not found.
 const FILTERED_FROM_SUGGESTIONS: &[&str] = &["invalid", "patch", "batch"];
 
+/// ツールエラーを `HookContext` へ載せる前に認証情報を伏せる。
+///
+/// `opencode-provider::redact_credential_query_params` は `pub(crate)` のため
+/// このクレートから参照できない。公開されている
+/// `opencode_plugin::redact_sensitive_text` を再利用する薄いローカルヘルパとし、
+/// 生の `e.to_string()` をプラグインへ渡さないことを一箇所で保証する。
+fn redact_tool_error(error: &ToolError) -> String {
+    opencode_plugin::redact_sensitive_text(&error.to_string())
+}
+
+/// JSON 値に含まれる文字列を再帰的に伏せ字にする。
+///
+/// `args` / `output` / `title` / `metadata` は入れ子のオブジェクトや配列に
+/// 認証情報を埋め込めるため、トップレベルの文字列だけでは不十分である。
+/// 全階層の文字列値へ [`opencode_plugin::redact_sensitive_text`] を適用し、
+/// キー名と構造はそのまま保持する（エラー時の [`redact_tool_error`] は既存のまま）。
+fn redact_json_strings(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(opencode_plugin::redact_sensitive_text(text))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_json_strings).collect())
+        }
+        serde_json::Value::Object(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), redact_json_strings(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
@@ -106,7 +140,7 @@ impl ToolRegistry {
         let mut before_hook_ctx = HookContext::new(HookEvent::ToolExecuteBefore)
             .with_session(&ctx.session_id)
             .with_data("tool", serde_json::json!(tool_id))
-            .with_data("args", args.clone());
+            .with_data("args", redact_json_strings(&args));
         if let Some(call_id) = &ctx.call_id {
             before_hook_ctx = before_hook_ctx.with_data("call_id", serde_json::json!(call_id));
         }
@@ -124,19 +158,22 @@ impl ToolRegistry {
         let mut hook_ctx = HookContext::new(HookEvent::ToolExecuteAfter)
             .with_session(&ctx.session_id)
             .with_data("tool", serde_json::json!(tool_id))
-            .with_data("args", args);
+            .with_data("args", redact_json_strings(&args));
         if let Some(call_id) = &ctx.call_id {
             hook_ctx = hook_ctx.with_data("call_id", serde_json::json!(call_id));
         }
 
         hook_ctx = match &result {
             Ok(r) => hook_ctx
-                .with_data("title", serde_json::json!(&r.title))
-                .with_data("output", serde_json::json!(&r.output))
-                .with_data("metadata", serde_json::json!(&r.metadata))
+                .with_data("title", redact_json_strings(&serde_json::json!(&r.title)))
+                .with_data("output", redact_json_strings(&serde_json::json!(&r.output)))
+                .with_data(
+                    "metadata",
+                    redact_json_strings(&serde_json::json!(&r.metadata)),
+                )
                 .with_data("error", serde_json::json!(false)),
             Err(e) => hook_ctx
-                .with_data("output", serde_json::json!(e.to_string()))
+                .with_data("output", serde_json::json!(redact_tool_error(e)))
                 .with_data("error", serde_json::json!(true)),
         };
 
@@ -257,6 +294,7 @@ pub async fn create_default_registry() -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn schema() -> ToolSchema {
         ToolSchema {
@@ -332,5 +370,248 @@ mod tests {
         assert!(names.contains(&"write".to_owned()));
         assert!(names.contains(&"batch".to_owned()));
         assert!(names.contains(&"invalid".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn tool_error_token_is_redacted_before_reaching_hook_data() {
+        const TOKEN: &str = "tok_registry_secret_5a4b3c2d";
+
+        struct FailingTool;
+
+        #[async_trait::async_trait]
+        impl Tool for FailingTool {
+            fn id(&self) -> &str {
+                "redaction-test-tool"
+            }
+
+            fn description(&self) -> &str {
+                "test tool that fails with a credential-bearing error"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ToolContext,
+            ) -> Result<ToolResult, ToolError> {
+                Err(ToolError::ExecutionError(format!(
+                    "request to https://svc-user:{TOKEN}@api.example.com failed: api_key={TOKEN}"
+                )))
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        registry.register(FailingTool).await;
+
+        let captured: Arc<Mutex<Vec<HashMap<String, serde_json::Value>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let captured_for_hook = Arc::clone(&captured);
+        let system = opencode_plugin::global();
+        system
+            .register(opencode_plugin::Hook::new(
+                "registry-redaction-regression",
+                HookEvent::ToolExecuteAfter,
+                move |ctx| {
+                    let captured = Arc::clone(&captured_for_hook);
+                    async move {
+                        captured
+                            .lock()
+                            .expect("capture lock")
+                            .push(ctx.data.clone());
+                        Ok(())
+                    }
+                },
+            ))
+            .await;
+
+        let ctx = ToolContext::new(
+            "redaction-session".to_string(),
+            "redaction-message".to_string(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        );
+        let result = registry
+            .execute("redaction-test-tool", serde_json::json!({}), ctx)
+            .await;
+        assert!(result.is_err(), "the test tool must fail");
+
+        system
+            .remove(
+                &HookEvent::ToolExecuteAfter,
+                "registry-redaction-regression",
+            )
+            .await;
+
+        let entries = captured.lock().expect("capture lock");
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|data| {
+                data.get("tool").and_then(|value| value.as_str()) == Some("redaction-test-tool")
+            })
+            .collect();
+        assert!(!relevant.is_empty(), "after-hook data must be captured");
+        for data in relevant {
+            let serialized = serde_json::to_string(data).expect("hook data must serialize");
+            assert!(
+                !serialized.contains(TOKEN),
+                "token leaked into hook data: {serialized}"
+            );
+            assert!(
+                !serialized.contains("svc-user"),
+                "URL userinfo leaked into hook data: {serialized}"
+            );
+            assert!(
+                serialized.contains("<redacted>"),
+                "no redaction marker in hook data: {serialized}"
+            );
+        }
+    }
+
+    /// 回帰テスト: 成功時のフックデータ（args / title / output / metadata）に
+    /// ネストして埋め込まれたトークン値がそのまま Plugin 側へ渡らないこと。
+    #[tokio::test]
+    async fn success_hook_data_string_values_are_redacted() {
+        const TOKEN: &str = "tok_success_secret_9f8e7d6c";
+        const BEARER_TOKEN: &str = "sk-live-abcdefghijklmnop";
+
+        struct SuccessTool;
+
+        #[async_trait::async_trait]
+        impl Tool for SuccessTool {
+            fn id(&self) -> &str {
+                "redaction-success-tool"
+            }
+
+            fn description(&self) -> &str {
+                "test tool that succeeds with credential-bearing output"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ToolContext,
+            ) -> Result<ToolResult, ToolError> {
+                Ok(ToolResult {
+                    title: format!("result api_key={TOKEN}"),
+                    output: format!("done Bearer {BEARER_TOKEN}"),
+                    metadata: HashMap::from([
+                        (
+                            "detail".to_string(),
+                            serde_json::json!(format!("api_key={TOKEN}")),
+                        ),
+                        (
+                            "nested".to_string(),
+                            serde_json::json!({ "log": format!("Bearer {BEARER_TOKEN}") }),
+                        ),
+                    ]),
+                    truncated: false,
+                })
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        registry.register(SuccessTool).await;
+
+        let before_captured: Arc<Mutex<Vec<HashMap<String, serde_json::Value>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let after_captured: Arc<Mutex<Vec<HashMap<String, serde_json::Value>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let before_for_hook = Arc::clone(&before_captured);
+        let after_for_hook = Arc::clone(&after_captured);
+        let system = opencode_plugin::global();
+        system
+            .register(opencode_plugin::Hook::new(
+                "registry-success-redaction-before",
+                HookEvent::ToolExecuteBefore,
+                move |ctx| {
+                    let captured = Arc::clone(&before_for_hook);
+                    async move {
+                        captured
+                            .lock()
+                            .expect("capture lock")
+                            .push(ctx.data.clone());
+                        Ok(())
+                    }
+                },
+            ))
+            .await;
+        system
+            .register(opencode_plugin::Hook::new(
+                "registry-success-redaction-after",
+                HookEvent::ToolExecuteAfter,
+                move |ctx| {
+                    let captured = Arc::clone(&after_for_hook);
+                    async move {
+                        captured
+                            .lock()
+                            .expect("capture lock")
+                            .push(ctx.data.clone());
+                        Ok(())
+                    }
+                },
+            ))
+            .await;
+
+        let ctx = ToolContext::new(
+            "success-redaction-session".to_string(),
+            "success-redaction-message".to_string(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        );
+        let args = serde_json::json!({
+            "prompt": format!("api_key={TOKEN}"),
+            "nested": { "header": format!("Bearer {BEARER_TOKEN}") },
+        });
+        let result = registry
+            .execute("redaction-success-tool", args, ctx)
+            .await
+            .expect("the test tool must succeed");
+        // 伏せ字はフックデータのみに適用し、ツール結果本体は変更しない。
+        assert!(result.output.contains(BEARER_TOKEN));
+
+        system
+            .remove(
+                &HookEvent::ToolExecuteBefore,
+                "registry-success-redaction-before",
+            )
+            .await;
+        system
+            .remove(
+                &HookEvent::ToolExecuteAfter,
+                "registry-success-redaction-after",
+            )
+            .await;
+
+        for (label, captured) in [("before", &before_captured), ("after", &after_captured)] {
+            let entries = captured.lock().expect("capture lock");
+            let relevant: Vec<_> = entries
+                .iter()
+                .filter(|data| {
+                    data.get("tool").and_then(|value| value.as_str())
+                        == Some("redaction-success-tool")
+                })
+                .collect();
+            assert!(!relevant.is_empty(), "{label}-hook data must be captured");
+            for data in relevant {
+                let serialized = serde_json::to_string(data).expect("hook data must serialize");
+                assert!(
+                    !serialized.contains(TOKEN),
+                    "{label}: token leaked into hook data: {serialized}"
+                );
+                assert!(
+                    !serialized.contains(BEARER_TOKEN),
+                    "{label}: bearer token leaked into hook data: {serialized}"
+                );
+                assert!(
+                    serialized.contains("<redacted>"),
+                    "{label}: no redaction marker in hook data: {serialized}"
+                );
+            }
+        }
     }
 }

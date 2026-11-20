@@ -1,6 +1,21 @@
 //! Local LLM MCP Server - Rust implementation
 //!
 //! Provides tools for querying local LLMs via ollama.
+//!
+//! # 配線状況
+//!
+//! 本クレートは現行の実行系で利用中である。リポジトリ直下 `opencode.jsonc` の
+//! `mcp.local-llm` が `enabled: true` で
+//! `command = ["cargo", "run", "--bin", "opencode-local-llm"]` として設定されており、
+//! stdio MCP サーバとして起動される（stdin の JSON-RPC 行を読み、stdout へ応答を書く）。
+//!
+//! 「Rust クレートからライブラリ依存されていない」ことと「実行系で使われない」は別である。
+//! 前者は Cargo の依存グラフ上、他クレートが本クレートをライブラリとして依存していない
+//! という事実であり、後者は実行時にプロセスとして起動されないという事実である。
+//! 本クレートは前者に該当するが、上記のとおり stdio MCP サーバとして起動されるため
+//! 後者には該当せず、現行の実行系から利用される。
+//!
+//! 本次変更ではコードの挙動を一切変更しない。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

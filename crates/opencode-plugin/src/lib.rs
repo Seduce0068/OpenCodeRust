@@ -20,6 +20,215 @@ use tokio::sync::RwLock;
 
 pub mod subprocess;
 
+/// 自由形式のエラー文字列に含まれる認証情報を伏せる。
+///
+/// プラグインフックのエラーやツール実行エラーは `key=value` 形式のトークン、
+/// `Bearer <value>`、URL の userinfo (`user:pass@host`) をそのまま含むことがある。
+/// これをフックデータや `tracing` ログへ渡す前に caller が必ず通すこと。
+///
+/// 依存を増やさないため regex は使わず、区切り文字を基準にした走査で処理する。
+/// 既知のキー名・トークン接頭辞・スキーム付き URL の userinfo だけを対象とし、
+/// ホストやパスなど障害追跡に必要な情報は残す。
+pub fn redact_sensitive_text(input: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    const SECRET_KEYS: &[&str] = &[
+        "x-goog-api-key",
+        "x-api-key",
+        "x-auth-token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "access_token",
+        "access-token",
+        "refresh_token",
+        "refresh-token",
+        "auth_token",
+        "auth-token",
+        "client_secret",
+        "client-secret",
+        "authorization",
+        "signature",
+        "secret",
+        "password",
+        "token",
+        "key",
+        "code",
+        "sig",
+    ];
+    const TOKEN_PREFIXES: &[&str] = &[
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "AKIA",
+        "ASIA",
+        "eyJ",
+    ];
+
+    fn is_edge(byte: u8) -> bool {
+        byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'"' | b'\''
+                    | b'<'
+                    | b'>'
+                    | b'('
+                    | b')'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'&'
+                    | b'?'
+                    | b'#'
+                    | b':'
+                    | b'@'
+            )
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        // scheme://user:pass@host -> scheme://host
+        if bytes[index].is_ascii_alphabetic() {
+            let mut scheme_end = index;
+            while scheme_end < bytes.len()
+                && (bytes[scheme_end].is_ascii_alphanumeric()
+                    || matches!(bytes[scheme_end], b'+' | b'-' | b'.'))
+            {
+                scheme_end += 1;
+            }
+            if bytes
+                .get(scheme_end..)
+                .is_some_and(|tail| tail.starts_with(b"://"))
+            {
+                let authority_start = scheme_end + 3;
+                let mut authority_end = authority_start;
+                while authority_end < bytes.len()
+                    && !matches!(
+                        bytes[authority_end],
+                        b'/' | b'?'
+                            | b'#'
+                            | b' '
+                            | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'\''
+                            | b'<'
+                            | b'>'
+                            | b')'
+                            | b','
+                            | b';'
+                    )
+                {
+                    authority_end += 1;
+                }
+                let authority = &input[authority_start..authority_end];
+                if let Some(at) = authority.rfind('@') {
+                    out.push_str(&input[index..authority_start]);
+                    index = authority_start + at + 1;
+                    continue;
+                }
+                out.push_str(&input[index..authority_start]);
+                index = authority_start;
+                continue;
+            }
+        }
+
+        // Bearer <value> -> Bearer <redacted>
+        if index == 0 || is_edge(bytes[index - 1]) {
+            let rest = &input[index..];
+            if rest.len() >= 6 && rest.as_bytes()[..6].eq_ignore_ascii_case(b"bearer") {
+                let after = index + 6;
+                if bytes.get(after) == Some(&b' ') {
+                    out.push_str(&input[index..after]);
+                    let mut value_end = after + 1;
+                    while value_end < bytes.len() && !is_edge(bytes[value_end]) {
+                        value_end += 1;
+                    }
+                    out.push_str(REDACTED);
+                    index = value_end;
+                    continue;
+                }
+            }
+        }
+
+        // key=value -> key=<redacted>
+        let mut key_end = index;
+        while key_end < bytes.len()
+            && (bytes[key_end].is_ascii_alphanumeric() || matches!(bytes[key_end], b'_' | b'-'))
+        {
+            key_end += 1;
+        }
+        if key_end > index && bytes.get(key_end) == Some(&b'=') {
+            let key = input[index..key_end].to_ascii_lowercase();
+            if SECRET_KEYS.contains(&key.as_str()) {
+                out.push_str(&input[index..=key_end]);
+                out.push_str(REDACTED);
+                let mut value_end = key_end + 1;
+                while value_end < bytes.len()
+                    && !matches!(
+                        bytes[value_end],
+                        b'&' | b'#'
+                            | b' '
+                            | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'\''
+                            | b'<'
+                            | b'>'
+                            | b','
+                            | b';'
+                            | b')'
+                    )
+                {
+                    value_end += 1;
+                }
+                index = value_end;
+                continue;
+            }
+        }
+
+        // Well-known token prefixes (sk-, ghp_, JWT ...).
+        if index == 0 || is_edge(bytes[index - 1]) {
+            if let Some(prefix) = TOKEN_PREFIXES
+                .iter()
+                .find(|&&prefix| input[index..].starts_with(prefix))
+            {
+                let mut value_end = index + prefix.len();
+                while value_end < bytes.len()
+                    && (bytes[value_end].is_ascii_alphanumeric()
+                        || matches!(bytes[value_end], b'-' | b'_' | b'.' | b'+' | b'/'))
+                {
+                    value_end += 1;
+                }
+                out.push_str(REDACTED);
+                index = value_end;
+                continue;
+            }
+        }
+
+        let ch = input[index..].chars().next().expect("non-empty suffix");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// HookError をログへ出す直前に通す整形ヘルパ。
+fn redacted_hook_error(error: &HookError) -> String {
+    redact_sensitive_text(&error.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,7 +536,7 @@ pub async fn trigger(context: HookContext) {
     let results = system.trigger(context).await;
     for result in results {
         if let Err(e) = result {
-            tracing::warn!("Plugin hook error: {}", e);
+            tracing::warn!("Plugin hook error: {}", redacted_hook_error(&e));
         }
     }
 }
@@ -341,7 +550,7 @@ pub async fn trigger_collect(context: HookContext) -> Vec<HookOutput> {
     for result in results {
         match result {
             Ok(output) => outputs.push(output),
-            Err(e) => tracing::warn!("Plugin hook error: {}", e),
+            Err(e) => tracing::warn!("Plugin hook error: {}", redacted_hook_error(&e)),
         }
     }
     outputs
@@ -499,6 +708,50 @@ mod tests {
         assert_eq!(
             *order.lock().unwrap(),
             vec!["high".to_string(), "low".to_string()]
+        );
+    }
+
+    #[test]
+    fn redacted_hook_error_hides_token_values_and_url_userinfo() {
+        let token = "tok_super_secret_9f8e7d";
+        let error = HookError::ExecutionError(format!(
+            "request to https://svc-user:{token}@api.example.com failed: token={token} Bearer {token}"
+        ));
+
+        let redacted = redacted_hook_error(&error);
+        assert!(
+            !redacted.contains(token),
+            "token leaked into log: {redacted}"
+        );
+        assert!(
+            !redacted.contains("svc-user"),
+            "URL userinfo leaked into log: {redacted}"
+        );
+        assert!(
+            !redacted.contains('@'),
+            "URL userinfo separator leaked into log: {redacted}"
+        );
+        assert!(
+            redacted.contains("<redacted>"),
+            "no redaction marker: {redacted}"
+        );
+        assert!(
+            redacted.contains("api.example.com"),
+            "host must stay for diagnosis: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_sensitive_text_masks_known_token_prefixes() {
+        let raw = "denied for sk-abcdefghijklmnopqrstuvwxyz and ghp_1234567890";
+        let redacted = redact_sensitive_text(raw);
+        assert!(
+            !redacted.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "token leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("ghp_1234567890"),
+            "token leaked: {redacted}"
         );
     }
 }
