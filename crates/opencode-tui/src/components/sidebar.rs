@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::branding::{APP_NAME, APP_SHORT_NAME, APP_VERSION_DATE};
 use crate::context::{
@@ -223,7 +224,7 @@ impl Sidebar {
             key: "session",
             title: "Session",
             lines: vec![Line::from(Span::styled(
-                truncate_text(&title, area.width as usize),
+                truncate_to_width(&title, area.width as usize),
                 Style::default().fg(theme.text).bold(),
             ))],
             summary: None,
@@ -235,7 +236,7 @@ impl Sidebar {
                 key: "share",
                 title: "Share",
                 lines: vec![Line::from(Span::styled(
-                    truncate_text(&share.url, area.width as usize),
+                    truncate_to_width(&share.url, area.width as usize),
                     Style::default().fg(theme.info),
                 ))],
                 summary: None,
@@ -352,7 +353,7 @@ impl Sidebar {
                 mcp_lines.push(Line::from(vec![
                     Span::styled("• ", Style::default().fg(color)),
                     Span::styled(
-                        truncate_text(&server.name, area.width.saturating_sub(14) as usize),
+                        truncate_to_width(&server.name, area.width.saturating_sub(14) as usize),
                         Style::default().fg(theme.text),
                     ),
                     Span::styled(
@@ -396,7 +397,7 @@ impl Sidebar {
                 lsp_lines.push(Line::from(vec![
                     Span::styled("• ", Style::default().fg(color)),
                     Span::styled(
-                        truncate_text(&server.id, area.width.saturating_sub(14) as usize),
+                        truncate_to_width(&server.id, area.width.saturating_sub(14) as usize),
                         Style::default().fg(theme.text),
                     ),
                     Span::styled(
@@ -430,7 +431,7 @@ impl Sidebar {
                     todo_lines.push(Line::from(vec![
                         Span::styled("☐ ", Style::default().fg(theme.warning)),
                         Span::styled(
-                            truncate_text(&todo.content, area.width.saturating_sub(2) as usize),
+                            truncate_to_width(&todo.content, area.width.saturating_sub(2) as usize),
                             Style::default().fg(theme.text_muted),
                         ),
                     ]));
@@ -451,7 +452,7 @@ impl Sidebar {
                 for entry in entries.iter().take(8) {
                     file_lines.push(Line::from(vec![
                         Span::styled(
-                            truncate_text(&entry.file, area.width.saturating_sub(14) as usize),
+                            truncate_to_width(&entry.file, area.width.saturating_sub(14) as usize),
                             Style::default().fg(theme.text),
                         ),
                         Span::raw(" "),
@@ -604,16 +605,27 @@ fn contains_point(area: Option<Rect>, col: u16, row: u16) -> bool {
     col >= area.x && col < max_x && row >= area.y && row < max_y
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+/// Truncate to a terminal display-width budget, counting full-width characters as
+/// two columns and reserving one column for the ellipsis so the result never
+/// exceeds `max_width`.
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
         return String::new();
     }
-    if text.chars().count() <= max_chars {
+    if UnicodeWidthStr::width(text) <= max_width {
         return text.to_string();
     }
-    let mut out = String::with_capacity(max_chars + 1);
-    for ch in text.chars().take(max_chars.saturating_sub(1)) {
+    let ellipsis_width = UnicodeWidthStr::width("…");
+    let budget = max_width.saturating_sub(ellipsis_width);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > budget {
+            break;
+        }
         out.push(ch);
+        used += ch_width;
     }
     out.push('…');
     out
@@ -668,10 +680,27 @@ mod tests {
     }
 
     #[test]
-    fn truncate_text_by_chars() {
-        assert_eq!(truncate_text("hello", 10), "hello");
-        assert_eq!(truncate_text("hello world", 5), "hell…");
-        assert_eq!(truncate_text("hello", 0), "");
+    fn truncate_to_width_keeps_ascii_behavior() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello world", 5), "hell…");
+        assert_eq!(truncate_to_width("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_width_never_exceeds_budget_for_full_width_title() {
+        let title = "日本語タイトル"; // 7 full-width chars = 14 columns
+        assert_eq!(truncate_to_width(title, 14), title);
+
+        for max_width in [1, 2, 5, 8, 13] {
+            let truncated = truncate_to_width(title, max_width);
+            assert!(
+                UnicodeWidthStr::width(truncated.as_str()) <= max_width,
+                "width {} exceeded for {:?}",
+                max_width,
+                truncated
+            );
+            assert!(truncated.ends_with('…'));
+        }
     }
 
     #[test]
