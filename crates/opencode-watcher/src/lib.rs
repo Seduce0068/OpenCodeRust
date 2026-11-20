@@ -236,6 +236,10 @@ impl FileWatcher {
         }
 
         self.watched_paths.remove(path);
+        // Debounce bookkeeping is keyed by the concrete file paths that fired
+        // events, not by the watched root. Drop every entry under `path` so an
+        // unwatched subtree cannot leave stale keys in the map forever.
+        self.clear_debounce_entries_for(path);
 
         if self.watched_paths.is_empty() {
             *watcher_guard = None;
@@ -250,7 +254,19 @@ impl FileWatcher {
     pub fn stop(&self) {
         self.watched_paths.clear();
         *self.watcher.write() = None;
+        self.event_last_seen.clear();
         info!("Stopped all file watchers");
+    }
+
+    /// Removes debounce bookkeeping for `path` and every path beneath it.
+    ///
+    /// Event callbacks record the concrete changed file, so a single watched
+    /// directory can leave many child entries in `event_last_seen`. Matching
+    /// by path prefix (component-wise via [`Path::starts_with`]) clears the
+    /// whole subtree without touching other watched roots.
+    fn clear_debounce_entries_for(&self, path: &Path) {
+        self.event_last_seen
+            .retain(|entry_path, _| !entry_path.starts_with(path));
     }
 
     pub fn watched_paths(&self) -> Vec<PathBuf> {
@@ -589,6 +605,56 @@ mod tests {
         assert!(
             saw_deep,
             "second path must also be watched recursively (deep file)"
+        );
+    }
+
+    // Regression: unwatch() must drop debounce bookkeeping for the removed root
+    // and everything beneath it, otherwise those keys live forever.
+    #[test]
+    fn test_unwatch_clears_debounce_entries_for_path_and_descendants() {
+        let temp_dir = TempDir::new().unwrap();
+        let watcher = FileWatcher::new(WatcherConfig::default()).unwrap();
+        watcher.watch(temp_dir.path()).unwrap();
+
+        let direct = temp_dir.path().join("direct.txt");
+        let nested = temp_dir.path().join("sub").join("nested.txt");
+        let unrelated = PathBuf::from("/unrelated/keep.txt");
+
+        watcher
+            .event_last_seen
+            .insert(direct.clone(), Instant::now());
+        watcher
+            .event_last_seen
+            .insert(nested.clone(), Instant::now());
+        watcher
+            .event_last_seen
+            .insert(unrelated.clone(), Instant::now());
+        assert_eq!(watcher.event_last_seen.len(), 3);
+
+        watcher.unwatch(temp_dir.path()).unwrap();
+
+        assert!(!watcher.event_last_seen.contains_key(&direct));
+        assert!(!watcher.event_last_seen.contains_key(&nested));
+        assert!(
+            watcher.event_last_seen.contains_key(&unrelated),
+            "entries outside the unwatched root must be preserved"
+        );
+    }
+
+    // Regression: stop() must clear all debounce bookkeeping.
+    #[test]
+    fn test_stop_clears_all_debounce_entries() {
+        let watcher = FileWatcher::new(WatcherConfig::default()).unwrap();
+        watcher
+            .event_last_seen
+            .insert(PathBuf::from("/any/path.txt"), Instant::now());
+        assert_eq!(watcher.event_last_seen.len(), 1);
+
+        watcher.stop();
+
+        assert!(
+            watcher.event_last_seen.is_empty(),
+            "stop() must drop every debounce entry"
         );
     }
 }

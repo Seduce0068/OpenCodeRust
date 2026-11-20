@@ -3,6 +3,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Metadata, PermissionRequest, Tool, ToolContext, ToolError, ToolResult};
 
+/// `task` ツールの再帰上限。子サブセッションがさらに `task` を呼べるため、
+/// 深さを追跡してこの値に達したら拒否する。
+pub const MAX_SUBAGENT_DEPTH: u32 = 3;
+
+/// `ToolContext::extra` に現在の深さを格納するキー。
+pub const SUBAGENT_DEPTH_KEY: &str = "subagent_depth";
+
+/// コンテキストに記録された現在のサブエージェント深さを返す。
+///
+/// キーが無い場合はルート（0）として扱う。値が不正な場合も推測せず 0 とみなす
+/// （深さは信用できる呼び出し元が設定する値であり、ユーザー入力ではない）。
+fn subagent_depth(ctx: &ToolContext) -> u32 {
+    ctx.extra
+        .get(SUBAGENT_DEPTH_KEY)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+/// 子サブセッションへ深さを伝播する。
+///
+/// 子の `ToolContext` は実行側（opencode-agent / opencode-session）で作り直され
+/// `extra` が引き継がれないため、実効的な伝播は `disabled_tools` 経由で行う。
+/// 上限に達した深さの子には `task` を渡さず、再帰をここで断つ。
+fn propagate_depth_to_disabled_tools(disabled_tools: &mut Vec<String>, child_depth: u32) {
+    if child_depth >= MAX_SUBAGENT_DEPTH && !disabled_tools.iter().any(|tool| tool == "task") {
+        disabled_tools.push("task".to_string());
+    }
+}
+
 pub struct TaskTool;
 
 impl TaskTool {
@@ -85,6 +115,15 @@ impl Tool for TaskTool {
         let input: TaskInput =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
+        // `bypassAgentCheck` の有無にかかわらず、深さ上限は常に適用する。
+        // エラー文言には深さの値・トークン値・パスを一切含めない。
+        let depth = subagent_depth(&ctx);
+        if depth >= MAX_SUBAGENT_DEPTH {
+            return Err(ToolError::PermissionDenied(
+                "subagent depth limit exceeded".to_string(),
+            ));
+        }
+
         let bypass_check = ctx
             .extra
             .get("bypassAgentCheck")
@@ -103,7 +142,8 @@ impl Tool for TaskTool {
         }
 
         let agent = get_agent(&input.subagent_type);
-        let disabled_tools = get_disabled_tools(agent.as_ref(), input.load_skills.as_ref());
+        let mut disabled_tools = get_disabled_tools(agent.as_ref(), input.load_skills.as_ref());
+        propagate_depth_to_disabled_tools(&mut disabled_tools, depth.saturating_add(1));
         let preferred_model = if let Some(model) = agent.as_ref().and_then(|a| {
             a.model
                 .as_ref()
@@ -379,6 +419,119 @@ mod tests {
         assert!(result
             .output
             .contains("task_id: task_existing_42 (for resuming to continue this task if needed)"));
+    }
+
+    fn recording_ctx(
+        created: Arc<Mutex<bool>>,
+        disabled: Arc<Mutex<Option<Vec<String>>>>,
+    ) -> ToolContext {
+        ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_create_subsession({
+                let created = created.clone();
+                let disabled = disabled.clone();
+                move |_agent, _title, _model, disabled_tools| {
+                    let created = created.clone();
+                    let disabled = disabled.clone();
+                    async move {
+                        *created.lock().await = true;
+                        *disabled.lock().await = Some(disabled_tools);
+                        Ok("task_child".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(
+                |_session_id, _prompt| async move { Ok("child output".to_string()) },
+            )
+    }
+
+    #[tokio::test]
+    async fn task_rejects_when_depth_limit_exceeded() {
+        let created = Arc::new(Mutex::new(false));
+        let disabled = Arc::new(Mutex::new(None));
+        let mut ctx = recording_ctx(created.clone(), disabled);
+        ctx.extra.insert(
+            SUBAGENT_DEPTH_KEY.into(),
+            serde_json::json!(MAX_SUBAGENT_DEPTH),
+        );
+
+        let args = serde_json::json!({
+            "description": "Too deep",
+            "prompt": "Should not run",
+            "subagent_type": "build"
+        });
+
+        let err = TaskTool::new().execute(args, ctx).await.unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied(_)));
+        assert!(!(*created.lock().await));
+    }
+
+    #[tokio::test]
+    async fn task_depth_limit_applies_with_bypass_agent_check() {
+        let created = Arc::new(Mutex::new(false));
+        let disabled = Arc::new(Mutex::new(None));
+        let mut ctx = recording_ctx(created.clone(), disabled);
+        ctx.extra.insert(
+            SUBAGENT_DEPTH_KEY.into(),
+            serde_json::json!(MAX_SUBAGENT_DEPTH),
+        );
+        ctx.extra
+            .insert("bypassAgentCheck".into(), serde_json::json!(true));
+
+        let args = serde_json::json!({
+            "description": "Too deep with bypass",
+            "prompt": "Should not run",
+            "subagent_type": "build"
+        });
+
+        let err = TaskTool::new().execute(args, ctx).await.unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied(_)));
+        assert!(!(*created.lock().await));
+    }
+
+    #[tokio::test]
+    async fn task_disables_task_tool_in_child_at_depth_limit() {
+        let created = Arc::new(Mutex::new(false));
+        let disabled = Arc::new(Mutex::new(None));
+        let mut ctx = recording_ctx(created.clone(), disabled.clone());
+        ctx.extra.insert(
+            SUBAGENT_DEPTH_KEY.into(),
+            serde_json::json!(MAX_SUBAGENT_DEPTH - 1),
+        );
+
+        let args = serde_json::json!({
+            "description": "Last allowed launch",
+            "prompt": "Run once",
+            "subagent_type": "build"
+        });
+
+        TaskTool::new().execute(args, ctx).await.unwrap();
+
+        assert!(*created.lock().await);
+        let disabled = disabled.lock().await.clone().unwrap();
+        assert!(disabled.iter().any(|tool| tool == "task"));
+    }
+
+    #[tokio::test]
+    async fn task_keeps_task_tool_enabled_below_depth_limit() {
+        let created = Arc::new(Mutex::new(false));
+        let disabled = Arc::new(Mutex::new(None));
+        let mut ctx = recording_ctx(created.clone(), disabled.clone());
+        ctx.extra.insert(
+            SUBAGENT_DEPTH_KEY.into(),
+            serde_json::json!(MAX_SUBAGENT_DEPTH - 2),
+        );
+
+        let args = serde_json::json!({
+            "description": "Allowed launch",
+            "prompt": "Run",
+            "subagent_type": "build"
+        });
+
+        TaskTool::new().execute(args, ctx).await.unwrap();
+
+        assert!(*created.lock().await);
+        let disabled = disabled.lock().await.clone().unwrap();
+        assert!(!disabled.iter().any(|tool| tool == "task"));
     }
 
     #[test]

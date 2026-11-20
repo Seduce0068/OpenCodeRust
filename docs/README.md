@@ -47,6 +47,7 @@ This documentation set describes the current **OpenCodeRust** codebase
 - [MCP](opencode-mcp.md) – Client, OAuth, and transport layer
 - [Permission](opencode-permission.md) – Rules and decision engine
 - [PTY](opencode-server.md) – Pseudo-terminal sessions in Server
+- [PTY (retired crate)](opencode-pty.md) – Retired crate notice and current location
 - [Plugin](opencode-plugin.md) – Hooks and TypeScript subprocess bridge
 - [Provider](opencode-provider.md) – Multi-provider model adapters
 - [Server](opencode-server.md) – HTTP routes and event stream
@@ -59,6 +60,16 @@ This documentation set describes the current **OpenCodeRust** codebase
 - [Watcher](opencode-watcher.md) – Filesystem watcher
 - [Security audit](security-audit.md) – cargo-audit runbook and triage
 - [Termux build](TERMUX_BUILD.md) – Android build notes
+
+## Reports
+
+Historical review snapshots. Both are marked `status: Superseded` and do not describe
+the current state.
+
+- [Cross-review report (2026-11-17)](cross-review-report-2026-11-17.md)
+  – `status: Superseded`
+- [Investigation final report](investigation-final-report.md)
+  – `status: Superseded`
 
 ## Code and documentation conventions
 

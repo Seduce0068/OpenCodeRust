@@ -39,6 +39,8 @@ pub struct AgentExecutor {
     disabled_tools: HashSet<String>,
     subsessions: Arc<Mutex<HashMap<String, SubsessionState>>>,
     max_steps: u32,
+    /// この executor がサブエージェントとして動いている深さ（ルートは 0）。
+    subagent_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +48,7 @@ struct SubsessionState {
     agent: AgentInfo,
     conversation: Conversation,
     disabled_tools: HashSet<String>,
+    subagent_depth: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -73,7 +76,14 @@ impl AgentExecutor {
             disabled_tools: HashSet::new(),
             subsessions: Arc::new(Mutex::new(HashMap::new())),
             max_steps,
+            subagent_depth: 0,
         }
+    }
+
+    /// サブエージェントとしての深さを設定する（ルートは 0）。
+    pub fn with_subagent_depth(mut self, depth: u32) -> Self {
+        self.subagent_depth = depth;
+        self
     }
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -102,6 +112,7 @@ impl AgentExecutor {
                         agent: state.agent,
                         conversation: state.conversation,
                         disabled_tools: state.disabled_tools.into_iter().collect(),
+                        subagent_depth: 0,
                     },
                 )
             })
@@ -486,12 +497,19 @@ impl AgentExecutor {
             .map(|r| r.output)
     }
 
-    fn with_subsession_callbacks(&self, ctx: ToolContext) -> ToolContext {
+    fn with_subsession_callbacks(&self, mut ctx: ToolContext) -> ToolContext {
+        // task ツールの深さガードに現在値を渡す（extra は子で作り直されるため
+        // 実効的な伝播は disabled_tools 経由だが、ここでも整合させておく）。
+        ctx.extra.insert(
+            opencode_tool::task::SUBAGENT_DEPTH_KEY.to_string(),
+            serde_json::json!(self.subagent_depth),
+        );
         let subsessions = self.subsessions.clone();
         let providers = self.providers.clone();
         let tools = self.tools.clone();
         // 親セッションの無効ツールを子セッションへ継承するためのスナップショット。
         let parent_disabled_tools = self.disabled_tools.clone();
+        let parent_depth = self.subagent_depth;
 
         ctx.with_create_subsession({
             let subsessions = subsessions.clone();
@@ -533,6 +551,7 @@ impl AgentExecutor {
                             agent,
                             conversation,
                             disabled_tools: merged_disabled_tools,
+                            subagent_depth: parent_depth + 1,
                         },
                     );
                     Ok(session_id)
@@ -561,7 +580,8 @@ impl AgentExecutor {
 
                     let mut executor =
                         AgentExecutor::new(state.agent, providers.clone(), tools.clone())
-                            .with_disabled_tools(state.disabled_tools.iter().cloned());
+                            .with_disabled_tools(state.disabled_tools.iter().cloned())
+                            .with_subagent_depth(state.subagent_depth);
                     executor.conversation = state.conversation;
 
                     let output = executor.execute_subsession(prompt).await.map_err(|e| {

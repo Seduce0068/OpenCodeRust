@@ -40,7 +40,7 @@ Rustは以下の強みでこれらを解決可能：
 
 ### 1. 互換性維持（上流追随）
 
-- **CLI インターフェース互換**: `opencode` コマンド引数・サブコマンド・フラグを維持
+- **CLI 引数・サブコマンド互換**: `opencode` の引数・サブコマンド・フラグは準拠。バイナリ名は `opencoderust`。
 - **API 互換**: HTTP/SSE/WebSocket エンドポイント、JSON スキーマを維持
 - **設定互換**: `opencode.jsonc` / `.opencode/opencode.jsonc` 形式を維持
 - **セッション形式互換**: SQLite スキーマ・JSON エクスポート形式を維持

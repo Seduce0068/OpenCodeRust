@@ -4,7 +4,7 @@ title: "OpenCodeRust 全体クロスレビュー報告 (2026-11-17)"
 description: >-
   5回の観点別レビューと第6回の重複排除・妥当性検証の結果。
   95件を66グループに統合。
-status: Current
+status: Superseded
 tags:
   - cross-review
   - audit
@@ -17,9 +17,24 @@ verified:
   at: "2026-11-17T21:29:22+09:00"
 ---
 
+## 更新注記（2026-11-21）
+
+本報告書は 2026-11-17 時点のクロスレビュー・スナップショットであり、現行状態を表さない。
+`status` を `Superseded` へ変更し、以下は履歴記録として保持する。
+記載中のクレート数は現行の 21 へ更新した。
+
+完了済み項目の解決先は次のとおり。
+
+- H-12（Bearer トークンの平文ログ出力）: [CHANGELOG.md](../CHANGELOG.md) の
+  [Unreleased] Fixed と [todo.md](../todo.md) の完了エントリを参照。
+- M-06（placeholder エンドポイントの隠蔽）: [CHANGELOG.md](../CHANGELOG.md) の
+  [Unreleased] Fixed と [todo.md](../todo.md) の完了エントリを参照。
+- L-12（read ツールの `limit=0` 誤メッセージ）: [CHANGELOG.md](../CHANGELOG.md) の
+  Fixed と [todo.md](../todo.md) の完了エントリを参照。
+
 ## 目的と範囲
 
-プロジェクト全体（22 crate、Cargo.toml / Cargo.lock、docs、ADR、CI、opencode.jsonc、
+プロジェクト全体（21 crate、Cargo.toml / Cargo.lock、docs、ADR、CI、opencode.jsonc、
 スクリプト）を様々な観点でクロスレビューし、重複と妥当性を吸収して
 ルート `todo.md` に追加する。コードの修正は行わない。
 
