@@ -180,23 +180,12 @@ status: current
 
 - [ ] **`.opencode/opencode.json{,c}` が load_project と load_all で二重読込**
   — `loader.rs:126-136` / CFG-010
-- [ ] **shell_exec が子プロセス出力を read_to_end で無制限保持**
-  — `session/prompt.rs:3497` / RES-05
-- [ ] **FileWatcher の debounce DashMap が prune されず無期限残存**
-  — `watcher/lib.rs:88` / RES-06
-- [ ] **Task ツールのサブエージェント再帰に深さ上限なし** — `tool/task.rs:80-132` / RES-07
-- [ ] **wellknown 設定キャッシュが期限切れエントリを削除しない** — `wellknown.rs:191` / RES-08
 - [ ] **セッション生成時のプラグインフック task が JoinHandle を保持せずデタッチ**
   — `session.rs:780` / RES-09
 - [ ] **storage のマイグレーション SQL 定数が pub で外部露出** — `storage/lib.rs:15,21` / API-07
 - [ ] **util/watcher/tui/tool の crate 級・pub 項目に doc 欠落** — `各 lib.rs` / API-08
 - [ ] **Plugin::register_hooks が手動 `Pin<Box>` で非同期パターンが 3 様式**
   — `plugin/lib.rs:255` / API-09
-- [ ] **status: Current のクロスレビュー報告が過去スナップショットのまま**
-  — `cross-review-report:7` / CROSS-REVIEW
-- [ ] **文書索引が opencode-pty.md と報告書を案内していない**
-  — `docs/README.md:36-61` / DOCS-INDEX
-- [ ] **憲章の opencode コマンド互換主張が実バイナリ名と不一致** — `charter:43` / CHARTER-CLI
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -338,6 +327,8 @@ status: current
 
 ## 完了
 
+- [x] **[リソース/ドキュメント 7 件]** 回収・再帰上限・履歴スナップショット
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[storage/mcp 5 件]** metadata/cost 往復・v3 移行・権限 fail-closed
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[config/wire/glob 7 件]** env 配線・serde 対称化・連鎖置換
@@ -635,6 +626,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 実装メモ（リソース/ドキュメントの修正時）: task 担当が
+  executor.rs の子 ToolContext が extra 空で作り直される旨を指摘。親が
+  AgentExecutor に subagent_depth を追加し、SubsessionState 経由で子へ +1
+  伝播するよう配線（実再帰経路でも上限が効く）。永続化復元側は depth=0。
 - 2026-11-21 R4 残存（storage/mcp の修正時、記録のみ）: user_version=3 なのに
   messages.metadata/usage 列が欠ける不整合 DB は自己修復されない（エッジケース）。
   起動時 tolerant 一覧のコメント（session 破損はスキップ）と message 側 fail-loud
