@@ -9,10 +9,10 @@ tags:
   - tooling
 generated:
   by: agent
-  at: "2026-11-21T00:34:34+09:00"
+  at: "2026-11-21T03:06:01+09:00"
 reviewed:
   by: agent
-  at: "2026-11-21T00:34:34+09:00"
+  at: "2026-11-21T03:06:01+09:00"
 ---
 
 ## ADR-0008: テストカバレッジの現状と段階的改善方針
@@ -146,7 +146,7 @@ session / tool は改善したが依然として未達である。
 主因だったが、再計測で 10 行分回復し、タイミング依存の計測揺らぎである
 ことを確認した。
 
-テスト件数自体は 2725 件で、`cargo test --workspace --all-targets` と
+テスト件数自体は 2730 件で、`cargo test --workspace --all-targets` と
 `cargo nextest run --workspace` の両方が green である。2026-11-19 の再計測は
 既存のタイミング依存テスト（`client::tests::call_tool_resets_timeout_on_progress_notification`、
 20ms の progress deadline）が tarpaulin の計測オーバーヘッドでタイムアウトした
@@ -194,7 +194,7 @@ session / tool は改善したが依然として未達である。
   と比較する。
 - 段階的なテスト追加の結果、`opencode-tool/src/truncation.rs` は
   58/58 行 (100%) に到達し、`opencode-permission` は 85.97%、
-  `opencode-tool` は 42.87% となった。
+  `opencode-tool` は 55.12% (1,922/3,487) となった。
   未カバー分岐のテスト追加を重要パス (session / tool) へ継続する。
 
 ### Links

@@ -9,6 +9,8 @@ use crate::Config;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+/// リモート `.well-known/opencode` レスポンスの最大バイト数（8 MiB）。
+const MAX_WELLKNOWN_JSON_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The JSON shape returned by `{url}/.well-known/opencode`.
 #[derive(Debug, Deserialize)]
@@ -180,7 +182,11 @@ async fn fetch_wellknown_config(client: &reqwest::Client, endpoint: &str) -> Res
         anyhow::bail!("HTTP {} from {}", resp.status(), endpoint);
     }
 
-    let wk: WellKnownResponse = resp.json().await?;
+    let body = resp.bytes().await?;
+    if body.len() as u64 > MAX_WELLKNOWN_JSON_BYTES {
+        anyhow::bail!("well-known response exceeds size limit");
+    }
+    let wk: WellKnownResponse = serde_json::from_slice(&body)?;
     let config_value = wk
         .config
         .unwrap_or(serde_json::Value::Object(Default::default()));
@@ -224,6 +230,11 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wellknown_byte_limit_is_eight_mib() {
+        assert_eq!(MAX_WELLKNOWN_JSON_BYTES, 8 * 1024 * 1024);
+    }
 
     /// Env vars and the wellknown cache are process-global: serialize every
     /// test that touches either so they cannot interfere with one another.

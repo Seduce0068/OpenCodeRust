@@ -6,8 +6,21 @@ tags: [investigation, final, roadmap, opencoderust]
 generated:
   by: lead
   at: "2026-11-17T21:35:00+09:00"
-status: Current
+status: Superseded
 ---
+
+## 更新注記（2026-11-21）
+
+本レポートは 2026-11-17 時点の調査スナップショットであり、現行状態を表さない。
+`status` を `Superseded` へ変更し、現行文書として索引に掲載する対象外とする。
+記載中のクレート数は現行の 21 へ更新した。完了済み項目の解決先は次のとおり。
+
+- F-01 / F-24 / F-25 (ドキュメント整合):
+  [ADR-0007](adr/adr-0007-missing-docs-deferred.md)、
+  [ADR-0008](adr/adr-0008-coverage-baseline.md)、
+  [opencode-provider.md](opencode-provider.md) を参照。
+- F-16 / F-26 (CI ゲート・`/api` prefix):
+  [CHANGELOG.md](../CHANGELOG.md) の [Unreleased] Fixed を参照。
 
 ## 目的と方法
 
@@ -15,7 +28,7 @@ status: Current
 エージェントチーム（延べ 10 エージェント、内 2 件は途中失敗を Lead が代替）
 で並列実行し、6 回目の本レポートで重複・妥当性を吸収した。
 
-対象: `OpenCodeRust`（22 クレート、Commit `71e8eef`）
+対象: `OpenCodeRust`（21 クレート、Commit `71e8eef`）
 参照 upstream: `/home/koppe/ドキュメント/作業用/opencode` @ `9c7bc2f42f`
 （2026-10-31）
 

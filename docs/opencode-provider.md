@@ -16,7 +16,8 @@ building, streaming response parsing, retries, and model capability queries.
 
 - Unified provider abstraction
 - Integrate multiple vendor APIs (OpenAI, Anthropic, Google, xAI, Groq, etc.)
-- Register a local LiteRT-LM provider (currently a placeholder; see below)
+- Do not register a local LiteRT-LM provider (FFI 未リンクのため登録しない /
+  FFI is not linked; see below)
 - Model registration, context window, capability metadata
 - Retry and streaming event handling
 

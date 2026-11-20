@@ -66,12 +66,17 @@ AGENTS.md セクション8は「公開 API: すべてに `///` ドキュメン�
 - 既存の `cargo check` / `clippy` / `test` のゲートは影響を受けない。
 - rustdoc の HTML タグ解釈警告（`Vec<PartInput>`）は別途修正済みである。
 
-段階的対応の進捗（2026-11-18 時点）:
+段階的対応の進捗（2026-11-21 更新）:
 
 - `opencode-cli` / `opencode-local-llm`: 個別 green（既存）。
 - `opencode-types` / `opencode-core`: クレートドキュメント (`//!`) と主要
-  `pub mod` の `///` を追加済み。個別 pub 型の `///` は段階対応中で、
-  `missing_docs` は 2 クレート合計 276 件残存。
+  `pub mod` の `///` を追加済み。2026-11-18 時点では 2 クレート合計
+  276 件残存していたが、個別 pub 型へ `///` を 280 行追加し、
+  2026-11-21 に 0 件へ解消した（[CHANGELOG.md](../../CHANGELOG.md) の
+  [Unreleased] Fixed、L-08 第3段）。
+- この 0 件は上記 2 クレートに限る。Context の表に挙げた他クレート
+  (`opencode-tui` 1,336 件、`opencode-provider` 1,106 件など) は未対応で、
+  workspace 全体の `missing_docs` gate は失敗し続ける。
 
 ### Links
 
