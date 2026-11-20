@@ -294,11 +294,8 @@ status: current
 - [ ] **トップレベル env マップがサブプロセスへ適用されない dead 設定** — `schema.rs:275` / CFG-008
 - [ ] **mcp.protocol auto が legacy と同一 revision で probe 未実装**
   — `schema.rs:775-789` / CFG-009
-- [ ] **MCP OAuth のサーバ別メモリログが無上限で蓄積** — `mcp_oauth.rs:110,191` / RES-01
 - [ ] **セッション更新 Hook が unbounded_channel で全 Session clone を送る**
   — `routes.rs:2260` / RES-02
-- [ ] **grep が全マッチを Vec 保持し巨大 1 行を丸ごと読む** — `grep_tool.rs:161,211` / RES-03
-- [ ] **Models/wellknown のリモート取得にレスポンスバイト上限なし** — `models.rs:165` / RES-04
 - [ ] **opencode-server の glob re-export で DTO とドメイン型が同名衝突**
   — `server/lib.rs:29-35` / API-04
 - [ ] **lsp feature 経由の公開 API に doc が無い** — `tool/lsp_tool.rs:12-38` / API-05
@@ -306,13 +303,6 @@ status: current
   — `Cargo.toml:3-25` / API-06
 - [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
   — `session/todo.rs:441` / API-10
-- [ ] **ADR-0007 の missing_docs 276 件残存が解消済みで古い** — `adr-0007:69-74` / ADR-0007
-- [ ] **ADR-0008 内で opencode-tool カバレッジ値が矛盾**
-  — `adr-0008:129,195` / ADR-0008-TOOL
-- [ ] **provider ドキュメントが未登録の LiteRT を責務に挙げる**
-  — `opencode-provider.md:19` / PROVIDER-LITERT
-- [ ] **status: Current の調査最終報告が完了済みタスクを未対応として提示**
-  — `investigation-final-report.md:18` / INVESTIGATION-REPORT
 
 - [ ] **TodoStatus/Priority の serde と `parse_*` が往復非対称**
   — `todo.rs:30-107` / WIRE-03
@@ -372,6 +362,8 @@ status: current
 
 ## 完了
 
+- [x] **[リソース境界/ドキュメント 6 件]** 8 MiB 上限・ログ ring・ADR 追随
+  （2026-11-21、swarm-coding R1-R6・制限プロファイル）
 - [x] **[config/API/ADR high 10 件]** マージ・再 bootstrap・境界整備
   （2026-11-21、swarm-coding R1-R6・制限プロファイル）
 - [x] **[health/ping/logwarn 3 件]** 認証除外・O(1) readiness・失敗可視化
@@ -663,6 +655,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 検証メモ（リソース境界/ドキュメントの修正時）: workspace 全体の
+  cargo test が初回のみ `secure_auth_store_behaviour` で failed（MCP auth file の
+  env 競合）となったが、単体再実行と workspace 再実行で pass（flaky）。
+  investigation-final-report の status を Superseded へ変更（OKF status enum 外、
+  バリデータ導入時に要確認）。remotelimit 担当が変更を返さなかったため親が直接実装。
 - 2026-11-21 R4 残存（config/API/ADR の修正時、記録のみ）: 正規化ロジックが
   opencode-config と server 側でミラー状態（長期的には pub 関数を共有）、
   PATCH の restart_required は plugin/watcher 等を未列挙。
