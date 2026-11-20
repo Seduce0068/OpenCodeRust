@@ -46,7 +46,8 @@ impl HelpDialog {
             return;
         }
 
-        // キー割当の説明行を 2 行追加したため、80x24 でも末尾が見えるよう 20 -> 22 に拡大。
+        // 80x24 の viewport に収まる高さ 22（内側 20 行）を維持し、
+        // キー割当と IME 注記が末尾まで見えるよう表示行を整理している。
         let dialog_area = centered_rect(74, 22, area);
         self.click_map.set_area(dialog_area);
         frame.render_widget(Clear, dialog_area);
@@ -76,10 +77,9 @@ impl HelpDialog {
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("  Ctrl+X  Open command list"),
-            Line::from("  Ctrl+P  Open command palette"),
-            Line::from("  Ctrl+H  Open help"),
-            Line::from("  Ctrl+C/q Exit TUI"),
+            Line::from("  Ctrl+X then n/l/m/a/t/b/s/q/u/r  Commands"),
+            Line::from("  Ctrl+P  Command palette | Ctrl+H  Help"),
+            Line::from("  Ctrl+C / q  Exit TUI"),
             Line::from(""),
             Line::from(Span::styled(
                 "Prompt",
@@ -87,12 +87,11 @@ impl HelpDialog {
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("  Enter   Submit prompt"),
-            Line::from("  Ctrl+U  Clear prompt"),
-            Line::from("  Ctrl+V  Paste clipboard"),
-            Line::from("  Ctrl+Shift+C  Copy prompt"),
-            Line::from("  Ctrl+Shift+X  Cut prompt"),
-            Line::from("  Alt+Up/Alt+Down  Prompt history"),
+            Line::from("  Enter  Submit | Ctrl+U  Clear prompt"),
+            Line::from("  Ctrl+V  Paste from clipboard"),
+            Line::from("  IME is not supported; paste Japanese with Ctrl+V"),
+            Line::from("  Ctrl+Shift+C / Ctrl+Shift+X  Copy / cut prompt"),
+            Line::from("  Alt+Up / Alt+Down  Prompt history"),
             Line::from(""),
             Line::from(Span::styled(
                 "Dialogs",
@@ -100,14 +99,11 @@ impl HelpDialog {
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("  Ctrl+M  Model list"),
-            Line::from("  Alt+V   Cycle model variant"),
-            Line::from("  Ctrl+T  Toggle thinking"),
-            Line::from("  Alt+T   Toggle tool details"),
-            Line::from("  Use /agents to open full agent list"),
-            Line::from("  Ctrl+S  Toggle sidebar"),
-            Line::from("  Use command palette for session/theme/status/MCP dialogs"),
-            Line::from("  Use command palette -> Toggle appearance to switch dark/light"),
+            Line::from("  Ctrl+M  Models | Alt+V  Model variant"),
+            Line::from("  Ctrl+T  Thinking | Alt+T  Tool details"),
+            Line::from("  Ctrl+S  Sidebar | /agents  Agent list"),
+            Line::from("  Command palette: sessions / theme / status / MCP"),
+            Line::from("  Command palette -> Toggle appearance: dark / light"),
         ];
 
         frame.render_widget(
@@ -282,5 +278,25 @@ mod tests {
         assert!(text.contains("Alt+V"), "variant cycle keybind");
         assert!(text.contains("Ctrl+T"), "toggle thinking keybind");
         assert!(text.contains("Alt+T"), "toggle tool details keybind");
+    }
+
+    #[test]
+    fn render_explains_leader_sequence_and_ime_paste() {
+        let mut dialog = HelpDialog::new();
+        dialog.open();
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            dialog.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        assert!(
+            text.contains("Ctrl+X then n/l/m/a/t/b/s/q/u/r"),
+            "leader keys must be spelled out in help"
+        );
+        assert!(
+            text.contains("IME is not supported") && text.contains("Japanese with Ctrl+V"),
+            "IME limitation and paste guidance must be visible"
+        );
     }
 }

@@ -281,7 +281,7 @@ impl SessionView {
             .rev()
             .find(|m| matches!(m.role, MessageRole::Assistant) && m.tokens.output > 0);
 
-        // TS parity: cost only sums assistant messages.
+        // Cost accounting sums assistant messages only.
         let total_cost: f64 = messages
             .iter()
             .filter(|m| matches!(m.role, MessageRole::Assistant))
@@ -395,16 +395,32 @@ impl SessionView {
             .iter()
             .filter(|s| matches!(s.status, crate::context::McpConnectionStatus::Connected))
             .count();
-        let has_mcp_failures = mcp_servers
+        let failed_mcp = mcp_servers
             .iter()
-            .any(|s| matches!(s.status, crate::context::McpConnectionStatus::Failed));
-        let has_mcp_registration_needed = mcp_servers.iter().any(|s| {
-            matches!(
-                s.status,
-                crate::context::McpConnectionStatus::NeedsClientRegistration
-            )
-        });
-        let has_mcp_issues = has_mcp_failures || has_mcp_registration_needed;
+            .filter(|s| matches!(s.status, crate::context::McpConnectionStatus::Failed))
+            .count();
+        let registration_needed_mcp = mcp_servers
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    crate::context::McpConnectionStatus::NeedsClientRegistration
+                )
+            })
+            .count();
+        let auth_needed_mcp = mcp_servers
+            .iter()
+            .filter(|s| matches!(s.status, crate::context::McpConnectionStatus::NeedsAuth))
+            .count();
+        let has_mcp_failures = failed_mcp > 0;
+        let has_mcp_registration_needed = registration_needed_mcp > 0;
+        let has_mcp_issues = has_mcp_failures || has_mcp_registration_needed || auth_needed_mcp > 0;
+        let mcp_footer_label = mcp_status_footer_label(
+            connected_mcp,
+            failed_mcp,
+            registration_needed_mcp,
+            auth_needed_mcp,
+        );
         let show_connect_hint =
             !has_connected_provider && Utc::now().timestamp().rem_euclid(15) >= 10;
 
@@ -447,7 +463,7 @@ impl SessionView {
                     theme.success
                 };
                 right_spans.push(Span::styled(
-                    format!("⊙ {} MCP", connected_mcp),
+                    mcp_footer_label,
                     Style::default().fg(mcp_color),
                 ));
                 right_spans.push(Span::raw("  "));
@@ -1414,6 +1430,33 @@ fn format_number(value: u64) -> String {
     out.chars().rev().collect()
 }
 
+/// セッションフッターの MCP 要約を、色に頼らない文言付きで返す。
+///
+/// 括弧内の語彙はサイドバーの `status_text`（`failed` / `needs auth` /
+/// `needs client ID`）と同じものを使い、色覚に依存せず状態を判別できるようにする。
+fn mcp_status_footer_label(
+    connected: usize,
+    failed: usize,
+    registration_needed: usize,
+    auth_needed: usize,
+) -> String {
+    let mut issues = Vec::new();
+    if failed > 0 {
+        issues.push(format!("{} failed", failed));
+    }
+    if auth_needed > 0 {
+        issues.push(format!("{} needs auth", auth_needed));
+    }
+    if registration_needed > 0 {
+        issues.push(format!("{} needs client ID", registration_needed));
+    }
+    if issues.is_empty() {
+        format!("⊙ {} MCP", connected)
+    } else {
+        format!("⊙ {} MCP ({})", connected, issues.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,5 +1564,17 @@ mod tests {
         view.scroll_offset = usize::MAX;
         view.last_messages_area = Some(Rect::new(0, 0, 40, 10));
         assert!(!view.handle_click(0, 5));
+    }
+
+    #[test]
+    fn mcp_footer_label_spells_out_status_in_words() {
+        // 色だけでは状態が伝わらないため、サイドバーと同じ status_text を文言化する。
+        assert_eq!(mcp_status_footer_label(2, 0, 0, 0), "⊙ 2 MCP");
+        assert_eq!(mcp_status_footer_label(2, 1, 0, 0), "⊙ 2 MCP (1 failed)");
+        assert_eq!(
+            mcp_status_footer_label(1, 0, 1, 1),
+            "⊙ 1 MCP (1 needs auth, 1 needs client ID)"
+        );
+        assert_eq!(mcp_status_footer_label(0, 2, 0, 0), "⊙ 0 MCP (2 failed)");
     }
 }

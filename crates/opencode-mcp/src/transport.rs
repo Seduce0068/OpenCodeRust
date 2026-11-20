@@ -604,6 +604,23 @@ impl SseTransport {
     }
 }
 
+impl Drop for SseTransport {
+    fn drop(&mut self) {
+        // `Drop` は非同期コンテキストとは限らないため `lock().await` は使えない。
+        // `try_lock()` で待機せずに取得する。同時に `connect()` / `close()` が
+        // ガードを保持している場合は、その側が `abort()` を担当するため、
+        // ここで待つ必要も待てる必要もない。
+        //
+        // 401 リトライ等で旧 transport が単にドロップされる経路でも、
+        // JoinHandle がデタッチされてタスクがリークしないよう保険として働く。
+        if let Ok(mut task) = self.sse_task.try_lock() {
+            if let Some(handle) = task.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl McpTransport for SseTransport {
     async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
@@ -760,6 +777,7 @@ mod http_sse_limit_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Once;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -995,5 +1013,115 @@ mod http_sse_limit_tests {
 
         transport.close().await.expect("close");
         handle.join().expect("mock thread must not panic");
+    }
+
+    /// 接続を開いたままイベントを送らない SSE モック。
+    /// リスナタスクが自然終了しないため、Drop の abort を観測できる。
+    fn serve_sse_keep_open() -> (
+        String,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        ensure_no_proxy();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+        let addr = listener.local_addr().expect("loopback addr must succeed");
+        let url = format!("http://{addr}/mcp");
+        let connected = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let connected_thread = Arc::clone(&connected);
+        let stop_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("mock listener must be nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            panic!("mock timed out waiting for a connection");
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("mock accept failed: {err}"),
+                }
+            };
+            connected_thread.store(true, Ordering::Release);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("mock read timeout");
+
+            // リクエスト（ヘッダ + Content-Length 分のボディ）を読み捨てる。
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("mock must read request");
+                assert!(read > 0, "unexpected EOF while reading request");
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(position) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let read = stream
+                    .read(&mut chunk)
+                    .expect("mock must read request body");
+                assert!(read > 0, "unexpected EOF while reading request body");
+                buf.extend_from_slice(&chunk[..read]);
+            }
+
+            // SSE ヘッダだけ送り、接続を開いたままイベントは送らない。
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop_thread.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        (url, connected, stop, handle)
+    }
+
+    /// 401 リトライ等で旧 transport が単にドロップされる経路のリーク回帰。
+    #[tokio::test]
+    async fn dropping_sse_transport_aborts_background_listener() {
+        let (url, connected, stop, server) = serve_sse_keep_open();
+
+        let transport = SseTransport::new(url, None);
+        transport.connect().await.expect("connect must succeed");
+
+        // リスナが実際に接続するまで待ち、自然終了済みのタスクを
+        // 計測しないようにする。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !connected.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "SSE listener never connected");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let abort_handle = {
+            let task = transport.sse_task.lock().await;
+            task.as_ref()
+                .expect("listener task must be registered")
+                .abort_handle()
+        };
+        // 現行 tokio の AbortHandle には is_aborted() が無いため、
+        // Drop が完了し、二重 abort も安全であることだけを検証する。
+        drop(transport);
+        abort_handle.abort();
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("mock thread must not panic");
     }
 }

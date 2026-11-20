@@ -28,11 +28,39 @@ It is the configuration entrypoint for runtime behaviour.
 - Project extension: `.opencode/opencode.jsonc` / `.opencode/opencode.json`
 - Global: `~/.config/opencode/opencode.jsonc` (or `.json`)
 
+## JSONC / JSON precedence
+
+Every layer reads both formats when they exist in the same directory:
+`opencode.jsonc` first, then `opencode.json`. Plain JSON is merged last and
+therefore has the higher priority. This rule is identical for the global,
+project, `.opencode` extension and managed layers:
+
+| Layer | Read order (low to high) |
+| --- | --- |
+| Global | `~/.config/opencode/opencode.jsonc` → `opencode.json` |
+| Project | `opencode.jsonc` → `opencode.json` |
+| Extension | `.opencode/opencode.jsonc` → `.opencode/opencode.json` |
+| Managed | `opencode.jsonc` → `opencode.json` |
+
+Layer precedence is global → custom config (`OPENCODE_CONFIG`) → project →
+`.opencode` directories → inline config (`OPENCODE_CONFIG_CONTENT`) →
+environment overrides → managed config. Within a single layer,
+`opencode.json` always wins over `opencode.jsonc`.
+
+Write-back updates target the effective winner: when both files coexist the
+patch is written to `opencode.json`, so it is not shadowed on the next load.
+Updates only target files directly under the project (or global config)
+directory. `.opencode/` extension files and inherited ancestor configs are
+read-only for the update API; a patch in a project with an effective
+`.opencode/opencode.json` may therefore be shadowed on the next load.
+
 ## Usage notes
 
 - When adding new config fields, define default behaviour
 - Merge behaviour should remain predictable
 - Changes to provider/mcp/agent fields should be reflected in docs
+- A `{file:...}` reference inside a `//` or `/* ... */` comment is left
+  verbatim; only references in real settings are expanded
 
 ## Schema compatibility
 

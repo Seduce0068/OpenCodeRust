@@ -544,6 +544,7 @@ impl App {
                 if self.leader_state.active {
                     if self.leader_state.check_timeout() {
                         // Leader timed out, fall through to normal handling
+                        self.prompt.set_leader_active(false);
                     } else {
                         let action = match key.code {
                             KeyCode::Char('n') => Some(CommandAction::NewSession),
@@ -559,6 +560,7 @@ impl App {
                             _ => None,
                         };
                         self.leader_state.reset();
+                        self.prompt.set_leader_active(false);
                         if let Some(action) = action {
                             self.execute_command_action(action)?;
                         }
@@ -569,6 +571,7 @@ impl App {
                 // Ctrl+X starts leader key sequence
                 if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL {
                     self.leader_state.start(KeyCode::Char('x'));
+                    self.prompt.set_leader_active(true);
                     return Ok(());
                 }
 
@@ -3127,7 +3130,7 @@ impl App {
                     McpConnectionStatus::Connected => "connected",
                     McpConnectionStatus::Disconnected => "disconnected",
                     McpConnectionStatus::Failed => "failed",
-                    McpConnectionStatus::NeedsAuth => "needs authentication",
+                    McpConnectionStatus::NeedsAuth => "needs auth",
                     McpConnectionStatus::NeedsClientRegistration => "needs client ID",
                     McpConnectionStatus::Disabled => "disabled",
                 };

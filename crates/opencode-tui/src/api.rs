@@ -318,6 +318,286 @@ fn unsupported(operation: &'static str) -> anyhow::Error {
     anyhow::Error::new(UnsupportedEndpointError { operation })
 }
 
+const REDACTED: &str = "[redacted]";
+const SENSITIVE_KEY_PARTS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "api_key",
+    "apikey",
+    "credential",
+];
+
+/// 既知プレフィックスのみを対象に、トークン値全体を `[redacted]` へ置換する。
+///
+/// 誤マスクを避けるため、一般の高エントロピー文字列は対象にしない。対象は
+/// `sk-`、JWT（`eyJ` で始まる Base64URL 3 セグメント）、GitHub PAT
+/// （`ghp_` / `gho_` / `github_pat_`）、AWS アクセスキー（`AKIA` / `ASIA`）、
+/// および `token=` / `api_key=` に続く値に限定する。
+fn redact_token_patterns(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        /// プレフィックス後は Base64URL / `.` / `-` / `_` の連続。
+        Word,
+        /// プレフィックス後は区切り文字に達するまでの連続（キーと値が一体の表現）。
+        Value,
+        /// `eyJ` + Base64URL 3 セグメント。
+        Jwt,
+        /// `AKIA` / `ASIA` + 大文字数字 16 文字。
+        Aws,
+    }
+
+    fn is_base64url(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+    }
+
+    fn value_len(rest: &str, kind: Kind) -> usize {
+        match kind {
+            Kind::Word => rest
+                .bytes()
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_')
+                })
+                .count(),
+            Kind::Value => rest
+                .bytes()
+                .take_while(|byte| {
+                    !byte.is_ascii_whitespace()
+                        && !matches!(
+                            *byte,
+                            b'"' | b'\'' | b',' | b';' | b')' | b']' | b'}' | b'&'
+                        )
+                })
+                .count(),
+            Kind::Jwt => {
+                let mut segments = rest.splitn(3, '.');
+                let header = segments.next().unwrap_or("");
+                let payload = segments.next().unwrap_or("");
+                let signature = segments.next().unwrap_or("");
+                if header.is_empty()
+                    || payload.is_empty()
+                    || signature.is_empty()
+                    || !header.bytes().all(is_base64url)
+                    || !payload.bytes().all(is_base64url)
+                    || !signature.bytes().all(is_base64url)
+                {
+                    return 0;
+                }
+                header.len() + 1 + payload.len() + 1 + signature.len()
+            }
+            Kind::Aws => {
+                let len = rest
+                    .bytes()
+                    .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                    .take(16)
+                    .count();
+                if len == 16 {
+                    len
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    // 長いプレフィックスを先に並べ、同位置では最長のものを優先する。
+    const PATTERNS: &[(&str, Kind)] = &[
+        ("github_pat_", Kind::Word),
+        ("api_key=", Kind::Value),
+        ("apikey=", Kind::Value),
+        ("token=", Kind::Value),
+        ("ghp_", Kind::Word),
+        ("gho_", Kind::Word),
+        ("akia", Kind::Aws),
+        ("asia", Kind::Aws),
+        ("eyj", Kind::Jwt),
+        ("sk-", Kind::Word),
+    ];
+
+    let mut out = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while !remaining.is_empty() {
+        let lower = remaining.to_ascii_lowercase();
+        let mut best: Option<(usize, usize, Kind)> = None;
+        for (prefix, kind) in PATTERNS {
+            let Some(index) = lower.find(*prefix) else {
+                continue;
+            };
+            let better = match best {
+                None => true,
+                Some((best_index, best_len, _)) => {
+                    index < best_index || (index == best_index && prefix.len() > best_len)
+                }
+            };
+            if better {
+                best = Some((index, prefix.len(), *kind));
+            }
+        }
+
+        let Some((index, prefix_len, kind)) = best else {
+            out.push_str(remaining);
+            break;
+        };
+
+        out.push_str(&remaining[..index]);
+        let after_prefix = &remaining[index + prefix_len..];
+        let len = value_len(after_prefix, kind);
+        if len == 0 {
+            // 既知プレフィックスでも値が無い場合はマスクしない（誤マスク回避）。
+            out.push_str(&remaining[..index + prefix_len]);
+            remaining = after_prefix;
+            continue;
+        }
+        out.push_str(REDACTED);
+        remaining = &after_prefix[len..];
+    }
+
+    out
+}
+
+/// JSON の機微キーの値と、値に埋め込まれた既知トークンをマスクする。
+///
+/// キー名に依存しない既知プレフィックスのマスクも行うため、ログへトークン値が
+/// 出ないようにする（一般の高エントロピー文字列はマスクしない）。
+fn redact_sensitive(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if SENSITIVE_KEY_PARTS.iter().any(|part| lower.contains(*part)) {
+                    *child = serde_json::Value::String(REDACTED.to_string());
+                } else {
+                    redact_sensitive(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_sensitive(item);
+            }
+        }
+        serde_json::Value::String(text) => {
+            let redacted = redact_token_patterns(text);
+            if redacted != text.as_str() {
+                *text = redacted;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 改行・制御文字を畳み、既知のトークンをマスクして長さを制限する。
+fn truncate_summary(raw: &str, max_chars: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let scrubbed_tokens = redact_token_patterns(&collapsed);
+
+    let mut out = String::with_capacity(scrubbed_tokens.len());
+    let mut redact_next = false;
+    for word in scrubbed_tokens.split(' ') {
+        if redact_next {
+            out.push_str(REDACTED);
+            out.push(' ');
+            redact_next = false;
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if lower == "bearer" {
+            out.push_str(REDACTED);
+            out.push(' ');
+            redact_next = true;
+            continue;
+        }
+        out.push_str(word);
+        out.push(' ');
+    }
+    let scrubbed = out.trim_end();
+    if scrubbed.chars().count() <= max_chars {
+        return scrubbed.to_string();
+    }
+    let mut truncated: String = scrubbed.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// 共通エラースキーマから `(type, message)` を取り出す。
+///
+/// `{"error": {"message": ..., "type": ...}}` を優先し、フラットな
+/// `{"message": ..., "type": ...}` と `{"error": "..."}` にも対応する。
+fn extract_error_fields(body: &str) -> (Option<String>, Option<String>) {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+    let error = value.get("error");
+
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| error.and_then(serde_json::Value::as_str))
+        .map(|raw| truncate_summary(raw, 200));
+    let kind = error
+        .and_then(|e| e.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("type").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            error
+                .and_then(|e| e.get("name"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(|raw| truncate_summary(raw, 80));
+    (kind, message)
+}
+
+/// 4xx / 5xx ごとの対処文。
+fn status_advice(status: reqwest::StatusCode) -> &'static str {
+    if status.is_client_error() {
+        " Check the request (parameters, authentication, permissions) and retry."
+    } else if status.is_server_error() {
+        " The server is temporarily unavailable; retry in a moment."
+    } else {
+        ""
+    }
+}
+
+/// HTTP エラーレスポンスを要約して toast に出す一文へ変換する。
+///
+/// 生ボディはここでログにのみ残し（機微キーはマスク）、利用者には
+/// `type` / `message` と status ごとの対処文だけを渡す。
+fn error_detail(status: reqwest::StatusCode, body: &str) -> String {
+    let (kind, message) = extract_error_fields(body);
+
+    let logged_body = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut value) => {
+            redact_sensitive(&mut value);
+            value.to_string()
+        }
+        // プレーンテキストにはトークン等が混在し得るため全文はログに出さない。
+        Err(_) => "<non-JSON body omitted>".to_string(),
+    };
+    tracing::warn!(
+        status = %status,
+        error_type = ?kind,
+        message = ?message,
+        body = %truncate_summary(&logged_body, 512),
+        "API request failed"
+    );
+
+    let detail = match (kind, message) {
+        (Some(kind), Some(message)) => format!("[{}] {}", kind, message),
+        (None, Some(message)) => message,
+        (Some(kind), None) => format!("[{}]", kind),
+        (None, None) => "no error details returned".to_string(),
+    };
+    format!("{} - {}{}", status, detail, status_advice(status))
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -368,7 +648,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to create session: {} - {}", status, text);
+            anyhow::bail!("Failed to create session: {}", error_detail(status, &text));
         }
 
         let session: SessionInfo = response.json()?;
@@ -383,7 +663,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get session: {} - {}", status, text);
+            anyhow::bail!("Failed to get session: {}", error_detail(status, &text));
         }
 
         let session: SessionInfo = response.json()?;
@@ -418,7 +698,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to list sessions: {} - {}", status, text);
+            anyhow::bail!("Failed to list sessions: {}", error_detail(status, &text));
         }
 
         let sessions: Vec<SessionInfo> = response.json()?;
@@ -431,7 +711,10 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get session status: {} - {}", status, text);
+            anyhow::bail!(
+                "Failed to get session status: {}",
+                error_detail(status, &text)
+            );
         }
         Ok(response.json::<HashMap<String, SessionStatusInfo>>()?)
     }
@@ -450,10 +733,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to update session `{}` title: {} - {}",
+                "Failed to update session `{}` title: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         let session: SessionInfo = response.json()?;
@@ -467,10 +749,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to delete session `{}`: {} - {}",
+                "Failed to delete session `{}`: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         // M-52: 旧実装は Value::get(...).unwrap_or(true) で、
@@ -503,7 +784,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to send prompt to {}: {} - {}", url, status, text);
+            anyhow::bail!("Failed to send prompt: {}", error_detail(status, &text));
         }
 
         let result: serde_json::Value = response.json()?;
@@ -528,7 +809,10 @@ impl ApiClient {
         }
         if !status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to execute shell command: {} - {}", status, text);
+            anyhow::bail!(
+                "Failed to execute shell command: {}",
+                error_detail(status, &text)
+            );
         }
 
         Ok(response.json::<serde_json::Value>()?)
@@ -541,7 +825,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to abort session: {} - {}", status, text);
+            anyhow::bail!("Failed to abort session: {}", error_detail(status, &text));
         }
 
         Ok(response.json::<serde_json::Value>()?)
@@ -555,7 +839,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get providers: {} - {}", status, text);
+            anyhow::bail!("Failed to get providers: {}", error_detail(status, &text));
         }
 
         let providers: ProviderListResponse = response.json()?;
@@ -570,7 +854,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to list agents: {} - {}", status, text);
+            anyhow::bail!("Failed to list agents: {}", error_detail(status, &text));
         }
 
         let agents: Vec<AgentInfo> = response.json()?;
@@ -589,7 +873,7 @@ impl ApiClient {
         }
         if !status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to list skills: {} - {}", status, text);
+            anyhow::bail!("Failed to list skills: {}", error_detail(status, &text));
         }
 
         Ok(response.json::<Vec<String>>()?)
@@ -603,7 +887,10 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to fetch MCP status: {} - {}", status, text);
+            anyhow::bail!(
+                "Failed to fetch MCP status: {}",
+                error_detail(status, &text)
+            );
         }
 
         let mut servers: Vec<McpStatusInfo> = response
@@ -620,7 +907,11 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to start MCP auth `{}`: {} - {}", name, status, text);
+            anyhow::bail!(
+                "Failed to start MCP auth `{}`: {}",
+                name,
+                error_detail(status, &text)
+            );
         }
         Ok(response.json::<McpAuthStartInfo>()?)
     }
@@ -632,10 +923,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to authenticate MCP `{}`: {} - {}",
+                "Failed to authenticate MCP `{}`: {}",
                 name,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         Ok(response.json::<McpStatusInfo>()?)
@@ -648,10 +938,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to remove MCP auth `{}`: {} - {}",
+                "Failed to remove MCP auth `{}`: {}",
                 name,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         // M-52: `success` の欠落・型不一致は Err として返す。
@@ -665,7 +954,11 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to connect MCP `{}`: {} - {}", name, status, text);
+            anyhow::bail!(
+                "Failed to connect MCP `{}`: {}",
+                name,
+                error_detail(status, &text)
+            );
         }
         // M-52: サーバは Json<bool> を返す。解析失敗は Err として返す。
         Ok(response.json::<bool>()?)
@@ -677,7 +970,11 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to disconnect MCP `{}`: {} - {}", name, status, text);
+            anyhow::bail!(
+                "Failed to disconnect MCP `{}`: {}",
+                name,
+                error_detail(status, &text)
+            );
         }
         // M-52: サーバは Json<bool> を返す。解析失敗は Err として返す。
         Ok(response.json::<bool>()?)
@@ -691,7 +988,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get messages: {} - {}", status, text);
+            anyhow::bail!("Failed to get messages: {}", error_detail(status, &text));
         }
 
         let messages: Vec<MessageInfo> = response.json()?;
@@ -708,7 +1005,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get todos: {} - {}", status, text);
+            anyhow::bail!("Failed to get todos: {}", error_detail(status, &text));
         }
         Ok(response.json::<Vec<TodoInfo>>()?)
     }
@@ -725,7 +1022,10 @@ impl ApiClient {
         }
         if !http_status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get LSP status: {} - {}", http_status, text);
+            anyhow::bail!(
+                "Failed to get LSP status: {}",
+                error_detail(http_status, &text)
+            );
         }
         // 到達不能な成功パス。解析すべきレスポンス型は存在しないため空結果を返す。
         Ok(Vec::new())
@@ -743,7 +1043,10 @@ impl ApiClient {
         }
         if !http_status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to get formatter status: {} - {}", http_status, text);
+            anyhow::bail!(
+                "Failed to get formatter status: {}",
+                error_detail(http_status, &text)
+            );
         }
         // 到達不能な成功パス。解析すべきレスポンス型は存在しないため空結果を返す。
         Ok(Vec::new())
@@ -756,10 +1059,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to share session `{}`: {} - {}",
+                "Failed to share session `{}`: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         Ok(response.json::<ShareResponse>()?)
@@ -772,10 +1074,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to unshare session `{}`: {} - {}",
+                "Failed to unshare session `{}`: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         // M-52: サーバの unshare_session は `{"unshared": true}` を返す。
@@ -792,10 +1093,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to compact session `{}`: {} - {}",
+                "Failed to compact session `{}`: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         Ok(response.json::<CompactResponse>()?)
@@ -815,10 +1115,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to revert session `{}`: {} - {}",
+                "Failed to revert session `{}`: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         Ok(response.json::<RevertResponse>()?)
@@ -844,10 +1143,9 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to fork session `{}`: {} - {}",
+                "Failed to fork session `{}`: {}",
                 session_id,
-                status,
-                text
+                error_detail(status, &text)
             );
         }
         Ok(response.json::<SessionInfo>()?)
@@ -873,9 +1171,8 @@ impl ApiClient {
             let status = response.status();
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
-                "Failed to reply to permission request: {} - {}",
-                status,
-                text
+                "Failed to reply to permission request: {}",
+                error_detail(status, &text)
             );
         }
         Ok(())
@@ -890,7 +1187,10 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to reply to question: {} - {}", status, text);
+            anyhow::bail!(
+                "Failed to reply to question: {}",
+                error_detail(status, &text)
+            );
         }
         Ok(())
     }
@@ -901,7 +1201,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
-            anyhow::bail!("Failed to reject question: {} - {}", status, text);
+            anyhow::bail!("Failed to reject question: {}", error_detail(status, &text));
         }
         Ok(())
     }
@@ -911,6 +1211,115 @@ impl ApiClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- HTTP エラー要約（生ボディを toast に出さない） ---
+
+    #[test]
+    fn error_detail_uses_common_error_schema_and_client_advice() {
+        let detail = error_detail(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid model id","type":"invalid_request"}}"#,
+        );
+
+        assert!(detail.contains("400 Bad Request"), "{detail}");
+        assert!(detail.contains("[invalid_request]"), "{detail}");
+        assert!(detail.contains("invalid model id"), "{detail}");
+        assert!(detail.contains("Check the request"), "{detail}");
+        assert!(
+            !detail.contains("\""),
+            "raw JSON body must not leak: {detail}"
+        );
+    }
+
+    #[test]
+    fn error_detail_supports_flat_schema_and_server_advice() {
+        let detail = error_detail(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"message":"database unavailable","type":"internal_error"}"#,
+        );
+
+        assert!(detail.contains("500 Internal Server Error"), "{detail}");
+        assert!(detail.contains("database unavailable"), "{detail}");
+        assert!(detail.contains("retry in a moment"), "{detail}");
+    }
+
+    #[test]
+    fn error_detail_never_includes_token_values() {
+        let detail = error_detail(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"bad token sk-dummy-secret-123","type":"auth","token":"sk-dummy-secret-123"}}"#,
+        );
+
+        assert!(detail.contains("401 Unauthorized"), "{detail}");
+        assert!(!detail.contains("sk-dummy-secret-123"), "{detail}");
+        assert!(detail.contains("[redacted]"), "{detail}");
+    }
+
+    #[test]
+    fn error_detail_redacts_jwt_github_pat_and_aws_access_key() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkdW1teSJ9.ZHVtbXlzaWduYXR1cmViYXNlNjR1cmxfMTIz";
+        let pat = "ghp_dummy1234567890abcdefghijklmnopqr";
+        let oauth = "gho_dummy1234567890abcdefghijklmnopqr";
+        let fine_grained = "github_pat_dummy1234567890_abcdefghijklmnopqrstuvwxyz";
+        let aws = "AKIADUMMY12345678901";
+        let aws_temp = "ASIADUMMY12345678901";
+        let secrets = [jwt, pat, oauth, fine_grained, aws, aws_temp];
+        let body = format!(
+            r#"{{"error":{{"message":"denied jwt={jwt} pat={pat} oauth={oauth} fine={fine_grained} aws={aws} temp={aws_temp}","type":"auth"}},"hint":"also {jwt}"}}"#
+        );
+
+        // toast へ渡る要約にトークン値が出ないこと。
+        let detail = error_detail(reqwest::StatusCode::UNAUTHORIZED, &body);
+        assert!(detail.contains("401 Unauthorized"), "{detail}");
+        for secret in secrets {
+            assert!(
+                !detail.contains(secret),
+                "secret leaked into toast: {detail}"
+            );
+        }
+        assert!(detail.contains(REDACTED), "{detail}");
+
+        // error_detail が tracing::warn! へ渡す本文と同じ経路を検証する。
+        let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        redact_sensitive(&mut value);
+        let logged = truncate_summary(&value.to_string(), 512);
+        for secret in secrets {
+            assert!(
+                !logged.contains(secret),
+                "secret leaked into log body: {logged}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_token_patterns_keeps_generic_high_entropy_strings() {
+        let generic = "aB3dEf7hJk9mNp2qRs5tUv8wXy0z";
+        assert_eq!(redact_token_patterns(generic), generic);
+
+        // 既知プレフィックスが無い文字列は、長くてもマスクしない。
+        let long = "Q7xKp2mVn9Ld4Rf8Ws1Yt6Zh3Bc5Jg0Na";
+        assert_eq!(redact_token_patterns(long), long);
+    }
+
+    #[test]
+    fn error_detail_falls_back_for_non_json_body() {
+        let detail = error_detail(reqwest::StatusCode::BAD_GATEWAY, "upstream went away");
+
+        assert!(detail.contains("502 Bad Gateway"), "{detail}");
+        assert!(detail.contains("no error details returned"), "{detail}");
+        assert!(!detail.contains("upstream went away"), "{detail}");
+    }
+
+    #[test]
+    fn error_detail_accepts_plain_error_string() {
+        let detail = error_detail(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"permission denied"}"#,
+        );
+
+        assert!(detail.contains("403 Forbidden"), "{detail}");
+        assert!(detail.contains("permission denied"), "{detail}");
+    }
 
     // --- SessionInfo / SessionTimeInfo / SessionRevertInfo ---
 

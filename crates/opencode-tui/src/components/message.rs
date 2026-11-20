@@ -189,9 +189,16 @@ impl MessageView {
                     let diff_lines = diff_view.to_lines(theme);
                     lines.extend(diff_lines);
                 } else if !arguments.is_empty() {
+                    let total = arguments.lines().count();
                     for line in arguments.lines().take(5) {
                         lines.push(Line::from(Span::styled(
                             format!("  {}", line),
+                            Style::default().fg(theme.text_muted),
+                        )));
+                    }
+                    if total > 5 {
+                        lines.push(Line::from(Span::styled(
+                            format!("  … ({} more lines)", total - 5),
                             Style::default().fg(theme.text_muted),
                         )));
                     }
@@ -213,9 +220,16 @@ impl MessageView {
             }
             "todowrite" => {
                 if let Some(res) = result {
+                    let total = res.lines().count();
                     for line in res.lines().take(10) {
                         lines.push(Line::from(Span::styled(
                             format!("  {}", line),
+                            Style::default().fg(theme.text),
+                        )));
+                    }
+                    if total > 10 {
+                        lines.push(Line::from(Span::styled(
+                            format!("  … ({} more lines)", total - 10),
                             Style::default().fg(theme.text),
                         )));
                     }
@@ -564,5 +578,90 @@ mod tests {
         assert!(text.contains("Error: oops"));
         assert!(text.contains("m1"));
         assert!(text.contains("500ms"));
+    }
+
+    // --- ツール出力の切り詰めマーカー ---
+
+    #[test]
+    fn edit_arguments_show_how_many_lines_were_truncated() {
+        let theme = theme();
+        let view = MessageView::new(MessageRole::Assistant);
+        let args = (1..=8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let text = lines_to_text(&view.render_tool_call(
+            "edit",
+            &args,
+            &ToolCallStatus::Completed,
+            None,
+            &theme,
+        ));
+
+        assert!(text.contains("line 1"));
+        assert!(text.contains("line 5"));
+        assert!(!text.contains("line 6"));
+        assert!(text.contains("… (3 more lines)"));
+    }
+
+    #[test]
+    fn apply_patch_arguments_show_how_many_lines_were_truncated() {
+        let theme = theme();
+        let view = MessageView::new(MessageRole::Assistant);
+        let args = (1..=6)
+            .map(|i| format!("patch {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let text = lines_to_text(&view.render_tool_call(
+            "apply_patch",
+            &args,
+            &ToolCallStatus::Completed,
+            None,
+            &theme,
+        ));
+
+        assert!(text.contains("… (1 more lines)"));
+    }
+
+    #[test]
+    fn todowrite_result_shows_how_many_lines_were_truncated() {
+        let theme = theme();
+        let view = MessageView::new(MessageRole::Assistant);
+        let result = (1..=13)
+            .map(|i| format!("todo {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let text = lines_to_text(&view.render_tool_call(
+            "todowrite",
+            "",
+            &ToolCallStatus::Completed,
+            Some(&result),
+            &theme,
+        ));
+
+        assert!(text.contains("todo 10"));
+        assert!(!text.contains("todo 11"));
+        assert!(text.contains("… (3 more lines)"));
+    }
+
+    #[test]
+    fn truncation_marker_is_omitted_when_output_fits() {
+        let theme = theme();
+        let view = MessageView::new(MessageRole::Assistant);
+        let result = "todo 1\ntodo 2";
+
+        let text = lines_to_text(&view.render_tool_call(
+            "todowrite",
+            "",
+            &ToolCallStatus::Completed,
+            Some(result),
+            &theme,
+        ));
+
+        assert!(text.contains("todo 2"));
+        assert!(!text.contains("more lines"));
     }
 }

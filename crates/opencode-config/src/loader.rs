@@ -92,11 +92,13 @@ impl ConfigLoader {
     fn load_global_from(&mut self, config_dir: &Path) -> Result<()> {
         let global_config_path = config_dir.join("opencode");
 
+        // Match project/managed precedence: read both formats in order so
+        // plain JSON is merged last and wins when both files exist. Breaking
+        // at the first match would invert this layer's priority.
         for ext in &["jsonc", "json"] {
             let path = global_config_path.with_extension(ext);
             if path.exists() {
                 self.load_from_file(&path)?;
-                break;
             }
         }
 
@@ -495,6 +497,17 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
     Some(json_path)
 }
 
+/// Return the escaped contents of a JSON string literal for `value`.
+///
+/// `serde_json::to_string` escapes every control character, including `\b`,
+/// `\f` and NUL. The first and last bytes of its result are always ASCII double
+/// quotes, so slicing them off yields the body to splice into an existing
+/// string literal. Shared by `{env:VAR}` and `{file:...}` expansions.
+fn json_string_body(value: &str) -> String {
+    let quoted = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 /// Substitute `{env:VAR}` patterns with environment variable values.
 ///
 /// Values are inserted as JSON string data, never as raw source text, so a
@@ -530,15 +543,12 @@ fn substitute_env_vars(text: &str) -> String {
             }
         };
 
-        // Serializing a String always yields a quoted JSON string whose first
-        // and last bytes are ASCII double quotes; slicing them off leaves the
-        // escaped contents used inside an existing string literal.
-        let quoted = serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string());
+        let body = json_string_body(&value);
         let match_start = caps.get(0).map_or(0, |m| m.start());
         if inside_json_string_literal(text, match_start) {
-            quoted[1..quoted.len() - 1].to_string()
+            body
         } else {
-            quoted
+            format!("\"{body}\"")
         }
     })
     .to_string()
@@ -609,40 +619,108 @@ fn inside_json_string_literal(text: &str, pos: usize) -> bool {
     in_string
 }
 
+/// Returns `true` when byte offset `pos` in `text` is inside a JSONC comment.
+///
+/// Both `//` line comments and `/* ... */` block comments are recognised. The
+/// scan also tracks string literals so comment markers inside a string (for
+/// example `"https://example.com"`) are not mistaken for real comments, and
+/// so quotes inside a comment do not disturb the string state.
+fn is_inside_comment(text: &str, pos: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut i = 0;
+
+    while i < pos {
+        let byte = bytes[i];
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                line_comment = true;
+                i += 2;
+                continue;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                block_comment = true;
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    line_comment || block_comment
+}
+
 /// Resolve `{file:path}` patterns by reading file contents.
-/// Skips patterns on commented lines. Resolves relative paths from `base_dir`.
+///
+/// Every match is classified at its own byte offset: references inside `//`
+/// or `/* ... */` comments are left verbatim, all others are expanded. The
+/// output is rebuilt by splicing only the matched ranges, so an identical
+/// reference at another position is never affected by this decision.
+///
+/// File contents are escaped with `serde_json::to_string`, the same path used
+/// by `substitute_env_vars`, so every control character (including `\b`, `\f`
+/// and NUL) is escaped and the expanded config stays parseable.
 fn resolve_file_references(text: &str, base_dir: &Path) -> Result<String> {
     let re = regex::Regex::new(r"\{file:([^}]+)\}").unwrap();
 
-    let mut result = text.to_string();
-
-    // Collect all matches first to avoid borrow issues
-    let matches: Vec<(String, String)> = re
+    // Collect ranges first to avoid borrowing `text` while rebuilding it.
+    let matches: Vec<(usize, usize, String, String)> = re
         .captures_iter(text)
         .map(|caps| {
-            let full_match = caps.get(0).unwrap().as_str().to_string();
-            let file_path_str = caps[1].to_string();
-            (full_match, file_path_str)
+            let whole = caps.get(0).unwrap();
+            (
+                whole.start(),
+                whole.end(),
+                whole.as_str().to_string(),
+                caps[1].to_string(),
+            )
         })
         .collect();
 
-    for (full_match, file_path_str) in matches {
-        // Check if the match is on a commented line
-        let match_start = match text.find(&full_match) {
-            Some(pos) => pos,
-            None => continue,
-        };
-        let line_start = text[..match_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let line_end = text[line_start..]
-            .find('\n')
-            .map(|p| line_start + p)
-            .unwrap_or(text.len());
-        let line = &text[line_start..line_end];
-        if line.trim().starts_with("//") {
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    for (start, end, full_match, file_path_str) in matches {
+        result.push_str(&text[cursor..start]);
+        cursor = end;
+
+        if is_inside_comment(text, start) {
+            result.push_str(&full_match);
             continue;
         }
 
-        // Resolve the file path
         let resolved = if let Some(stripped) = file_path_str.strip_prefix("~/") {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("~"))
@@ -653,7 +731,8 @@ fn resolve_file_references(text: &str, base_dir: &Path) -> Result<String> {
             base_dir.join(&file_path_str)
         };
 
-        // Read the file
+        // The error names the reference and path only. File contents are
+        // never copied into an error or log message.
         let content = fs::read_to_string(&resolved).with_context(|| {
             format!(
                 "bad file reference: \"{}\" - {} does not exist",
@@ -663,17 +742,22 @@ fn resolve_file_references(text: &str, base_dir: &Path) -> Result<String> {
         })?;
         let content = content.trim();
 
-        // Escape for JSON string context (newlines, quotes)
-        let escaped = content
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t");
-
-        result = result.replace(&full_match, &escaped);
+        // Use the shared serde_json escaper instead of the old hand-written
+        // five-case replacement: it escapes every control character (\b, \f,
+        // NUL, ...), not only backslash, quote, newline, carriage return and
+        // tab.
+        let body = json_string_body(content);
+        if inside_json_string_literal(text, start) {
+            // The surrounding quotes are already present in the config text.
+            result.push_str(&body);
+        } else {
+            result.push('"');
+            result.push_str(&body);
+            result.push('"');
+        }
     }
 
+    result.push_str(&text[cursor..]);
     Ok(result)
 }
 
@@ -1810,22 +1894,26 @@ pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
 
 /// Update global config by merging a patch.
 ///
-/// The target file follows the precedence of [`ConfigLoader::load_global`],
-/// which stops at the first of `opencode.jsonc` / `opencode.json` that exists.
-/// If a JSONC file is selected, re-serialization drops its comments and
-/// trailing commas, just as for [`project_config_write_path`]. An existing
-/// file that fails to parse aborts the update instead of being replaced with a
-/// default config, preserving the user's secrets and permission rules.
+/// The target file follows the precedence of [`ConfigLoader::load_global`]:
+/// both `opencode.jsonc` and `opencode.json` are read, in that order, so plain
+/// JSON wins when both exist. When they coexist the patch must land in JSON,
+/// otherwise it would be shadowed on the next load. If a JSONC file is the
+/// sole target, re-serialization drops its comments and trailing commas, just
+/// as for [`project_config_write_path`]. An existing file that fails to parse
+/// aborts the update instead of being replaced with a default config,
+/// preserving the user's secrets and permission rules.
 pub fn update_global_config(patch: &Config) -> Result<()> {
     let global_path = get_global_config_path();
 
-    // Try to find existing global config file. `load_global_from` also picks
-    // the first existing file in jsonc -> json order, so keep that precedence.
-    let config_path = ["jsonc", "json"]
-        .iter()
-        .map(|ext| global_path.with_extension(ext))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| global_path.with_extension("json"));
+    // `load_global_from` reads jsonc first and json second, so json is the
+    // last writer and wins when both exist. Mirror that precedence here.
+    let config_path = if global_path.with_extension("json").exists() {
+        global_path.with_extension("json")
+    } else if global_path.with_extension("jsonc").exists() {
+        global_path.with_extension("jsonc")
+    } else {
+        global_path.with_extension("json")
+    };
 
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
@@ -2130,6 +2218,35 @@ mod tests {
     }
 
     #[test]
+    fn substitute_env_vars_escapes_backspace_and_formfeed() {
+        // An OS environment variable cannot hold NUL (set_var would panic), so
+        // the env path is verified with \b and \f. NUL is covered through the
+        // shared json_string_body helper used by this expansion.
+        const VAR: &str = "OPENCODE_H17_CTRL_CHARS";
+        let value = "a\u{0008}b\u{000c}d";
+        std::env::set_var(VAR, value);
+
+        let token = substitute_env_vars(r#"{"api_key": {env:OPENCODE_H17_CTRL_CHARS}}"#);
+        let literal = substitute_env_vars(r#"{"api_key": "{env:OPENCODE_H17_CTRL_CHARS}"}"#);
+        std::env::remove_var(VAR);
+
+        for result in [&token, &literal] {
+            let parsed: serde_json::Value = serde_json::from_str(result)
+                .unwrap_or_else(|err| panic!("control chars must stay JSON-safe: {err}"));
+            assert_eq!(parsed["api_key"].as_str(), Some(value));
+        }
+    }
+
+    #[test]
+    fn json_string_body_escapes_nul_and_other_control_characters() {
+        let value = "a\u{0008}b\u{000c}c\u{0000}d";
+        let body = json_string_body(value);
+        let parsed: serde_json::Value = serde_json::from_str(&format!("\"{body}\""))
+            .unwrap_or_else(|err| panic!("control chars must stay JSON-safe: {err}"));
+        assert_eq!(parsed.as_str(), Some(value));
+    }
+
+    #[test]
     fn substitute_env_vars_string_literal_escapes_special_characters() {
         const VAR: &str = "OPENCODE_H17_LITERAL_SPECIAL";
         let value = "a\"b\\c\nd\re\tf";
@@ -2247,6 +2364,70 @@ mod tests {
         let input = format!(r#"{{"api_key": "{{file:{}}}"}}"#, secret_path.display());
         let result = resolve_file_references(&input, &temp.path).unwrap();
         assert!(result.contains("absolute-secret"));
+    }
+
+    #[test]
+    fn resolve_file_references_skips_block_comments() {
+        let temp = TestDir::new("opencode_file_ref_block_comment");
+        fs::write(temp.path.join("secret.txt"), "block-comment-secret").unwrap();
+
+        let input = r#"{
+            /* "api_key": "{file:secret.txt}" */
+            "model": "claude"
+        }"#;
+        let result = resolve_file_references(input, &temp.path).unwrap();
+
+        assert!(
+            result.contains("{file:secret.txt}"),
+            "a reference inside a block comment must stay verbatim"
+        );
+        assert!(
+            !result.contains("block-comment-secret"),
+            "a reference inside a block comment must not be expanded"
+        );
+    }
+
+    #[test]
+    fn resolve_file_references_expands_setting_despite_identical_comment() {
+        let temp = TestDir::new("opencode_file_ref_duplicate");
+        fs::write(temp.path.join("shared.txt"), "shared-secret").unwrap();
+
+        // The same reference appears first in a comment and then in a real
+        // setting; the first occurrence must not decide the fate of the rest.
+        let input = r#"{
+            // "api_key": "{file:shared.txt}"
+            "instructions": ["{file:shared.txt}"]
+        }"#;
+        let result = resolve_file_references(input, &temp.path).unwrap();
+
+        assert!(
+            result.contains(r#""instructions": ["shared-secret"]"#),
+            "the real setting must be expanded"
+        );
+        assert!(
+            result.contains(r#"// "api_key": "{file:shared.txt}""#),
+            "the identical comment occurrence must stay verbatim"
+        );
+    }
+
+    #[test]
+    fn resolve_file_references_escapes_backspace_formfeed_and_nul() {
+        let temp = TestDir::new("opencode_file_ref_ctrl");
+        let content = "a\u{0008}b\u{000c}c\u{0000}d";
+        fs::write(temp.path.join("secret.txt"), content).unwrap();
+
+        let input = r#"{"api_key": "{file:secret.txt}"}"#;
+        let result = resolve_file_references(input, &temp.path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .unwrap_or_else(|err| panic!("file control chars must stay JSON-safe: {err}"));
+        assert_eq!(parsed["api_key"].as_str(), Some(content));
+    }
+
+    #[test]
+    fn is_inside_comment_ignores_comment_markers_inside_strings() {
+        let text = r#"{"url": "https://example.com", "key": "{file:secret.txt}"}"#;
+        let pos = text.find("{file:secret.txt}").unwrap();
+        assert!(!is_inside_comment(text, pos));
     }
 
     #[test]
@@ -3029,6 +3210,37 @@ theme = "dark"
         );
         assert!(!config_dir.join("config.bak").exists());
         assert_eq!(loader.config().model.as_deref(), Some("current-model"));
+    }
+
+    #[test]
+    fn load_global_from_reads_both_formats_with_json_winning() {
+        let temp = TestDir::new("opencode_global_both_formats");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("opencode.jsonc"),
+            r#"{ "model": "jsonc-model", "theme": "light" }"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("opencode.json"),
+            r#"{ "model": "json-model" }"#,
+        )
+        .unwrap();
+
+        let mut loader = ConfigLoader::new();
+        loader.load_global_from(&config_dir).unwrap();
+
+        assert_eq!(
+            loader.config().model.as_deref(),
+            Some("json-model"),
+            "json must be merged after jsonc so it wins"
+        );
+        assert_eq!(
+            loader.config().theme.as_deref(),
+            Some("light"),
+            "keys present only in jsonc must survive"
+        );
     }
 
     #[test]
