@@ -522,6 +522,10 @@ pub struct ServerState {
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
+    /// このインスタンス専用の CORS 追加許可オリジン。
+    /// 旧 `EXTRA_CORS_WHITELIST`（プロセス共有 static）から移行し、
+    /// リクエスト判定は常にこのフィールドのみを参照する。
+    pub(crate) extra_cors_whitelist: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ServerState {
@@ -554,6 +558,9 @@ impl ServerState {
             session_repo: None,
             message_repo: None,
             input_repo: None,
+            // CLI の起動時設定は legacy シードから 1 度だけコピーする。
+            // 以降の変更はこのインスタンス内に閉じる。
+            extra_cors_whitelist: Arc::new(RwLock::new(snapshot_legacy_cors_seed())),
         }
     }
 
@@ -1099,7 +1106,12 @@ impl Default for ServerState {
     }
 }
 
-static EXTRA_CORS_WHITELIST: LazyLock<RwLock<HashSet<String>>> =
+/// CLI 起動時に `set_cors_whitelist()` へ渡されたオリジンのシード。
+///
+/// リクエスト判定には使わず、`ServerState::new()` が初期値をコピーするためだけに
+/// 保持する。process-global な状態をリクエスト経路から排除するため、
+/// 判定は常に各 `ServerState::extra_cors_whitelist` を参照する。
+static LEGACY_CORS_SEED: LazyLock<RwLock<HashSet<String>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
 fn normalize_origin(origin: &str) -> Option<String> {
@@ -1111,21 +1123,45 @@ fn normalize_origin(origin: &str) -> Option<String> {
     }
 }
 
-pub fn set_cors_whitelist(origins: Vec<String>) {
-    let mut next = HashSet::new();
-    for origin in origins {
-        if let Some(normalized) = normalize_origin(&origin) {
-            next.insert(normalized);
-        }
-    }
+fn normalize_cors_origins(origins: Vec<String>) -> HashSet<String> {
+    origins
+        .iter()
+        .filter_map(|origin| normalize_origin(origin))
+        .collect()
+}
 
-    match EXTRA_CORS_WHITELIST.write() {
+/// Legacy シードのスナップショットを返す（poisoned でも読み出す）。
+fn snapshot_legacy_cors_seed() -> HashSet<String> {
+    match LEGACY_CORS_SEED.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// 後方互換 API。CLI の起動時設定を受け取り、`ServerState` 生成時のシードとして
+/// 保持するだけであり、リクエストごとの CORS 判定には関与しない。
+/// `ServerState` 生成後に本関数を再呼び出しても既存インスタンスには反映されない。
+///
+/// 新しいコードでは `ServerState::set_cors_whitelist()` を優先すること。
+/// オリジン値のみを扱い、認証トークンは受け取らないため、ログやエラーへ
+/// 秘密情報が出る経路は存在しない。
+pub fn set_cors_whitelist(origins: Vec<String>) {
+    let next = normalize_cors_origins(origins);
+    match LEGACY_CORS_SEED.write() {
         Ok(mut guard) => *guard = next,
         Err(poisoned) => *poisoned.into_inner() = next,
     }
 }
 
-fn is_allowed_origin(origin: &str) -> bool {
+fn is_extra_allowed_origin_exact_in(origin: &str, whitelist: &RwLock<HashSet<String>>) -> bool {
+    let normalized = normalize_origin(origin).unwrap_or_else(|| origin.to_string());
+    match whitelist.read() {
+        Ok(guard) => guard.contains(&normalized),
+        Err(poisoned) => poisoned.into_inner().contains(&normalized),
+    }
+}
+
+fn is_allowed_origin_with_extra(origin: &str, whitelist: &RwLock<HashSet<String>>) -> bool {
     let parsed = Url::parse(origin);
     let Ok(parsed) = parsed else {
         return false;
@@ -1151,17 +1187,61 @@ fn is_allowed_origin(origin: &str) -> bool {
     // Allow exact opencode.ai subdomains (no wildcard suffix)
     let is_opencode_ai = scheme == "https" && matches!(host, "opencode.ai" | "www.opencode.ai");
 
-    // Check extra whitelist with exact match
-    let is_extra = is_extra_allowed_origin_exact(origin);
+    // Check the per-instance extra whitelist with exact match.
+    let is_extra = is_extra_allowed_origin_exact_in(origin, whitelist);
 
     is_localhost || is_tauri || is_opencode_ai || is_extra
 }
 
-fn is_extra_allowed_origin_exact(origin: &str) -> bool {
-    let normalized = normalize_origin(origin).unwrap_or_else(|| origin.to_string());
-    match EXTRA_CORS_WHITELIST.read() {
-        Ok(guard) => guard.contains(&normalized),
-        Err(poisoned) => poisoned.into_inner().contains(&normalized),
+impl ServerState {
+    /// このインスタンスの CORS 追加許可オリジンを設定する（完全置換）。
+    /// オリジンのみを扱い、認証トークンは受け取らない。
+    pub fn set_cors_whitelist(&self, origins: Vec<String>) {
+        let next = normalize_cors_origins(origins);
+        match self.extra_cors_whitelist.write() {
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
+    }
+
+    /// このインスタンスの追加許可リストにオリジンが完全一致するかを返す。
+    #[cfg(test)]
+    pub(crate) fn is_extra_allowed_origin_exact(&self, origin: &str) -> bool {
+        is_extra_allowed_origin_exact_in(origin, &self.extra_cors_whitelist)
+    }
+
+    /// このインスタンスの許可リストを用いて Origin ヘッダ値を検証する。
+    #[cfg(test)]
+    pub(crate) fn is_allowed_origin(&self, origin: &str) -> bool {
+        is_allowed_origin_with_extra(origin, &self.extra_cors_whitelist)
+    }
+
+    /// このインスタンスに結びついた CORS ミドルウェアを構築する。
+    ///
+    /// `AllowOrigin::predicate` は `'static` のクロージャを要求するため、
+    /// リクエスト判定には `Arc<RwLock<_>>` をクローンして捕捉する。
+    /// これにより同じプロセスの別インスタンスへ設定が漏れない。
+    pub(crate) fn cors_layer(&self) -> CorsLayer {
+        let extra = Arc::clone(&self.extra_cors_whitelist);
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::predicate(
+                move |origin: &HeaderValue, _parts: &Parts| {
+                    origin
+                        .to_str()
+                        .is_ok_and(|value| is_allowed_origin_with_extra(value, &extra))
+                },
+            ))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ])
+            .allow_headers(cors_allow_headers())
+            // ブラウザの fetch から相関 ID を読めるようにする（allow_headers は
+            // リクエスト側の許可のみでレスポンスヘッダの露出は制御しない）。
+            .expose_headers([HeaderName::from_static("x-request-id")])
     }
 }
 
@@ -1344,26 +1424,6 @@ fn cors_allow_headers() -> [HeaderName; 5] {
     ]
 }
 
-fn cors_layer() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            |origin: &HeaderValue, _parts: &Parts| {
-                origin.to_str().map(is_allowed_origin).unwrap_or(false)
-            },
-        ))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-        ])
-        .allow_headers(cors_allow_headers())
-        // ブラウザの fetch から相関 ID を読めるようにする（allow_headers は
-        // リクエスト側の許可のみでレスポンスヘッダの露出は制御しない）。
-        .expose_headers([HeaderName::from_static("x-request-id")])
-}
-
 /// 2 つの文字列を固定時間で比較する（新規依存なしの自前実装）。
 ///
 /// `subtle` 等の定数時間比較クレートは workspace に存在しないため、ここでは
@@ -1484,7 +1544,7 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
              request: Request<axum::body::Body>,
              next: Next| async move { auth_middleware(state, request, next).await },
         ))
-        .layer(cors_layer())
+        .layer(state.cors_layer())
         .layer(TraceLayer::new_for_http().on_response(RequestCompletionLog))
         .layer(middleware::from_fn(request_span_middleware))
         .with_state(state);
@@ -1521,7 +1581,7 @@ pub async fn run_server_with_state(
              request: Request<axum::body::Body>,
              next: Next| async move { auth_middleware(state, request, next).await },
         ))
-        .layer(cors_layer())
+        .layer(state.cors_layer())
         .layer(TraceLayer::new_for_http().on_response(RequestCompletionLog))
         .layer(middleware::from_fn(request_span_middleware))
         .with_state(state);
@@ -2304,6 +2364,7 @@ mod tests {
 
     #[test]
     fn cors_allows_loopback_origins_with_and_without_explicit_port() {
+        let state = ServerState::new();
         // L-17: ブラウザは既定ポートを省略するため、port なしの localhost Origin も許可する。
         // 許可範囲は loopback ホスト + http/https に限定したまま拡張する。
         for origin in [
@@ -2320,7 +2381,7 @@ mod tests {
             "http://[::1]:3000",
         ] {
             assert!(
-                is_allowed_origin(origin),
+                state.is_allowed_origin(origin),
                 "loopback origin should be allowed: {origin}"
             );
         }
@@ -2328,6 +2389,7 @@ mod tests {
 
     #[test]
     fn cors_rejects_remote_hosts_and_non_http_schemes() {
+        let state = ServerState::new();
         // セキュリティ境界: localhost 以外は port の有無にかかわらず決して許可しない。
         for origin in [
             "http://example.com",
@@ -2339,7 +2401,7 @@ mod tests {
             "ftp://localhost",
         ] {
             assert!(
-                !is_allowed_origin(origin),
+                !state.is_allowed_origin(origin),
                 "remote/non-http origin must be rejected: {origin}"
             );
         }
@@ -2347,11 +2409,38 @@ mod tests {
 
     #[test]
     fn cors_preserves_existing_tauri_and_opencode_ai_allowlist() {
-        assert!(is_allowed_origin("tauri://localhost"));
-        assert!(is_allowed_origin("http://tauri.localhost"));
-        assert!(is_allowed_origin("https://opencode.ai"));
-        assert!(is_allowed_origin("https://www.opencode.ai"));
-        assert!(!is_allowed_origin("http://opencode.ai"));
+        let state = ServerState::new();
+        assert!(state.is_allowed_origin("tauri://localhost"));
+        assert!(state.is_allowed_origin("http://tauri.localhost"));
+        assert!(state.is_allowed_origin("https://opencode.ai"));
+        assert!(state.is_allowed_origin("https://www.opencode.ai"));
+        assert!(!state.is_allowed_origin("http://opencode.ai"));
+    }
+
+    #[test]
+    fn cors_whitelist_is_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+        let first_origin = "https://first.example.com";
+        let second_origin = "https://second.example.com";
+
+        assert!(!first.is_allowed_origin(first_origin));
+        assert!(!second.is_allowed_origin(first_origin));
+
+        // 末尾スラッシュ付きで設定しても正規化されて完全一致する。
+        first.set_cors_whitelist(vec![format!("{first_origin}/"), "   ".to_string()]);
+
+        assert!(first.is_extra_allowed_origin_exact(first_origin));
+        assert!(first.is_allowed_origin(first_origin));
+        assert!(!second.is_extra_allowed_origin_exact(first_origin));
+        assert!(!second.is_allowed_origin(first_origin));
+
+        // 逆方向の変更も波及せず、既に設定したエントリも維持される。
+        second.set_cors_whitelist(vec![second_origin.to_string()]);
+        assert!(second.is_allowed_origin(second_origin));
+        assert!(!first.is_allowed_origin(second_origin));
+        assert!(first.is_allowed_origin(first_origin));
+        assert!(!second.is_allowed_origin(first_origin));
     }
 
     // ---- R2 回帰テスト: CORS カスタムヘッダ / 401 スキーマ / fail-open ----
@@ -2453,9 +2542,10 @@ mod tests {
         // 設定そのものの検証は loopback 可否に依存させない（必ず走るガード）。
         cors_allow_headers_include_custom_headers_for_session_and_telemetry();
 
+        let state = Arc::new(ServerState::new());
         let app = axum::Router::new()
             .route("/session", axum::routing::get(|| async { "ok" }))
-            .layer(cors_layer());
+            .layer(state.cors_layer());
         let Some((addr, server)) = start_test_server(app).await else {
             return;
         };
