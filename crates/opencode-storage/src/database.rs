@@ -143,6 +143,26 @@ pub(crate) fn sqlite_pool_options(max_connections: u32) -> SqlitePoolOptions {
 }
 
 impl Database {
+    /// `Database` が実際に接続する SQLite ファイルのパスを返す。
+    ///
+    /// `OPENCODE_DATA_DIR` に空でない値が設定されていれば、その値（前後の空白は
+    /// 除去）を `dirs::data_local_dir()` の代わりのデータディレクトリ基数として
+    /// 優先する。空文字・空白のみ・非 UTF-8 の値は不正として無視し、従来どおり
+    /// `dirs::data_local_dir()`（取得不能なら `.`）を使う。
+    ///
+    /// 解決したパスはログやエラーには含めない。CLI の `db path` も同じ helper を
+    /// 参照し、バックアップ対象と表示値がずれないようにする。
+    pub fn database_path() -> PathBuf {
+        let base = match std::env::var("OPENCODE_DATA_DIR") {
+            // 前後空白を除いた値が残る場合だけ上書きとして採用する。
+            // 空・空白のみ・非 UTF-8（Err）は従来の既定へフォールバック。
+            Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+            _ => dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")),
+        };
+
+        base.join("opencode").join("opencode.db")
+    }
+
     pub async fn new() -> Result<Self, DatabaseError> {
         let db_path = Self::get_database_path()?;
 
@@ -153,7 +173,8 @@ impl Database {
 
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-        info!("Connecting to database at {}", db_path.display());
+        // 解決済みパスはログに出さない（OPENCODE_DATA_DIR の値を漏らさない）。
+        info!("Connecting to database");
 
         let pool = sqlite_pool_options(5)
             .connect(&db_url)
@@ -216,12 +237,9 @@ impl Database {
         migrate_pool(&self.pool).await
     }
 
+    /// パス解決は公開 helper に一本化し、ここは互換のための委譲だけを行う。
     fn get_database_path() -> Result<PathBuf, DatabaseError> {
-        let data_dir = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("opencode");
-
-        Ok(data_dir.join("opencode.db"))
+        Ok(Self::database_path())
     }
 }
 
@@ -585,6 +603,75 @@ mod migration_tests {
             count_sessions(pool, "fk-parent").await,
             1,
             "deleting a message must not delete its parent session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::Database;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// `OPENCODE_DATA_DIR` を書き換えるテストを直列化する。
+    static DATA_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreDataDir(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreDataDir {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("OPENCODE_DATA_DIR", value),
+                None => std::env::remove_var("OPENCODE_DATA_DIR"),
+            }
+        }
+    }
+
+    fn default_path() -> PathBuf {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("opencode")
+            .join("opencode.db")
+    }
+
+    #[test]
+    fn database_path_prefers_trimmed_data_dir_override() {
+        let _guard = DATA_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreDataDir(std::env::var_os("OPENCODE_DATA_DIR"));
+
+        let base = std::env::temp_dir().join(format!("opencode-db-path-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("OPENCODE_DATA_DIR", format!("  {}  ", base.display()));
+
+        assert_eq!(
+            Database::database_path(),
+            base.join("opencode").join("opencode.db"),
+            "OPENCODE_DATA_DIR must replace the data_local_dir base"
+        );
+    }
+
+    #[test]
+    fn database_path_ignores_empty_or_invalid_values() {
+        let _guard = DATA_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreDataDir(std::env::var_os("OPENCODE_DATA_DIR"));
+
+        for value in ["", "   ", "\t\n"] {
+            std::env::set_var("OPENCODE_DATA_DIR", value);
+            assert_eq!(
+                Database::database_path(),
+                default_path(),
+                "invalid OPENCODE_DATA_DIR={value:?} must fall back"
+            );
+        }
+
+        std::env::remove_var("OPENCODE_DATA_DIR");
+        assert_eq!(
+            Database::database_path(),
+            default_path(),
+            "unset OPENCODE_DATA_DIR must use the conventional base"
         );
     }
 }

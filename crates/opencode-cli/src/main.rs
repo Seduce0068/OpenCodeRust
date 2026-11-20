@@ -2754,11 +2754,17 @@ fn truncate_text(input: &str, max_chars: usize) -> String {
     out
 }
 
+/// ローカル DB のパス。`Database` の公開 helper に委譲し、重複計算を避ける。
 fn local_database_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("opencode")
-        .join("opencode.db")
+    Database::database_path()
+}
+
+/// `opencoderust db path` が表示する文字列。
+///
+/// 表示ロジックを純粋関数に切り出し、実際の `Database` が使うパスと同じ値
+/// であることを回帰テストで直接検証できるようにする。
+fn db_path_display() -> String {
+    local_database_path().display().to_string()
 }
 
 async fn handle_db_command(
@@ -2767,7 +2773,7 @@ async fn handle_db_command(
     format: DbOutputFormat,
 ) -> anyhow::Result<()> {
     if matches!(action, Some(DbCommands::Path)) {
-        println!("{}", local_database_path().display());
+        println!("{}", db_path_display());
         return Ok(());
     }
 
@@ -6886,5 +6892,65 @@ mod tests {
             .await
             .expect_err("fork without base must fail");
         assert!(err.to_string().contains("--fork"));
+    }
+
+    // --- DB パス解決 / db path の回帰テスト -----------------------------------
+
+    /// `OPENCODE_DATA_DIR` を書き換えるテストを直列化する。
+    static DB_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DB_PATH_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    struct RestoreDataDir(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreDataDir {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("OPENCODE_DATA_DIR", value),
+                None => std::env::remove_var("OPENCODE_DATA_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn db_path_output_matches_database_path() {
+        let _guard = DB_PATH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestoreDataDir(std::env::var_os("OPENCODE_DATA_DIR"));
+
+        std::env::remove_var("OPENCODE_DATA_DIR");
+        let default_output = db_path_display();
+        assert_eq!(
+            default_output,
+            Database::database_path().display().to_string(),
+            "`db path` must print the path the Database actually uses"
+        );
+
+        for invalid in ["", "   ", "\t"] {
+            std::env::set_var("OPENCODE_DATA_DIR", invalid);
+            assert_eq!(
+                db_path_display(),
+                default_output,
+                "invalid OPENCODE_DATA_DIR={invalid:?} must keep the default output"
+            );
+            assert_eq!(
+                db_path_display(),
+                Database::database_path().display().to_string()
+            );
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "opencoderust-db-path-{}-{}",
+            std::process::id(),
+            DB_PATH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::env::set_var("OPENCODE_DATA_DIR", base.as_os_str());
+        let expected = base.join("opencode").join("opencode.db");
+        assert_eq!(db_path_display(), expected.display().to_string());
+        assert_eq!(
+            db_path_display(),
+            Database::database_path().display().to_string(),
+            "`db path` must follow OPENCODE_DATA_DIR exactly as Database does"
+        );
     }
 }

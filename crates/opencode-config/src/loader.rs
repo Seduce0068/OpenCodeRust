@@ -456,12 +456,8 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
         }
     };
 
-    if let Err(error) = fs::write(&json_path, serialized) {
-        tracing::warn!(
-            path = %json_path.display(),
-            %error,
-            "failed to write migrated JSON config"
-        );
+    if let Err(error) = write_config_file(&json_path, serialized.as_bytes()) {
+        tracing::warn!(%error, "failed to write migrated JSON config");
         return None;
     }
 
@@ -1674,13 +1670,130 @@ pub async fn load_config_with_remote<P: AsRef<Path>>(project_dir: P) -> Result<C
     loader.load_all_with_remote(project_dir).await
 }
 
+/// Select the project-level config file that an update must write back to.
+///
+/// This mirrors the precedence of [`ConfigLoader::load_project`], which loads
+/// `opencode.jsonc` before `opencode.json` so that plain JSON wins when both
+/// files are present. The write target must be that same effective winner,
+/// otherwise a patch written to the shadowed JSONC file would be overwritten
+/// again by `opencode.json` on the next load. Concretely:
+///
+/// * both `opencode.jsonc` and `opencode.json` exist -> `opencode.json`;
+/// * only `opencode.jsonc` exists -> `opencode.jsonc` (never create a shadowing
+///   `opencode.json` in a JSONC-only project);
+/// * neither exists -> `opencode.json` (historical behaviour).
+///
+/// # JSONC write-back trade-off
+///
+/// When `opencode.jsonc` is the selected target the config is re-serialized
+/// with `serde_json::to_string_pretty`. Comments and trailing commas from the
+/// original file are **not** preserved and are lost after the write. This is
+/// an accepted trade-off that keeps a single, safe serialization path for all
+/// targets; callers must be aware that a JSONC write-back rewrites the file as
+/// plain JSON syntax.
+fn project_config_write_path(project_dir: &Path) -> PathBuf {
+    let json = project_dir.join("opencode.json");
+    let jsonc = project_dir.join("opencode.jsonc");
+
+    // `load_project` reads jsonc first, then json, so json is the last writer
+    // and wins. When both exist we must write to json for the patch to survive
+    // a reload; jsonc is only chosen when it is the sole existing file.
+    if json.exists() {
+        json
+    } else if jsonc.exists() {
+        jsonc
+    } else {
+        json
+    }
+}
+
+/// Persist serialized config with an atomic replace.
+///
+/// On Unix the bytes go to a fresh temporary file created with mode `0600`,
+/// are `fsync`ed, and are then `rename`d over the destination. The umask cannot
+/// widen the permissions, an interrupted write can never truncate the
+/// destination, and errors carry only an I/O error category -- never a value
+/// or a path. The rename also tightens an existing file's permissions to 0600.
+#[cfg(unix)]
+fn write_config_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(".{file_name}.tmp-{}-{nanos}-{seq}", std::process::id());
+    let temp_path = path.with_file_name(temp_name);
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        // `mode(0o600)` is still subject to the umask; pin the exact mode so
+        // a restrictive umask cannot make the file unreadable on the next run.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result.map_err(|error| anyhow::anyhow!("failed to persist config ({:?})", error.kind()))
+}
+
+/// Windows keeps the historical direct write: `rename` cannot atomically
+/// replace an existing file there, so a temp-file dance would be less safe.
+#[cfg(not(unix))]
+fn write_config_file(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents)
+        .map_err(|error| anyhow::anyhow!("failed to persist config ({:?})", error.kind()))
+}
+
+/// Parse the on-disk config immediately before a write-back update.
+///
+/// An unparseable existing file must abort the update: falling back to
+/// `Config::default()` and re-serializing would silently erase the user's
+/// `api_key`, `permission` and other settings. The returned error is generic
+/// on purpose -- it carries neither the file path nor the raw contents (which
+/// may contain secrets), only the fact that parsing failed. A warning is
+/// emitted at the same time so operators can see why the update was refused.
+fn parse_existing_config_for_update(content: &str) -> Result<Config> {
+    parse_jsonc(content).map_err(|_| {
+        tracing::warn!("existing config could not be parsed; refusing to overwrite it");
+        anyhow::anyhow!("refusing to overwrite existing config: current content failed to parse")
+    })
+}
+
 /// Update project-level config by merging a patch.
+///
+/// Writes to the file chosen by [`project_config_write_path`]. If that file is
+/// `opencode.jsonc`, re-serialization drops its comments and trailing commas
+/// (see the note on [`project_config_write_path`]). An existing file that fails
+/// to parse aborts the update rather than being replaced with a default
+/// config, so secrets and permission rules are never silently discarded.
 pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
-    let config_path = project_dir.join("opencode.json");
+    let config_path = project_config_write_path(project_dir);
 
     let existing = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)?;
-        parse_jsonc(&content).unwrap_or_default()
+        let content = fs::read_to_string(&config_path).map_err(|error| {
+            anyhow::anyhow!("failed to read current config ({:?})", error.kind())
+        })?;
+        parse_existing_config_for_update(&content)?
     } else {
         Config::default()
     };
@@ -1690,17 +1803,24 @@ pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
 
     let json =
         serde_json::to_string_pretty(&merged).with_context(|| "Failed to serialize config")?;
-    fs::write(&config_path, json)
-        .with_context(|| format!("Failed to write config to {:?}", config_path))?;
+    write_config_file(&config_path, json.as_bytes())?;
 
     Ok(())
 }
 
 /// Update global config by merging a patch.
+///
+/// The target file follows the precedence of [`ConfigLoader::load_global`],
+/// which stops at the first of `opencode.jsonc` / `opencode.json` that exists.
+/// If a JSONC file is selected, re-serialization drops its comments and
+/// trailing commas, just as for [`project_config_write_path`]. An existing
+/// file that fails to parse aborts the update instead of being replaced with a
+/// default config, preserving the user's secrets and permission rules.
 pub fn update_global_config(patch: &Config) -> Result<()> {
     let global_path = get_global_config_path();
 
-    // Try to find existing global config file
+    // Try to find existing global config file. `load_global_from` also picks
+    // the first existing file in jsonc -> json order, so keep that precedence.
     let config_path = ["jsonc", "json"]
         .iter()
         .map(|ext| global_path.with_extension(ext))
@@ -1713,8 +1833,10 @@ pub fn update_global_config(patch: &Config) -> Result<()> {
     }
 
     let existing = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)?;
-        parse_jsonc(&content).unwrap_or_default()
+        let content = fs::read_to_string(&config_path).map_err(|error| {
+            anyhow::anyhow!("failed to read current config ({:?})", error.kind())
+        })?;
+        parse_existing_config_for_update(&content)?
     } else {
         Config::default()
     };
@@ -1724,8 +1846,7 @@ pub fn update_global_config(patch: &Config) -> Result<()> {
 
     let json =
         serde_json::to_string_pretty(&merged).with_context(|| "Failed to serialize config")?;
-    fs::write(&config_path, json)
-        .with_context(|| format!("Failed to write global config to {:?}", config_path))?;
+    write_config_file(&config_path, json.as_bytes())?;
 
     Ok(())
 }
@@ -2181,6 +2302,201 @@ mod tests {
         let content = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
         let config: Config = serde_json::from_str(&content).unwrap();
         assert_eq!(config.model, Some("claude-3-opus".to_string()));
+    }
+
+    #[test]
+    fn update_config_writes_back_to_existing_jsonc_without_creating_json() {
+        let temp = TestDir::new("opencode_update_jsonc_preferred");
+        let jsonc = temp.path.join("opencode.jsonc");
+        fs::write(
+            &jsonc,
+            r#"{
+                // user-maintained JSONC file
+                "model": "jsonc-model",
+                "theme": "dark",
+            }"#,
+        )
+        .unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"model":"patched-model"}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        assert!(
+            !temp.path.join("opencode.json").exists(),
+            "updating a JSONC-only project must not create a shadowing opencode.json"
+        );
+        let written = fs::read_to_string(&jsonc).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(raw["model"], serde_json::json!("patched-model"));
+        assert_eq!(
+            raw["theme"],
+            serde_json::json!("dark"),
+            "keys already present in the JSONC file must survive the merge"
+        );
+    }
+
+    #[test]
+    fn update_config_updates_existing_json_in_place() {
+        let temp = TestDir::new("opencode_update_existing_json");
+        let json = temp.path.join("opencode.json");
+        fs::write(&json, r#"{"model":"old-model","theme":"dark"}"#).unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"model":"new-model"}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        assert!(!temp.path.join("opencode.jsonc").exists());
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(raw["model"], serde_json::json!("new-model"));
+        assert_eq!(raw["theme"], serde_json::json!("dark"));
+    }
+
+    #[test]
+    fn update_config_writes_to_json_when_jsonc_and_json_coexist() {
+        let temp = TestDir::new("opencode_update_both_formats");
+        // Stop `find_up` at this directory so the reload below cannot pick up
+        // a config from an ancestor of the temp directory.
+        fs::create_dir_all(temp.path.join(".git")).unwrap();
+
+        let jsonc = temp.path.join("opencode.jsonc");
+        let json = temp.path.join("opencode.json");
+        // The loader reads jsonc first and json second, so json wins.
+        let jsonc_original = r#"{ "model": "jsonc-model", "theme": "light" }"#;
+        let json_original = r#"{ "model": "json-model", "theme": "dark" }"#;
+        fs::write(&jsonc, jsonc_original).unwrap();
+        fs::write(&json, json_original).unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"model":"patched-model"}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        // The patch must land in opencode.json -- writing it to the shadowed
+        // JSONC file would be invisible after the next load.
+        let written = fs::read_to_string(&json).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(raw["model"], serde_json::json!("patched-model"));
+        assert_eq!(raw["theme"], serde_json::json!("dark"));
+        assert_eq!(
+            fs::read_to_string(&jsonc).unwrap(),
+            jsonc_original,
+            "the shadowed JSONC file must be left untouched"
+        );
+
+        // Verify through the real loader merge order that the patch survives.
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader.load_project(&temp.path).unwrap();
+        assert_eq!(loader.config().model.as_deref(), Some("patched-model"));
+        assert_eq!(loader.config().theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn update_config_does_not_overwrite_unparseable_existing_config() {
+        let temp = TestDir::new("opencode_update_invalid_existing");
+        let json = temp.path.join("opencode.json");
+        let original = r#"{ "model": "kept-model", "theme": }"#; // invalid JSON
+        fs::write(&json, original).unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"model":"patched-model"}"#).unwrap();
+        let result = update_config(&temp.path, &patch);
+        assert!(
+            result.is_err(),
+            "an unparseable existing config must abort the update"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&json).unwrap(),
+            original,
+            "existing config must remain byte-identical"
+        );
+        let error = result.unwrap_err().to_string();
+        for secret in ["kept-model", "patched-model"] {
+            assert!(
+                !error.contains(secret),
+                "token value leaked into error: {secret}"
+            );
+        }
+        assert!(
+            !error.contains(&temp.path.to_string_lossy().into_owned()),
+            "path leaked into error"
+        );
+    }
+
+    #[test]
+    fn parse_existing_config_for_update_rejects_invalid_content() {
+        assert!(parse_existing_config_for_update(r#"{"theme": }"#).is_err());
+        let valid = parse_existing_config_for_update(r#"{"model":"m"}"#).unwrap();
+        assert_eq!(valid.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn update_config_leaves_no_temporary_files() {
+        let temp = TestDir::new("opencode_update_no_temp_residue");
+        let patch: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        let entries: Vec<String> = fs::read_dir(&temp.path)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["opencode.json".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_config_writes_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("opencode_update_0600");
+        let patch: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        let mode = fs::metadata(temp.path.join("opencode.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "config must not be umask-dependent or readable by other users"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_config_tightens_permissions_of_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("opencode_update_tighten");
+        let path = temp.path.join("opencode.json");
+        fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        update_config(&temp.path, &patch).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "atomic replace must correct permissive modes");
+    }
+
+    #[test]
+    fn update_config_errors_never_expose_values_or_paths() {
+        let temp = TestDir::new("opencode_update_error_redaction");
+        let blocker = temp.path.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+
+        let secret = "DO-NOT-LOG-THIS-TOKEN";
+        let patch: Config = serde_json::from_str(&format!(
+            r#"{{"provider":{{"p":{{"api_key":"{secret}"}}}}}}"#
+        ))
+        .unwrap();
+
+        let error = update_config(&blocker, &patch).unwrap_err().to_string();
+        assert!(!error.contains(secret), "token value leaked into error");
+        assert!(!error.contains("blocker"), "path leaked into error");
+        assert!(
+            !error.contains(&temp.path.to_string_lossy().into_owned()),
+            "temporary path leaked into error"
+        );
     }
 
     // ── OPENCODE_* environment override regression tests ───────────
