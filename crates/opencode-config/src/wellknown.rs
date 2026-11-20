@@ -11,6 +11,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 /// リモート `.well-known/opencode` レスポンスの最大バイト数（8 MiB）。
 const MAX_WELLKNOWN_JSON_BYTES: u64 = 8 * 1024 * 1024;
+/// `CACHE` が保持する URL エントリ数の上限。
+/// URL が際限なく増えても HashMap が無制限に伸びないようにする。
+const MAX_CACHE_ENTRIES: usize = 256;
 
 /// The JSON shape returned by `{url}/.well-known/opencode`.
 #[derive(Debug, Deserialize)]
@@ -195,12 +198,15 @@ async fn fetch_wellknown_config(client: &reqwest::Client, endpoint: &str) -> Res
 }
 
 fn get_cached(url: &str) -> Option<Config> {
-    let guard = CACHE.lock().ok()?;
-    let map = guard.as_ref()?;
-    let entry = map.get(url)?;
-    if entry.fetched_at.elapsed() < CACHE_TTL {
-        Some(entry.config.clone())
+    let mut guard = CACHE.lock().ok()?;
+    let map = guard.as_mut()?;
+    let is_fresh = map.get(url)?.fetched_at.elapsed() < CACHE_TTL;
+    if is_fresh {
+        map.get(url).map(|entry| entry.config.clone())
     } else {
+        // TTL 切れのエントリはここで削除する。放置すると URL 数だけ
+        // HashMap が伸び続けるため、ミス時にも確実に回収する。
+        map.remove(url);
         None
     }
 }
@@ -211,6 +217,11 @@ fn set_cached(url: String, config: Config) {
         Err(_) => return,
     };
     let map = guard.get_or_insert_with(HashMap::new);
+    // 新規 URL で上限に達している場合は最古のエントリを追い出してから挿入する。
+    // 既存 URL の更新ではエントリ数は増えないので追い出さない。
+    if !map.contains_key(&url) && map.len() >= MAX_CACHE_ENTRIES {
+        evict_oldest_cached(map);
+    }
     map.insert(
         url,
         CacheEntry {
@@ -218,6 +229,18 @@ fn set_cached(url: String, config: Config) {
             fetched_at: Instant::now(),
         },
     );
+}
+
+/// Removes the least-recently-fetched entry to make room under
+/// [`MAX_CACHE_ENTRIES`]. The URL itself is never logged.
+fn evict_oldest_cached(map: &mut HashMap<String, CacheEntry>) {
+    let oldest = map
+        .iter()
+        .min_by_key(|(_, entry)| entry.fetched_at)
+        .map(|(oldest_url, _)| oldest_url.clone());
+    if let Some(oldest) = oldest {
+        map.remove(&oldest);
+    }
 }
 
 /// Clears the wellknown config cache. Useful for testing or forced refresh.
@@ -324,6 +347,58 @@ mod tests {
         let _guard = TEST_ENV_MUTEX.lock().unwrap();
         clear_cache();
         assert!(get_cached("https://unknown.example.com").is_none());
+    }
+
+    // Regression: a TTL-expired entry must be removed from the map on lookup,
+    // not merely reported as a miss.
+    #[test]
+    fn expired_cache_entry_is_removed() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        clear_cache();
+
+        let url = "https://expired.example.com".to_string();
+        {
+            let mut guard = CACHE.lock().unwrap();
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.insert(
+                url.clone(),
+                CacheEntry {
+                    config: Config::default(),
+                    fetched_at: Instant::now() - CACHE_TTL - Duration::from_secs(1),
+                },
+            );
+        }
+
+        assert!(get_cached(&url).is_none());
+        {
+            let guard = CACHE.lock().unwrap();
+            let map = guard.as_ref().expect("cache map must still exist");
+            assert!(!map.contains_key(&url), "expired entry must be removed");
+        }
+
+        clear_cache();
+    }
+
+    // Regression: the total number of cached URLs must stay bounded.
+    #[test]
+    fn cache_entry_count_is_bounded_by_max_cache_entries() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        clear_cache();
+
+        for i in 0..(MAX_CACHE_ENTRIES + 8) {
+            set_cached(format!("https://cap-{i}.example.com"), Config::default());
+        }
+
+        {
+            let guard = CACHE.lock().unwrap();
+            let map = guard.as_ref().expect("cache map must exist");
+            assert!(
+                map.len() <= MAX_CACHE_ENTRIES,
+                "cache must stay within MAX_CACHE_ENTRIES"
+            );
+        }
+
+        clear_cache();
     }
 
     #[allow(clippy::await_holding_lock)]

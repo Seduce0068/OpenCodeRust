@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -1502,6 +1502,12 @@ impl SessionPrompt {
                         .clone()
                         .unwrap_or_else(|| Arc::new(|_req| Box::pin(async { Ok(()) })))
                         .into_callback(),
+                );
+                // ルートセッションは深さ 0。子セッション側で深さが更新されると
+                // `task` ツールが上限を判定できる（トークン値・パスは格納しない）。
+                tool_context.extra.insert(
+                    opencode_tool::task::SUBAGENT_DEPTH_KEY.into(),
+                    serde_json::json!(0u32),
                 );
 
                 if let Some(callback) = question_callback.clone() {
@@ -3489,6 +3495,35 @@ eval {}
     }
 }
 
+/// 子プロセスの stdout/stderr を保持する上限（1 MiB）。
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// 出力を `max_bytes` まで保持し、それ以降は読み捨てる。
+///
+/// `read_to_end` で無制限にバッファすると大量出力でメモリを食い潰す。
+/// 上限に達した後も読み続けるのは、パイプが満杯になった子プロセスが
+/// 終了待ちでハングするのを防ぐため。戻り値の bool は切り捨て発生を示す。
+async fn read_capped<R: AsyncRead + Unpin>(mut reader: R, max_bytes: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        if buf.len() >= max_bytes {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => truncated = true,
+            }
+            continue;
+        }
+        let want = chunk.len().min(max_bytes - buf.len());
+        match reader.read(&mut chunk[..want]).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    (buf, truncated)
+}
+
 /// Execute a shell command in the session context (matching TS `SessionPrompt.shell`).
 ///
 /// Creates a user message + assistant message with a tool call part recording
@@ -3521,18 +3556,16 @@ pub async fn shell_exec(input: &ShellInput, session: &mut Session) -> anyhow::Re
     let mut stdout = String::new();
     let mut stderr = String::new();
 
-    let stdout_task = child.stdout.take().map(|mut pipe| {
+    let stdout_task = child.stdout.take().map(|pipe| {
         tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).to_string()
+            let (buf, truncated) = read_capped(pipe, MAX_CAPTURE_BYTES).await;
+            (String::from_utf8_lossy(&buf).to_string(), truncated)
         })
     });
-    let stderr_task = child.stderr.take().map(|mut pipe| {
+    let stderr_task = child.stderr.take().map(|pipe| {
         tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).to_string()
+            let (buf, truncated) = read_capped(pipe, MAX_CAPTURE_BYTES).await;
+            (String::from_utf8_lossy(&buf).to_string(), truncated)
         })
     });
 
@@ -3546,14 +3579,17 @@ pub async fn shell_exec(input: &ShellInput, session: &mut Session) -> anyhow::Re
         }
     }
 
+    let mut truncated = false;
     if let Some(task) = stdout_task {
-        if let Ok(out) = task.await {
+        if let Ok((out, was_truncated)) = task.await {
             stdout = out;
+            truncated |= was_truncated;
         }
     }
     if let Some(task) = stderr_task {
-        if let Ok(out) = task.await {
+        if let Ok((out, was_truncated)) = task.await {
             stderr = out;
+            truncated |= was_truncated;
         }
     }
 
@@ -3564,6 +3600,9 @@ pub async fn shell_exec(input: &ShellInput, session: &mut Session) -> anyhow::Re
     } else {
         format!("{}\n{}", stdout, stderr)
     };
+    if truncated {
+        result.push_str("\n\n<metadata>\nOutput truncated at capture limit\n</metadata>");
+    }
     if aborted {
         result.push_str("\n\n<metadata>\nUser aborted the command\n</metadata>");
     }
@@ -4466,6 +4505,32 @@ mod tests {
         assert_eq!(invocation.args[1], "-l");
         assert!(invocation.args[2].contains("shopt -s expand_aliases"));
         assert!(invocation.args[2].contains(".bashrc"));
+    }
+
+    #[tokio::test]
+    async fn read_capped_truncates_output_over_limit() {
+        // 外部プロセスを起動せず、上限の 2 倍のデータをメモリ上で読ませる。
+        let data = vec![b'x'; MAX_CAPTURE_BYTES * 2];
+        let (buf, truncated) = read_capped(std::io::Cursor::new(data), MAX_CAPTURE_BYTES).await;
+        assert_eq!(buf.len(), MAX_CAPTURE_BYTES);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_capped_keeps_small_output_without_truncation() {
+        let data = vec![b'a'; 1024];
+        let (buf, truncated) =
+            read_capped(std::io::Cursor::new(data.clone()), MAX_CAPTURE_BYTES).await;
+        assert_eq!(buf, data);
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn read_capped_marks_exact_limit_as_not_truncated() {
+        let data = vec![b'b'; MAX_CAPTURE_BYTES];
+        let (buf, truncated) = read_capped(std::io::Cursor::new(data), MAX_CAPTURE_BYTES).await;
+        assert_eq!(buf.len(), MAX_CAPTURE_BYTES);
+        assert!(!truncated);
     }
 
     #[test]
