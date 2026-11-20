@@ -106,6 +106,9 @@ pub enum PermissionAction {
     ApproveAlways,
 }
 
+/// 権限プロンプトのキーヒント。Enter は暗黙 approve せず既定で Deny にする。
+pub const PERMISSION_KEY_HINT: &str = "Enter: Deny (default)  Esc: Deny";
+
 pub struct PermissionPrompt {
     requests: Vec<PermissionRequest>,
     current_index: usize,
@@ -228,7 +231,8 @@ impl PermissionPrompt {
             None => return,
         };
 
-        let height = 8u16;
+        // キーヒント行を追加したため 9 行（枠 2 行 + 内容 7 行）。
+        let height = 9u16;
         let width = area.width.saturating_sub(2).min(80);
 
         // Render inline at the bottom of the session area
@@ -267,6 +271,10 @@ impl PermissionPrompt {
                 Span::styled("[n] Deny  ", Style::default().fg(theme.error)),
                 Span::styled("[a] Always allow", Style::default().fg(theme.primary)),
             ]),
+            Line::from(Span::styled(
+                PERMISSION_KEY_HINT,
+                Style::default().fg(theme.text_muted),
+            )),
         ];
 
         let paragraph = Paragraph::new(content)
@@ -610,5 +618,35 @@ mod tests {
             .set(Some(Rect::new(10, 20, 40, 8)));
         prompt.handle_click(11, 26);
         assert!(prompt.take_pending_action().is_none());
+    }
+
+    #[test]
+    fn permission_key_hint_states_enter_and_esc_default_to_deny() {
+        assert!(PERMISSION_KEY_HINT.contains("Enter: Deny"));
+        assert!(PERMISSION_KEY_HINT.contains("Esc: Deny"));
+        assert!(!PERMISSION_KEY_HINT.contains("Enter: Allow"));
+    }
+
+    #[test]
+    fn handle_click_keeps_button_mapping_with_extra_hint_row() {
+        // ヒント行を追加してもボタン行（area.y + height - 2）の割り当ては不変。
+        let mut prompt = PermissionPrompt::new();
+        prompt.add_request(sample_request());
+        prompt
+            .last_rendered_area
+            .set(Some(Rect::new(10, 20, 40, 9)));
+
+        prompt.handle_click(11, 27);
+        assert_eq!(
+            prompt.take_pending_action(),
+            Some(PermissionAction::Approve)
+        );
+        prompt.handle_click(25, 27);
+        assert_eq!(prompt.take_pending_action(), Some(PermissionAction::Deny));
+        prompt.handle_click(40, 27);
+        assert_eq!(
+            prompt.take_pending_action(),
+            Some(PermissionAction::ApproveAlways)
+        );
     }
 }

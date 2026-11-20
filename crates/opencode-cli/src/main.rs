@@ -3686,6 +3686,14 @@ fn provider_env_var(provider: &str) -> Option<&'static str> {
         .find_map(|(name, env)| (*name == normalized).then_some(*env))
 }
 
+/// `auth login` の対話入力が使えない／キャンセルされた場合の案内。
+/// トークン値は一切含めない（ログ・エラーへの漏洩を防ぐ）。
+fn auth_login_token_guidance(provider: &str, env_var: &str) -> String {
+    format!(
+        "Interactive token entry is unavailable or was cancelled. Provide the token via --token <TOKEN> or the {env_var} environment variable:\n  opencode auth login {provider} --token <TOKEN>\n  export {env_var}=<TOKEN>"
+    )
+}
+
 async fn handle_auth_command(action: AuthCommands) -> anyhow::Result<()> {
     match action {
         AuthCommands::List => {
@@ -3731,11 +3739,15 @@ async fn handle_auth_command(action: AuthCommands) -> anyhow::Result<()> {
             let value = if let Some(token) = token {
                 token
             } else {
-                print!("Enter token for {}: ", provider);
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                input.trim().to_string()
+                // 端末エコーを無効化して入力する（値はログ・エラーへ出さない）。
+                // 対話端末でない／raw mode を開始できない場合は案内のみを表示する。
+                match opencode_tui::App::read_secret_from_terminal(&format!(
+                    "Enter token for {}: ",
+                    provider
+                ))? {
+                    Some(token) => token,
+                    None => anyhow::bail!("{}", auth_login_token_guidance(&provider, env_var)),
+                }
             };
 
             if value.is_empty() {
@@ -6147,6 +6159,50 @@ mod tests {
     #[test]
     fn rejects_unknown_subcommand() {
         assert!(Cli::try_parse_from(["opencoderust", "unknown-cmd"]).is_err());
+    }
+
+    #[test]
+    fn auth_login_guidance_uses_only_token_flag_and_env_var() {
+        let guidance = auth_login_token_guidance("anthropic", "ANTHROPIC_API_KEY");
+        assert!(guidance.contains("--token <TOKEN>"));
+        assert!(guidance.contains("ANTHROPIC_API_KEY"));
+        assert!(guidance.contains("ANTHROPIC_API_KEY=<TOKEN>"));
+        // 案内にトークン値らしき文字列は含まない。
+        assert!(!guidance.contains("sk-"));
+        assert!(!guidance.contains("dummy-secret-value"));
+    }
+
+    #[test]
+    fn auth_login_accepts_optional_token_flag() {
+        let cli = Cli::try_parse_from(["opencoderust", "auth", "login", "anthropic"]).unwrap();
+        match cli.command {
+            Some(Commands::Auth {
+                action: AuthCommands::Login { provider, token },
+            }) => {
+                assert_eq!(provider.as_deref(), Some("anthropic"));
+                assert!(token.is_none());
+            }
+            _ => panic!("expected auth login"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "opencoderust",
+            "auth",
+            "login",
+            "anthropic",
+            "--token",
+            "dummy-secret-value",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Auth {
+                action: AuthCommands::Login { provider, token },
+            }) => {
+                assert_eq!(provider.as_deref(), Some("anthropic"));
+                assert_eq!(token.as_deref(), Some("dummy-secret-value"));
+            }
+            _ => panic!("expected auth login"),
+        }
     }
 
     #[test]

@@ -161,8 +161,11 @@ impl ConfigLoader {
     /// 3. Project config (opencode.json{,c})
     /// 4. .opencode directories (agents, commands, plugins, modes, config)
     /// 5. Inline config (OPENCODE_CONFIG_CONTENT)
-    /// 6. Managed config directory (enterprise, highest priority)
-    ///    Then: legacy field migrations, flag overrides, plugin dedup
+    /// 6. OPENCODE_* environment overrides (OPENCODE_PERMISSION,
+    ///    OPENCODE_DISABLE_*). Applied before managed config so that managed
+    ///    config keeps the documented highest priority.
+    /// 7. Managed config directory (enterprise, highest priority)
+    ///    Then: legacy field migrations, plugin dedup, provider normalization
     pub fn load_all<P: AsRef<Path>>(&mut self, project_dir: P) -> Result<Config> {
         let project_dir = project_dir.as_ref();
 
@@ -237,10 +240,15 @@ impl ConfigLoader {
         // Inline config content overrides all non-managed config sources
         self.load_from_env_content()?;
 
+        // Environment overrides are intentionally applied *before* managed
+        // config so the enterprise managed config remains the highest-priority
+        // source (matching the documented merge order above).
+        apply_env_overrides(&mut self.config);
+
         // Load managed config (enterprise, highest priority)
         self.load_managed_config()?;
 
-        // Apply legacy field migrations and flag overrides
+        // Apply legacy field migrations, plugin dedup, provider normalization.
         apply_post_load_transforms(&mut self.config);
 
         eprintln!(
@@ -259,7 +267,8 @@ impl ConfigLoader {
     /// 4. Project config (opencode.json{,c})
     /// 5. .opencode directories
     /// 6. Inline config (OPENCODE_CONFIG_CONTENT)
-    /// 7. Managed config directory (enterprise, highest priority)
+    /// 7. OPENCODE_* environment overrides (below managed config)
+    /// 8. Managed config directory (enterprise, highest priority)
     pub async fn load_all_with_remote<P: AsRef<Path>>(&mut self, project_dir: P) -> Result<Config> {
         let wellknown_config = crate::wellknown::load_wellknown().await;
         self.config.merge(wellknown_config);
@@ -1469,7 +1478,73 @@ pub fn deduplicate_plugins(plugins: Vec<String>) -> Vec<String> {
     unique
 }
 
-/// Apply post-load transforms: legacy migrations, flag overrides, plugin dedup.
+/// Parses a boolean-like environment value with fail-closed semantics.
+///
+/// Only `true`, `1`, and `yes` (case-insensitive, surrounding whitespace
+/// ignored) enable a flag. `false`, `0`, `no`, empty strings, and any malformed
+/// value leave the flag disabled. This stops an accidentally-set
+/// `OPENCODE_DISABLE_*=false` (or `=0`, or an empty value) from silently
+/// disabling functionality.
+fn parse_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes"
+    )
+}
+
+/// Reads a boolean-like environment variable with fail-closed semantics.
+///
+/// Unset, non-UTF-8, or non-truthy values all yield `false`.
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| parse_env_flag(&value))
+}
+
+/// Applies the `OPENCODE_PERMISSION` environment override.
+///
+/// A malformed value is ignored and only the variable name plus the JSON error
+/// category are logged. The raw value is never included in the warning, so a
+/// secret accidentally placed in the variable cannot leak into logs.
+fn apply_permission_env_override(config: &mut Config) {
+    let Ok(perm_json) = env::var("OPENCODE_PERMISSION") else {
+        return;
+    };
+
+    match serde_json::from_str::<PermissionConfig>(&perm_json) {
+        Ok(perm) => {
+            let target = config
+                .permission
+                .get_or_insert_with(PermissionConfig::default);
+            for (k, v) in perm.rules() {
+                target.rules_mut().insert(k, v);
+            }
+        }
+        Err(err) => {
+            // Log only the variable name and error category — never the value.
+            tracing::warn!(
+                env_var = "OPENCODE_PERMISSION",
+                error_category = ?err.classify(),
+                "ignoring invalid OPENCODE_PERMISSION value"
+            );
+        }
+    }
+}
+
+/// Applies all `OPENCODE_*` environment overrides.
+///
+/// Called before managed config loading so that managed (enterprise) config
+/// stays the highest-priority source, as documented on `load_all`.
+fn apply_env_overrides(config: &mut Config) {
+    apply_permission_env_override(config);
+
+    if env_flag_enabled("OPENCODE_DISABLE_AUTOCOMPACT") {
+        config.compaction.get_or_insert_with(Default::default).auto = Some(false);
+    }
+    if env_flag_enabled("OPENCODE_DISABLE_PRUNE") {
+        config.compaction.get_or_insert_with(Default::default).prune = Some(false);
+    }
+}
+
+/// Apply post-load transforms: legacy migrations, plugin dedup, provider normalization.
 fn apply_post_load_transforms(config: &mut Config) {
     // Migrate deprecated `mode` field to `agent` field
     if let Some(mode_configs) = config.mode.take() {
@@ -1480,18 +1555,6 @@ fn apply_post_load_transforms(config: &mut Config) {
                 merge_agent_config(existing, mode_agent);
             } else {
                 agent_configs.entries.insert(name, mode_agent);
-            }
-        }
-    }
-
-    // OPENCODE_PERMISSION env var override
-    if let Ok(perm_json) = env::var("OPENCODE_PERMISSION") {
-        if let Ok(perm) = serde_json::from_str::<PermissionConfig>(&perm_json) {
-            let target = config
-                .permission
-                .get_or_insert_with(PermissionConfig::default);
-            for (k, v) in perm.rules() {
-                target.rules_mut().insert(k, v);
             }
         }
     }
@@ -1529,16 +1592,6 @@ fn apply_post_load_transforms(config: &mut Config) {
     // Handle migration from autoshare to share field
     if config.autoshare == Some(true) && config.share.is_none() {
         config.share = Some(crate::schema::ShareMode::Auto);
-    }
-
-    // Apply flag overrides for compaction settings
-    if env::var("OPENCODE_DISABLE_AUTOCOMPACT").is_ok() {
-        let compaction = config.compaction.get_or_insert_with(Default::default);
-        compaction.auto = Some(false);
-    }
-    if env::var("OPENCODE_DISABLE_PRUNE").is_ok() {
-        let compaction = config.compaction.get_or_insert_with(Default::default);
-        compaction.prune = Some(false);
     }
 
     // Deduplicate plugins, preserving whether the source explicitly set the key.
@@ -2128,6 +2181,135 @@ mod tests {
         let content = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
         let config: Config = serde_json::from_str(&content).unwrap();
         assert_eq!(config.model, Some("claude-3-opus".to_string()));
+    }
+
+    // ── OPENCODE_* environment override regression tests ───────────
+
+    // Env vars are process-global; serialize the tests that mutate them.
+    static ENV_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn parse_env_flag_accepts_only_explicit_truthy_values() {
+        for value in ["true", "TRUE", " True ", "1", "yes", "YES"] {
+            assert!(parse_env_flag(value), "{value:?} must enable the flag");
+        }
+        for value in [
+            "false", "FALSE", "0", "no", "NO", "", " ", "garbage", "enabled", "2",
+        ] {
+            assert!(
+                !parse_env_flag(value),
+                "{value:?} must leave the flag disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_flags_ignore_falsy_and_invalid_env_values() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const AUTO: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
+        const PRUNE: &str = "OPENCODE_DISABLE_PRUNE";
+
+        for value in ["false", "0", "no", "", "garbage"] {
+            let mut config = Config {
+                compaction: Some(crate::schema::CompactionConfig {
+                    auto: Some(true),
+                    prune: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            std::env::set_var(AUTO, value);
+            std::env::set_var(PRUNE, value);
+            apply_env_overrides(&mut config);
+            std::env::remove_var(AUTO);
+            std::env::remove_var(PRUNE);
+
+            let compaction = config.compaction.expect("compaction config kept");
+            assert_eq!(compaction.auto, Some(true), "{value:?} disabled auto");
+            assert_eq!(compaction.prune, Some(true), "{value:?} disabled prune");
+        }
+    }
+
+    #[test]
+    fn disable_flags_fire_for_truthy_env_values() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const AUTO: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
+        const PRUNE: &str = "OPENCODE_DISABLE_PRUNE";
+
+        let mut config = Config::default();
+        std::env::set_var(AUTO, "true");
+        std::env::set_var(PRUNE, "1");
+        apply_env_overrides(&mut config);
+        std::env::remove_var(AUTO);
+        std::env::remove_var(PRUNE);
+
+        let compaction = config.compaction.expect("truthy flags must set compaction");
+        assert_eq!(compaction.auto, Some(false));
+        assert_eq!(compaction.prune, Some(false));
+    }
+
+    #[test]
+    fn invalid_permission_env_json_is_ignored_without_crashing() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const VAR: &str = "OPENCODE_PERMISSION";
+        // Contains a secret-looking token: the warning must never include it.
+        let invalid = r#"{"secret-looking":"DO-NOT-LOG-ME",,,"#;
+
+        let mut config = Config::default();
+        std::env::set_var(VAR, invalid);
+        apply_env_overrides(&mut config); // must not panic
+        std::env::remove_var(VAR);
+
+        assert!(
+            config.permission.is_none(),
+            "invalid JSON must keep defaults"
+        );
+    }
+
+    #[test]
+    fn permission_env_json_merges_rules() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const VAR: &str = "OPENCODE_PERMISSION";
+
+        let mut config = Config::default();
+        std::env::set_var(VAR, r#"{"read":"deny"}"#);
+        apply_env_overrides(&mut config);
+        std::env::remove_var(VAR);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert!(matches!(
+            rules.get("read"),
+            Some(PermissionRule::Action(PermissionAction::Deny))
+        ));
+    }
+
+    #[test]
+    fn managed_config_overrides_environment_flags() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const MANAGED: &str = "OPENCODE_TEST_MANAGED_CONFIG_DIR";
+        const AUTO: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
+
+        let temp = TestDir::new("opencode_managed_over_env");
+        fs::write(
+            temp.path.join("opencode.json"),
+            r#"{"compaction":{"auto":true}}"#,
+        )
+        .unwrap();
+
+        std::env::set_var(MANAGED, temp.path.as_os_str());
+        std::env::set_var(AUTO, "true");
+        let mut loader = ConfigLoader::new().without_global_config();
+        let result = loader.load_all(&temp.path);
+        std::env::remove_var(AUTO);
+        std::env::remove_var(MANAGED);
+
+        let config = result.expect("load_all must succeed");
+        assert_eq!(
+            config.compaction.and_then(|c| c.auto),
+            Some(true),
+            "managed config must win over OPENCODE_DISABLE_AUTOCOMPACT"
+        );
     }
 
     // ── YAML frontmatter parsing tests ──────────────────────────────
