@@ -58,6 +58,24 @@ pub struct PermissionRuleset {
     pub mode: Option<String>,
 }
 
+/// セッション中に `Always` 応答で記録された動的 allow。
+///
+/// 静的な `AgentInfo.permission` や `Session.permission` とは完全に分離して保持し、
+/// セッション終了（`SessionManager::delete`）時に破棄される。パターンは承認時に
+/// 要求された値をそのまま保持し、ワイルドカード展開は行わない（権限昇格防止）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicPermissionAllow {
+    pub permission: String,
+    pub patterns: Vec<String>,
+}
+
+impl DynamicPermissionAllow {
+    /// 完全一致でのみマッチする。ワイルドカード解釈は意図的に行わない。
+    pub fn matches(&self, permission: &str, patterns: &[String]) -> bool {
+        self.permission == permission && self.patterns == patterns
+    }
+}
+
 /// Time tracking for session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTime {
@@ -721,6 +739,9 @@ pub struct SessionRow {
 
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
+    /// セッションスコープの動的 allow。`Session` のスナップショットや DB 行には
+    /// 含めず、セッション削除時にエントリごと破棄する。
+    dynamic_allows: HashMap<String, Vec<DynamicPermissionAllow>>,
     events: Vec<SessionEvent>,
 }
 
@@ -728,6 +749,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            dynamic_allows: HashMap::new(),
             events: Vec::new(),
         }
     }
@@ -838,6 +860,10 @@ impl SessionManager {
     }
 
     /// Set permission rules.
+    ///
+    /// ポリシー更新時は、それまで `Always` 応答で記録されていた動的 allow も破棄する。
+    /// 静的ルールの変更後に古い許可が残ると権限が過剰に付与されるため。
+    /// セッションが存在しない場合は何もしない。
     pub fn set_permission(
         &mut self,
         session_id: &str,
@@ -848,10 +874,57 @@ impl SessionManager {
             session.set_permission(permission);
             session.clone()
         };
+        self.dynamic_allows.remove(session_id);
         self.events.push(SessionEvent::Updated {
             info: updated.clone(),
         });
         Some(updated)
+    }
+
+    /// `Always` 応答で記録済みの動的 allow があるかを完全一致で判定する。
+    ///
+    /// ワイルドカード展開は行わないため、承認時に批准されていない
+    /// パターンや別ツールが誤ってスキップされることはない。
+    pub fn is_permission_approved(
+        &self,
+        session_id: &str,
+        permission: &str,
+        patterns: &[String],
+    ) -> bool {
+        self.dynamic_allows.get(session_id).is_some_and(|allows| {
+            allows
+                .iter()
+                .any(|allow| allow.matches(permission, patterns))
+        })
+    }
+
+    /// `Always` 応答時に呼び出し、要求された permission と pattern をそのまま記録する。
+    ///
+    /// 静的な `Session.permission` / `AgentInfo.permission` は変更しない。
+    /// `broker.ask()` 待機中にセッションが削除されていた場合はエントリを作らず `false` を
+    /// 返す（孤立した動的 allow の蓄積を防ぐ）。記録した場合は `true` を返す
+    /// （既存と重複していた場合も `true`）。
+    pub fn record_permission_allow(
+        &mut self,
+        session_id: &str,
+        permission: &str,
+        patterns: Vec<String>,
+    ) -> bool {
+        if !self.sessions.contains_key(session_id) {
+            return false;
+        }
+        let entry = DynamicPermissionAllow {
+            permission: permission.to_string(),
+            patterns,
+        };
+        let allows = self
+            .dynamic_allows
+            .entry(session_id.to_string())
+            .or_default();
+        if !allows.contains(&entry) {
+            allows.push(entry);
+        }
+        true
     }
 
     /// Set revert info.
@@ -979,6 +1052,8 @@ impl SessionManager {
         }
 
         let session = self.sessions.remove(id)?;
+        // セッションスコープの動的 allow もセッション終了で破棄する。
+        self.dynamic_allows.remove(id);
         self.events.push(SessionEvent::Deleted {
             info: session.clone(),
         });
@@ -1142,6 +1217,105 @@ mod tests {
 
         manager.delete(&session.id);
         assert_eq!(manager.count(), 0);
+    }
+
+    /// Always で記録した動的 allow は同一 (permission, patterns) のみスキップし、
+    /// 別ツール／別パターンはスキップしない（権限昇格禁止）。
+    #[test]
+    fn test_dynamic_permission_allow_is_exact_match() {
+        let mut manager = SessionManager::new();
+        let session = manager.create("project-1", "/path/to/project");
+        let sid = session.id.as_str();
+
+        assert!(!manager.is_permission_approved(sid, "bash", &["git status".to_string()]));
+
+        assert!(manager.record_permission_allow(sid, "bash", vec!["git status".to_string()]));
+
+        // 同一ツール・同一パターンはスキップ対象。
+        assert!(manager.is_permission_approved(sid, "bash", &["git status".to_string()]));
+        // 別ツールは依然プロンプト対象。
+        assert!(!manager.is_permission_approved(sid, "write", &["git status".to_string()]));
+        // パターンが異なる場合もスキップしない（ワイルドカード拡張なし）。
+        assert!(!manager.is_permission_approved(sid, "bash", &["rm -rf /".to_string()]));
+        assert!(!manager.is_permission_approved(sid, "bash", &[]));
+
+        // 重複記録は冪等。
+        assert!(manager.record_permission_allow(sid, "bash", vec!["git status".to_string()]));
+        assert!(manager.is_permission_approved(sid, "bash", &["git status".to_string()]));
+    }
+
+    /// 動的 allow はセッションスコープであり、セッション終了で消える。
+    #[test]
+    fn test_dynamic_permission_allow_is_session_scoped_and_cleared_on_delete() {
+        let mut manager = SessionManager::new();
+        let first = manager.create("project-1", "/path/to/project");
+        let second = manager.create("project-1", "/path/to/project");
+        let first_id = first.id.clone();
+
+        assert!(manager.record_permission_allow(&first_id, "bash", vec!["ls".to_string()]));
+
+        // 別セッションには漏れない。
+        assert!(!manager.is_permission_approved(&second.id, "bash", &["ls".to_string()]));
+
+        manager.delete(&first_id);
+        assert!(!manager.is_permission_approved(&first_id, "bash", &["ls".to_string()]));
+    }
+
+    /// R4(high) 回帰: broker.ask() 待機中にセッションが削除された後に Always が
+    /// 記録されても、削除済み session_id に孤立エントリを作らないこと。
+    #[test]
+    fn test_record_permission_allow_ignores_deleted_session() {
+        let mut manager = SessionManager::new();
+        let session = manager.create("project-1", "/path/to/project");
+        let deleted_id = session.id.clone();
+        assert!(manager.delete(&deleted_id).is_some());
+
+        // 削除済みセッションへの記録は no-op で false を返す。
+        assert!(!manager.record_permission_allow(&deleted_id, "bash", vec!["ls".to_string()]));
+        assert!(!manager.is_permission_approved(&deleted_id, "bash", &["ls".to_string()]));
+
+        // 存在しない session_id 全般でも同じく no-op。
+        assert!(!manager.record_permission_allow("ses_missing", "write", vec![]));
+        assert!(!manager.is_permission_approved("ses_missing", "write", &[]));
+    }
+
+    /// R4(high) 回帰: PATCH で permission を更新した際、そのセッションに残っていた
+    /// Always の動的 allow が消えること。他セッションの allow は維持される。
+    #[test]
+    fn test_set_permission_clears_dynamic_allows() {
+        let mut manager = SessionManager::new();
+        let first = manager.create("project-1", "/path/to/project");
+        let second = manager.create("project-1", "/path/to/project");
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+
+        assert!(manager.record_permission_allow(&first_id, "bash", vec!["ls".to_string()]));
+        assert!(manager.record_permission_allow(&first_id, "write", vec!["README.md".to_string()]));
+        assert!(manager.record_permission_allow(&second_id, "bash", vec!["ls".to_string()]));
+
+        let updated = manager
+            .set_permission(
+                &first_id,
+                PermissionRuleset {
+                    allow: vec!["bash".to_string()],
+                    deny: vec![],
+                    mode: Some("normal".to_string()),
+                },
+            )
+            .expect("session should be updated");
+        assert_eq!(updated.permission.as_ref().unwrap().allow, vec!["bash"]);
+
+        // 静的ルールは反映されたが、動的 allow はクリアされる。
+        assert!(!manager.is_permission_approved(&first_id, "bash", &["ls".to_string()]));
+        assert!(!manager.is_permission_approved(&first_id, "write", &["README.md".to_string()]));
+
+        // 別セッションの動的 allow は残る。
+        assert!(manager.is_permission_approved(&second_id, "bash", &["ls".to_string()]));
+
+        // 存在しないセッションでは何も起きない（None が返る）。
+        assert!(manager
+            .set_permission("ses_missing", PermissionRuleset::default())
+            .is_none());
     }
 
     /// R4(high) 回帰: SessionManager::set_summary を直接呼ぶ経路でも

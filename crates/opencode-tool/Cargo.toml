@@ -19,7 +19,6 @@ opencode-lsp = { path = "../opencode-lsp", optional = true }
 lsp-types = { workspace = true, optional = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
-lazy_static = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
