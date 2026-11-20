@@ -22,7 +22,9 @@ use std::time::Duration;
 use opencode_agent::{AgentExecutor, AgentInfo, AgentRegistry};
 use opencode_command::{CommandContext, CommandRegistry};
 use opencode_config::loader::{load_config, migrate_global_config};
-use opencode_config::{LspConfig, LspServerConfig as ConfigLspServerConfig};
+use opencode_config::{
+    LspConfig, LspServerConfig as ConfigLspServerConfig, ServerConfig as ConfigServerConfig,
+};
 use opencode_grep::{FileSearchOptions, Ripgrep};
 use opencode_lsp::{LspClient, LspServerConfig};
 use opencode_plugin::init_global;
@@ -38,6 +40,78 @@ use opencode_storage::{Database, MessageRepository, SessionRepository};
 use opencode_tool::skill::list_available_skills;
 use opencode_tool::{create_default_registry, ToolContext};
 use opencode_types::{MessagePart, Session, SessionMessage};
+
+/// CLI で明示指定されたサーバ起動オプションのみを保持する。
+/// 未指定（`None` / 空ベクタ）は `config.server.*` を採用する。
+#[derive(Debug, Default)]
+struct ServerCliOverrides {
+    port: Option<u16>,
+    hostname: Option<String>,
+    mdns: Option<bool>,
+    mdns_domain: Option<String>,
+    cors: Vec<String>,
+}
+
+/// ローカルサーバ起動時に実際に使う値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerRuntimeConfig {
+    port: u16,
+    hostname: String,
+    mdns: bool,
+    mdns_domain: String,
+    cors: Vec<String>,
+}
+
+/// `config.server.*` を基底に、CLI で明示指定された項目だけを上書きする。
+/// CORS は config 側と CLI 側をマージする（重複は除外）。
+fn resolve_server_runtime_config(
+    overrides: ServerCliOverrides,
+    configured: Option<&ConfigServerConfig>,
+) -> ServerRuntimeConfig {
+    let port = overrides
+        .port
+        .or_else(|| configured.and_then(|config| config.port))
+        .unwrap_or(0);
+    let hostname = overrides
+        .hostname
+        .or_else(|| configured.and_then(|config| config.hostname.clone()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let mdns = overrides
+        .mdns
+        .or_else(|| configured.and_then(|config| config.mdns))
+        .unwrap_or(false);
+    let mdns_domain = overrides
+        .mdns_domain
+        .or_else(|| configured.and_then(|config| config.mdns_domain.clone()))
+        .unwrap_or_else(|| "opencode.local".to_string());
+
+    let mut cors = configured
+        .and_then(|config| config.cors.clone())
+        .unwrap_or_default();
+    for origin in overrides.cors {
+        if !cors.contains(&origin) {
+            cors.push(origin);
+        }
+    }
+
+    ServerRuntimeConfig {
+        port,
+        hostname,
+        mdns,
+        mdns_domain,
+        cors,
+    }
+}
+
+/// 現在の cwd の `config.server.*` を読み、CLI 明示指定とマージして返す。
+/// 設定読み込み失敗は警告せず既定値へフォールバックする（秘密情報を出さない）。
+fn server_runtime_from_cli(overrides: ServerCliOverrides) -> ServerRuntimeConfig {
+    let configured = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config_for(&cwd).ok())
+        .and_then(|config| config.server);
+    resolve_server_runtime_config(overrides, configured.as_ref())
+}
 
 /// プロセス全体で共有する設定キャッシュ。キーは設定読み込みに使った cwd。
 ///
@@ -108,14 +182,15 @@ enum Commands {
         prompt: Option<String>,
         #[arg(long, default_value = "build")]
         agent: String,
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        hostname: String,
-        #[arg(long, default_value_t = false)]
-        mdns: bool,
-        #[arg(long = "mdns-domain", default_value = "opencode.local")]
-        mdns_domain: String,
+        // config.server.* を基底にするため、未指定と明示指定を区別する。
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        mdns: Option<bool>,
+        #[arg(long = "mdns-domain")]
+        mdns_domain: Option<String>,
         #[arg(long)]
         cors: Vec<String>,
     },
@@ -174,40 +249,43 @@ enum Commands {
     },
     #[command(about = "Start HTTP server")]
     Serve {
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        hostname: String,
-        #[arg(long, default_value_t = false)]
-        mdns: bool,
-        #[arg(long = "mdns-domain", default_value = "opencode.local")]
-        mdns_domain: String,
+        // config.server.* を基底にするため、未指定と明示指定を区別する。
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        mdns: Option<bool>,
+        #[arg(long = "mdns-domain")]
+        mdns_domain: Option<String>,
         #[arg(long)]
         cors: Vec<String>,
     },
     #[command(about = "Start headless server and open web interface")]
     Web {
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        hostname: String,
-        #[arg(long, default_value_t = false)]
-        mdns: bool,
-        #[arg(long = "mdns-domain", default_value = "opencode.local")]
-        mdns_domain: String,
+        // config.server.* を基底にするため、未指定と明示指定を区別する。
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        mdns: Option<bool>,
+        #[arg(long = "mdns-domain")]
+        mdns_domain: Option<String>,
         #[arg(long)]
         cors: Vec<String>,
     },
     #[command(about = "Start ACP (Agent Client Protocol) server")]
     Acp {
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        hostname: String,
-        #[arg(long, default_value_t = false)]
-        mdns: bool,
-        #[arg(long = "mdns-domain", default_value = "opencode.local")]
-        mdns_domain: String,
+        // config.server.* を基底にするため、未指定と明示指定を区別する。
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        mdns: Option<bool>,
+        #[arg(long = "mdns-domain")]
+        mdns_domain: Option<String>,
         #[arg(long)]
         cors: Vec<String>,
         #[arg(long, default_value = ".")]
@@ -700,11 +778,13 @@ async fn main() -> anyhow::Result<()> {
                 fork,
                 agent,
                 prompt,
-                port,
-                hostname,
-                mdns,
-                mdns_domain,
-                cors,
+                ServerCliOverrides {
+                    port,
+                    hostname,
+                    mdns,
+                    mdns_domain,
+                    cors,
+                },
                 None,
                 None,
             )
@@ -724,11 +804,7 @@ async fn main() -> anyhow::Result<()> {
                 false,
                 "build".to_string(),
                 None,
-                0,
-                "127.0.0.1".to_string(),
-                false,
-                "opencode.local".to_string(),
-                vec![],
+                ServerCliOverrides::default(),
                 Some(url),
                 password,
             )
@@ -779,7 +855,17 @@ async fn main() -> anyhow::Result<()> {
             mdns_domain,
             cors,
         }) => {
-            run_server_command("serve", port, hostname, mdns, mdns_domain, cors).await?;
+            run_server_command(
+                "serve",
+                ServerCliOverrides {
+                    port,
+                    hostname,
+                    mdns,
+                    mdns_domain,
+                    cors,
+                },
+            )
+            .await?;
         }
         Some(Commands::Web {
             port,
@@ -788,7 +874,14 @@ async fn main() -> anyhow::Result<()> {
             mdns_domain,
             cors,
         }) => {
-            run_web_command(port, hostname, mdns, mdns_domain, cors).await?;
+            run_web_command(ServerCliOverrides {
+                port,
+                hostname,
+                mdns,
+                mdns_domain,
+                cors,
+            })
+            .await?;
         }
         Some(Commands::Acp {
             port,
@@ -798,7 +891,17 @@ async fn main() -> anyhow::Result<()> {
             cors,
             cwd,
         }) => {
-            run_acp_command(port, hostname, mdns, mdns_domain, cors, cwd).await?;
+            run_acp_command(
+                ServerCliOverrides {
+                    port,
+                    hostname,
+                    mdns,
+                    mdns_domain,
+                    cors,
+                },
+                cwd,
+            )
+            .await?;
         }
         Some(Commands::Models {
             provider,
@@ -878,11 +981,7 @@ async fn main() -> anyhow::Result<()> {
                 false,
                 "build".to_string(),
                 None,
-                0,
-                "127.0.0.1".to_string(),
-                false,
-                "opencode.local".to_string(),
-                vec![],
+                ServerCliOverrides::default(),
                 None,
                 None,
             )
@@ -914,11 +1013,7 @@ async fn run_tui(
     fork: bool,
     agent_name: String,
     initial_prompt: Option<String>,
-    port: u16,
-    hostname: String,
-    mdns: bool,
-    mdns_domain: String,
-    cors: Vec<String>,
+    overrides: ServerCliOverrides,
     attach_url: Option<String>,
     password: Option<String>,
 ) -> anyhow::Result<()> {
@@ -937,17 +1032,23 @@ async fn run_tui(
     let base_url = if let Some(url) = attach_url {
         url
     } else {
-        let bind_host = if mdns && hostname == "127.0.0.1" {
+        // ローカルサーバ起動直前に config.server.* を読み、明示指定のみ上書きする。
+        let runtime = server_runtime_from_cli(overrides);
+        let bind_host = if runtime.mdns && runtime.hostname == "127.0.0.1" {
             "0.0.0.0".to_string()
         } else {
-            hostname.clone()
+            runtime.hostname.clone()
         };
         let client_host = if bind_host == "0.0.0.0" {
             "127.0.0.1".to_string()
         } else {
             bind_host.clone()
         };
-        let bind_port = if port == 0 { 3000 } else { port };
+        let bind_port = if runtime.port == 0 {
+            3000
+        } else {
+            runtime.port
+        };
         let addr: SocketAddr = format!("{}:{}", bind_host, bind_port).parse()?;
         let server_url = format!("http://{}:{}", client_host, bind_port);
         // TUI のローカルサーバは run_server_command を通らず run_server を直接 spawn
@@ -955,11 +1056,16 @@ async fn run_tui(
         // attach（外部サーバへ接続する経路）ではローカルサーバを起動しないので出さない。
         emit_auth_status_notice();
         eprintln!("Starting local server for TUI at {}", server_url);
-        opencode_server::set_cors_whitelist(cors.clone());
+        opencode_server::set_cors_whitelist(runtime.cors);
         let mut handle = tokio::spawn(async move { opencode_server::run_server(addr).await });
         wait_for_server_ready(&server_url, Duration::from_secs(90), Some(&mut handle)).await?;
         server_handle = Some(handle);
-        mdns_publisher = start_mdns_publisher_if_needed(mdns, &bind_host, bind_port, &mdns_domain);
+        mdns_publisher = start_mdns_publisher_if_needed(
+            runtime.mdns,
+            &bind_host,
+            bind_port,
+            &runtime.mdns_domain,
+        );
         server_url
     };
 
@@ -2381,30 +2487,35 @@ fn emit_auth_status_notice() {
     let _ = write_auth_status_notice(&mut io::stderr());
 }
 
-async fn run_server_command(
-    mode: &str,
-    port: u16,
-    hostname: String,
-    mdns: bool,
-    mdns_domain: String,
-    cors: Vec<String>,
-) -> anyhow::Result<()> {
+/// 実効値を使って HTTP サーバを起動する（serve / web / acp の共通経路）。
+async fn run_http_server(mode: &str, runtime: ServerRuntimeConfig) -> anyhow::Result<()> {
     // 認証状態の通知は CLI 側で 1 回だけ出す（server 側は警告を出さない）。
     // 判定は server の parse_no_auth と同一（fail-closed）。
     emit_auth_status_notice();
 
-    let bind_host = if mdns && hostname == "127.0.0.1" {
+    let bind_host = if runtime.mdns && runtime.hostname == "127.0.0.1" {
         "0.0.0.0".to_string()
     } else {
-        hostname
+        runtime.hostname
     };
-    let bind_port = if port == 0 { 3000 } else { port };
-    opencode_server::set_cors_whitelist(cors);
-    let _mdns_publisher = start_mdns_publisher_if_needed(mdns, &bind_host, bind_port, &mdns_domain);
+    let bind_port = if runtime.port == 0 {
+        3000
+    } else {
+        runtime.port
+    };
+    opencode_server::set_cors_whitelist(runtime.cors);
+    let _mdns_publisher =
+        start_mdns_publisher_if_needed(runtime.mdns, &bind_host, bind_port, &runtime.mdns_domain);
     let addr: SocketAddr = format!("{}:{}", bind_host, bind_port).parse()?;
     println!("Starting OpenCode {} server on {}", mode, addr);
     opencode_server::run_server(addr).await?;
     Ok(())
+}
+
+/// `config.server.*` を読み、CLI の明示指定のみ上書きしてサーバを起動する。
+async fn run_server_command(mode: &str, overrides: ServerCliOverrides) -> anyhow::Result<()> {
+    let runtime = server_runtime_from_cli(overrides);
+    run_http_server(mode, runtime).await
 }
 
 fn try_open_browser(url: &str) {
@@ -2440,44 +2551,46 @@ fn try_open_browser(url: &str) {
     );
 }
 
-async fn run_web_command(
-    port: u16,
-    hostname: String,
-    mdns: bool,
-    mdns_domain: String,
-    cors: Vec<String>,
-) -> anyhow::Result<()> {
-    let bind_port = if port == 0 { 3000 } else { port };
-    let display_host = if hostname == "0.0.0.0" {
+async fn run_web_command(overrides: ServerCliOverrides) -> anyhow::Result<()> {
+    // ブラウザ URL とサーバのバインド先で同じ実効値を使う。
+    let runtime = server_runtime_from_cli(overrides);
+    let bind_port = if runtime.port == 0 {
+        3000
+    } else {
+        runtime.port
+    };
+    let display_host = if runtime.hostname == "0.0.0.0" {
         "localhost".to_string()
     } else {
-        hostname.clone()
+        runtime.hostname.clone()
     };
     let url = format!("http://{}:{}", display_host, bind_port);
     println!("Web interface: {}", url);
     try_open_browser(&url);
-    run_server_command("web", bind_port, hostname, mdns, mdns_domain, cors).await
+    run_http_server("web", runtime).await
 }
 
-async fn run_acp_command(
-    port: u16,
-    hostname: String,
-    mdns: bool,
-    mdns_domain: String,
-    cors: Vec<String>,
-    cwd: PathBuf,
-) -> anyhow::Result<()> {
+async fn run_acp_command(overrides: ServerCliOverrides, cwd: PathBuf) -> anyhow::Result<()> {
     std::env::set_current_dir(&cwd)
         .map_err(|e| anyhow::anyhow!("Failed to change directory to {}: {}", cwd.display(), e))?;
 
-    if try_run_external_acp_bridge(port, &hostname, mdns, &mdns_domain, &cors, &cwd)? {
+    // cwd 切り替え後に解決し、外部 bridge と HTTP フォールバックで同じ値を使う。
+    let runtime = server_runtime_from_cli(overrides);
+    if try_run_external_acp_bridge(
+        runtime.port,
+        &runtime.hostname,
+        runtime.mdns,
+        &runtime.mdns_domain,
+        &runtime.cors,
+        &cwd,
+    )? {
         return Ok(());
     }
 
     eprintln!(
         "Warning: no external ACP stdio bridge runtime found; falling back to HTTP server mode."
     );
-    run_server_command("acp", port, hostname, mdns, mdns_domain, cors).await
+    run_http_server("acp", runtime).await
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -6136,6 +6249,95 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn config_server_port_is_used_and_cli_overrides_only_when_explicit() {
+        let configured = ConfigServerConfig {
+            port: Some(41234),
+            hostname: Some("0.0.0.0".to_string()),
+            mdns: Some(true),
+            mdns_domain: Some("example.local".to_string()),
+            cors: Some(vec!["http://config.example".to_string()]),
+        };
+
+        // 未指定なら config.server.* がそのまま使われる。
+        let runtime =
+            resolve_server_runtime_config(ServerCliOverrides::default(), Some(&configured));
+        assert_eq!(runtime.port, 41234);
+        assert_eq!(runtime.hostname, "0.0.0.0");
+        assert!(runtime.mdns);
+        assert_eq!(runtime.mdns_domain, "example.local");
+        assert_eq!(runtime.cors, vec!["http://config.example".to_string()]);
+
+        // 明示指定だけが上書きされ、cors は config 側とマージされる。
+        let runtime = resolve_server_runtime_config(
+            ServerCliOverrides {
+                port: Some(51234),
+                hostname: Some("127.0.0.1".to_string()),
+                mdns: Some(false),
+                cors: vec!["http://cli.example".to_string()],
+                ..Default::default()
+            },
+            Some(&configured),
+        );
+        assert_eq!(runtime.port, 51234);
+        assert_eq!(runtime.hostname, "127.0.0.1");
+        assert!(!runtime.mdns);
+        assert_eq!(runtime.mdns_domain, "example.local");
+        assert_eq!(
+            runtime.cors,
+            vec![
+                "http://config.example".to_string(),
+                "http://cli.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_flags_are_optional_until_config_is_merged() {
+        let cli = Cli::try_parse_from(["opencoderust", "serve"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                port,
+                hostname,
+                mdns,
+                ..
+            }) => {
+                assert_eq!(port, None);
+                assert_eq!(hostname, None);
+                assert_eq!(mdns, None);
+            }
+            _ => panic!("expected Serve variant"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "opencoderust",
+            "serve",
+            "--port",
+            "41234",
+            "--hostname",
+            "0.0.0.0",
+            "--mdns",
+            "--cors",
+            "http://cli.example",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                port,
+                hostname,
+                mdns,
+                cors,
+                ..
+            }) => {
+                assert_eq!(port, Some(41234));
+                assert_eq!(hostname.as_deref(), Some("0.0.0.0"));
+                assert_eq!(mdns, Some(true));
+                assert_eq!(cors, vec!["http://cli.example".to_string()]);
+            }
+            _ => panic!("expected Serve variant"),
+        }
     }
 
     #[test]

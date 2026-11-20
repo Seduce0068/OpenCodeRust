@@ -1683,8 +1683,11 @@ fn apply_post_load_transforms(config: &mut Config) {
 
 /// Folds the current-schema `providers` map into the runtime `provider` map.
 ///
-/// The legacy `provider` map wins when both spellings define the same id, so
-/// project-level overrides keep working. Connection settings that the current
+/// Cross-layer spelling conflicts are resolved earlier by `Config::merge`,
+/// where the higher-precedence layer wins regardless of which spelling it
+/// used. What reaches this function is a leftover from a single source layer
+/// that defined both spellings for one id; for that case the legacy `provider`
+/// map keeps its historical priority. Connection settings that the current
 /// schema nests under `settings` are flattened into the fields consumed by the
 /// provider bootstrap (`npm`, `base_url`, `api_key`, `options`).
 fn normalize_provider_configs(config: &mut Config) {
@@ -3345,6 +3348,79 @@ theme = "dark"
             config.plugin.is_empty(),
             "plugins from .opencode/plugins must not revive after reload"
         );
+    }
+
+    // ── R2 merge regressions: timezone / agents / provider conflicts ──
+
+    #[test]
+    fn load_from_str_layers_preserve_timezone_and_agents() {
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader
+            .load_from_str(r#"{"timezone":"UTC","agents":{"reviewer":{"prompt":"base prompt"}}}"#)
+            .unwrap();
+        loader
+            .load_from_str(
+                r#"{"timezone":"Asia/Tokyo","agents":{"reviewer":{"model":"new-model"},"build":{}}}"#,
+            )
+            .unwrap();
+
+        let config = loader.get_config();
+        assert_eq!(config.timezone.as_deref(), Some("Asia/Tokyo"));
+        let agents = config.agents.expect("agents kept across layers");
+        let reviewer = agents.get("reviewer").expect("reviewer");
+        assert_eq!(reviewer.prompt.as_deref(), Some("base prompt"));
+        assert_eq!(reviewer.model.as_deref(), Some("new-model"));
+        assert!(agents.contains_key("build"));
+    }
+
+    #[test]
+    fn project_providers_override_global_provider_after_normalization() {
+        let mut loader = ConfigLoader::new().without_global_config();
+        // Lower precedence layer uses the legacy spelling.
+        loader
+            .load_from_str(r#"{"provider":{"x":{"name":"global-name","api_key":"global-value"}}}"#)
+            .unwrap();
+        // Higher precedence layer uses the current spelling.
+        loader
+            .load_from_str(r#"{"providers":{"x":{"name":"project-name","npm":"project-pkg"}}}"#)
+            .unwrap();
+
+        let mut config = loader.get_config();
+        apply_post_load_transforms(&mut config);
+
+        assert!(
+            config.providers.is_none(),
+            "current-schema map must be folded into provider"
+        );
+        let provider = config
+            .provider
+            .expect("provider map")
+            .remove("x")
+            .expect("project provider");
+        assert_eq!(provider.name.as_deref(), Some("project-name"));
+        assert_eq!(provider.npm.as_deref(), Some("project-pkg"));
+        assert_eq!(provider.api_key, None, "global value must not survive");
+    }
+
+    #[test]
+    fn project_legacy_provider_overrides_global_providers_after_normalization() {
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader
+            .load_from_str(r#"{"providers":{"x":{"name":"global-name"}}}"#)
+            .unwrap();
+        loader
+            .load_from_str(r#"{"provider":{"x":{"name":"project-name"}}}"#)
+            .unwrap();
+
+        let mut config = loader.get_config();
+        apply_post_load_transforms(&mut config);
+
+        let provider = config
+            .provider
+            .expect("provider map")
+            .remove("x")
+            .expect("project provider");
+        assert_eq!(provider.name.as_deref(), Some("project-name"));
     }
 }
 

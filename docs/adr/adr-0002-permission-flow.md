@@ -65,10 +65,22 @@ generated:
 
 ## Consequences
 
-- ツール実行前に必ずユーザー確認を行う
-- `always` 選択は永続化されず、現呼出しのみ permissive として扱う
-  （`PermissionResponse::Always` は callback で `Ok(())` に変換されるだけで、
-  以降のリクエストを自動許可する状態は残らない）。永続化の配線は将来課題
+- ツール実行前にユーザー確認を行うが、記録済みの動的 allow に一致する
+  同一リクエストは確認をスキップする
+- `always` 選択は現呼出しのみで消えるのではなく、セッションスコープの
+  動的 allow として記録される。以降は同一の `(permission, patterns)`
+  リクエストをプロンプトなしでスキップする
+  （`routes.rs::handle_permission_request` が `broker.ask()` の前に
+  `is_permission_approved()` で判定し、`Always` 応答時に
+  `record_permission_allow()` で記録）。完全一致でのみマッチし
+  ワイルドカード展開は行わないため、未批准のパターンや別ツールが
+  誤って許可されることはない。プロセス再起動を跨ぐ永続化は行わない
+- 動的 allow の破棄条件: セッション削除（`SessionManager::delete`）と
+  ポリシー更新（`SessionManager::set_permission`）の際に当該セッションの
+  動的 allow を削除する。`broker.ask()` 待機中にセッションが削除された
+  場合は記録せず、孤立したエントリは残らない
+- 静的な `Session.permission` / `AgentInfo.permission` ルール（deny/allow）は
+  動的 allow の記録・判定では変更されない
 - TUI/HTTP 両方で統一 UX
 - `OPENCODE_NO_AUTH=1` でも権限フローは独立動作
 
@@ -78,3 +90,7 @@ generated:
 - 実装: `server.rs:62-70, 129-231`（Broker と PendingEntryGuard）,
   `routes.rs:1994-2022, 3995-4032`（コールバック生成と `/permission/{id}/reply`）,
   `prompt.rs:1502-1510`（`with_ask` 注入）
+- 動的 allow: `routes.rs::handle_permission_request`（事前判定と記録）,
+  `opencode-session/src/session.rs` の `DynamicPermissionAllow` /
+  `is_permission_approved()` / `record_permission_allow()` /
+  `set_permission()` / `delete()`（スコープと破棄条件）

@@ -10,16 +10,19 @@
 //! `use opencode_agent::{AgentExecutor, AgentInfo};` のようにクレート直下から import し、
 //! `AgentExecutor` に `GenerateInput` を渡してエージェントを実行する。
 
-#![allow(
-    ambiguous_glob_reexports,
-    clippy::cloned_ref_to_slice_refs,
-    clippy::field_reassign_with_default
-)]
+#![allow(clippy::cloned_ref_to_slice_refs, clippy::field_reassign_with_default)]
 
 pub mod agent;
 pub mod executor;
 pub mod message;
 
-pub use agent::*;
+// crate 直下の再エクスポートは明示リストで統一する。
+// `agent::AgentError`（旧名の deprecated alias）と executor の `AgentError` を
+// glob で同時に再エクスポートすると曖昧になるため、直下では executor 側のみを公開する。
+pub use agent::{
+    AgentConfigLoadError, AgentGenerateError, AgentInfo, AgentMode, AgentRegistry, BuiltinAgent,
+    GenerateInput, GenerateResult, GeneratedAgentConfig, ModelRef, PermissionDecision,
+    PermissionNext, ToolCallResult, UsageInfo,
+};
 pub use executor::*;
 pub use message::*;

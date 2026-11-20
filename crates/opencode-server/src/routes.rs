@@ -1191,6 +1191,8 @@ fn resolve_provider_and_model(
     let resolve_from_model = |model: &str| -> Result<(String, String)> {
         state
             .providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .parse_model_string(model)
             .ok_or_else(|| ApiError::BadRequest(format!("Model not found: {}", model)))
     };
@@ -1206,6 +1208,8 @@ fn resolve_provider_and_model(
     } else {
         let first = state
             .providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .list_models()
             .into_iter()
             .next()
@@ -1215,6 +1219,8 @@ fn resolve_provider_and_model(
 
     let provider = state
         .providers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get_provider(&provider_id)
         .map_err(|e| ApiError::ProviderError(e.to_string()))?;
     if provider.get_model(&model_id).is_none() {
@@ -2126,7 +2132,12 @@ fn spawn_prompt_execution(
     let task_agent = request.agent.clone();
     let task_model = request.model.model_id.clone();
     let task_provider = request.model.provider_id.clone();
-    let provider = match task_state.providers.get_provider(&task_provider) {
+    let provider = match task_state
+        .providers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_provider(&task_provider)
+    {
         Ok(provider) => provider,
         Err(error) => {
             tracing::error!(session_id = %session_id, %error, "prompt provider unavailable");
@@ -3186,7 +3197,11 @@ fn variants_for_model(
 
 async fn list_providers(State(state): State<Arc<ServerState>>) -> Json<ProviderListResponse> {
     let variant_lookup = get_model_variant_lookup().await;
-    let models = state.providers.list_models();
+    let models = state
+        .providers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .list_models();
     let mut provider_map: HashMap<String, Vec<ModelInfo>> = HashMap::new();
     for m in models {
         let provider_id = m.provider.clone();
@@ -3332,7 +3347,62 @@ fn config_routes() -> Router<Arc<ServerState>> {
         .route("/providers", get(get_config_providers))
 }
 
-/// Serialize a config for API responses with provider API keys masked.
+/// Whether a JSON object key names a credential that must never be returned.
+///
+/// Matching is case-insensitive and ignores `-`/`_` separators so `apiKey`,
+/// `api_key`, `API-KEY` and `Authorization` are all covered by one check.
+fn is_secret_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "authorization"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "secret"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "credential"
+            | "credentials"
+            | "privatekey"
+    )
+}
+
+/// Recursively replace non-empty values under known secret keys with `***`.
+///
+/// Objects and arrays are walked so credentials nested in `settings`,
+/// `options` or `headers` are covered as well, while the response shape stays
+/// unchanged. Only non-empty string values are masked, and original values
+/// never reach logs or errors.
+fn mask_nested_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_secret_key(key.as_str()) && child.as_str().is_some_and(|s| !s.is_empty()) {
+                    *child = serde_json::json!("***");
+                } else {
+                    mask_nested_secrets(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                mask_nested_secrets(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Serialize a config for API responses with provider credentials masked at
+/// every nesting level (top level, `settings`, `options` and `headers`).
 fn config_for_response(config: &AppConfig) -> serde_json::Value {
     let mut value = match serde_json::to_value(config) {
         Ok(v) => v,
@@ -3342,15 +3412,7 @@ fn config_for_response(config: &AppConfig) -> serde_json::Value {
         for key in ["provider", "providers"] {
             if let Some(providers) = obj.get_mut(key).and_then(|p| p.as_object_mut()) {
                 for provider in providers.values_mut() {
-                    if let Some(p) = provider.as_object_mut() {
-                        for secret_key in ["api_key", "apiKey"] {
-                            if let Some(secret) = p.get_mut(secret_key) {
-                                if secret.as_str().is_some_and(|s| !s.is_empty()) {
-                                    *secret = serde_json::json!("***");
-                                }
-                            }
-                        }
-                    }
+                    mask_nested_secrets(provider);
                 }
             }
         }
@@ -3361,6 +3423,37 @@ fn config_for_response(config: &AppConfig) -> serde_json::Value {
 async fn get_config(State(state): State<Arc<ServerState>>) -> Result<Json<serde_json::Value>> {
     let config = state.config.read().await;
     Ok(Json(config_for_response(&config)))
+}
+
+/// PATCH のうち再起動が必要なキーを列挙する。設定値（特に秘密情報）は含めない。
+fn restart_required_keys(patch: &AppConfig) -> Vec<String> {
+    let Some(server) = patch.server.as_ref() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    if server.port.is_some() {
+        keys.push("server.port".to_string());
+    }
+    if server.hostname.is_some() {
+        keys.push("server.hostname".to_string());
+    }
+    if server.mdns.is_some() {
+        keys.push("server.mdns".to_string());
+    }
+    if server.mdns_domain.is_some() {
+        keys.push("server.mdnsDomain".to_string());
+    }
+    if server.cors.is_some() {
+        keys.push("server.cors".to_string());
+    }
+    keys
+}
+
+/// 現在の config/auth から `ProviderRegistry` を作り直して差し替える。
+/// 値ではなく provider_id のみを扱い、トークン値をログへ出さない。
+async fn rebuild_provider_registry_after_patch(state: &Arc<ServerState>) {
+    let registry = state.build_provider_registry_from_auth().await;
+    state.replace_provider_registry(registry);
 }
 
 async fn patch_config(
@@ -3379,13 +3472,26 @@ async fn patch_config(
         tracing::warn!(%error, "failed to persist patched config");
     }
 
+    // 永続化後に再 bootstrap し、後続のモデル解決が更新済み config/auth を
+    // 参照するようにする（再起動不要な項目は即時反映）。
+    rebuild_provider_registry_after_patch(&state).await;
+    let restart_required = restart_required_keys(&patch);
+
+    let mut response = config_for_response(&updated);
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "restart_required".to_string(),
+            serde_json::json!(restart_required),
+        );
+    }
+
     state.broadcast(
         &serde_json::json!({
             "type": "config.updated",
         })
         .to_string(),
     );
-    Ok(Json(config_for_response(&updated)))
+    Ok(Json(response))
 }
 
 #[derive(Debug, Serialize)]
@@ -3399,7 +3505,11 @@ async fn get_config_providers(
     State(state): State<Arc<ServerState>>,
 ) -> Json<ConfigProvidersResponse> {
     let variant_lookup = get_model_variant_lookup().await;
-    let models = state.providers.list_models();
+    let models = state
+        .providers
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .list_models();
     let mut provider_map: HashMap<String, Vec<ModelInfo>> = HashMap::new();
     for m in models {
         let provider_id = m.provider.clone();
@@ -6211,6 +6321,67 @@ mod mapping_tests {
         assert_eq!(value["provider"]["openai"]["api_key"], "***");
         assert!(!value.to_string().contains("super-secret-key"));
     }
+
+    #[test]
+    fn config_for_response_masks_nested_provider_secrets() {
+        // テスト専用のダミー値。ログ・エラーへは出さない。
+        let provider = opencode_config::schema::ProviderConfig {
+            api_key: Some("dummy-top-level-key".to_string()),
+            settings: Some(HashMap::from([(
+                "apiKey".to_string(),
+                serde_json::json!("dummy-settings-key"),
+            )])),
+            headers: Some(HashMap::from([(
+                "Authorization".to_string(),
+                serde_json::json!("Bearer dummy-header-token"),
+            )])),
+            options: Some(HashMap::from([(
+                "nested".to_string(),
+                serde_json::json!({"token": "dummy-nested-token", "keep": "visible"}),
+            )])),
+            ..Default::default()
+        };
+        let config = AppConfig {
+            provider: Some(HashMap::from([("openai".to_string(), provider.clone())])),
+            providers: Some(HashMap::from([("plural".to_string(), provider)])),
+            ..Default::default()
+        };
+
+        let value = config_for_response(&config);
+        for (section, id) in [("provider", "openai"), ("providers", "plural")] {
+            assert_eq!(value[section][id]["api_key"], "***");
+            assert_eq!(value[section][id]["settings"]["apiKey"], "***");
+            assert_eq!(value[section][id]["headers"]["Authorization"], "***");
+            assert_eq!(value[section][id]["options"]["nested"]["token"], "***");
+            assert_eq!(value[section][id]["options"]["nested"]["keep"], "visible");
+        }
+        let rendered = value.to_string();
+        for secret in [
+            "dummy-top-level-key",
+            "dummy-settings-key",
+            "Bearer dummy-header-token",
+            "dummy-nested-token",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a provider secret leaked into the response"
+            );
+        }
+
+        // 空文字列はマスクしない（既存仕様を維持）。
+        let empty_config = AppConfig {
+            provider: Some(HashMap::from([(
+                "openai".to_string(),
+                opencode_config::schema::ProviderConfig {
+                    api_key: Some(String::new()),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let empty_value = config_for_response(&empty_config);
+        assert_eq!(empty_value["provider"]["openai"]["api_key"], "");
+    }
 }
 
 #[cfg(test)]
@@ -7895,5 +8066,143 @@ mod permission_always_tests {
             ),
             "orphaned dynamic allow must not be recorded for a deleted session"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_patch_runtime_tests {
+    use super::*;
+
+    fn config_with_openai_model(model_id: &str) -> AppConfig {
+        let model = opencode_config::schema::ModelConfig {
+            name: Some(model_id.to_string()),
+            ..Default::default()
+        };
+        let provider = opencode_config::schema::ProviderConfig {
+            // テスト専用のダミー値。ログ・エラーへは出さない。
+            api_key: Some("dummy-key-for-test".to_string()),
+            models: Some(HashMap::from([(model_id.to_string(), model)])),
+            ..Default::default()
+        };
+        AppConfig {
+            provider: Some(HashMap::from([("openai".to_string(), provider)])),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_rebuild_changes_model_resolution() {
+        let state = Arc::new(ServerState::new());
+        *state.config.write().await = config_with_openai_model("model-a");
+        rebuild_provider_registry_after_patch(&state).await;
+
+        let (provider, resolved_provider_id, model_id) =
+            resolve_provider_and_model(&state, Some("model-a"), None, None)
+                .expect("model-a must resolve before PATCH");
+        assert_eq!(resolved_provider_id, "openai");
+        assert_eq!(model_id, "model-a");
+        assert!(
+            !provider.id().is_empty(),
+            "resolved provider must be usable"
+        );
+
+        let patch = AppConfig {
+            disabled_providers: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        state.config.write().await.merge(patch);
+        rebuild_provider_registry_after_patch(&state).await;
+
+        assert!(
+            resolve_provider_and_model(&state, Some("model-a"), None, None).is_err(),
+            "model-a must stop resolving after PATCH disables its provider"
+        );
+    }
+
+    #[test]
+    fn restart_required_keys_lists_only_server_fields() {
+        let patch = AppConfig::default();
+        assert!(restart_required_keys(&patch).is_empty());
+
+        let patch = AppConfig {
+            server: Some(opencode_config::schema::ServerConfig {
+                port: Some(41234),
+                hostname: Some("127.0.0.1".to_string()),
+                cors: Some(vec!["http://example.test".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let keys = restart_required_keys(&patch);
+        assert_eq!(
+            keys,
+            vec![
+                "server.port".to_string(),
+                "server.hostname".to_string(),
+                "server.cors".to_string(),
+            ]
+        );
+        // キー名だけを返し、設定値（CORS オリジン等）はレスポンスへ混ぜない。
+        assert!(!format!("{keys:?}").contains("example.test"));
+    }
+
+    #[test]
+    fn patch_config_rebuilds_registry_after_persistence() {
+        let source = include_str!("routes.rs");
+        let start = source
+            .find("async fn patch_config(")
+            .expect("patch_config must exist");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("patch_config closing brace");
+        let body = &rest[..end];
+        let persist_at = body.find("update_config(").expect("persist call");
+        let rebuild_at = body
+            .find("rebuild_provider_registry_after_patch(")
+            .expect("registry rebuild call");
+        assert!(
+            persist_at < rebuild_at,
+            "provider registry must be rebuilt after config persistence: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_adding_plural_provider_rebuilds_registry_with_it() {
+        let state = Arc::new(ServerState::new());
+        assert!(
+            resolve_provider_and_model(&state, Some("patched-model"), None, None).is_err(),
+            "precondition: patched-model must not resolve before PATCH"
+        );
+
+        let model = opencode_config::schema::ModelConfig {
+            name: Some("patched-model".to_string()),
+            ..Default::default()
+        };
+        let patch = AppConfig {
+            providers: Some(HashMap::from([(
+                "openai".to_string(),
+                opencode_config::schema::ProviderConfig {
+                    // テスト専用のダミー値。ログ・エラーへは出さない。
+                    api_key: Some("dummy-patched-key".to_string()),
+                    models: Some(HashMap::from([("patched-model".to_string(), model)])),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        state.config.write().await.merge(patch);
+        rebuild_provider_registry_after_patch(&state).await;
+
+        let registry = state.providers.read().expect("provider registry lock");
+        assert!(
+            registry.get("openai").is_some(),
+            "PATCH-added providers.openai must be present in the rebuilt registry"
+        );
+        drop(registry);
+
+        let (_, provider_id, model_id) =
+            resolve_provider_and_model(&state, Some("patched-model"), None, None)
+                .expect("patched model must resolve after PATCH");
+        assert_eq!(provider_id, "openai");
+        assert_eq!(model_id, "patched-model");
     }
 }

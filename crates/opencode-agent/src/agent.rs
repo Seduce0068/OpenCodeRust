@@ -186,8 +186,12 @@ pub struct GenerateInput {
     pub model: Option<ModelRef>,
 }
 
+/// `AgentRegistry::generate` の失敗を表すエラー。
+///
+/// crate 直下の `AgentError` は executor 側の実行時エラーを指すため、
+/// 生成処理固有の本型は `AgentGenerateError` として区別する。
 #[derive(Debug, thiserror::Error)]
-pub enum AgentError {
+pub enum AgentGenerateError {
     #[error("Provider error: {0}")]
     ProviderError(#[from] opencode_provider::ProviderError),
 
@@ -197,6 +201,15 @@ pub enum AgentError {
     #[error("No default model available")]
     NoDefaultModel,
 }
+
+/// 移行期の旧名エイリアス。module 経由の参照のみを維持する。
+///
+/// crate 直下の `AgentError` は executor 側の実行時エラーを指すため、
+/// 新しいコードでは `AgentGenerateError` を使用すること。
+#[deprecated(
+    note = "use AgentGenerateError instead; crate-root AgentError is executor::AgentError"
+)]
+pub type AgentError = AgentGenerateError;
 
 impl AgentInfo {
     pub fn from_builtin(builtin: BuiltinAgent) -> Self {
@@ -755,12 +768,15 @@ impl AgentRegistry {
         &self,
         input: GenerateInput,
         provider_registry: &opencode_provider::ProviderRegistry,
-    ) -> Result<GeneratedAgentConfig, AgentError> {
-        let model_ref = input.model.clone().ok_or(AgentError::NoDefaultModel)?;
+    ) -> Result<GeneratedAgentConfig, AgentGenerateError> {
+        let model_ref = input
+            .model
+            .clone()
+            .ok_or(AgentGenerateError::NoDefaultModel)?;
 
         let provider = provider_registry
             .get(&model_ref.provider_id)
-            .ok_or(AgentError::NoDefaultModel)?;
+            .ok_or(AgentGenerateError::NoDefaultModel)?;
 
         let existing_names: Vec<&str> = self.agents.keys().map(|s| s.as_str()).collect();
         let existing_list = existing_names.join(", ");
@@ -802,7 +818,7 @@ impl AgentRegistry {
             .trim();
 
         serde_json::from_str(cleaned)
-            .map_err(|e| AgentError::ParseError(format!("{}: {}", e, cleaned)))
+            .map_err(|e| AgentGenerateError::ParseError(format!("{}: {}", e, cleaned)))
     }
 }
 

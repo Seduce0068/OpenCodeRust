@@ -19,6 +19,7 @@ opencode-lsp = { path = "../opencode-lsp" }
 opencode-plugin = { path = "../opencode-plugin" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -37,4 +38,3 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-async-trait = { workspace = true }
