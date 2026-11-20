@@ -178,8 +178,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **plugin host が stdin EOF を検知せず自終了できない**
-  — `plugin-host.ts:87-104,120-128` / PLUG-HOST-EOF
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -277,8 +275,6 @@ status: current
 - [ ] **認証キーのローテーションが無く 1 プロバイダ 1 キー固定** — `auth.rs:57-64,179-193` / P-07
 - [ ] **Bedrock の autoload 判定と Provider 生成で認証方式が不一致**
   — `bootstrap.rs:553-581,2217-2241` / P-08
-- [ ] **モデル ID 解決が HashMap 順依存で非決定的**
-  — `bootstrap.rs:1714-1726`, `provider.rs:390-397` / P-10
 - [ ] **CodeMode の timeoutMs がホストツール呼び出しを拘束できない**
   — `tools.rs:78-82` / CM-HOST-TIMEOUT
 - [ ] **local-llm がリクエストを直列処理し 300 秒間キャンセル不能**
@@ -290,8 +286,6 @@ status: current
 
 - [ ] **per-instance ServerState と process-global な CORS/plugin/fetch-proxy 状態が矛盾**
   — — `server.rs:491-516,996` / R1-AR03 / 中
-- [ ] **プラグイン host/builtin スクリプトが予測可能な共有キャッシュへ symlink 追従で書き込まれる**
-  — — `loader.rs:68-74,164-178` / R1-IV08 / 中
 - [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
   — `renovate.json:3-5` / R1-DP02 / 中
 - [ ] **reqwest 既定 feature で rustls と native-tls が二重搭載**
@@ -299,6 +293,8 @@ status: current
 
 ## 完了
 
+- [x] **[plugin/provider 3 件]** symlink 防御・モデル決定性・EOF 終了
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[CLI/session/docs 11 件]** JSON 契約・実配線・セッション保全
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[重複整理 18 件]** 過去ラウンドで対応済みの未着手を完了へ
@@ -562,6 +558,10 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（plugin/provider の修正時、記録のみ）: verify_script が
+  load_all 開始時の一度のみで spawn 直前の TOCTOU を覆えていない。deno が
+  ローカルに未インストールのため plugin-host.ts の deno check / smoke test 未実施。
+  load_all が検証失敗時に spawn しない統合テストが不足（単体テストのみ）。
 - 2026-11-20 R4 指摘（CLI/session/docs の修正時）: 4 件すべて対応済み。
   docs/opencode-config.md の 55-57 行目（timeout マッピング済み）と 72-73 行目
   （timeout 未マッピング）の内部矛盾は「timeout 側は触らない」指示で未修正。
