@@ -178,9 +178,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **セッション生成時のプラグインフック task が JoinHandle を保持せずデタッチ**
-  — `session.rs:780` / RES-09
-- [ ] **util/watcher/tui/tool の crate 級・pub 項目に doc 欠落** — `各 lib.rs` / API-08
 - [ ] **Plugin::register_hooks が手動 `Pin<Box>` で非同期パターンが 3 様式**
   — `plugin/lib.rs:255` / API-09
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -284,10 +281,6 @@ status: current
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
-- [ ] **delete_session が実行中タスクを残し同一 ID 再作成で二重実行**
-  — `routes.rs:466-479` / R1-CONC-04
-- [ ] **Responses ストリームが受信側切断をアイドル中に検知しない**
-  — `responses.rs:1462-1465` / R1-CONC-06
 - [ ] **MCP progress が期限を無制限に延長し transport ロックを保持**
   — `client.rs:487-525` / R1-CONC-07
 - [ ] **MCP OAuth の保留状態・クライアント生成が Check-Then-Act で競合**
@@ -297,6 +290,8 @@ status: current
 
 ## 完了
 
+- [x] **[stream/フック 3 件]** 切断即検知・Drop cleanup・個別 timeout
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI 表示幅 5 件]** 全角幅計算・centered 境界・toast 省略
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin/tool/mcp 4 件]** hook redact・userinfo 除去・npm 排水
@@ -604,6 +599,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（stream/フックの修正時、記録のみ）: shutdown 回帰テストは
+  観測用 task のみで実 trigger の abort は未検証。SSE の [DONE] 後に Inner while を
+  抜けても外側 loop は継続し、接続を維持する上流では task が残る（既存挙動）。
 - 2026-11-21 R4 残存（plugin/tool/mcp の修正時、記録のみ）: plugin と mcp の
   redactor が分立しておりマスク対象に差がある（共通化は設計判断）。両 redactor
   は key=value 形式のみ対応し key: value / JSON 形式は未カバー（doc で対象を
