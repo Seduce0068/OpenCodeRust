@@ -242,27 +242,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **`timezone` が Config::merge から欠落し全レイヤで失われる**
-  — `schema.rs:285-326` / R1-CFG-001 / 高
-- [ ] **`agents`（複数形）が Config::merge から欠落し未配線**
-  — `schema.rs:2007-2008` / R1-CFG-002 / 高
-- [ ] **PATCH /config が ProviderRegistry を再構築せず変更が反映されない**
-  — `routes.rs:3366-3389` / R1-CFG-003 / 高
-- [ ] **server セクション（port/hostname/cors）が起動経路で読まれない**
-  — `schema.rs:564-579` / R1-CFG-004 / 高
-- [ ] **provider/providers の競合がレイヤ順でなく拼写順で解決される**
-  — `schema.rs:2009-2010` / R1-CFG-006 / 高
-- [ ] **AgentError が 2 定義とも glob re-export され曖昧**
-  — `agent.rs:190`, `executor.rs:13` / API-01 / 高
-- [ ] **SessionOps が async_trait 化されず Send 保証と object safety を失う**
-  — `compaction.rs:167-168` / API-02 / 高
-- [ ] **opencode-session の glob re-export が同名型を多数抱える**
-  — `session/lib.rs:37-58` / API-03 / 高
-- [ ] **ADR-0002 の always 非永続化が実装（動的 allow）と逆転**
-  — `adr-0002:69-72` / ADR-0002-ALWAYS-PERSIST / 高
-- [ ] **ADR-0001 のトークン ログ出力が実装のマスク化と矛盾**
-  — `adr-0001:31,79` / ADR-0001-TOKEN-LOG / 高
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -393,6 +372,8 @@ status: current
 
 ## 完了
 
+- [x] **[config/API/ADR high 10 件]** マージ・再 bootstrap・境界整備
+  （2026-11-21、swarm-coding R1-R6・制限プロファイル）
 - [x] **[health/ping/logwarn 3 件]** 認証除外・O(1) readiness・失敗可視化
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[ログ/health 2 件]** 一意名と世代保持、liveness/readiness 分離
@@ -682,6 +663,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（config/API/ADR の修正時、記録のみ）: 正規化ロジックが
+  opencode-config と server 側でミラー状態（長期的には pub 関数を共有）、
+  PATCH の restart_required は plugin/watcher 等を未列挙。
 - 2026-11-20 cross-skill 集約（swarm93、4 担当・38 件、観点: リソース上限 /
   API 境界 / ADR 整合 / 設定の実効性）: high 10 / 中 16 / 低 12 を追記。親が
   high 4 件（timezone の merge 欠落・AgentError 2 定義・SessionOps の
