@@ -9,10 +9,10 @@ tags:
   - tooling
 generated:
   by: agent
-  at: "2026-11-20T10:33:35+09:00"
+  at: "2026-11-20T10:57:23+09:00"
 reviewed:
   by: agent
-  at: "2026-11-20T10:33:35+09:00"
+  at: "2026-11-20T10:57:23+09:00"
 ---
 
 ## ADR-0008: テストカバレッジの現状と段階的改善方針
@@ -146,7 +146,7 @@ session / tool は改善したが依然として未達である。
 主因だったが、再計測で 10 行分回復し、タイミング依存の計測揺らぎである
 ことを確認した。
 
-テスト件数自体は 2574 件で、`cargo test --workspace --all-targets` と
+テスト件数自体は 2580 件で、`cargo test --workspace --all-targets` と
 `cargo nextest run --workspace` の両方が green である。2026-11-19 の再計測は
 既存のタイミング依存テスト（`client::tests::call_tool_resets_timeout_on_progress_notification`、
 20ms の progress deadline）が tarpaulin の計測オーバーヘッドでタイムアウトした
