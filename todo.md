@@ -273,19 +273,11 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **lsp feature 経由の公開 API に doc が無い** — `tool/lsp_tool.rs:12-38` / API-05
-- [ ] **3 crate（codemode/local-llm/watcher）がどこからも依存されず孤立**
-  — `Cargo.toml:3-25` / API-06
 - [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
   — `session/todo.rs:441` / API-10
 
 - [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
   — `tui/Cargo.toml:25` / DEPS-04
-- [ ] **ツールエラー文字列がプラグインとログへ無 redact で渡る** — `registry.rs:132-140` / ERR-08
-- [ ] **MCP discovery エラーが userinfo を含む URL を保持**
-  — `discovery.rs:21-33` / ERR-09
-- [ ] **npm インストールが piped stdio のまま status() で待ちデッドロック**
-  — `loader.rs:365-377` / ERR-10
 - [ ] **Home/Session フッタのパディングがバイト長で全角で位置がずれる**
   — `home.rs:239-267`, `session.rs:351-486` / RENDER-03
 - [ ] **sidebar の truncate_text が文字数基準で呼出側は表示幅を渡す**
@@ -314,6 +306,8 @@ status: current
 
 ## 完了
 
+- [x] **[plugin/tool/mcp 4 件]** hook redact・userinfo 除去・npm 排水
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定階層/retryable 3 件]** .opencode 維持・schema 非公開・retry 保持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定キャッシュ/protocol/hook 3 件]** fingerprint・正規化・coalescing
@@ -617,6 +611,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（plugin/tool/mcp の修正時、記録のみ）: plugin と mcp の
+  redactor が分立しておりマスク対象に差がある（共通化は設計判断）。両 redactor
+  は key=value 形式のみ対応し key: value / JSON 形式は未カバー（doc で対象を
+  明記）。local-llm は library 依存が無いだけで opencode.jsonc の MCP サーバと
+  しては有効で、doc を実態へ修正済み。
 - 2026-11-21 実装メモ（設定階層/retryable の修正時）: R4 が指摘した
   HOME/.opencode と OPENCODE_CONFIG_DIR の設定階層消失を load_project 側の
   明示読み込みで吸収。storage は意図的に非公開のため Cargo.toml へ
