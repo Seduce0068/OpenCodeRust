@@ -204,14 +204,7 @@ status: current
     推奨は**現状維持＋実害計測を先行**。まずエミット回数と clone 時間を測り、
     問題が確認されればスナップショット全件送りを増分イベント送りへ変更する検討。
 - [ ] **README のクレート数が 22 で現行 21 と不一致** — `README.md:142` / R1-TS02
-- [ ] **opencode-config.md の cwd 未対応記述が実装と矛盾**
-  — — `docs/opencode-config.md:71` / R1-TS05
-- [ ] **Session::touch テストが恒真アサーションで何も検証していない**
-  — — `session_integration.rs:72-80` / R1-TS08
 - [ ] **差分コーパスが RegExp/URL/normalize を完全に除外** — `parity_corpus.rs:1-7` / R1-TS10
-- [ ] **README にログレベル/出力先/ヘルスチェック/認証運用情報が無い** — `README.md:125-138` / R1-OB10
-- [ ] **docs/architecture.md の検証コマンドが CI ゲートより弱い**
-  — — `docs/architecture.md:114-119` / R1-DP07
 - [ ] **once_cell / lazy_static が std::sync::OnceLock / LazyLock で置換可能**
   — — `Cargo.toml:70-71` / R1-DP09
 
@@ -297,21 +290,8 @@ status: current
 
 - [ ] **per-instance ServerState と process-global な CORS/plugin/fetch-proxy 状態が矛盾**
   — — `server.rs:491-516,996` / R1-AR03 / 中
-- [ ] **CLI clear が履歴を消去せずメッセージのみ出力** — `main.rs:1649-1652` / R1-ST02 / 中
-- [ ] **run --format json のローカル実行で JSON 以外が標準出力に混在**
-  — — `main.rs:1515-1524` / R1-ST05 / 中
-- [ ] **stats の Total Cost が常に Cost unavailable（コスト永続化未配線）**
-  — — `main.rs:2512-2517` / R1-ST06 / 中
-- [ ] **tui --fork --session が実際にはフォークせずベースセッションへ接続**
-  — — `main.rs:999-1003` / R1-ST07 / 中
 - [ ] **プラグイン host/builtin スクリプトが予測可能な共有キャッシュへ symlink 追従で書き込まれる**
   — — `loader.rs:68-74,164-178` / R1-IV08 / 中
-- [ ] **subsessions メタデータのデシリアライズ失敗が次の保存で削除される**
-  — `prompt.rs:1777-1796` / R1-E05 / 中
-- [ ] **revert が Snapshot::track 失敗を空文字として保存**
-  — `revert.rs:101-116` / R1-E06 / 中
-- [ ] **compaction が要約メッセージを先に永続化し LLM 失敗時に残す**
-  — `compaction.rs:466-471,659-666` / R1-E10 / 中
 - [ ] **Renovate に exact-pin 群（`oxc_*` / tree-sitter）のグルーピングがない**
   — `renovate.json:3-5` / R1-DP02 / 中
 - [ ] **reqwest 既定 feature で rustls と native-tls が二重搭載**
@@ -319,6 +299,8 @@ status: current
 
 ## 完了
 
+- [x] **[CLI/session/docs 11 件]** JSON 契約・実配線・セッション保全
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[重複整理 18 件]** 過去ラウンドで対応済みの未着手を完了へ
   （2026-11-20、親が実コードで確認）
 - [x] **[観測性/整合性 9 件]** ログ・相関 ID・retry・Runbook
@@ -580,6 +562,9 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 指摘（CLI/session/docs の修正時）: 4 件すべて対応済み。
+  docs/opencode-config.md の 55-57 行目（timeout マッピング済み）と 72-73 行目
+  （timeout 未マッピング）の内部矛盾は「timeout 側は触らない」指示で未修正。
 - 2026-11-20 R4 残存（TUI/retry/plugin の修正時、記録のみ）: App::drop の
   JoinHandle::join が SSE 読み出しタイムアウト（120s）までブロックしうる
   （blocking reqwest のため設計判断）。TS 側で auth.callback が失敗すると
