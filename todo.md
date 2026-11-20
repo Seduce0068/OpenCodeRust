@@ -178,11 +178,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **`.opencode/opencode.json{,c}` が load_project と load_all で二重読込**
-  — `loader.rs:126-136` / CFG-010
 - [ ] **セッション生成時のプラグインフック task が JoinHandle を保持せずデタッチ**
   — `session.rs:780` / RES-09
-- [ ] **storage のマイグレーション SQL 定数が pub で外部露出** — `storage/lib.rs:15,21` / API-07
 - [ ] **util/watcher/tui/tool の crate 級・pub 項目に doc 欠落** — `各 lib.rs` / API-08
 - [ ] **Plugin::register_hooks が手動 `Pin<Box>` で非同期パターンが 3 様式**
   — `plugin/lib.rs:255` / API-09
@@ -284,10 +281,6 @@ status: current
 
 - [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
   — `tui/Cargo.toml:25` / DEPS-04
-- [ ] **README の Requirements に MSRV 1.97 と C ツールチェーンが無い**
-  — `README.md:32-42` / DEPS-06
-- [ ] **ストリーム再符号化で ApiErrorWithSource がプレーン ApiError に退化**
-  — `llm.rs:205-254` / ERR-07
 - [ ] **ツールエラー文字列がプラグインとログへ無 redact で渡る** — `registry.rs:132-140` / ERR-08
 - [ ] **MCP discovery エラーが userinfo を含む URL を保持**
   — `discovery.rs:21-33` / ERR-09
@@ -321,6 +314,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定階層/retryable 3 件]** .opencode 維持・schema 非公開・retry 保持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定キャッシュ/protocol/hook 3 件]** fingerprint・正規化・coalescing
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース/ドキュメント 7 件]** 回収・再帰上限・履歴スナップショット
@@ -622,6 +617,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 実装メモ（設定階層/retryable の修正時）: R4 が指摘した
+  HOME/.opencode と OPENCODE_CONFIG_DIR の設定階層消失を load_project 側の
+  明示読み込みで吸収。storage は意図的に非公開のため Cargo.toml へ
+  publish = false を明記（schema 定数は pub(crate)）。
 - 2026-11-21 R4 残存（設定キャッシュ/protocol/hook の修正時、記録のみ）:
   config_for の read→load→write に TOCTOU があり、同一 cwd の並行呼び出しで
   load_config が重複実行され得る（結果の整合性は保たれる）。担当外ドキュメント
