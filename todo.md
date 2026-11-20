@@ -223,29 +223,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **SessionStatus の serde wire 値が PascalCase で DB/API と不一致**
-  — `session.rs:82-94` / R1-NEW-WIRE-01 / 高
-- [ ] **MessageRole に serde rename が無く lowercase 形式が読めない**
-  — `message.rs:23-33` / R1-NEW-WIRE-02 / 高
-- [ ] **types と session の同名型が JSON 往復で usage 等を沈黙して失う**
-  — `server.rs:875-880` / R1-NEW-WIRE-05 / 高
-- [ ] **.cargo/audit.toml の ignore 2 件が現行 lock と不一致（stale suppression）**
-  — `.cargo/audit.toml:7-23` / R1-NEW-DEPS-01 / 高
-- [ ] **opencode-tool の lsp feature が未配線で README と実挙動が矛盾**
-  — `tool/Cargo.toml:12-13` / R1-NEW-DEPS-02 / 高
-- [ ] **Google の API キーが URL クエリからエラー文字列へ漏洩**
-  — `google.rs:186-200` / R1-NEW-ERR-01 / 高
-- [ ] **prompt 失敗エラーが無 redact でログと会話へ二重流出**
-  — `routes.rs:2381-2408` / R1-NEW-ERR-02 / 高
-- [ ] **AgentExecutor が型付き ProviderError を String へ平坦化し retry 情報を失う**
-  — `executor.rs:12-28` / R1-NEW-ERR-03 / 中高
-- [ ] **MCP 認証ストアの読取/JSON 失敗が空 HashMap として黙って扱われる**
-  — `mcp/auth.rs:75-86` / R1-NEW-ERR-04 / 中高
-- [ ] **ダイアログ検索行に水平スクロールが無く長い入力のカーソルが消える**
-  — `command_palette.rs:415-430` / R1-RENDER-01 / 高
-- [ ] **インラインモーダルに wrap が無く承認対象テキストが右端で切れる**
-  — `permission.rs:254-289`, `question.rs:245-325` / R1-RENDER-02 / 高
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -353,6 +330,8 @@ status: current
 
 ## 完了
 
+- [x] **[wire/秘密/レンダ high 11 件]** 互換・redaction・fail-loud
+  （2026-11-20、swarm-coding R1-R6）
 - [x] **[テスト品質 8 件]** 恒真・環境依存・env 後始末・start 原子的化
   （2026-11-20、swarm-coding R1-R6）
 - [x] **[config/UX/並行 11 件]** コメント判定・トークンマスク・リーク解消
@@ -634,6 +613,12 @@ status: current
 
 ## メモ
 
+- 2026-11-20 R4 残存（high 11 件の修正時、記録のみ）: SSE 経路の生エラー漏洩は
+  safe_prompt_failure_client_info 経由で修正済み。messages テーブルに
+  metadata/usage 列が無く DB 往復で失われる問題（v3 マイグレーション要）、
+  decode_stream_error の message 非 redact、MCP OAuth 本線が fail-open 互換
+  ラッパのまま、question.rs のクリック判定が折り返しを無視、
+  wrapped_row_count が単語境界を過小評価、session 側 serde 属性欠落（実害なし）。
 - 2026-11-20 cross-skill 集約（swarm88、4 担当・36 件、観点: wire 形式 /
   レンダリング / エラー伝播 / 依存 feature）: high 11 / 中 25 を追記。親が
   high 4 件（audit.toml の stale ignore・LSP feature 未配線・Google の key=・
