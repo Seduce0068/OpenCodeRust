@@ -245,8 +245,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **PTY セッションが自然終了しても HashMap に残存**
-  — `server/pty.rs:156-189` / RES-01 / 中
 - [ ] **OAuth 放置フローの一時状態に TTL/回収が無い**
   — `mcp/oauth.rs:441-496` / RES-04 / 中
 - [ ] **DELETE 系が存在しないリソースに 404（冪等性の解釈差）**
@@ -281,6 +279,8 @@ status: current
 
 ## 完了
 
+- [x] **[PTY セッション回収 1 件]** reaped フラグと async 側 prune
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース累積 2 件]** writer_lock 回収と plugin レジストリ排水
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[メッセージ wire 統一 1 件]** get_message を list_messages と同一化
@@ -662,6 +662,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（PTY 回収の修正時、記録のみ）: prune 回帰テストは
+  resources: None の合成エントリのみで、実 JoinHandle/Sender/writer の強参照
+  解放を直接検証していない（検証ギャップ）。親が child mutex poison 時に
+  wait() をスキップして reaped が立つ medium を修正。
 - 2026-11-21 R4 残存（リソース累積の修正時、記録のみ）: shutdown_all が
   clients/auth_bridges を別クリティカルセクションで排水するため並行 load_all
   の bridge が失われる可能性（本番呼び出しなし）。hook_system の古い hook も
