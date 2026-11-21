@@ -1235,6 +1235,40 @@ fn tracing_print_enabled(cli_command: &Option<Commands>, is_tui: bool) -> bool {
     !is_tui && !run_json_output
 }
 
+/// CFG2-07: 起動時 tracing の設定を読み込むディレクトリを解決する。
+///
+/// `Commands::Tui { project }` が指定された場合はそのパスを返し、それ以外
+/// （project 未指定・他コマンド）は `fallback_cwd`（通常は現在の cwd）を返す。
+///
+/// `run_tui` 内で後勝ちの `set_current_dir(project)` は従来どおり行うため、
+/// ここではプロセスの cwd を変更せず、設定読み込み対象パスだけを切り替える。
+/// これにより `--project` 指定時は対象プロジェクトの `config.logLevel` が
+/// 起動時 tracing に反映され、`config_for` と `replay_config_diagnostics` は
+/// 同じキー（project パス）で動作するため CFGVAL-01 の replay も壊れない。
+fn startup_config_dir(
+    cli_command: &Option<Commands>,
+    fallback_cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    let selected = match cli_command {
+        Some(Commands::Tui {
+            project: Some(project),
+            ..
+        }) => Some(project.clone()),
+        _ => fallback_cwd.map(Path::to_path_buf),
+    };
+    // 相対パス / symlink でも run_tui の set_current_dir 後の cwd と同じ
+    // 物理絶対パスをキーにし、config_for と replay のキャッシュを共有する（R4）。
+    selected.map(|path| {
+        std::fs::canonicalize(&path).unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            }
+        })
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1258,15 +1292,19 @@ async fn main() -> anyhow::Result<()> {
     // is_tui 判定自体は TUI 用途で維持したまま、print 引数のみを追加で絞る。
     let tracing_print = tracing_print_enabled(&cli.command, is_tui);
     let cwd = std::env::current_dir().ok();
-    let startup_log_level = cwd
+    // CFG2-07: TUI の --project 指定先の config.logLevel を起動時 tracing に
+    // 反映するため、cwd ではなく解決済みの対象ディレクトリから設定を読む。
+    // 実際の cwd 切り替えは run_tui 内の既存処理が後勝ちで行う。
+    let startup_dir = startup_config_dir(&cli.command, cwd.as_deref());
+    let startup_log_level = startup_dir
         .as_ref()
-        .and_then(|cwd| config_for(cwd).ok())
+        .and_then(|dir| config_for(dir).ok())
         .and_then(|config| config.log_level);
     // print=true（非 TUI かつ `run --format json` ではない）の場合は log_dir は
     // init_tracing 側で早期 return され不使用。
     // TUI／JSON run のファイルログは cwd 直下に置かず、init_tracing のユーザー専用既定
     // ディレクトリ (XDG_STATE_HOME / $HOME/.local/state 配下) を使うため None を渡す。
-    // cwd は上の config 読み込み用に維持する。
+    // startup_dir は上の config 読み込みと下の replay 用に維持する。
     // 第 2 戻り値 (WorkerGuard) を main のローカルとして保持し、終了時にフラッシュさせる。
     let (_log_path, _log_guard) =
         opencode_util::init_tracing(startup_log_level.as_deref(), None, tracing_print);
@@ -1276,8 +1314,10 @@ async fn main() -> anyhow::Result<()> {
     // キャッシュに預けた診断を 1 回だけ再発火させ、対象 5 警告を届ける。
     // 再発火後はバッファをクリアし、以降のロードは tracing へ直接出力する。
     TRACING_READY.store(true, Ordering::Relaxed);
-    if let Some(cwd) = &cwd {
-        replay_config_diagnostics(cwd);
+    if let Some(dir) = &startup_dir {
+        // CFG2-07: config_for と同じキー（--project 指定時は project パス）で
+        // replay し、初期化前に捕捉した診断を取りこぼさないようにする。
+        replay_config_diagnostics(dir);
     }
 
     match cli.command {
@@ -8384,6 +8424,110 @@ mod tests {
         assert_eq!(third.model.as_deref(), Some("cache-test-model-two-longer"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- CFG2-07: --project 指定時の起動時 logLevel 解決の回帰テスト ------------
+
+    #[test]
+    fn startup_config_dir_prefers_tui_project_over_cwd() {
+        let cwd = PathBuf::from("/tmp/cfg207-cwd-dir");
+        let project = PathBuf::from("/tmp/cfg207-project-dir");
+
+        // --project 指定時は project パスが選ばれる。
+        let cli = Cli::try_parse_from(["opencoderust", "tui", "/tmp/cfg207-project-dir"])
+            .expect("parse tui with project");
+        assert_eq!(
+            startup_config_dir(&cli.command, Some(&cwd)),
+            Some(project.clone())
+        );
+        // cwd が取得できない場合でも project は解決できる。
+        assert_eq!(startup_config_dir(&cli.command, None), Some(project));
+
+        // project 未指定・他コマンドは従来どおり cwd を使う。
+        let cli = Cli::try_parse_from(["opencoderust", "tui"]).expect("parse tui without project");
+        assert_eq!(
+            startup_config_dir(&cli.command, Some(&cwd)),
+            Some(cwd.clone())
+        );
+        let cli = Cli::try_parse_from(["opencoderust", "serve"]).expect("parse serve");
+        assert_eq!(startup_config_dir(&cli.command, Some(&cwd)), Some(cwd));
+    }
+
+    #[test]
+    fn startup_log_level_uses_project_config_when_project_is_given() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        let _restore_content = RestoreEnv(
+            "OPENCODE_CONFIG_CONTENT",
+            std::env::var_os("OPENCODE_CONFIG_CONTENT"),
+        );
+
+        let project_dir = temp_config_project("cfg207-project");
+        let cwd_dir = temp_config_project("cfg207-cwd");
+        // グローバル設定の干渉を避け、各ディレクトリの project config だけを効かせる。
+        std::env::set_var("XDG_CONFIG_HOME", &project_dir);
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        fs::write(project_dir.join("opencode.json"), r#"{"logLevel":"trace"}"#)
+            .expect("write project config");
+        fs::write(cwd_dir.join("opencode.json"), r#"{"logLevel":"error"}"#)
+            .expect("write cwd config");
+        invalidate_config_cache(&project_dir);
+        invalidate_config_cache(&cwd_dir);
+
+        let cli = Cli::try_parse_from([
+            "opencoderust",
+            "tui",
+            project_dir.to_str().expect("utf8 project path"),
+        ])
+        .expect("parse tui with project");
+
+        // 起動時 tracing と同じ解決経路を通す。
+        let startup_dir = startup_config_dir(&cli.command, Some(&cwd_dir)).expect("startup dir");
+        assert_eq!(startup_dir, project_dir);
+        let level = config_for(&startup_dir)
+            .expect("config_for project")
+            .log_level;
+        assert_eq!(level.as_deref(), Some("trace"));
+
+        // 元 cwd の設定とは異なることを固定（従来挙動からの切り替えを証明）。
+        let cwd_level = config_for(&cwd_dir).expect("config_for cwd").log_level;
+        assert_eq!(cwd_level.as_deref(), Some("error"));
+
+        let _ = fs::remove_dir_all(&project_dir);
+        let _ = fs::remove_dir_all(&cwd_dir);
+    }
+
+    #[test]
+    fn startup_log_level_uses_cwd_when_project_is_absent() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        let _restore_content = RestoreEnv(
+            "OPENCODE_CONFIG_CONTENT",
+            std::env::var_os("OPENCODE_CONFIG_CONTENT"),
+        );
+
+        let cwd_dir = temp_config_project("cfg207-noproject");
+        std::env::set_var("XDG_CONFIG_HOME", &cwd_dir);
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        fs::write(cwd_dir.join("opencode.json"), r#"{"logLevel":"warn"}"#)
+            .expect("write cwd config");
+        invalidate_config_cache(&cwd_dir);
+
+        let cli = Cli::try_parse_from(["opencoderust", "tui"]).expect("parse tui without project");
+        let startup_dir = startup_config_dir(&cli.command, Some(&cwd_dir)).expect("startup dir");
+        assert_eq!(startup_dir, cwd_dir);
+        let level = config_for(&startup_dir).expect("config_for cwd").log_level;
+        assert_eq!(
+            level.as_deref(),
+            Some("warn"),
+            "project 未指定時は従来どおり cwd の logLevel を使う"
+        );
+
+        let _ = fs::remove_dir_all(&cwd_dir);
     }
 
     #[test]
