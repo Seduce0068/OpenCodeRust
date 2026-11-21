@@ -16,8 +16,12 @@ pub(crate) mod schema;
 
 pub use database::*;
 pub use repository::{
-    InputRepository, MessageRepository, SessionRepository, TodoItem, TodoRepository,
+    InputRepository, MessageRepository, SessionRepository, TodoItem, TodoRepository, TodoRow,
 };
+
+// Todo の状態・優先度と parse 関数は opencode-types を単一情報源とする。
+// opencode-session は opencode-types を直接依存しないため、本クレート経由で再エクスポートする。
+pub use opencode_types::{parse_priority, parse_status, TodoPriority, TodoStatus};
 
 use anyhow::Result;
 use sqlx::{Pool, Sqlite};

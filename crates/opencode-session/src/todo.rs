@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// 状態・優先度と parse 関数は opencode-types の定義を単一情報源として再利用する。
+// 本クレートは opencode-types を直接依存しないため、storage の再エクスポートを経由する。
+pub use opencode_storage::{parse_priority, parse_status, TodoPriority, TodoStatus};
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TodoInfo {
     pub content: String,
@@ -437,102 +441,6 @@ impl Default for TodoManager {
     }
 }
 
-/// セッション側の Todo 状態。
-///
-/// JSON 表現は [`TodoStatus::as_str`] と同じ snake_case を正式とし、
-/// 旧 serde 出力だった PascalCase は alias で読み取り互換を維持する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoStatus {
-    #[serde(alias = "Pending")]
-    Pending,
-    #[serde(alias = "InProgress")]
-    InProgress,
-    #[serde(alias = "Completed")]
-    Completed,
-    #[serde(alias = "Cancelled")]
-    Cancelled,
-}
-
-impl TodoStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TodoStatus::Pending => "pending",
-            TodoStatus::InProgress => "in_progress",
-            TodoStatus::Completed => "completed",
-            TodoStatus::Cancelled => "cancelled",
-        }
-    }
-}
-
-impl std::fmt::Display for TodoStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// セッション側の Todo 優先度。
-///
-/// 状態と同じく、JSON 表現は [`TodoPriority::as_str`] と同じ小文字を正式とする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoPriority {
-    #[serde(alias = "High")]
-    High,
-    #[serde(alias = "Medium")]
-    Medium,
-    #[serde(alias = "Low")]
-    Low,
-}
-
-impl TodoPriority {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TodoPriority::High => "high",
-            TodoPriority::Medium => "medium",
-            TodoPriority::Low => "low",
-        }
-    }
-}
-
-impl std::fmt::Display for TodoPriority {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// 比較用に小文字化し、区切り文字を除去して serde / as_str / 旧 PascalCase を統一する。
-fn normalize_todo_word(value: &str) -> String {
-    value
-        .to_lowercase()
-        .chars()
-        .filter(|c| !matches!(*c, '_' | '-' | ' '))
-        .collect()
-}
-
-/// serde の snake_case 表現・旧 PascalCase 表現・`as_str()` 由来の DB 値を
-/// すべて受け付けて状態へ復元する。未知の値は `Pending` にフォールバックする。
-pub fn parse_status(status: &str) -> TodoStatus {
-    match normalize_todo_word(status).as_str() {
-        "pending" => TodoStatus::Pending,
-        "inprogress" => TodoStatus::InProgress,
-        "completed" => TodoStatus::Completed,
-        "cancelled" => TodoStatus::Cancelled,
-        _ => TodoStatus::Pending,
-    }
-}
-
-/// serde の小文字表現・旧 PascalCase 表現・`as_str()` 由来の DB 値を
-/// すべて受け付けて優先度へ復元する。未知の値は `Medium` にフォールバックする。
-pub fn parse_priority(priority: &str) -> TodoPriority {
-    match normalize_todo_word(priority).as_str() {
-        "high" => TodoPriority::High,
-        "medium" => TodoPriority::Medium,
-        "low" => TodoPriority::Low,
-        _ => TodoPriority::Medium,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,6 +854,61 @@ mod tests {
             let wire: String =
                 serde_json::from_str(&serde_json::to_string(&variant).unwrap()).unwrap();
             assert_eq!(parse_priority(&wire), variant);
+        }
+    }
+
+    /// `opencode-types` 側（storage の再エクスポート経由）と session 側が
+    /// 同じ型・同じ parse 結果であることを固定する回帰テスト。
+    /// 型の同一性はコンパイル時、parse 結果は実行時に検証する。
+    #[test]
+    fn session_todo_types_and_parse_match_types_layer() {
+        use opencode_storage as types_layer;
+
+        // ローカル再定義が復活するとここが type mismatch でコンパイル失敗する。
+        fn same_status(value: types_layer::TodoStatus) -> TodoStatus {
+            value
+        }
+        fn same_priority(value: types_layer::TodoPriority) -> TodoPriority {
+            value
+        }
+
+        assert_eq!(
+            same_status(parse_status("in_progress")),
+            types_layer::parse_status("IN_PROGRESS")
+        );
+        assert_eq!(
+            same_priority(parse_priority("high")),
+            types_layer::parse_priority("High")
+        );
+
+        // serde 表現・旧 PascalCase・as_str 由来の DB 値・未知値で結果が一致すること。
+        for input in [
+            "pending",
+            "Pending",
+            "IN_PROGRESS",
+            "in progress",
+            "completed",
+            "Completed",
+            "cancelled",
+            "Cancelled",
+            "unknown",
+            "",
+        ] {
+            assert_eq!(parse_status(input), types_layer::parse_status(input));
+            assert_eq!(
+                parse_status(input).as_str(),
+                types_layer::parse_status(input).as_str()
+            );
+        }
+
+        for input in [
+            "high", "High", "MEDIUM", "medium", "low", "Low", "unknown", "",
+        ] {
+            assert_eq!(parse_priority(input), types_layer::parse_priority(input));
+            assert_eq!(
+                parse_priority(input).as_str(),
+                types_layer::parse_priority(input).as_str()
+            );
         }
     }
 }

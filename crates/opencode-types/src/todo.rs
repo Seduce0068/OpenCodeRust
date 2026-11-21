@@ -1,3 +1,7 @@
+//! Todo 型と status / priority の parse 関数の単一情報源。
+//!
+//! storage / session 層はこのモジュールの定義を再エクスポートし、同名の重複定義を持たない。
+
 use serde::{Deserialize, Serialize};
 
 /// Todo の本文と状態・優先度を表す情報。
@@ -252,5 +256,38 @@ mod tests {
         // 旧 serde 由来の PascalCase も parse で受け付ける。
         assert_eq!(parse_status("InProgress"), TodoStatus::InProgress);
         assert_eq!(parse_priority("High"), TodoPriority::High);
+    }
+
+    /// storage / session が再エクスポートする parse の正規結果として扱う基準表。
+    /// 層をまたいで同じ結果になることのアンカーとして固定する。
+    #[test]
+    fn canonical_parse_table_is_stable() {
+        for (input, expected) in [
+            ("pending", "pending"),
+            ("Pending", "pending"),
+            ("IN_PROGRESS", "in_progress"),
+            ("in progress", "in_progress"),
+            ("completed", "completed"),
+            ("Completed", "completed"),
+            ("cancelled", "cancelled"),
+            ("Cancelled", "cancelled"),
+            ("unknown", "pending"),
+            ("", "pending"),
+        ] {
+            assert_eq!(parse_status(input).as_str(), expected);
+        }
+
+        for (input, expected) in [
+            ("high", "high"),
+            ("High", "high"),
+            ("MEDIUM", "medium"),
+            ("medium", "medium"),
+            ("low", "low"),
+            ("Low", "low"),
+            ("unknown", "medium"),
+            ("", "medium"),
+        ] {
+            assert_eq!(parse_priority(input).as_str(), expected);
+        }
     }
 }
