@@ -229,8 +229,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **SessionRepository::update が permission JSON を二重エンコード**
-  — `storage/repository.rs:357-386` / T-01 / 高（事実確認済み、PATCH から到達）
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
@@ -310,6 +308,8 @@ status: current
 
 ## 完了
 
+- [x] **[permission 二重エンコード 1 件]** PATCH 後の CorruptData を解消
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定ロード失敗警告 1 件]** 値非依存フォールバック通知
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider 警告/frontmatter/TUI join 3 件]** 値非露出の警告とスレッド回収
