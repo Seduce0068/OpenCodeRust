@@ -228,8 +228,6 @@ status: current
 
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
-- [ ] **PLUGIN_LOADER が OnceLock 固定で 2 番目の loader が黙って破棄**
-  — `routes.rs:6060` / STATE-02 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
   — `server.rs:869-887` / STATE-05 / 高
 
@@ -304,6 +302,8 @@ status: current
 
 ## 完了
 
+- [x] **[loader warn/redact 1 件]** 重複登録の可視化とキー正規化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[observability/dogfood 12 件]** 相関 ID・構造化ログ・手順反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[共有型集約 1 件]** types 単一情報源化を既存実装として確認
@@ -625,6 +625,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（loader warn/redact の修正時、記録のみ）: 複数語の機微値
+  （"secret: ab cd ef"）は値の終端判定が曖昧なため 1 語目のみマスク。
+  camelCase と OAuth 系キーの suffix 正規化は対応済み。誤マスク（token /
+  bearer の非機微文脈）と suffix リストの漏れ（auth / passwd 等）は未対応。
 - 2026-11-21 R4 残存（observability/dogfood の修正時、記録のみ）: redact の
   キー一覧が完全一致のみで client_secret / access_token 等を漏らし得る。
   rotation は本番 HTTP 経路へ未配線のまま（NOTE 明記）。restart_required の
