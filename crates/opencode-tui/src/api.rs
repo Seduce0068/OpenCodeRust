@@ -746,17 +746,27 @@ impl ApiClient {
         Ok(session)
     }
 
+    /// セッションを削除し、実際に削除が発生したかを返す。
+    ///
+    // API-04 方針: サーバは存在しないセッションへの `DELETE` に
+    // `SessionNotFound`（HTTP 404）で応答する。この API 契約は変更しない。
+    // TUI 側の解釈だけを冪等にし、404 を「既に削除済み」として `Ok(false)` に
+    // 変換する（再試行時にエラー扱いになって失敗する問題を防ぐ）。
+    // 404 以外の非成功ステータスは従来どおり `Err` とする。
+    // エラー・ログにはセッション ID / トークン / パスを一切含めない。
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<bool> {
         let url = format!("{}/session/{}", self.base_url, session_id);
         let response = self.client.delete(&url).send()?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 既に削除済み。ボディは内容を見ずに読み捨てる（Keep-Alive の
+            // コネクションをプールへ戻すため）。ログ・エラーへは渡さない。
+            let _ = response.bytes();
+            return Ok(false);
+        }
+        if !status.is_success() {
             let text = response.text().unwrap_or_default();
-            anyhow::bail!(
-                "Failed to delete session `{}`: {}",
-                session_id,
-                error_detail(status, &text)
-            );
+            anyhow::bail!("Failed to delete session: {}", error_detail(status, &text));
         }
         // M-52: 旧実装は Value::get(...).unwrap_or(true) で、
         // キー欠落や型不一致を「削除成功」として報告していた。
@@ -2356,6 +2366,11 @@ mod tests {
 
     impl RecordingMock {
         fn spawn(response_body: &'static str) -> Self {
+            Self::spawn_with_status("200 OK", response_body)
+        }
+
+        /// 任意のステータス行で応答するモック（loopback のみ、外部送信なし）。
+        fn spawn_with_status(status_line: &'static str, response_body: &'static str) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
             let addr = listener.local_addr().expect("loopback addr must succeed");
             let base_url = format!("http://{addr}");
@@ -2415,7 +2430,7 @@ mod tests {
                     .push(RecordedRequest { request_line, body });
 
                 let response_headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     response_body.len()
                 );
                 stream
@@ -2529,5 +2544,79 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&request.body).expect("fork body must be JSON");
         assert_eq!(body, json!({}), "empty body must not be sent");
+    }
+
+    // --- API-04: DELETE の 404 を冪等な「既に削除済み」として扱う回帰テスト ---
+    // サーバ契約（SessionNotFound = 404）は変更せず、TUI 側の解釈のみを検証する。
+
+    #[test]
+    fn delete_session_returns_ok_false_on_404() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "404 Not Found",
+            r#"{"error":{"type":"SessionNotFound","message":"session not found"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let deleted = client
+            .delete_session("ses-missing")
+            .expect("404 must be interpreted as already deleted, not an error");
+        assert!(!deleted, "404 must map to Ok(false)");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("DELETE /session/ses-missing "),
+            "delete must DELETE /session/{{id}}: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn delete_session_still_errors_on_500_without_leaking_session_id() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "500 Internal Server Error",
+            r#"{"error":{"type":"internal_error","message":"boom"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let err = client
+            .delete_session("ses-secret-id")
+            .expect_err("500 must remain an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("500 Internal Server Error"),
+            "message: {message}"
+        );
+        assert!(
+            !message.contains("ses-secret-id"),
+            "session id must not leak into error: {message}"
+        );
+        assert!(
+            !message.contains("/session/"),
+            "path must not leak into error: {message}"
+        );
+        let _request = mock.request();
+    }
+
+    #[test]
+    fn delete_session_parses_deleted_response_on_200() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status("200 OK", r#"{"deleted":true}"#);
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let deleted = client
+            .delete_session("ses-1")
+            .expect("200 must parse DeletedResponse");
+        assert!(deleted, "`deleted: true` must map to Ok(true)");
+
+        let request = mock.request();
+        assert!(
+            request.request_line.starts_with("DELETE /session/ses-1 "),
+            "delete must DELETE /session/{{id}}: {}",
+            request.request_line
+        );
     }
 }
