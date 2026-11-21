@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T19:03:50+09:00"
+  at: "2026-11-21T19:25:43+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2923 件（all-features は 2922 件）
+  テスト総数 594 → 2926 件（all-features は 2925 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `server` / `tui`: MCP 同期失敗をヘッダで伝え、ボディの既存ワイヤ形状を維持
+  （swarm-coding R1-R6）
 - `plugin` / `server`: plugin init の競合可視化と世代採番、session sync の
   追加・更新のみ化と明示削除配線（swarm-coding R1-R6）
 - `config`: 入れ子キー誤記と不正値の警告（ユーザー定義名は `*` でマスク）
