@@ -1214,6 +1214,56 @@ fn glob_md_files_recursive(dir: &Path, results: &mut Vec<PathBuf>) -> Result<()>
     Ok(())
 }
 
+/// Recover the frontmatter key responsible for a deserialization failure.
+///
+/// Serde error text can embed the offending value (`invalid type: string
+/// "..."`), so it is never logged. Instead each key is removed in turn and the
+/// config is re-parsed; a key whose removal makes parsing succeed identifies
+/// the failing field. Only identifier-shaped keys are eligible for logging.
+fn failing_frontmatter_field<T: serde::de::DeserializeOwned>(
+    parsed: &serde_json::Value,
+) -> Option<String> {
+    let object = parsed.as_object()?;
+    for key in object.keys() {
+        if !is_loggable_field_name(key) {
+            continue;
+        }
+        let mut reduced = object.clone();
+        reduced.remove(key);
+        if serde_json::from_value::<T>(serde_json::Value::Object(reduced)).is_ok() {
+            return Some(key.clone());
+        }
+    }
+    None
+}
+
+fn is_loggable_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Warn about a frontmatter metadata parse failure using only the file name
+/// and the failing field name. Values and the markdown body are never logged.
+fn warn_frontmatter_parse_failure<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    parsed: &serde_json::Value,
+) {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && name.len() <= 128)
+        .unwrap_or("<unnamed>");
+    let field = failing_frontmatter_field::<T>(parsed).unwrap_or_else(|| "<unknown>".to_string());
+    tracing::warn!(
+        file = %file_name,
+        field = %field,
+        "frontmatter metadata parse failed; using defaults for metadata"
+    );
+}
+
 /// Parse a markdown file as a command definition.
 /// Extracts YAML frontmatter and body content.
 fn parse_markdown_command(path: &Path, base_dir: &Path) -> Option<(String, CommandConfig)> {
@@ -1224,8 +1274,14 @@ fn parse_markdown_command(path: &Path, base_dir: &Path) -> Option<(String, Comma
     let name = derive_name_from_path(path, base_dir, &["command", "commands"]);
 
     let mut config = if let Some(fm) = frontmatter {
-        serde_json::from_value::<CommandConfig>(serde_yaml_frontmatter_to_json(&fm))
-            .unwrap_or_default()
+        let parsed = serde_yaml_frontmatter_to_json(&fm);
+        match serde_json::from_value::<CommandConfig>(parsed.clone()) {
+            Ok(parsed_config) => parsed_config,
+            Err(_) => {
+                warn_frontmatter_parse_failure::<CommandConfig>(path, &parsed);
+                CommandConfig::default()
+            }
+        }
     } else {
         CommandConfig::default()
     };
@@ -1243,8 +1299,14 @@ fn parse_markdown_agent(path: &Path, base_dir: &Path) -> Option<(String, AgentCo
     let name = derive_name_from_path(path, base_dir, &["agent", "agents", "mode", "modes"]);
 
     let mut config = if let Some(fm) = frontmatter {
-        serde_json::from_value::<AgentConfig>(serde_yaml_frontmatter_to_json(&fm))
-            .unwrap_or_default()
+        let parsed = serde_yaml_frontmatter_to_json(&fm);
+        match serde_json::from_value::<AgentConfig>(parsed.clone()) {
+            Ok(parsed_config) => parsed_config,
+            Err(_) => {
+                warn_frontmatter_parse_failure::<AgentConfig>(path, &parsed);
+                AgentConfig::default()
+            }
+        }
     } else {
         AgentConfig::default()
     };
@@ -3374,6 +3436,69 @@ mod tests {
         let (_name, config) = result.unwrap();
         let desc = config.description.unwrap();
         assert!(desc.contains("model: claude"));
+    }
+
+    /// Regression: one malformed frontmatter field used to be swallowed by
+    /// `unwrap_or_default()`, losing every metadata field silently. The warning
+    /// must name only the file and the failing field; values/body must not leak.
+    #[test]
+    fn invalid_frontmatter_warns_with_filename_and_field_only() {
+        let temp = TestDir::new("opencode_md_bad_frontmatter");
+        let agent_dir = temp.path.join("agents");
+        let cmd_dir = temp.path.join("commands");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(&cmd_dir).unwrap();
+
+        const BAD_VALUE: &str = "VALUE_SENTINEL_NEVER_LOG";
+        const BODY_SENTINEL: &str = "BODY_SENTINEL_NEVER_LOG";
+
+        fs::write(
+            agent_dir.join("bad-agent.md"),
+            format!("---\ndescription: {BAD_VALUE}\nmode: not-a-mode\n---\n\n{BODY_SENTINEL}\n"),
+        )
+        .unwrap();
+        fs::write(
+            cmd_dir.join("bad-command.md"),
+            format!("---\ndescription: keep-me\nsubtask: {BAD_VALUE}\n---\n\n{BODY_SENTINEL}\n"),
+        )
+        .unwrap();
+
+        let buffer = WarningBuffer::default();
+        let agent = tracing::subscriber::with_default(
+            WarningSubscriber {
+                buffer: buffer.clone(),
+            },
+            || parse_markdown_agent(&agent_dir.join("bad-agent.md"), &temp.path),
+        );
+        let command = tracing::subscriber::with_default(
+            WarningSubscriber {
+                buffer: buffer.clone(),
+            },
+            || parse_markdown_command(&cmd_dir.join("bad-command.md"), &temp.path),
+        );
+
+        let text = buffer.text();
+        assert!(
+            text.contains("frontmatter metadata parse failed") && text.contains("using defaults"),
+            "warning must announce the fallback: {text}"
+        );
+        assert!(text.contains("bad-agent.md"), "{text}");
+        assert!(text.contains("bad-command.md"), "{text}");
+        assert!(text.contains("field=mode"), "{text}");
+        assert!(text.contains("field=subtask"), "{text}");
+        let full_path = temp.path.to_string_lossy().into_owned();
+        for forbidden in [BAD_VALUE, BODY_SENTINEL, full_path.as_str()] {
+            assert!(!text.contains(forbidden), "frontmatter data leaked: {text}");
+        }
+
+        // Existing fallback behavior is preserved: metadata is defaulted while
+        // the markdown body is still loaded into the prompt/template.
+        let (_name, agent_config) = agent.expect("bad agent must still load");
+        assert!(agent_config.description.is_none());
+        assert!(agent_config.prompt.unwrap().contains(BODY_SENTINEL));
+        let (_name, command_config) = command.expect("bad command must still load");
+        assert!(command_config.description.is_none());
+        assert!(command_config.template.unwrap().contains(BODY_SENTINEL));
     }
 
     #[test]
