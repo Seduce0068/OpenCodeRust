@@ -5,6 +5,47 @@ use axum::{
 };
 use serde_json::json;
 
+/// 機微情報のキー名かどうかを判定する。
+///
+/// 大文字小文字を無視し、`-` と `_` を同一視して正規化したうえで **suffix 一致** を行う。
+/// 完全一致ではなく suffix 一致にすることで、OAuth 系の `client_secret` /
+/// `client-secret` / `access_token` / `api-key` / `refresh_token` / `id_token` など、
+/// 既知の語に接頭辞が付いた形も検出できる。
+fn is_secret_key(key: &str) -> bool {
+    const SENSITIVE_KEY_SUFFIXES: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "authorization",
+        "bearer",
+        "api_key",
+        "apikey",
+        "credential",
+        "credentials",
+        "secret_key",
+        "private_key",
+        "access_key",
+    ];
+
+    let normalized = key
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .replace('-', "_");
+    // camelCase の境界（small→large）を _ へ変換し、secretKey → secret_key に正規化する。
+    let mut with_boundaries = String::with_capacity(normalized.len() + 4);
+    let mut previous: Option<char> = None;
+    for ch in normalized.chars() {
+        if ch.is_uppercase() && previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            with_boundaries.push('_');
+        }
+        with_boundaries.push(ch);
+        previous = Some(ch);
+    }
+    let normalized = with_boundaries.to_ascii_lowercase();
+    SENSITIVE_KEY_SUFFIXES
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
+}
+
 /// 内部エラーの詳細を tracing ログへ出す前に、パスとトークンらしい値を伏せる。
 ///
 /// クライアントには汎用メッセージと相関 ID だけを返し、内部詳細はログへ残す。
@@ -14,31 +55,36 @@ pub(crate) fn redact_sensitive_detail(detail: &str) -> String {
     const REDACTED: &str = "<redacted>";
     let mut words: Vec<&str> = Vec::new();
     let mut redact_next = false;
+    let mut redaction_budget = 0usize;
+    const MAX_REDACTED_VALUE_WORDS: usize = 1;
     for word in detail.split_whitespace() {
         let trimmed = word.trim_matches(|c: char| matches!(c, ',' | ';' | ')' | ']'));
-        let key = trimmed
-            .split(['=', ':'])
-            .next()
-            .unwrap_or("")
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .to_ascii_lowercase();
-        let is_secret_key = matches!(
-            key.as_str(),
-            "token" | "secret" | "password" | "authorization" | "bearer" | "api_key" | "apikey"
-        );
+        let key = trimmed.split(['=', ':']).next().unwrap_or("");
+        let secret_key = is_secret_key(key);
         let looks_like_path = trimmed.contains('/') || trimmed.contains('\\');
         let looks_like_token = trimmed.len() >= 24
             && trimmed
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '='));
-        // 機微キーを含む語は「値が 24 文字未満」でも漏洩し得るため、
-        // 現在語そのものも伏せる。後続語は redact_next で長さに関わらず伏せる。
-        if redact_next || is_secret_key || looks_like_path || looks_like_token {
+        // 機微キーを含む語は値が 24 文字未満でも漏洩し得るため語全体を伏せる。
+        // 後続語は redact_next で長さに関わらず常に伏せる（キーと値が別語でも安全）。
+        if redact_next || secret_key || looks_like_path || looks_like_token {
             words.push(REDACTED);
         } else {
             words.push(word);
         }
-        redact_next = is_secret_key;
+        // 機微キー検出後は、次の `key=` / `key:` による新しいKeyValueが出るまで
+        // 値の一部として伏せ続ける（"secret: ab cd ef failed" の複数語に対応）。
+        let starts_new_assignment = word.contains('=') || word.contains(':');
+        if secret_key {
+            redact_next = true;
+            redaction_budget = MAX_REDACTED_VALUE_WORDS;
+        } else if redact_next {
+            redaction_budget = redaction_budget.saturating_sub(1);
+            if redaction_budget == 0 || (starts_new_assignment && !is_secret_key(key)) {
+                redact_next = false;
+            }
+        }
     }
     words.join(" ")
 }
@@ -436,6 +482,97 @@ mod tests {
 
         let redacted = redact_sensitive_detail("password: short2 failed");
         assert!(!redacted.contains("short2"), "{redacted}");
+    }
+
+    #[test]
+    fn is_secret_key_normalizes_case_and_separators_and_uses_suffix_match() {
+        for key in [
+            "token",
+            "TOKEN",
+            "client_secret",
+            "client-secret",
+            "CLIENT_SECRET",
+            "access_token",
+            "access-token",
+            "ACCESS_TOKEN",
+            "api-key",
+            "api_key",
+            "API_KEY",
+            "apikey",
+            "refresh_token",
+            "id_token",
+            "authorization",
+            "Bearer",
+            "password",
+            "x-amz-security-token",
+            "private_key",
+        ] {
+            assert!(is_secret_key(key), "expected secret key: {key}");
+        }
+
+        for safe in [
+            "find_text",
+            "model",
+            "provider",
+            "status",
+            "duration",
+            "JoinError",
+        ] {
+            assert!(!is_secret_key(safe), "unexpected secret key: {safe}");
+        }
+    }
+
+    #[test]
+    fn redacted_internal_detail_hides_camel_case_keys_and_multiword_values() {
+        let detail =
+            "oauth secretKey=abc123 accessKey: xyz privateKey=q7 client_secret: ab cd ef failed";
+        let redacted = redact_sensitive_detail(detail);
+        for leaked in [
+            "abc123",
+            "xyz",
+            "q7",
+            "secretKey",
+            "accessKey",
+            "privateKey",
+        ] {
+            assert!(!redacted.contains(leaked), "leaked {leaked}: {redacted}");
+        }
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+    }
+
+    #[test]
+    fn redacted_internal_detail_hides_oauth_keys_even_with_short_values() {
+        // 回帰ガード (R2): OAuth 系のキーは完全一致でなくてもマスクし、
+        // 値が短くてもキー語と後続値を <redacted> に置換する。
+        let detail = concat!(
+            "oauth client_secret=abcdef access_token: ghijkl ",
+            "api-key=mnopqr refresh_token=stuvwx id_token=yzabcd client-secret=efghij"
+        );
+        let redacted = redact_sensitive_detail(detail);
+        for leaked in [
+            "abcdef",
+            "ghijkl",
+            "mnopqr",
+            "stuvwx",
+            "yzabcd",
+            "efghij",
+            "client_secret",
+            "access_token",
+            "api-key",
+            "refresh_token",
+            "id_token",
+        ] {
+            assert!(!redacted.contains(leaked), "leaked {leaked}: {redacted}");
+        }
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        // 無害な語はトレース可能性のため残る。
+        assert!(redacted.contains("oauth"), "{redacted}");
+
+        // キーと値が別語でも、値が 2 文字でも伏せる。
+        let short = redact_sensitive_detail("client_secret: q7 failed");
+        assert!(!short.contains("q7"), "{short}");
+        assert!(!short.contains("client_secret"), "{short}");
+        assert!(short.ends_with("failed"), "{short}");
     }
 
     #[tokio::test]
