@@ -94,6 +94,30 @@ impl ConfigLoader {
         Ok(())
     }
 
+    /// Loads a config file explicitly selected by the caller (for example via
+    /// `OPENCODE_CONFIG`).
+    ///
+    /// Unlike the incidental candidates of the project find-up scan, an
+    /// explicit path that does not exist is a likely user mistake and must not
+    /// disappear silently. Only the file name is logged: the full path can
+    /// contain user identifiers and is deliberately never emitted. No file
+    /// content, token value or path is included in the warning payload.
+    pub fn load_from_explicit_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        if !path.exists() {
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            tracing::warn!(
+                file_name = %file_name,
+                "explicitly specified config file does not exist; ignoring (full path not logged)"
+            );
+            return Ok(());
+        }
+        self.load_from_file(path)
+    }
+
     pub fn load_global(&mut self) -> Result<()> {
         if self.ignore_global_config {
             return Ok(());
@@ -185,7 +209,9 @@ impl ConfigLoader {
 
     pub fn load_from_env(&mut self) -> Result<()> {
         if let Ok(config_path) = env::var("OPENCODE_CONFIG") {
-            self.load_from_file(&config_path)?;
+            // Explicitly requested paths get a missing-file warning; the
+            // find-up candidates in `load_project` stay silent by design.
+            self.load_from_explicit_file(&config_path)?;
         }
 
         Ok(())
@@ -1798,8 +1824,10 @@ fn apply_env_overrides(config: &mut Config) {
 
 /// Apply post-load transforms: legacy migrations, plugin dedup, provider normalization.
 fn apply_post_load_transforms(config: &mut Config) {
-    // Migrate deprecated `mode` field to `agent` field
+    // Migrate deprecated `mode` field to `agent` field. The warning names only
+    // the keys — never the mode names or any other config value.
     if let Some(mode_configs) = config.mode.take() {
+        tracing::warn!("mode is deprecated; use agent instead (value not logged)");
         let agent_configs = config.agent.get_or_insert_with(AgentConfigs::default);
         for (name, mut mode_agent) in mode_configs.entries {
             mode_agent.mode = Some(AgentMode::Primary);
@@ -1811,8 +1839,10 @@ fn apply_post_load_transforms(config: &mut Config) {
         }
     }
 
-    // Backwards compatibility: legacy top-level `tools` config -> permission
+    // Backwards compatibility: legacy top-level `tools` config -> permission.
+    // Log only the key names; tool names and enable flags are never included.
     if let Some(tools) = config.tools.take() {
+        tracing::warn!("tools is deprecated; use permission instead (value not logged)");
         let mut perms = HashMap::new();
         for (tool, enabled) in tools {
             let action = if enabled {
@@ -1841,7 +1871,12 @@ fn apply_post_load_transforms(config: &mut Config) {
         config.username = env::var("USER").or_else(|_| env::var("USERNAME")).ok();
     }
 
-    // Handle migration from autoshare to share field
+    // Handle migration from autoshare to share field. Warn whenever the
+    // deprecated key was supplied, even when its value does not trigger the
+    // migration; the boolean value itself is never logged.
+    if config.autoshare.is_some() {
+        tracing::warn!("autoshare is deprecated; use share instead (value not logged)");
+    }
     if config.autoshare == Some(true) && config.share.is_none() {
         config.share = Some(crate::schema::ShareMode::Auto);
     }
@@ -2140,7 +2175,12 @@ pub fn update_global_config(patch: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     struct TestDir {
         path: PathBuf,
@@ -3883,6 +3923,159 @@ theme = "dark"
             .as_ref()
             .and_then(|experimental| experimental.mcp_timeout)
             .is_none());
+    }
+
+    // ── R2 regression tests: silent legacy migrations / explicit config ───
+
+    /// Captures `tracing` events without adding a `tracing-subscriber` dev
+    /// dependency (same minimal pattern used by other crates in this repo).
+    #[derive(Clone, Default)]
+    struct WarningBuffer(Arc<Mutex<String>>);
+
+    impl WarningBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("warning buffer lock").clone()
+        }
+    }
+
+    struct WarningVisitor(WarningBuffer);
+
+    impl Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct WarningSubscriber {
+        buffer: WarningBuffer,
+    }
+
+    impl Subscriber for WarningSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut WarningVisitor(self.buffer.clone()));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn deprecated_migration_keys_emit_value_independent_warnings() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "mode": {"primary-agent": {"model": "legacy-primary"}},
+                "tools": {"secret-tool-name": true},
+                "autoshare": false
+            }"#,
+        )
+        .expect("legacy config must parse");
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            apply_post_load_transforms(&mut config);
+        });
+
+        let text = buffer.text();
+        assert!(
+            text.contains("mode is deprecated; use agent instead"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tools is deprecated; use permission instead"),
+            "{text}"
+        );
+        assert!(
+            text.contains("autoshare is deprecated; use share instead"),
+            "{text}"
+        );
+        // Distinctive sentinel values must never appear in the warning payload.
+        for forbidden in ["primary-agent", "legacy-primary", "secret-tool-name"] {
+            assert!(!text.contains(forbidden), "config value leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn missing_explicit_config_warns_with_filename_only() {
+        const ENV_VAR: &str = "OPENCODE_CONFIG";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TestDir::new("opencode_missing_explicit_config");
+        let missing = temp.path.join("my-opencode.jsonc");
+        std::env::set_var(ENV_VAR, &missing);
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let mut loader = ConfigLoader::new().without_global_config();
+        tracing::subscriber::with_default(subscriber, || {
+            loader
+                .load_from_env()
+                .expect("a missing explicit config must be ignored, not fatal");
+        });
+        std::env::remove_var(ENV_VAR);
+
+        let text = buffer.text();
+        assert!(text.contains("my-opencode.jsonc"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        // The absolute path (temp dir prefix) must never be logged.
+        let full_path = temp.path.to_string_lossy().into_owned();
+        assert!(
+            !text.contains(full_path.as_str()),
+            "full path leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn missing_find_up_candidates_do_not_warn() {
+        const ENV_VAR: &str = "OPENCODE_CONFIG_DIR";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TestDir::new("opencode_find_up_no_warning");
+        let project = temp.path.join("repo");
+        fs::create_dir_all(&project).unwrap();
+        // Stop find-up here so no ancestor config is consulted.
+        fs::create_dir_all(project.join(".git")).unwrap();
+        std::env::remove_var(ENV_VAR);
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let mut loader = ConfigLoader::new().without_global_config();
+        tracing::subscriber::with_default(subscriber, || {
+            loader
+                .load_project(&project)
+                .expect("project load must succeed without config files");
+        });
+
+        let text = buffer.text();
+        assert!(
+            !text.contains("does not exist") && !text.contains("explicitly specified config file"),
+            "find-up candidates must not warn when absent: {text}"
+        );
     }
 }
 

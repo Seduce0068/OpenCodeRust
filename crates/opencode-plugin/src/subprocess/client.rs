@@ -565,9 +565,24 @@ impl PluginSubprocess {
     }
 
     /// Gracefully shut down the plugin subprocess.
+    ///
+    /// Policy (SHUTDOWN-06): this is a best-effort cleanup. A failed `shutdown`
+    /// RPC is warned about but never propagated, and the two-second wait plus
+    /// the `kill()` fallback always run — the process must not depend solely on
+    /// `kill_on_drop(true)`. The `Result` signature is kept for caller
+    /// compatibility, but the method resolves to `Ok(())` on both paths:
+    /// plugin-supplied RPC error text may contain tokens, URLs or paths, and
+    /// `shutdown_all` logs any returned error, so neither the warning here nor
+    /// the return value may carry that text. Callers only need to know the
+    /// child has been reaped/terminated.
     pub async fn shutdown(&self) -> Result<(), PluginSubprocessError> {
-        let _: Value = self.call("shutdown", None).await?;
-        // Give the process a moment to exit, then kill if needed
+        if self.call::<Value>("shutdown", None).await.is_err() {
+            // Value-independent on purpose: never format the RPC error into the
+            // log, since its message comes from the plugin and may be sensitive.
+            tracing::warn!("plugin shutdown RPC failed; falling back to wait/kill");
+        }
+        // Give the process a moment to exit, then kill if needed. This path must
+        // be reached even when the RPC above failed.
         let mut proc = self.process.lock().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), proc.wait()).await;
         let _ = proc.kill().await;
@@ -1074,5 +1089,52 @@ mod tests {
         let legacy = PluginSubprocess::auth_callback_params(Some("dummy-code"), None);
         assert!(legacy.get("flowId").is_none());
         assert!(legacy.get("code").is_some());
+    }
+
+    // -- Shutdown fallback regression tests ---------------------------------
+
+    /// SHUTDOWN-06: a failed `shutdown` RPC must not short-circuit the
+    /// wait/kill fallback. `sleep 60` never answers the RPC (so `call` times
+    /// out) and cannot exit on its own within the two-second grace window;
+    /// if it is dead when `shutdown()` returns, the kill fallback ran.
+    #[tokio::test]
+    async fn shutdown_rpc_failure_still_kills_subprocess() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep subprocess");
+        let stdin = child.stdin.take().expect("take stdin");
+        let stdout = child.stdout.take().expect("take stdout");
+        let sub = PluginSubprocess {
+            name: String::new(),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            rpc_lock: Arc::new(Mutex::new(())),
+            process: Mutex::new(child),
+            request_id: AtomicU64::new(1),
+            hooks: Vec::new(),
+            auth_meta: None,
+            timeout: Duration::from_millis(100),
+        };
+
+        // The RPC times out, but shutdown is best-effort: it must still resolve
+        // to Ok so no plugin-supplied error text reaches the caller's logger.
+        sub.shutdown()
+            .await
+            .expect("shutdown must remain best-effort successful");
+
+        let status = sub
+            .process
+            .lock()
+            .await
+            .try_wait()
+            .expect("try_wait after shutdown");
+        assert!(
+            status.is_some(),
+            "subprocess survived a failed shutdown RPC (kill fallback skipped)"
+        );
     }
 }
