@@ -268,9 +268,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **Markdown 表の列幅が無制限で枠構造が壊れる** — `markdown/renderer.rs:83-119` / RENDER-06
-- [ ] **wrap_spans が幅 2 文字を満杯行へ置き領域より広い行を生成**
-  — `session.rs:1230-1256` / RENDER-07
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
@@ -278,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[Markdown 表/wrap_spans 2 件]** 幅クランプの本番配線と wide char 境界
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[Plugin/Todo 型 2 件]** async_trait 統一・単一情報源化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP progress/OAuth/ratatui 3 件]** hard deadline・並行フロー・feature
@@ -591,6 +590,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（Markdown 表/wrap_spans の修正時、記録のみ）: 列幅算出は
+  UnicodeWidthStr（書記素考慮）だが切り詰めは UnicodeWidthChar（文字単位）で、
+  ZWJ 絵文字等で基準が一致しない懸念（実害未確認・低優先）。
 - 2026-11-21 R4 残存（Plugin/Todo 型の修正時、記録のみ）: types 側の
   TodoInfo/TodoItem は実利用がなく session の TodoInfo は未集約。TodoStatus/
   Priority の serde 正式表現が snake_case へ変化（Deserialize alias は旧形式も
