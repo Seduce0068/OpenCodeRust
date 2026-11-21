@@ -262,10 +262,6 @@ status: current
   — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
 - [ ] **シグナル終了で tracing WorkerGuard のフラッシュが飛ぶ**
   — `main.rs:1032-1034` / SHUTDOWN-09 / 中（speculation）
-- [ ] **ネストしたキーの誤記がサイレントに無視される**
-  — `config/loader.rs:945-975` / CFGVAL-04 / 中
-- [ ] **不正な入れ子値（oauth/environment/headers）が無警告で捨てられる**
-  — `config/schema.rs:1229-1239` / CFGVAL-09 / 中
 - [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
   — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
@@ -286,6 +282,8 @@ status: current
 
 ## 完了
 
+- [x] **[入れ子キー/不正値警告 2 件]** ユーザー定義名のマスクと warn
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定エラー/スキーマ明記 2 件]** 値非露出と情報源の明確化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[テスト信頼性 2 件]** overflow 同期と心拍の継続観測
@@ -641,6 +639,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（入れ子キー警告の修正時、記録のみ）: mcp 直下の未知
+  キーを完全除外するため `mcp.srvrs` のような誤記が server id として扱われ
+  下位警告に誤記名が残る。provider スキーマの known 集合（baseURL/apiKey）が
+  実際の serde フィールド（base_url/api_key）と不一致で警告されない。
+  親がユーザー定義名の `*` マスクと有効な false 値の誤警告を直接修正。
 - 2026-11-21 R4 残存（設定エラーの修正時、記録のみ）: キー除去プローブが
   ユーザー定義キー（agent 名等）を field path として出し得る点、キー数に
   比例する探索コストの点は未対応（設計判断・未測定）。親が read / file-reference
