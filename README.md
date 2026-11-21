@@ -244,6 +244,9 @@ changing them while it runs has no effect and requires a restart:
   `RUST_LOG`, then `info`)
 - `OPENCODE_LOG_RETENTION` – number of log generations to keep
 - `OPENCODE_NO_AUTH` – whether authentication is disabled
+- `OPENCODE_CONFIG_STRICT_ENV` – `true`/`1`/`yes` (case-insensitive) makes an
+  undefined `{env:VAR}` fail loading, including chained references inside
+  `config.env` values (even unused ones). Default warns and continues.
 - `OPENCODE_AUTO_SHARE` – `true`/`1`/`yes` (case-insensitive) triggers auto-sharing
   for `run --attach`, right after the session is created (before the first
   message); `on` is false. No effect on local `run`. Same as `config.share: auto`.
