@@ -1482,7 +1482,7 @@ fn merge_option_map_deep_values<T: DeepMerge>(
 /// prefer the legacy spelling, so a global `provider.x` could shadow a project
 /// `providers.x` -- the opposite of the documented layer precedence.
 ///
-/// On a conflict only the key name and the two source spellings are logged;
+/// On a conflict only the key name and the static spelling hints are logged;
 /// provider values can contain credentials and must never reach the logs.
 fn merge_provider_maps(
     target_provider: &mut Option<HashMap<String, ProviderConfig>>,
@@ -1493,6 +1493,18 @@ fn merge_provider_maps(
     // A single source layer that defines both spellings for one id keeps the
     // historical legacy-wins policy used by `normalize_provider_configs`.
     if let (Some(current), Some(legacy)) = (source_providers.as_mut(), source_provider.as_ref()) {
+        for id in current.keys() {
+            if legacy.contains_key(id) {
+                // The key name and the preferred static spelling only:
+                // provider values may contain credentials and are never
+                // formatted here.
+                tracing::warn!(
+                    key = %id,
+                    preferred = "providers",
+                    "provider/providers conflict within one layer; legacy provider wins (use providers)"
+                );
+            }
+        }
         current.retain(|id, _| !legacy.contains_key(id));
     }
 
@@ -2130,6 +2142,64 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// Minimal `tracing` capture so warning regressions are assertable without
+    /// adding a `tracing-subscriber` dev-dependency.
+    #[derive(Clone, Default)]
+    struct WarningBuffer(Arc<Mutex<String>>);
+
+    impl WarningBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("warning buffer lock").clone()
+        }
+    }
+
+    struct WarningVisitor(WarningBuffer);
+
+    impl Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct WarningSubscriber {
+        buffer: WarningBuffer,
+    }
+
+    impl Subscriber for WarningSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut WarningVisitor(self.buffer.clone()));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
 
     /// `auto` is no longer a schema choice: it is accepted only for backward
     /// compatibility and normalized to `Legacy` while loading a config.
@@ -2999,5 +3069,50 @@ mod tests {
         assert_eq!(provider.base_url.as_deref(), Some("https://old"));
         assert_eq!(provider.api_key.as_deref(), Some("new-value"));
         assert!(base.providers.is_none());
+    }
+
+    /// Regression: a layer defining both `provider.x` and `providers.x` used to
+    /// silently drop the `providers` entry. The warning must name only the key
+    /// and the preferred spelling, never any provider value.
+    #[test]
+    fn same_layer_provider_conflict_warns_without_values() {
+        let layer: Config = serde_json::from_str(
+            r#"{
+                "provider": {"conflict-id": {"api_key": "TOKEN_SENTINEL_NEVER_LOG"}},
+                "providers": {
+                    "conflict-id": {"name": "NAME_SENTINEL_NEVER_LOG"},
+                    "other-id": {"name": "other"}
+                }
+            }"#,
+        )
+        .expect("single-layer config must parse");
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let mut base = Config::default();
+        tracing::subscriber::with_default(subscriber, || base.merge(layer));
+
+        let text = buffer.text();
+        assert!(
+            text.contains("conflict-id") && text.contains("providers"),
+            "warning must name the key and preferred spelling: {text}"
+        );
+        for forbidden in ["TOKEN_SENTINEL_NEVER_LOG", "NAME_SENTINEL_NEVER_LOG"] {
+            assert!(!text.contains(forbidden), "config value leaked: {text}");
+        }
+
+        // Legacy-wins behavior is unchanged: the legacy entry survives, the
+        // conflicting current-schema entry is dropped, unrelated ids remain.
+        let legacy = base
+            .provider
+            .as_ref()
+            .and_then(|map| map.get("conflict-id"))
+            .expect("legacy provider wins");
+        assert_eq!(legacy.api_key.as_deref(), Some("TOKEN_SENTINEL_NEVER_LOG"));
+        let current = base.providers.as_ref().expect("providers map");
+        assert!(!current.contains_key("conflict-id"));
+        assert!(current.contains_key("other-id"));
     }
 }

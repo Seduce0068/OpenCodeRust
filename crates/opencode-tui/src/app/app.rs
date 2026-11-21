@@ -137,6 +137,10 @@ pub struct App {
     sse_shutdown: Arc<AtomicBool>,
     /// SSE リスナの JoinHandle。App 終了後にポーリングが残らないようにする。
     sse_listener: Option<thread::JoinHandle<()>>,
+    /// 入力ポーリングスレッドへ終了を通知するフラグ。Drop で set してから join する。
+    input_shutdown: Arc<AtomicBool>,
+    /// 入力ポーリングスレッドの JoinHandle。App 終了後にポーリングが残らないようにする。
+    input_listener: Option<thread::JoinHandle<()>>,
     prompt: Prompt,
     selection: Selection,
     session_view: Option<SessionView>,
@@ -244,45 +248,8 @@ impl App {
             prompt.set_spinner_color(agent_color_from_name(&theme, &agent));
         }
 
-        let tick_rate = Duration::from_millis(TICK_RATE_MS);
-        thread::spawn(move || {
-            let mut last_tick = Instant::now();
-
-            loop {
-                let timeout = tick_rate
-                    .checked_sub(last_tick.elapsed())
-                    .unwrap_or(tick_rate);
-
-                if crossterm::event::poll(timeout).unwrap_or(false) {
-                    let event = match crossterm::event::read() {
-                        Ok(crossterm::event::Event::Key(key)) => Some(Event::Key(key)),
-                        Ok(crossterm::event::Event::Mouse(mouse))
-                            if !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved) =>
-                        {
-                            Some(Event::Mouse(mouse))
-                        }
-                        Ok(crossterm::event::Event::Resize(w, h)) => Some(Event::Resize(w, h)),
-                        Ok(crossterm::event::Event::FocusGained) => Some(Event::FocusGained),
-                        Ok(crossterm::event::Event::FocusLost) => Some(Event::FocusLost),
-                        Ok(crossterm::event::Event::Paste(s)) => Some(Event::Paste(s)),
-                        _ => None,
-                    };
-
-                    if let Some(e) = event {
-                        if event_tx_input.send(e).is_err() {
-                            break;
-                        }
-                    }
-                }
-
-                if last_tick.elapsed() >= tick_rate {
-                    if event_tx_input.send(Event::Tick).is_err() {
-                        break;
-                    }
-                    last_tick = Instant::now();
-                }
-            }
-        });
+        let input_shutdown = Arc::new(AtomicBool::new(false));
+        let input_listener = spawn_input_listener(event_tx_input, input_shutdown.clone());
 
         let mut app = Self {
             context,
@@ -291,6 +258,8 @@ impl App {
             event_rx,
             sse_shutdown,
             sse_listener: Some(sse_listener),
+            input_shutdown,
+            input_listener: Some(input_listener),
             prompt,
             selection: Selection::new(),
             session_view: None,
@@ -3775,10 +3744,15 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // event_rx は Drop::drop の後にフィールドが破棄されるため、SSE 側の
-        // send 失敗だけでは停止を検知できない。明示的にフラグを立ててから join する。
+        // event_rx は Drop::drop の後にフィールドが破棄されるため、SSE / 入力の
+        // 両スレッドとも send 失敗だけでは停止を検知できない。
+        // 先に両方のフラグを立て、それから各ハンドルを join して残留を防ぐ。
         self.sse_shutdown.store(true, Ordering::Relaxed);
+        self.input_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.sse_listener.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.input_listener.take() {
             let _ = handle.join();
         }
         let _ = terminal::restore();
@@ -4217,6 +4191,60 @@ fn sse_sleep_until(delay: Duration, shutdown: &AtomicBool) -> bool {
         }
         thread::sleep(SHUTDOWN_POLL.min(remaining));
     }
+}
+
+/// 入力ポーリングスレッドを起動し、JoinHandle を呼び出し側へ返す。
+/// 終了は `shutdown` フラグで通知し、ハンドルを join してスレッドの残留を防ぐ。
+/// 入力内容やトークン値はログ・エラーへ含めない。
+fn spawn_input_listener(
+    event_tx: Sender<Event>,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let tick_rate = Duration::from_millis(TICK_RATE_MS);
+        let mut last_tick = Instant::now();
+
+        loop {
+            // SSE リスナと同じく、受信側の消失に頼らず明示的なフラグで停止する。
+            // poll のタイムアウトは最大 TICK_RATE_MS なので、join は遅くてもその程度で戻る。
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or(tick_rate);
+
+            if crossterm::event::poll(timeout).unwrap_or(false) {
+                let event = match crossterm::event::read() {
+                    Ok(crossterm::event::Event::Key(key)) => Some(Event::Key(key)),
+                    Ok(crossterm::event::Event::Mouse(mouse))
+                        if !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved) =>
+                    {
+                        Some(Event::Mouse(mouse))
+                    }
+                    Ok(crossterm::event::Event::Resize(w, h)) => Some(Event::Resize(w, h)),
+                    Ok(crossterm::event::Event::FocusGained) => Some(Event::FocusGained),
+                    Ok(crossterm::event::Event::FocusLost) => Some(Event::FocusLost),
+                    Ok(crossterm::event::Event::Paste(s)) => Some(Event::Paste(s)),
+                    _ => None,
+                };
+
+                if let Some(e) = event {
+                    if event_tx.send(e).is_err() {
+                        break;
+                    }
+                }
+            }
+
+            if last_tick.elapsed() >= tick_rate {
+                if event_tx.send(Event::Tick).is_err() {
+                    break;
+                }
+                last_tick = Instant::now();
+            }
+        }
+    })
 }
 
 /// サーバイベントリスナを起動し、JoinHandle を呼び出し側へ返す。
@@ -5041,6 +5069,16 @@ mod tests {
             with_jitter <= Duration::from_millis(base + SSE_JITTER_MAX_MS),
             "jitter must stay within the bounded range"
         );
+    }
+
+    #[test]
+    fn input_listener_stops_on_shutdown_and_can_be_joined() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_input_listener(event_tx, shutdown.clone());
+        // App の Drop と同じ手順でフラグを立てて join できれば、入力スレッドが残留しない。
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(handle.join().is_ok());
     }
 
     #[test]
