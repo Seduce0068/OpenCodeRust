@@ -139,16 +139,28 @@ available keys while it waits for the next key. Press `Esc` to cancel.
 
 ## Configuration
 
-Configuration is merged from the following paths in priority order (searched upward):
+Configuration sources are merged in the following order, from lowest to
+highest precedence. Each later source overrides earlier ones; the managed
+source is merged last and therefore has the highest priority.
 
-- `opencode.jsonc`
-- `opencode.json`
-- `.opencode/opencode.jsonc`
-- `.opencode/opencode.json`
+| Order | Source | Details |
+| --- | --- | --- |
+| 1 (lowest) | Remote well-known | `.well-known/opencode` org defaults |
+| 2 | Global | `~/.config/opencode/opencode.json{,c}` |
+| 3 | Custom | Path from `OPENCODE_CONFIG` |
+| 4 | Project | `opencode.json{,c}` found by upward search (see note) |
+| 5 | `.opencode` dirs | Agents, commands, plugins, modes (markdown) |
+| 6 | Inline | `OPENCODE_CONFIG_CONTENT` |
+| 7 | Env overrides | `OPENCODE_PERMISSION`, `OPENCODE_DISABLE_*` |
+| 8 (highest) | Managed | Enterprise config directory, merged last |
 
-Global config default path:
-
-- Linux/macOS: `~/.config/opencode/opencode.jsonc` (or `.json`)
+At each project level both `opencode.jsonc` and `opencode.json` are searched.
+The project layer also reads `$HOME/.opencode/opencode.json{,c}` and
+`$OPENCODE_CONFIG_DIR/opencode.json{,c}` explicitly.
+`.opencode/opencode.json{,c}` are read by the project find-up scan, so the
+`.opencode` directory scan itself only loads agents, commands, plugins and
+modes from markdown/JS files. Environment overrides are applied before the
+managed config so that managed stays the highest-priority source.
 
 See: `docs/opencode-config.md`
 
