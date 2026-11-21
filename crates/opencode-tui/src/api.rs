@@ -888,6 +888,13 @@ impl ApiClient {
 
         let response = self.client.get(&url).send()?;
 
+        // 同期失敗は固定文言のヘッダで伝わる（値・パスは出ない）。
+        if let Some(warning) = response.headers().get("x-mcp-sync-warning") {
+            if let Ok(text) = warning.to_str() {
+                tracing::warn!(%text, "MCP server list may be stale");
+            }
+        }
+
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();

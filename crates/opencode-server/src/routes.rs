@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, Sse},
     response::{Html, IntoResponse, Response},
@@ -3846,6 +3846,22 @@ pub struct McpStatusInfo {
     pub error: Option<String>,
 }
 
+/// Fixed event name for the structured warn emitted when the on-disk MCP
+/// configuration cannot be synchronized. It carries no error value, path, URL,
+/// or token: the raw `ApiError` from `sync_mcp_from_disk` can embed absolute
+/// config paths or the current working directory in its Display text.
+const MCP_SYNC_WARN_EVENT: &str = "mcp_sync_from_disk_failed";
+
+/// Fixed, non-sensitive warning text returned to clients when synchronization
+/// from disk fails. The underlying error is intentionally omitted so no path,
+/// URL, or token leaks onto the wire.
+const MCP_SYNC_WARNING: &str =
+    "MCP configuration could not be synchronized from disk; returning cached in-memory state.";
+
+/// Header used to expose a disk-sync degradation without changing the
+/// `GET /mcp` JSON body shape. The value is a fixed, non-sensitive string.
+pub const MCP_SYNC_WARNING_HEADER: &str = "x-mcp-sync-warning";
+
 static MCP_OAUTH_MANAGER: std::sync::OnceLock<McpOAuthManager> = std::sync::OnceLock::new();
 
 fn get_mcp_oauth_manager() -> &'static McpOAuthManager {
@@ -3864,19 +3880,43 @@ impl From<McpServerInfoStruct> for McpStatusInfo {
     }
 }
 
-async fn get_mcp_status(
-    State(_state): State<Arc<ServerState>>,
-) -> Json<HashMap<String, McpStatusInfo>> {
-    let manager = get_mcp_oauth_manager();
-    if let Err(error) = sync_mcp_from_disk(manager).await {
-        tracing::warn!(%error, "failed to sync MCP servers from config");
+/// Builds the MCP status response from a disk-sync result and the currently
+/// registered servers.
+///
+/// The raw `Err` is intentionally discarded (`Err(_)`): `sync_mcp_from_disk`
+/// wraps config/cwd errors whose Display text can contain absolute paths. Both
+/// the client-facing `sync_warning` and the tracing event use fixed text only,
+/// so no path, URL, or token reaches the client or the logs.
+fn build_mcp_status_response(
+    sync_result: Result<()>,
+    servers: Vec<McpServerInfoStruct>,
+) -> (HeaderMap, HashMap<String, McpStatusInfo>) {
+    let mut headers = HeaderMap::new();
+    if sync_result.is_err() {
+        tracing::warn!(
+            event = MCP_SYNC_WARN_EVENT,
+            "MCP configuration could not be synchronized from disk"
+        );
+        // 固定値のみをヘッダへ載せる（パス・URL・トークンは出さない）。
+        if let Ok(value) = MCP_SYNC_WARNING.parse() {
+            headers.insert(MCP_SYNC_WARNING_HEADER, value);
+        }
     }
-    let servers = manager.list_servers().await;
     let mut result = HashMap::new();
     for server in servers {
         result.insert(server.name.clone(), McpStatusInfo::from(server));
     }
-    Json(result)
+    (headers, result)
+}
+
+async fn get_mcp_status(
+    State(_state): State<Arc<ServerState>>,
+) -> (HeaderMap, Json<HashMap<String, McpStatusInfo>>) {
+    let manager = get_mcp_oauth_manager();
+    let sync_result = sync_mcp_from_disk(manager).await;
+    let servers = manager.list_servers().await;
+    let (headers, body) = build_mcp_status_response(sync_result, servers);
+    (headers, Json(body))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6721,6 +6761,150 @@ mod mcp_callback_tests {
             "unexpected error: {error}"
         );
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod mcp_sync_status_tests {
+    use super::*;
+    use std::fmt::Write as _;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// `tracing-subscriber` を依存追加せずに warn 本文を捕捉する最小バッファ。
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("log buffer lock").clone()
+        }
+    }
+
+    struct CaptureVisitor(LogBuffer);
+
+    impl Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct CaptureSubscriber {
+        buffer: LogBuffer,
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(self.buffer.clone()));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    fn dummy_server(name: &str) -> McpServerInfoStruct {
+        McpServerInfoStruct {
+            name: name.to_string(),
+            status: "connected".to_string(),
+            tools: 3,
+            resources: 1,
+            error: None,
+            oauth_required: false,
+            oauth_status: None,
+        }
+    }
+
+    /// 回帰ガード: 同期失敗時に固定警告がヘッダへ露出し、ボディは従来の
+    /// `{server: McpStatusInfo}` 形状を維持すること。生エラー（パス・トークン）は出ない。
+    #[test]
+    fn sync_failure_exposes_fixed_warning_without_leaking_raw_error() {
+        let secret_path = "/home/user/.config/opencode/secrets/auth.json";
+        let secret_token = "sk-supersecret-token-value";
+        let sync_result: Result<()> = Err(ApiError::BadRequest(format!(
+            "Failed to load config from {secret_path} with token {secret_token}"
+        )));
+
+        let (headers, body) = build_mcp_status_response(sync_result, vec![dummy_server("cached")]);
+        let json = serde_json::to_string(&body).unwrap();
+
+        assert_eq!(
+            headers
+                .get(MCP_SYNC_WARNING_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(MCP_SYNC_WARNING)
+        );
+        assert!(body.contains_key("cached"));
+        assert!(!json.contains("sync_warning"), "{json}");
+        assert!(!json.contains(secret_path), "{json}");
+        assert!(!json.contains(secret_token), "{json}");
+        assert!(!json.contains("Failed to load config"), "{json}");
+    }
+
+    /// 回帰ガード: 同期成功時は従来のフラットな `{server: McpStatusInfo}` 形状を
+    /// 維持し、警告ヘッダも現れないこと（既存クライアント非破壊）。
+    #[test]
+    fn sync_success_keeps_backward_compatible_wire_shape() {
+        let (headers, body) = build_mcp_status_response(Ok(()), vec![dummy_server("ok-server")]);
+        assert!(headers.get(MCP_SYNC_WARNING_HEADER).is_none());
+
+        let value: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert!(value.get("sync_warning").is_none(), "{value}");
+        assert_eq!(value["ok-server"]["name"], "ok-server");
+        assert_eq!(value["ok-server"]["status"], "connected");
+    }
+
+    /// 回帰ガード: 同期失敗の warn は固定 event 名のみで、生エラー値・パス・
+    /// トークンがログへ出ないこと。
+    #[test]
+    fn sync_failure_warn_is_fixed_without_error_value_or_path() {
+        let secret_path = "/home/user/.config/opencode/config.json";
+        let secret_token = "sk-supersecret-token-value";
+        let sync_result: Result<()> = Err(ApiError::BadRequest(format!(
+            "Failed to load config from {secret_path} with token {secret_token}"
+        )));
+
+        let buffer = LogBuffer::default();
+        let subscriber = CaptureSubscriber {
+            buffer: buffer.clone(),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = build_mcp_status_response(sync_result, vec![]);
+        });
+
+        let text = buffer.text();
+        assert!(text.contains(MCP_SYNC_WARN_EVENT), "{text}");
+        for forbidden in [
+            secret_path,
+            secret_token,
+            "error=",
+            "Failed to load config",
+            "/home",
+            "sk-",
+        ] {
+            assert!(!text.contains(forbidden), "warn leaked {forbidden}: {text}");
+        }
     }
 }
 
