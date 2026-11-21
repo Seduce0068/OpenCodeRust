@@ -223,11 +223,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **MCP tools/list_changed フラグが失敗時に消耗しツール一覧が固定**
-  — `mcp/client.rs:789-790` / ERR2-01 / 高（事実確認済み）
-- [ ] **Anthropic SSE の error イベントが型境界で完全に失われる**
-  — `provider/stream.rs:307-381` / ERR2-02 / 高（事実確認済み）
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -312,6 +307,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP/Anthropic error 2 件]** フラグ復元と SSE error 昇格
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[LSP/一時ファイル 2 件]** close_document と RAII ガード
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[PTY セッション回収 1 件]** reaped フラグと async 側 prune
@@ -697,6 +694,11 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（MCP/Anthropic error の修正時、記録のみ）: 平文
+  StreamEvent::Error は session 側の構造化エンベロープと非互換で、
+  エンドツーエンドでは固定メッセージへ置換される（design decision:
+  provider→session のエンベロープ共有が必要）。親が error ペイロード欠落時の
+  空文字列・厳格デコード・SSE バッファ上限を直接修正。
 - 2026-11-21 cross-skill 集約（swarm147、2 担当・18 件、観点: 設定/environment /
   エラー伝播と型境界）: 親が high 2 件（tools_changed フラグ消耗、
   Anthropic SSE error イベント消失）を read で事実確認、高 2 / 中 15 / 低 7
