@@ -183,6 +183,45 @@ impl ModelsRegistry {
         self.fetch().await
     }
 
+    /// リモートから受け取った本文を検証してキャッシュとメモリへ反映する。
+    ///
+    /// サイズ超過・非 UTF-8・JSON 不正は取得失敗として扱い、既存のデータと
+    /// キャッシュファイルを一切書き換えない。キャッシュ書込失敗は飲まずに
+    /// ログへ出すが、取得データ自体は利用できる。ログには本文・URL・パスを
+    /// 出さない。
+    async fn accept_remote_body(&self, body: &[u8]) -> Option<ModelsData> {
+        if body.len() as u64 > MAX_REMOTE_JSON_BYTES {
+            tracing::warn!("models.dev response exceeds size limit; rejecting");
+            self.mark_fetch_failed().await;
+            return None;
+        }
+        let text = match std::str::from_utf8(body) {
+            Ok(text) => text,
+            Err(_) => {
+                tracing::warn!("models.dev response is not valid UTF-8; rejecting");
+                self.mark_fetch_failed().await;
+                return None;
+            }
+        };
+        let parsed = match serde_json::from_str::<ModelsData>(text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                tracing::warn!("models.dev response is not valid JSON; rejecting");
+                self.mark_fetch_failed().await;
+                return None;
+            }
+        };
+        if let Err(error) = tokio::fs::write(&self.cache_path, text.as_bytes()).await {
+            tracing::warn!(kind = ?error.kind(), "failed to write models.dev cache");
+        }
+        {
+            let mut data = self.data.write().await;
+            *data = Some(parsed.clone());
+        }
+        self.clear_failure_cache().await;
+        Some(parsed)
+    }
+
     async fn fetch(&self) -> ModelsData {
         if self.failure_cache_active().await {
             tracing::debug!("models.dev fetch skipped: failure cache is active");
@@ -205,26 +244,25 @@ impl ModelsRegistry {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {
-                let bytes = response.bytes().await.ok();
-                let within_limit = bytes
-                    .as_ref()
-                    .is_some_and(|body| body.len() as u64 <= MAX_REMOTE_JSON_BYTES);
-                if !within_limit {
-                    tracing::warn!("models.dev response exceeds size limit; ignoring");
-                }
-                let text = bytes.and_then(|body| String::from_utf8(body.to_vec()).ok());
-                if let Some(text) = text {
-                    if let Ok(parsed) = serde_json::from_str::<ModelsData>(&text) {
-                        let _ = tokio::fs::write(&self.cache_path, &text).await;
-                        let mut data = self.data.write().await;
-                        *data = Some(parsed.clone());
-                        self.clear_failure_cache().await;
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(body) => {
+                    if let Some(parsed) = self.accept_remote_body(&body).await {
                         return parsed;
                     }
                 }
+                Err(_) => {
+                    tracing::warn!("failed to read models.dev response body");
+                }
+            },
+            Ok(response) => {
+                tracing::warn!(
+                    status = response.status().as_u16(),
+                    "models.dev returned a non-success status"
+                );
             }
-            _ => {}
+            Err(_) => {
+                tracing::warn!("failed to fetch models.dev data");
+            }
         }
 
         self.mark_fetch_failed().await;
@@ -518,6 +556,80 @@ mod tests {
         assert!(registry.get_provider("anthropic").await.is_none());
 
         registry.clear_failure_cache().await;
+        assert!(!registry.failure_cache_active().await);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// サイズ超過レスポンスは失敗として扱い、既存のメモリ内データを維持する。
+    #[tokio::test]
+    async fn oversized_remote_body_keeps_existing_data_and_marks_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-models-oversize-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("models.json");
+        let registry = ModelsRegistry::new(cache_path.clone());
+
+        let original_json = serde_json::json!({
+            "anthropic": {
+                "name": "Anthropic",
+                "env": ["ANTHROPIC_API_KEY"],
+                "id": "anthropic",
+                "models": {}
+            }
+        })
+        .to_string();
+        let original: ModelsData = serde_json::from_str(&original_json).unwrap();
+        {
+            let mut data = registry.data.write().await;
+            *data = Some(original);
+        }
+
+        let oversized = vec![b'x'; MAX_REMOTE_JSON_BYTES as usize + 1];
+        assert!(registry.accept_remote_body(&oversized).await.is_none());
+        assert!(registry.failure_cache_active().await);
+        let current = registry
+            .data
+            .read()
+            .await
+            .clone()
+            .expect("existing data must survive an oversized response");
+        assert_eq!(
+            current
+                .get("anthropic")
+                .map(|provider| provider.name.as_str()),
+            Some("Anthropic")
+        );
+        assert!(
+            !cache_path.exists(),
+            "oversized payload must not be written to the cache"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// キャッシュ書込失敗は飲まず、取得データ自体は利用できる。
+    #[tokio::test]
+    async fn cache_write_failure_does_not_discard_fetched_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "opencode-models-cachefail-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // ディレクトリをキャッシュパスにすると書き込みが失敗する。
+        let registry = ModelsRegistry::new(dir.clone());
+
+        let body =
+            br#"{"openai":{"name":"OpenAI","env":["OPENAI_API_KEY"],"id":"openai","models":{}}}"#;
+        let parsed = registry
+            .accept_remote_body(body)
+            .await
+            .expect("a valid body is usable even when the cache write fails");
+        assert_eq!(
+            parsed.get("openai").map(|provider| provider.name.as_str()),
+            Some("OpenAI")
+        );
+        assert!(registry.data.read().await.is_some());
         assert!(!registry.failure_cache_active().await);
 
         std::fs::remove_dir_all(&dir).unwrap();

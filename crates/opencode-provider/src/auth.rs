@@ -197,24 +197,33 @@ impl AuthManager {
     /// The first credential becomes the active one and is persisted to `auth.json`;
     /// later credentials live in an in-memory round-robin pool. Call
     /// [`Self::rotate_key`] (or [`Self::get_next_auth`]) on 401/429 to advance.
+    ///
+    /// The durable write happens before the in-memory commit: if persistence fails,
+    /// the in-memory store is left untouched so it cannot drift ahead of `auth.json`.
     pub async fn try_add_key(&self, provider_id: &str, auth: AuthInfo) -> anyhow::Result<()> {
-        {
-            let mut state = self.state.write().await;
-            if state.credentials.contains_key(provider_id) {
-                state
-                    .key_pool
-                    .entry(provider_id.to_string())
-                    .or_default()
-                    .push_back(auth);
-            } else {
-                // First registration defines the primary that survives restarts.
-                state
-                    .credentials
-                    .insert(provider_id.to_string(), auth.clone());
-                state.primary.insert(provider_id.to_string(), auth);
-            }
+        let mut state = self.state.write().await;
+        let is_first = !state.credentials.contains_key(provider_id);
+        let mut next_primary = state.primary.clone();
+        if is_first {
+            // First registration defines the primary that survives restarts.
+            next_primary.insert(provider_id.to_string(), auth.clone());
         }
-        self.persist().await
+        // Persist the would-be on-disk state first. No key/token value is put into
+        // the error; only the file path and a short reason are included.
+        self.persist_primary(&next_primary).await?;
+        if is_first {
+            state
+                .credentials
+                .insert(provider_id.to_string(), auth.clone());
+            state.primary.insert(provider_id.to_string(), auth);
+        } else {
+            state
+                .key_pool
+                .entry(provider_id.to_string())
+                .or_default()
+                .push_back(auth);
+        }
+        Ok(())
     }
 
     /// Register an additional credential, logging persistence errors without secrets.
@@ -275,18 +284,21 @@ impl AuthManager {
     /// Insert credentials and persist them, returning a persistence error to the caller.
     ///
     /// Replaces the active credential and discards any pooled keys, matching the
-    /// historical single-credential `set` semantics.
+    /// historical single-credential `set` semantics. The in-memory update is
+    /// committed only after the durable write succeeds, so a persistence failure
+    /// leaves the previous credential active both in memory and on disk.
     pub async fn try_set(&self, provider_id: &str, auth: AuthInfo) -> anyhow::Result<()> {
-        {
-            let mut state = self.state.write().await;
-            state
-                .credentials
-                .insert(provider_id.to_string(), auth.clone());
-            // An explicit set defines a new primary, unlike a runtime rotation.
-            state.primary.insert(provider_id.to_string(), auth);
-            state.key_pool.remove(provider_id);
-        }
-        self.persist().await
+        let mut state = self.state.write().await;
+        let mut next_primary = state.primary.clone();
+        // An explicit set defines a new primary, unlike a runtime rotation.
+        next_primary.insert(provider_id.to_string(), auth.clone());
+        self.persist_primary(&next_primary).await?;
+        state
+            .credentials
+            .insert(provider_id.to_string(), auth.clone());
+        state.primary.insert(provider_id.to_string(), auth);
+        state.key_pool.remove(provider_id);
+        Ok(())
     }
 
     /// Insert credentials, logging a persistence error while keeping the legacy `()` return type
@@ -298,14 +310,19 @@ impl AuthManager {
     }
 
     /// Remove credentials and persist the deletion, returning a persistence error to the caller.
+    ///
+    /// The in-memory deletion is committed only after the durable write succeeds,
+    /// so a persistence failure cannot resurrect a "deleted" credential in memory
+    /// while it is still present in `auth.json` (or vice versa).
     pub async fn try_remove(&self, provider_id: &str) -> anyhow::Result<()> {
-        {
-            let mut state = self.state.write().await;
-            state.credentials.remove(provider_id);
-            state.primary.remove(provider_id);
-            state.key_pool.remove(provider_id);
-        }
-        self.persist().await
+        let mut state = self.state.write().await;
+        let mut next_primary = state.primary.clone();
+        next_primary.remove(provider_id);
+        self.persist_primary(&next_primary).await?;
+        state.credentials.remove(provider_id);
+        state.primary.remove(provider_id);
+        state.key_pool.remove(provider_id);
+        Ok(())
     }
 
     /// Remove credentials, logging a persistence error while keeping the legacy `()` return type
@@ -358,9 +375,15 @@ impl AuthManager {
         state.credentials.clone()
     }
 
-    async fn persist(&self) -> anyhow::Result<()> {
+    /// Persist `primary` and record the outcome in `persist_error`.
+    ///
+    /// The map is passed explicitly instead of being read from `self.state` so a
+    /// caller can durably write the *next* state before committing it to memory.
+    /// Framed errors contain only the file path and a short reason — never a key
+    /// or token value.
+    async fn persist_primary(&self, primary: &HashMap<String, AuthInfo>) -> anyhow::Result<()> {
         let framed = self
-            .persist_inner()
+            .write_primary_file(primary)
             .await
             .map_err(|error| match &self.filepath {
                 Some(path) => {
@@ -378,7 +401,10 @@ impl AuthManager {
         framed
     }
 
-    async fn persist_inner(&self) -> anyhow::Result<()> {
+    /// Write the registration-time primary to disk. Never writes the rotated
+    /// runtime-active credential. Takes no `self.state` lock: the caller supplies
+    /// the exact map to serialize.
+    async fn write_primary_file(&self, primary: &HashMap<String, AuthInfo>) -> anyhow::Result<()> {
         let Some(path) = self.filepath.as_ref() else {
             return Ok(());
         };
@@ -387,9 +413,9 @@ impl AuthManager {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let state = self.state.read().await;
-        // Persist the registration-time primary, never the rotated runtime active.
-        let json = serde_json::to_vec_pretty(&state.primary)?;
+        // Persist only the passed registration-time primary, never the rotated
+        // runtime active credential held in `state.credentials`.
+        let json = serde_json::to_vec_pretty(primary)?;
         tokio::fs::write(path, json).await?;
 
         #[cfg(unix)]
@@ -623,8 +649,8 @@ mod tests {
             .await
             .expect("persist error recorded");
         assert!(!last_error.contains("SENTINEL_SECRET_VALUE"));
-        // The in-memory value is still updated, matching the legacy behaviour.
-        assert!(manager.get("openai").await.is_some());
+        // Persistence failed, so the in-memory mutation must be rolled back.
+        assert!(manager.get("openai").await.is_none());
 
         let remove_error = manager
             .try_remove("openai")
@@ -632,6 +658,106 @@ mod tests {
             .expect_err("persistence must fail");
         assert!(format!("{remove_error}").contains("failed to persist auth store"));
         assert!(manager.last_persist_error().await.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ERR_PATH-02 regression: a failed durable write must never leave the
+    /// in-memory store ahead of `auth.json` on any of the three mutating paths.
+    #[tokio::test]
+    async fn failed_persist_rolls_back_every_mutating_path() {
+        let dir = temp_auth_dir();
+        let auth_path = dir.join("auth.json");
+        let manager = AuthManager::with_filepath(auth_path.clone());
+
+        // Baseline: one durable credential, written while the path is a regular file.
+        manager
+            .try_set(
+                "openai",
+                AuthInfo::Api {
+                    key: "DUMMY_KEY_ORIGINAL".to_string(),
+                },
+            )
+            .await
+            .expect("initial persist must succeed");
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_ORIGINAL")
+        );
+
+        // Turn the auth file path into a directory so every later write fails
+        // deterministically, without changing the manager's configured path.
+        std::fs::remove_file(&auth_path).expect("remove auth file");
+        std::fs::create_dir(&auth_path).expect("create directory at auth file path");
+
+        // try_set: replacing an existing credential must be rolled back.
+        let set_error = manager
+            .try_set(
+                "openai",
+                AuthInfo::Api {
+                    key: "DUMMY_KEY_REPLACEMENT".to_string(),
+                },
+            )
+            .await
+            .expect_err("set persist must fail");
+        assert!(format!("{set_error}").contains("failed to persist auth store"));
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_ORIGINAL")
+        );
+
+        // try_add_key on an existing provider (pool path) must not add a pooled key.
+        manager
+            .try_add_key(
+                "openai",
+                AuthInfo::Api {
+                    key: "DUMMY_KEY_POOLED".to_string(),
+                },
+            )
+            .await
+            .expect_err("pooled add persist must fail");
+        assert_eq!(manager.key_count("openai").await, 1);
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_ORIGINAL")
+        );
+
+        // try_add_key for a new provider (primary path) must not register it.
+        manager
+            .try_add_key(
+                "new-provider",
+                AuthInfo::Api {
+                    key: "DUMMY_KEY_NEW".to_string(),
+                },
+            )
+            .await
+            .expect_err("new provider add persist must fail");
+        assert!(manager.get("new-provider").await.is_none());
+        assert_eq!(manager.key_count("new-provider").await, 0);
+
+        // try_remove must restore the credential it tried to delete.
+        manager
+            .try_remove("openai")
+            .await
+            .expect_err("remove persist must fail");
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_ORIGINAL")
+        );
+
+        // Error reporting must still never leak a key value.
+        let last_error = manager
+            .last_persist_error()
+            .await
+            .expect("persist error recorded");
+        for secret in [
+            "DUMMY_KEY_ORIGINAL",
+            "DUMMY_KEY_REPLACEMENT",
+            "DUMMY_KEY_POOLED",
+            "DUMMY_KEY_NEW",
+        ] {
+            assert!(!last_error.contains(secret), "key value leaked: {secret}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
