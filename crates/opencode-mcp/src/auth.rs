@@ -6,7 +6,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::fs;
+
+/// プロセス共有の書き込み直列化ロック。
+///
+/// `read_all() → 変更 → write_all()` は不可分でなければならない。2 並行の
+/// `try_set` が同じ元データを読むと、後から書いた側が先の変更を上書きして
+/// 片方のキー（例: OAuth フローの verifier/state）が失われる。`try_set` /
+/// `try_remove` / `try_update_*` はこのロックを全体で保持し、
+/// read-modify-write を直列化する。`read_all()` 自体は並行読み取りを許可する。
+static WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+/// 書き込み直列化ロックを取得する（初回呼び出しで初期化）。
+fn write_lock() -> &'static tokio::sync::Mutex<()> {
+    WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 /// 権限是正失敗の安全な詳細。
 ///
@@ -353,8 +368,11 @@ pub async fn get_for_url(
     try_get_for_url(mcp_name, server_url).await
 }
 
-/// Persist an auth entry, propagating store read/write failures.
-pub async fn try_set(
+/// `try_set` の実体（呼び出し側が [`write_lock`] を保持済みであること）。
+///
+/// ロックを二重取得してデッドロックしないよう、`try_update_*` 系からも
+/// このロック無しのヘルパを呼ぶ。
+async fn set_unlocked(
     mcp_name: &str,
     entry: AuthEntry,
     server_url: Option<&str>,
@@ -369,6 +387,19 @@ pub async fn try_set(
     Ok(())
 }
 
+/// Persist an auth entry, propagating store read/write failures.
+///
+/// read-modify-write 全体をプロセス共有ロックで直列化し、並行呼び出しで
+/// 片方の変更が失われることを防ぐ。
+pub async fn try_set(
+    mcp_name: &str,
+    entry: AuthEntry,
+    server_url: Option<&str>,
+) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
+    set_unlocked(mcp_name, entry, server_url).await
+}
+
 /// Compatibility wrapper for [`try_set`] (legacy `std::io::Error` signature).
 pub async fn set(
     mcp_name: &str,
@@ -381,7 +412,10 @@ pub async fn set(
 }
 
 /// Remove all stored auth data for a server, propagating failures.
+///
+/// `try_set` と同じ書き込みロックを保持し、並行する更新と競合しないようにする。
 pub async fn try_remove(mcp_name: &str) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     let mut data = read_all().await?;
     data.remove(mcp_name);
     write_all(&data).await?;
@@ -399,9 +433,10 @@ pub async fn try_update_tokens(
     tokens: OAuthTokens,
     server_url: Option<&str>,
 ) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     let mut entry = try_get(mcp_name).await?.unwrap_or_default();
     entry.tokens = Some(tokens);
-    try_set(mcp_name, entry, server_url).await
+    set_unlocked(mcp_name, entry, server_url).await
 }
 
 /// Compatibility wrapper for [`try_update_tokens`].
@@ -422,10 +457,11 @@ pub async fn try_update_endpoints(
     token_url: &str,
     server_url: Option<&str>,
 ) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     let mut entry = try_get(mcp_name).await?.unwrap_or_default();
     entry.auth_url = Some(auth_url.to_string());
     entry.token_url = Some(token_url.to_string());
-    try_set(mcp_name, entry, server_url).await
+    set_unlocked(mcp_name, entry, server_url).await
 }
 
 /// Compatibility wrapper for [`try_update_endpoints`].
@@ -446,9 +482,10 @@ pub async fn try_update_client_info(
     info: OAuthClientInfo,
     server_url: Option<&str>,
 ) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     let mut entry = try_get(mcp_name).await?.unwrap_or_default();
     entry.client_info = Some(info);
-    try_set(mcp_name, entry, server_url).await
+    set_unlocked(mcp_name, entry, server_url).await
 }
 
 /// Compatibility wrapper for [`try_update_client_info`].
@@ -467,9 +504,10 @@ pub async fn try_update_code_verifier(
     mcp_name: &str,
     code_verifier: &str,
 ) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     let mut entry = try_get(mcp_name).await?.unwrap_or_default();
     entry.code_verifier = Some(code_verifier.to_string());
-    try_set(mcp_name, entry, None).await
+    set_unlocked(mcp_name, entry, None).await
 }
 
 /// Compatibility wrapper for [`try_update_code_verifier`].
@@ -484,9 +522,10 @@ pub async fn update_code_verifier(
 
 /// Clear the stored code verifier, propagating failures.
 pub async fn try_clear_code_verifier(mcp_name: &str) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     if let Some(mut entry) = try_get(mcp_name).await? {
         entry.code_verifier = None;
-        try_set(mcp_name, entry, None).await?;
+        set_unlocked(mcp_name, entry, None).await?;
     }
     Ok(())
 }
@@ -500,9 +539,10 @@ pub async fn clear_code_verifier(mcp_name: &str) -> Result<(), std::io::Error> {
 
 /// Store the OAuth state parameter, propagating failures.
 pub async fn try_update_oauth_state(mcp_name: &str, state: &str) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     let mut entry = try_get(mcp_name).await?.unwrap_or_default();
     entry.oauth_state = Some(state.to_string());
-    try_set(mcp_name, entry, None).await
+    set_unlocked(mcp_name, entry, None).await
 }
 
 /// Compatibility wrapper for [`try_update_oauth_state`].
@@ -528,9 +568,10 @@ pub async fn get_oauth_state(mcp_name: &str) -> Result<Option<String>, AuthStore
 
 /// Clear the stored OAuth state, propagating failures.
 pub async fn try_clear_oauth_state(mcp_name: &str) -> Result<(), AuthStoreError> {
+    let _guard = write_lock().lock().await;
     if let Some(mut entry) = try_get(mcp_name).await? {
         entry.oauth_state = None;
-        try_set(mcp_name, entry, None).await?;
+        set_unlocked(mcp_name, entry, None).await?;
     }
     Ok(())
 }
@@ -909,6 +950,54 @@ mod tests {
         );
     }
 
+    /// 回帰ガード: 2 並行 `try_set` が互いの変更を失わず、両キーが disk に残ること。
+    ///
+    /// 旧実装は `read_all() → insert() → write_all()` をロック無しで行うため、
+    /// 2 つのフローが同じ元データを読むと後書き込みが先書き込みを上書きし、
+    /// 片方のキー（OAuth の verifier/state）が消えていた。
+    async fn scenario_concurrent_try_set_keeps_both_keys() {
+        let tmp = TempAuthFile::new("concurrent-set");
+        tmp.activate();
+
+        // 両タスクを同時に走らせ、read-modify-write の競合を確実に発生させる。
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let entry_a = entry(Some(OAuthTokens {
+            access_token: "verifier-a".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            scope: None,
+        }));
+        let entry_b = entry(Some(OAuthTokens {
+            access_token: "verifier-b".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            scope: None,
+        }));
+
+        let first = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                try_set("flow-a", entry_a, None).await.expect("set flow-a");
+            })
+        };
+        let second = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                try_set("flow-b", entry_b, None).await.expect("set flow-b");
+            })
+        };
+
+        first.await.expect("flow-a task");
+        second.await.expect("flow-b task");
+
+        let data = read_all().await.expect("read store after concurrent sets");
+        assert!(data.contains_key("flow-a"), "first flow must survive");
+        assert!(data.contains_key("flow-b"), "second flow must survive");
+    }
+
     /// Env-var based scenarios run serially because the variable is global.
     #[tokio::test(flavor = "multi_thread")]
     async fn secure_auth_store_behaviour() {
@@ -925,5 +1014,6 @@ mod tests {
         #[cfg(unix)]
         scenario_io_failure_fails_loud().await;
         scenario_try_api_preserves_valid_store().await;
+        scenario_concurrent_try_set_keeps_both_keys().await;
     }
 }

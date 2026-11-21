@@ -118,6 +118,16 @@ pub const DEFAULT_EXECUTION_MS: u64 = 43_200_000;
 /// unimplemented `auto` negotiation mode.
 const LEGACY_PROTOCOL_REVISION: &str = "2025-11-25";
 
+/// Absolute upper bound for one progress-aware request, as a multiple of the
+/// configured timeout. Progress notifications may push the effective deadline
+/// out, but never beyond `call_start + timeout * this multiplier`.
+const PROGRESS_HARD_DEADLINE_MULTIPLIER: u32 = 4;
+
+/// Maximum number of progress notifications that may extend the effective
+/// deadline of a single request. Bounds extension work independently of the
+/// wall-clock hard deadline.
+const MAX_PROGRESS_DEADLINE_EXTENSIONS: u32 = 64;
+
 impl McpTimeouts {
     pub fn uniform(millis: u64) -> Self {
         Self {
@@ -160,7 +170,18 @@ enum RegistryConnectionConfig {
 
 pub struct McpClient {
     server_name: String,
-    transport: Mutex<Option<Box<dyn McpTransport>>>,
+    // Stored as Arc so a request can clone the transport and drop the Mutex
+    // guard before awaiting receive(); holding the guard across receive()
+    // would block every other request, close() and reconnect on this client.
+    transport: Mutex<Option<Arc<dyn McpTransport>>>,
+    /// Serializes a whole request exchange (send + response receive). The
+    /// transport has no id-based routing, so two callers waiting on the same
+    /// `transport.receive()` would consume each other's responses (`Some(_) =>
+    /// continue`) and time out. Holding this lock across send and the receive
+    /// loop guarantees one in-flight request at a time, while the separate
+    /// `transport` Mutex stays free for `close()` / reconnect during a pending
+    /// receive (R2 regression).
+    request_lock: Mutex<()>,
     request_id: AtomicU64,
     initialized: RwLock<bool>,
     capabilities: RwLock<Option<ServerCapabilities>>,
@@ -180,6 +201,7 @@ impl McpClient {
         Self {
             server_name,
             transport: Mutex::new(None),
+            request_lock: Mutex::new(()),
             request_id: AtomicU64::new(0),
             initialized: RwLock::new(false),
             capabilities: RwLock::new(None),
@@ -305,7 +327,7 @@ impl McpClient {
             StdioTransport::new(&config.command, &config.args, config.env, config.cwd).await?;
         {
             let mut t = self.transport.lock().await;
-            *t = Some(Box::new(transport));
+            *t = Some(Arc::new(transport));
         }
         self.initialize().await?;
         self.load_tools().await?;
@@ -366,7 +388,7 @@ impl McpClient {
         let transport = HttpTransport::new(url.clone(), Some(merged_headers));
         {
             let mut t = self.transport.lock().await;
-            *t = Some(Box::new(transport));
+            *t = Some(Arc::new(transport));
         }
         match self.initialize().await {
             Ok(()) => {
@@ -386,7 +408,7 @@ impl McpClient {
                             let transport = HttpTransport::new(url.clone(), Some(retry_headers));
                             {
                                 let mut t = self.transport.lock().await;
-                                *t = Some(Box::new(transport));
+                                *t = Some(Arc::new(transport));
                             }
                             self.initialize().await?;
                             self.load_tools().await?;
@@ -446,7 +468,7 @@ impl McpClient {
         transport.connect().await?;
         {
             let mut t = self.transport.lock().await;
-            *t = Some(Box::new(transport));
+            *t = Some(Arc::new(transport));
         }
         match self.initialize().await {
             Ok(()) => {
@@ -465,7 +487,7 @@ impl McpClient {
                             transport.connect().await?;
                             {
                                 let mut t = self.transport.lock().await;
-                                *t = Some(Box::new(transport));
+                                *t = Some(Arc::new(transport));
                             }
                             self.initialize().await?;
                             self.load_tools().await?;
@@ -496,8 +518,13 @@ impl McpClient {
             method: method.to_string(),
             params,
         };
-        let guard = self.transport.lock().await;
-        let transport = guard.as_ref().ok_or(McpClientError::NotInitialized)?;
+        let transport = {
+            let guard = self.transport.lock().await;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or(McpClientError::NotInitialized)?
+        };
         transport.send_notification(&notification).await
     }
 
@@ -506,6 +533,10 @@ impl McpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<JsonRpcResponse, McpClientError> {
+        // Keep send + receive atomic per request so concurrent callers cannot
+        // steal responses carrying another request's id.
+        let _request_guard = self.request_lock.lock().await;
+
         let id = self.next_id().await;
         let request = JsonRpcRequest::new(id, method);
         let request = if let Some(p) = params {
@@ -514,16 +545,17 @@ impl McpClient {
             request
         };
 
-        // Send under the lock, then release it.
-        {
+        // Clone the transport out so the Mutex guard is released before any
+        // await. Keeping it across `receive()` would block other requests and
+        // reconnects for the entire lifetime of this response wait.
+        let transport = {
             let guard = self.transport.lock().await;
-            let transport = guard.as_ref().ok_or(McpClientError::NotInitialized)?;
-            transport.send(&request).await?;
-        }
-
-        // Re-acquire for receive.
-        let guard = self.transport.lock().await;
-        let transport = guard.as_ref().ok_or(McpClientError::NotInitialized)?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or(McpClientError::NotInitialized)?
+        };
+        transport.send(&request).await?;
 
         let response = loop {
             match transport.receive().await? {
@@ -554,6 +586,10 @@ impl McpClient {
         params: Option<serde_json::Value>,
         timeout_ms: u64,
     ) -> Result<JsonRpcResponse, McpClientError> {
+        // Serialize send + receive so two concurrent callers never wait on the
+        // same `transport.receive()` and consume each other's id-tagged reply.
+        let _request_guard = self.request_lock.lock().await;
+
         let id = self.next_id().await;
         let request = JsonRpcRequest::new(id, method);
         let request = if let Some(p) = params {
@@ -562,28 +598,65 @@ impl McpClient {
             request
         };
 
-        {
+        // Clone the transport out so the Mutex guard is released before any
+        // await. Holding it across `receive()` would block other requests,
+        // close() and reconnects for the whole response wait.
+        let transport = {
             let guard = self.transport.lock().await;
-            let transport = guard.as_ref().ok_or(McpClientError::NotInitialized)?;
-            transport.send(&request).await?;
-        }
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or(McpClientError::NotInitialized)?
+        };
 
-        let guard = self.transport.lock().await;
-        let transport = guard.as_ref().ok_or(McpClientError::NotInitialized)?;
+        // The deadline is fixed BEFORE send: reqwest has no default request
+        // timeout, so an HTTP/SSE POST that accepts the connection but never
+        // answers must not hang forever. `call_start` also bounds the receive
+        // wait below, keeping send + receive under one absolute budget.
         let timeout_duration = Duration::from_millis(timeout_ms);
-        let mut deadline = tokio::time::Instant::now() + timeout_duration;
+        let call_start = tokio::time::Instant::now();
+        // Absolute bound fixed at call start. Progress notifications may extend
+        // the effective deadline, but never beyond this instant.
+        let hard_deadline =
+            call_start + timeout_duration.saturating_mul(PROGRESS_HARD_DEADLINE_MULTIPLIER);
+        let mut deadline = call_start + timeout_duration;
+        let mut extensions_used = 0u32;
+
+        // Cover send() itself with the same absolute bound. Progress cannot
+        // extend the send phase, but using hard_deadline keeps a single,
+        // explicit upper bound for the whole request exchange.
+        tokio::time::timeout_at(hard_deadline, transport.send(&request))
+            .await
+            .map_err(|_| McpClientError::Timeout)??;
 
         let response = loop {
-            let message = match tokio::time::timeout_at(deadline, transport.receive()).await {
-                Ok(result) => result?,
-                Err(_) => return Err(McpClientError::Timeout),
-            };
+            // `timeout_at` alone can be starved: if the transport keeps yielding
+            // messages without ever going pending, its inner future wins every
+            // poll and the timeout is never observed. Check the absolute bound
+            // explicitly on every iteration so a progress flood always ends.
+            if tokio::time::Instant::now() >= hard_deadline {
+                return Err(McpClientError::Timeout);
+            }
+            let effective_deadline = deadline.min(hard_deadline);
+            let message =
+                match tokio::time::timeout_at(effective_deadline, transport.receive()).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(McpClientError::Timeout),
+                };
 
             match message {
                 Some(JsonRpcMessage::Response(resp)) if resp.id == id => break resp,
                 Some(JsonRpcMessage::Notification(notif)) => {
                     if Self::is_progress_notification(&notif) {
-                        deadline = tokio::time::Instant::now() + timeout_duration;
+                        if let Some(next) = Self::next_progress_deadline(
+                            tokio::time::Instant::now(),
+                            timeout_duration,
+                            hard_deadline,
+                            extensions_used,
+                        ) {
+                            extensions_used += 1;
+                            deadline = next;
+                        }
                     }
                     self.handle_notification(notif).await;
                     continue;
@@ -688,6 +761,23 @@ impl McpClient {
         notif.method == "notifications/progress" || notif.method == "$/progress"
     }
 
+    /// Compute the effective deadline after a progress notification.
+    ///
+    /// Returns `None` once the extension budget is exhausted. Any accepted
+    /// extension is clamped to `hard_deadline`, so progress can never push the
+    /// effective deadline past the absolute bound fixed at call start.
+    fn next_progress_deadline(
+        now: tokio::time::Instant,
+        timeout: Duration,
+        hard_deadline: tokio::time::Instant,
+        extensions_used: u32,
+    ) -> Option<tokio::time::Instant> {
+        if extensions_used >= MAX_PROGRESS_DEADLINE_EXTENSIONS {
+            return None;
+        }
+        Some((now + timeout).min(hard_deadline))
+    }
+
     /// If the server sent a `tools/list_changed` notification, reload tools.
     /// Call this after operations that might trigger notifications.
     pub async fn refresh_tools_if_needed(&self) -> Result<(), McpClientError> {
@@ -789,11 +879,16 @@ impl McpClient {
     }
 
     pub async fn close(&self) -> Result<(), McpClientError> {
-        let mut transport = self.transport.lock().await;
-        if let Some(t) = transport.as_ref() {
+        // Take the transport out and drop the Mutex guard before awaiting
+        // close(), so in-flight requests waiting on receive() are not blocked
+        // by (or blocking) the shutdown path.
+        let transport = {
+            let mut guard = self.transport.lock().await;
+            guard.take()
+        };
+        if let Some(t) = transport {
             t.close().await?;
         }
-        *transport = None;
 
         self.tool_registry.clear_server(&self.server_name).await;
         self.set_status(McpStatus::Disabled).await;
@@ -1228,7 +1323,7 @@ mod tests {
 
         {
             let mut guard = client.transport.lock().await;
-            *guard = Some(Box::new(transport));
+            *guard = Some(Arc::new(transport));
         }
 
         let result = client
@@ -1238,6 +1333,177 @@ mod tests {
 
         assert_eq!(result.content.len(), 1);
         assert_eq!(result.content[0].text.as_deref(), Some("ok"));
+    }
+
+    /// A transport that never answers, only emits progress notifications at a
+    /// fixed interval. Models a server keeping a call alive forever by
+    /// streaming progress.
+    struct InfiniteProgressTransport {
+        interval: Duration,
+    }
+
+    #[async_trait]
+    impl McpTransport for InfiniteProgressTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            sleep(self.interval).await;
+            Ok(Some(JsonRpcMessage::Notification(JsonRpcNotification {
+                jsonrpc: "2.0".to_string(),
+                method: "notifications/progress".to_string(),
+                params: Some(serde_json::json!({ "progress": 1 })),
+            })))
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    /// The extension helper must refuse to extend past the extension budget,
+    /// and clamp any accepted extension to the absolute hard deadline.
+    #[test]
+    fn progress_deadline_extension_is_bounded() {
+        let now = tokio::time::Instant::now();
+        let timeout = Duration::from_millis(10);
+        let hard = now + Duration::from_millis(40);
+
+        assert_eq!(
+            McpClient::next_progress_deadline(now, timeout, hard, 0),
+            Some(now + Duration::from_millis(10))
+        );
+        // A late progress message would push past the hard deadline -> clamp.
+        assert_eq!(
+            McpClient::next_progress_deadline(now + Duration::from_millis(35), timeout, hard, 1),
+            Some(hard)
+        );
+        // Budget exhausted -> no further extension at all.
+        assert_eq!(
+            McpClient::next_progress_deadline(now, timeout, hard, MAX_PROGRESS_DEADLINE_EXTENSIONS),
+            None
+        );
+    }
+
+    /// Regression: an endless stream of progress notifications must not keep
+    /// tools/call alive forever. The hard deadline fixed at call start wins,
+    /// even though every progress message would otherwise refresh the deadline.
+    #[tokio::test]
+    async fn infinite_progress_times_out_at_hard_deadline() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_timeout(20);
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(InfiniteProgressTransport {
+                interval: Duration::from_millis(1),
+            }));
+        }
+
+        let started = tokio::time::Instant::now();
+        let error = client
+            .call_tool("streaming-tool", None)
+            .await
+            .expect_err("endless progress must still time out");
+        assert!(
+            matches!(&error, McpClientError::Timeout),
+            "unexpected: {error}"
+        );
+
+        let hard = Duration::from_millis(20).saturating_mul(PROGRESS_HARD_DEADLINE_MULTIPLIER);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "progress should have kept the call alive past the initial deadline"
+        );
+        assert!(
+            elapsed < hard + Duration::from_millis(200),
+            "call must terminate near the hard deadline, not continue indefinitely"
+        );
+    }
+
+    /// A transport whose receive() signals entry, then stays pending for a
+    /// fixed window before closing the connection.
+    struct SlowReceiveTransport {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl McpTransport for SlowReceiveTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            self.entered.store(true, Ordering::SeqCst);
+            sleep(self.delay).await;
+            Ok(None)
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    /// Regression: while a request awaits receive(), the outer transport Mutex
+    /// must be free for other callers (other requests, close, reconnect). With
+    /// the old guard-held-across-receive code this lock attempt would block for
+    /// the whole receive window and the short timeout below would fire.
+    #[tokio::test]
+    async fn transport_mutex_is_released_while_awaiting_receive() {
+        let client = Arc::new(
+            McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+                .with_timeout(5_000),
+        );
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(SlowReceiveTransport {
+                entered: entered.clone(),
+                delay: Duration::from_millis(300),
+            }));
+        }
+
+        let call_client = client.clone();
+        let call = tokio::spawn(async move { call_client.call_tool("slow", None).await });
+
+        // Wait until receive() is definitely pending before probing the lock.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "receive() was never entered"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        let guard = tokio::time::timeout(Duration::from_millis(80), client.transport.lock())
+            .await
+            .expect("transport Mutex must be available while receive() is pending");
+        drop(guard);
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("call must finish");
+        // receive() が None を返すと TransportError になる。
+        // このテストの目的は receive() 待ち中に Mutex が取得できたことなので、
+        // call の最終エラー種別は問わない（panic していなければよい）。
+        assert!(joined.is_ok(), "call task must not panic");
     }
 
     #[tokio::test]
@@ -1269,7 +1535,7 @@ mod tests {
 
         {
             let mut guard = client.transport.lock().await;
-            *guard = Some(Box::new(transport));
+            *guard = Some(Arc::new(transport));
         }
 
         client
@@ -1324,7 +1590,7 @@ mod tests {
             });
         {
             let mut guard = client.transport.lock().await;
-            *guard = Some(Box::new(HangingTransport));
+            *guard = Some(Arc::new(HangingTransport));
         }
 
         let error = client
@@ -1345,7 +1611,7 @@ mod tests {
             });
         {
             let mut guard = client.transport.lock().await;
-            *guard = Some(Box::new(HangingTransport));
+            *guard = Some(Arc::new(HangingTransport));
         }
 
         let error = client
@@ -1353,6 +1619,149 @@ mod tests {
             .await
             .expect_err("read_resource must time out");
         assert!(matches!(error, McpClientError::Timeout));
+    }
+
+    /// Transport with no id routing: `receive()` returns a response for the
+    /// most recently sent request id after a short delay. Without request-level
+    /// serialization two concurrent callers would both read the same reply and
+    /// the one whose id does not match would loop forever.
+    struct EchoTransport {
+        last_id: Mutex<Option<u64>>,
+        delay: Duration,
+    }
+
+    impl EchoTransport {
+        fn new(delay: Duration) -> Self {
+            Self {
+                last_id: Mutex::new(None),
+                delay,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for EchoTransport {
+        async fn send(&self, request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            *self.last_id.lock().await = Some(request.id);
+            Ok(())
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            sleep(self.delay).await;
+            let id = self.last_id.lock().await.unwrap_or(0);
+            Ok(Some(JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(serde_json::json!({
+                    "content": [{ "type": "text", "text": format!("resp-{id}") }]
+                })),
+                error: None,
+            })))
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    /// Regression (A): two concurrent `call_tool` invocations must each receive
+    /// the response matching their own request id, not steal each other's reply.
+    #[tokio::test]
+    async fn concurrent_call_tools_route_responses_by_id() {
+        let client = Arc::new(
+            McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+                .with_timeout(2_000),
+        );
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(EchoTransport::new(Duration::from_millis(10))));
+        }
+
+        let call_a = {
+            let client = client.clone();
+            tokio::spawn(async move { client.call_tool("tool-a", None).await })
+        };
+        let call_b = {
+            let client = client.clone();
+            tokio::spawn(async move { client.call_tool("tool-b", None).await })
+        };
+
+        let result_a = tokio::time::timeout(Duration::from_secs(2), call_a)
+            .await
+            .expect("call a must not hang")
+            .expect("call a task must succeed")
+            .expect("call a must succeed");
+        let result_b = tokio::time::timeout(Duration::from_secs(2), call_b)
+            .await
+            .expect("call b must not hang")
+            .expect("call b task must succeed")
+            .expect("call b must succeed");
+
+        let mut texts = vec![
+            result_a.content[0].text.clone().unwrap_or_default(),
+            result_b.content[0].text.clone().unwrap_or_default(),
+        ];
+        texts.sort();
+        assert_eq!(texts, vec!["resp-1".to_string(), "resp-2".to_string()]);
+    }
+
+    /// Transport whose `send()` never returns. Models an HTTP POST that is
+    /// accepted but never answered.
+    struct HangingSendTransport;
+
+    #[async_trait]
+    impl McpTransport for HangingSendTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            std::future::pending().await
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            Ok(None)
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    /// Regression (B): a send() that never returns must be bounded by the
+    /// request deadline, not hang forever.
+    #[tokio::test]
+    async fn hanging_send_times_out() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_timeout(30);
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(HangingSendTransport));
+        }
+
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(2), client.call_tool("hung", None))
+            .await
+            .expect("send must not hang forever")
+            .expect_err("unanswered send must time out");
+        assert!(matches!(error, McpClientError::Timeout));
+
+        // hard deadline = 30ms * PROGRESS_HARD_DEADLINE_MULTIPLIER (4) = 120ms.
+        let bound = Duration::from_millis(30).saturating_mul(PROGRESS_HARD_DEADLINE_MULTIPLIER);
+        assert!(
+            started.elapsed() < bound + Duration::from_millis(500),
+            "send must be covered by the hard deadline, not wait indefinitely"
+        );
     }
 
     /// The registry keeps one OAuth manager per server name; registering a

@@ -9,8 +9,8 @@ use oauth2::{
     PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{Mutex, RwLock};
 
 /// Static configuration for an OAuth-enabled MCP server.
 #[derive(Debug, Clone)]
@@ -43,12 +43,68 @@ struct PendingAuth {
     csrf_state: String,
 }
 
+/// Outcome of discovery plus dynamic client registration for one server.
+///
+/// Shared between manager instances that target the same server so concurrent
+/// callers never register a second client (RFC 7591).
+#[derive(Clone)]
+struct PreparedClient {
+    auth_url: String,
+    token_url: String,
+    client_id: String,
+    client_secret: Option<String>,
+    scopes: Vec<String>,
+    resource: Option<String>,
+}
+
+/// Identifies one OAuth server across every manager instance in the process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PrepareKey {
+    mcp_name: String,
+    server_url: String,
+}
+
+/// Process-wide slots for [`McpOAuthManager::prepare`].
+///
+/// Callers such as `oauth_client_for` construct a fresh manager per request,
+/// so an instance-local lock cannot prevent duplicate registration. The
+/// short-lived `std::sync::Mutex` only guards the slot map; the long-lived
+/// per-server `tokio::sync::Mutex` serializes the network work itself.
+type PreparedSlot = Arc<Mutex<Option<PreparedClient>>>;
+
+static PREPARE_SLOTS: OnceLock<std::sync::Mutex<HashMap<PrepareKey, PreparedSlot>>> =
+    OnceLock::new();
+
+fn prepare_slot(key: &PrepareKey) -> PreparedSlot {
+    let slots = PREPARE_SLOTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut slots = slots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slots
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+/// Drop a cached preparation when credentials for the server are removed.
+fn forget_prepare_slot(key: &PrepareKey) {
+    if let Some(slots) = PREPARE_SLOTS.get() {
+        let mut slots = slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.remove(key);
+    }
+}
+
 /// Manages the OAuth lifecycle for a single MCP server.
 pub struct McpOAuthManager {
     mcp_name: String,
     server_url: String,
     config: RwLock<McpOAuthConfig>,
-    pending: RwLock<Option<PendingAuth>>,
+    /// In-flight flows keyed by their CSRF state. Keying (instead of a single
+    /// `Option`) keeps every concurrently issued state resolvable by
+    /// `finish_auth`; a plain overwrite would silently drop one flow.
+    pending: RwLock<HashMap<String, PendingAuth>>,
     /// RFC 8707 resource indicator discovered during endpoint discovery.
     /// Kept on the manager (not `McpOAuthConfig`) so existing external config
     /// struct literals remain source-compatible. `None` omits the parameter.
@@ -97,9 +153,25 @@ impl McpOAuthManager {
             mcp_name,
             server_url,
             config: RwLock::new(config),
-            pending: RwLock::new(None),
+            pending: RwLock::new(HashMap::new()),
             resource: RwLock::new(None),
         }
+    }
+
+    /// Disk key for the transient record of one in-flight authorization flow.
+    ///
+    /// The PKCE verifier / CSRF state are persisted under a key derived from
+    /// the flow's CSRF `state` instead of the fixed `mcp_name`. The auth store
+    /// is a flat `HashMap<String, AuthEntry>`, so this gives each concurrent
+    /// flow its own record and prevents a later `start_auth` from overwriting
+    /// an earlier flow (or `finish_auth` from wiping another flow's record).
+    /// Tokens and client info remain under `mcp_name`, so token lookup and
+    /// refresh are unaffected.
+    ///
+    /// The returned key contains the raw state but is only ever used as a
+    /// storage key — it is never logged or included in an error message.
+    fn flow_disk_key(&self, state: &str) -> String {
+        format!("{}-oauth-flow-{}", self.mcp_name, state)
     }
 
     /// Records the RFC 8707 resource indicator from discovered endpoints.
@@ -108,6 +180,30 @@ impl McpOAuthManager {
         if let Some(resource) = resource {
             *self.resource.write().await = Some(resource);
         }
+    }
+
+    /// Fill only missing fields from a result produced by another manager
+    /// instance, so explicitly configured values keep precedence.
+    async fn apply_prepared(&self, prepared: &PreparedClient) {
+        {
+            let mut config = self.config.write().await;
+            if config.auth_url.is_empty() {
+                config.auth_url = prepared.auth_url.clone();
+            }
+            if config.token_url.is_empty() {
+                config.token_url = prepared.token_url.clone();
+            }
+            if config.scopes.is_empty() {
+                config.scopes = prepared.scopes.clone();
+            }
+            if config.client_id.is_none() {
+                config.client_id = Some(prepared.client_id.clone());
+            }
+            if config.client_secret.is_none() {
+                config.client_secret = prepared.client_secret.clone();
+            }
+        }
+        self.remember_resource(prepared.resource.clone()).await;
     }
 
     /// Validate config and return parsed URL components.
@@ -170,6 +266,21 @@ impl McpOAuthManager {
     /// Metadata Document, or dynamic registration. Only the first and last are
     /// implemented here; without either, the flow fails rather than guessing.
     pub async fn prepare(&self) -> Result<(), OAuthError> {
+        // Serialize discovery + dynamic registration per (mcp_name, server_url)
+        // across every manager instance in this process. Callers that build a
+        // fresh manager per request would otherwise register the same server
+        // twice when two requests race here.
+        let key = PrepareKey {
+            mcp_name: self.mcp_name.clone(),
+            server_url: self.server_url.clone(),
+        };
+        let slot = prepare_slot(&key);
+        let mut prepared_guard = slot.lock().await;
+        if let Some(prepared) = prepared_guard.as_ref() {
+            self.apply_prepared(prepared).await;
+            return Ok(());
+        }
+
         let (needs_endpoints, needs_client, redirect_uri, scopes) = {
             let config = self.config.read().await;
             (
@@ -264,6 +375,23 @@ impl McpOAuthManager {
             .await?;
         }
 
+        // Publish the outcome for later (or previously blocked) managers of
+        // the same server. Only a fully prepared client is reusable.
+        {
+            let config = self.config.read().await;
+            if let Some(client_id) = config.client_id.clone().filter(|id| !id.is_empty()) {
+                let resource = self.resource.read().await.clone();
+                *prepared_guard = Some(PreparedClient {
+                    auth_url: config.auth_url.clone(),
+                    token_url: config.token_url.clone(),
+                    client_id,
+                    client_secret: config.client_secret.clone(),
+                    scopes: config.scopes.clone(),
+                    resource,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -311,6 +439,11 @@ impl McpOAuthManager {
     /// and CSRF state are persisted both in-memory and on disk so that
     /// `finish_auth` can complete the exchange even after a process restart.
     pub async fn start_auth(&self) -> Result<String, OAuthError> {
+        // One write lock spans state issuance, disk persistence and the in-memory
+        // update. Concurrent calls can no longer interleave their PKCE/CSRF
+        // values or overwrite each other's pending flow.
+        let mut pending = self.pending.write().await;
+
         let config = self.config.read().await.clone();
         let (client_id, client_secret, auth_url, token_url, redirect_url) =
             self.parsed_config(&config)?;
@@ -339,17 +472,26 @@ impl McpOAuthManager {
 
         // Persist to disk for cross-restart resilience. A corrupt or unreadable
         // store must abort the flow instead of silently dropping PKCE/CSRF state.
-        auth::try_update_code_verifier(&self.mcp_name, pkce_verifier.secret()).await?;
-        auth::try_update_oauth_state(&self.mcp_name, csrf_state.secret()).await?;
+        // Store under a state-derived flow key so a concurrent second flow does
+        // not overwrite this one's verifier/state on disk.
+        let flow_key = self.flow_disk_key(csrf_state.secret());
+        // 2 回の try_update_* に分けると並行フローで read-modify-write が競合し、
+        // 片方の verifier が消えるため 1 回の try_set で両方を保存する。
+        let mut flow_entry = auth::try_get(&flow_key).await?.unwrap_or_default();
+        flow_entry.code_verifier = Some(pkce_verifier.secret().clone());
+        flow_entry.oauth_state = Some(csrf_state.secret().clone());
+        auth::try_set(&flow_key, flow_entry, None).await?;
 
-        // Also keep in memory for the fast path.
-        {
-            let mut pending = self.pending.write().await;
-            *pending = Some(PendingAuth {
+        // Also keep in memory for the fast path, keyed by the issued state so a
+        // second concurrent flow stays resolvable by `finish_auth`.
+        pending.insert(
+            csrf_state.secret().clone(),
+            PendingAuth {
                 pkce_verifier: pkce_verifier.secret().clone(),
                 csrf_state: csrf_state.secret().clone(),
-            });
-        }
+            },
+        );
+        drop(pending);
 
         Ok(url.to_string())
     }
@@ -359,12 +501,13 @@ impl McpOAuthManager {
         // Recover verifier + expected state.
         let (verifier_secret, expected_state) = {
             let pending = self.pending.read().await;
-            match pending.as_ref() {
+            match pending.get(state) {
                 Some(p) => (p.pkce_verifier.clone(), p.csrf_state.clone()),
                 None => {
-                    // No in-memory pending flow: recover verifier/state from disk.
-                    // A broken store is an error, never "no pending auth".
-                    let entry = auth::try_get(&self.mcp_name)
+                    // No in-memory pending flow: recover this flow's
+                    // verifier/state from its own state-keyed disk record. A
+                    // broken store is an error, never "no pending auth".
+                    let entry = auth::try_get(&self.flow_disk_key(state))
                         .await?
                         .ok_or(OAuthError::NoPendingAuth)?;
                     let v = entry.code_verifier.ok_or(OAuthError::NoPendingAuth)?;
@@ -410,13 +553,15 @@ impl McpOAuthManager {
 
         self.save_token_result(&token_result).await?;
 
-        // Clean up transient state. The clear operations are writes too; a
-        // failing store must surface instead of leaving stale PKCE/CSRF state.
-        auth::try_clear_code_verifier(&self.mcp_name).await?;
-        auth::try_clear_oauth_state(&self.mcp_name).await?;
+        // Clean up transient state for THIS flow only. Removing the whole
+        // flow record keeps a concurrent flow's verifier/state intact on disk.
+        // The removal is a write too; a failing store must surface instead of
+        // leaving stale PKCE/CSRF state.
+        auth::try_remove(&self.flow_disk_key(state)).await?;
         {
             let mut pending = self.pending.write().await;
-            *pending = None;
+            // Only the completed flow is removed; other in-flight flows stay.
+            pending.remove(state);
         }
 
         Ok(())
@@ -526,8 +671,20 @@ impl McpOAuthManager {
     /// Remove all stored OAuth credentials for this server.
     pub async fn remove_auth(&self) -> Result<(), OAuthError> {
         auth::try_remove(&self.mcp_name).await?;
-        let mut pending = self.pending.write().await;
-        *pending = None;
+        // Also drop any in-flight flow records keyed by their CSRF state, so
+        // logout leaves no verifier/state behind on disk.
+        let states: Vec<String> = {
+            let pending = self.pending.read().await;
+            pending.keys().cloned().collect()
+        };
+        for state in &states {
+            auth::try_remove(&self.flow_disk_key(state)).await?;
+        }
+        self.pending.write().await.clear();
+        forget_prepare_slot(&PrepareKey {
+            mcp_name: self.mcp_name.clone(),
+            server_url: self.server_url.clone(),
+        });
         Ok(())
     }
 
@@ -997,7 +1154,7 @@ mod tests {
                 "unexpected: {err}"
             );
             assert!(
-                manager.pending.read().await.is_none(),
+                manager.pending.read().await.is_empty(),
                 "no transient state may be installed when persistence fails"
             );
         }
@@ -1007,7 +1164,7 @@ mod tests {
         {
             let store = TestAuthFile::new("corrupt-callback", true);
             let manager = manager_with(dummy_config());
-            assert!(manager.pending.read().await.is_none());
+            assert!(manager.pending.read().await.is_empty());
             let err =
                 with_isolated_store(&store, || manager.finish_auth("dummy-code", "dummy-state"))
                     .await
@@ -1050,11 +1207,12 @@ mod tests {
                 let url = manager.start_auth().await?;
                 let (verifier, state) = {
                     let pending = manager.pending.read().await;
-                    let pending = pending.as_ref().expect("in-memory pending auth");
+                    let pending = pending.values().next().expect("in-memory pending auth");
                     (pending.pkce_verifier.clone(), pending.csrf_state.clone())
                 };
-                let stored_state = auth::try_get_oauth_state("dummy-server").await?;
-                let stored_verifier = auth::try_get("dummy-server")
+                let flow_key = manager.flow_disk_key(&state);
+                let stored_state = auth::try_get_oauth_state(&flow_key).await?;
+                let stored_verifier = auth::try_get(&flow_key)
                     .await?
                     .and_then(|entry| entry.code_verifier);
                 Ok::<_, OAuthError>((url, verifier, state, stored_state, stored_verifier))
@@ -1091,5 +1249,322 @@ mod tests {
             );
             assert!(!err.to_string().contains(SENTINEL));
         }
+    }
+
+    // --- concurrency regression tests -------------------------------------
+    //
+    // No real credentials and no external network: only loopback HTTP mocks
+    // and the isolated auth store are used.
+
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex as StdMutex, Once};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    static PREPARE_TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn ensure_no_proxy_for_loopback() {
+        static SET: Once = Once::new();
+        SET.call_once(|| {
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        });
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("mock must read request");
+            assert!(read > 0, "unexpected EOF while reading request headers");
+            buf.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let read = stream
+                .read(&mut chunk)
+                .expect("mock must read request body");
+            assert!(read > 0, "unexpected EOF while reading request body");
+            buf.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Minimal loopback OAuth server: resource metadata, AS metadata, register.
+    struct PrepareMock {
+        base_url: String,
+        seen: Arc<StdMutex<Vec<String>>>,
+        thread: thread::JoinHandle<()>,
+    }
+
+    impl PrepareMock {
+        fn spawn() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+            let addr = listener.local_addr().expect("loopback addr must succeed");
+            let base_url = format!("http://{addr}");
+            let base_for_thread = base_url.clone();
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let seen_for_thread = Arc::clone(&seen);
+            let thread = thread::spawn(move || {
+                listener
+                    .set_nonblocking(true)
+                    .expect("mock listener must be nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut last_request: Option<Instant> = None;
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .expect("mock stream read timeout");
+                            let request = read_http_request(&mut stream);
+                            let (status, body) = if request.starts_with("POST /register ") {
+                                ("200 OK", r#"{"client_id":"registered-client"}"#.to_string())
+                            } else if request.contains("/.well-known/oauth-protected-resource") {
+                                (
+                                    "200 OK",
+                                    format!(
+                                        r#"{{"resource":"{b}/mcp","authorization_servers":["{b}"],"scopes_supported":["mcp:read"]}}"#,
+                                        b = base_for_thread
+                                    ),
+                                )
+                            } else if request.contains("/.well-known/oauth-authorization-server") {
+                                (
+                                    "200 OK",
+                                    format!(
+                                        r#"{{"issuer":"{b}","authorization_endpoint":"{b}/authorize","token_endpoint":"{b}/token","registration_endpoint":"{b}/register","scopes_supported":["mcp:read"]}}"#,
+                                        b = base_for_thread
+                                    ),
+                                )
+                            } else {
+                                ("404 Not Found", "not found".to_string())
+                            };
+                            seen_for_thread
+                                .lock()
+                                .expect("mock seen lock")
+                                .push(request);
+                            let headers = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            stream
+                                .write_all(headers.as_bytes())
+                                .expect("mock must write headers");
+                            stream
+                                .write_all(body.as_bytes())
+                                .expect("mock must write body");
+                            last_request = Some(Instant::now());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            let quiet = last_request
+                                .is_some_and(|at| at.elapsed() > Duration::from_millis(300));
+                            if quiet || Instant::now() >= deadline {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock accept failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                base_url,
+                seen,
+                thread,
+            }
+        }
+
+        fn requests(self) -> Vec<String> {
+            self.thread.join().expect("mock thread must not panic");
+            self.seen.lock().expect("mock seen lock").clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_start_auth_keeps_both_states() {
+        let store = TestAuthFile::new("concurrent-start", false);
+        let manager = manager_with(dummy_config());
+
+        let states = with_isolated_store(&store, || {
+            let manager = &manager;
+            async move {
+                manager.pending.write().await.clear();
+                let (first, second) = tokio::join!(manager.start_auth(), manager.start_auth());
+                let urls = [first?, second?];
+                let mut states = Vec::new();
+                for url in &urls {
+                    let parsed = url::Url::parse(url).expect("authorization URL must parse");
+                    let state = parsed
+                        .query_pairs()
+                        .find(|(key, _)| key.as_ref() == "state")
+                        .map(|(_, value)| value.into_owned())
+                        .expect("authorization URL must carry a state");
+                    states.push(state);
+                }
+                Ok::<_, OAuthError>(states)
+            }
+        })
+        .await
+        .expect("both concurrent flows must start");
+
+        assert_eq!(states.len(), 2);
+        assert_ne!(states[0], states[1], "each flow needs a distinct state");
+        let pending = manager.pending.read().await;
+        assert_eq!(pending.len(), 2, "neither concurrent flow may be dropped");
+        for state in &states {
+            let flow = pending
+                .get(state)
+                .expect("every issued state must remain resolvable");
+            assert!(!flow.pkce_verifier.is_empty());
+            assert_eq!(&flow.csrf_state, state);
+        }
+    }
+
+    /// Regression (C): two concurrent `start_auth` calls must produce two
+    /// distinct disk records. The first flow stays recoverable from disk (no
+    /// overwrite), and removing one flow's record leaves the other intact —
+    /// this is exactly what `finish_auth` now does via `try_remove(flow_key)`.
+    #[tokio::test]
+    async fn concurrent_start_auth_keeps_both_flows_on_disk() {
+        let store = TestAuthFile::new("concurrent-start-disk", false);
+        let manager = manager_with(dummy_config());
+
+        let states = with_isolated_store(&store, || {
+            let manager = &manager;
+            async move {
+                manager.pending.write().await.clear();
+                let (first, second) = tokio::join!(manager.start_auth(), manager.start_auth());
+                let urls = [first?, second?];
+                let mut states = Vec::new();
+                for url in &urls {
+                    let parsed = url::Url::parse(url).expect("authorization URL must parse");
+                    let state = parsed
+                        .query_pairs()
+                        .find(|(key, _)| key.as_ref() == "state")
+                        .map(|(_, value)| value.into_owned())
+                        .expect("authorization URL must carry a state");
+                    states.push(state);
+                }
+                Ok::<_, OAuthError>(states)
+            }
+        })
+        .await
+        .expect("both concurrent flows must start");
+
+        assert_eq!(states.len(), 2);
+        assert_ne!(states[0], states[1]);
+
+        // with_isolated_store を再度呼ぶと activate() が store を "{}" で
+        // 上書きするため、ここでは env が自 store を指していることだけ確認し、
+        // 書き込まれたデータをそのまま読む。
+        assert!(
+            env_points_to(store.path.as_path()),
+            "test store must still be active after start_auth"
+        );
+        {
+            let manager = &manager;
+            let states = &states;
+            async move {
+                let mut flow_keys = Vec::new();
+                for state in states {
+                    let flow_key = manager.flow_disk_key(state);
+                    let disk_state = auth::try_get_oauth_state(&flow_key).await?;
+                    let disk_verifier = auth::try_get(&flow_key)
+                        .await?
+                        .and_then(|entry| entry.code_verifier);
+                    let pending_verifier = manager
+                        .pending
+                        .read()
+                        .await
+                        .get(state)
+                        .expect("issued state must remain in memory")
+                        .pkce_verifier
+                        .clone();
+                    assert_eq!(disk_state.as_deref(), Some(state.as_str()));
+                    assert_eq!(disk_verifier.as_deref(), Some(pending_verifier.as_str()));
+                    flow_keys.push(flow_key);
+                }
+                assert_ne!(
+                    flow_keys[0], flow_keys[1],
+                    "each concurrent flow must own a distinct disk record"
+                );
+
+                // Finishing one flow removes only that flow's record.
+                auth::try_remove(&flow_keys[0]).await?;
+                assert!(auth::try_get(&flow_keys[0]).await?.is_none());
+                assert!(
+                    auth::try_get(&flow_keys[1]).await?.is_some(),
+                    "the other flow must survive the first flow's cleanup"
+                );
+                Ok::<_, OAuthError>(())
+            }
+            .await
+            .expect("both flows must be recoverable and independently removable");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_prepare_registers_client_once() {
+        ensure_no_proxy_for_loopback();
+        let store = TestAuthFile::new("concurrent-prepare", false);
+
+        let (results, client_ids, requests) = with_isolated_store(&store, || async {
+            let mock = PrepareMock::spawn();
+            let server_url = format!("{}/mcp", mock.base_url);
+            let mcp_name = format!(
+                "prepare-once-{}",
+                PREPARE_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let make_manager = || {
+                McpOAuthManager::new(
+                    mcp_name.clone(),
+                    server_url.clone(),
+                    McpOAuthConfig {
+                        client_id: None,
+                        client_secret: None,
+                        auth_url: String::new(),
+                        token_url: String::new(),
+                        scopes: Vec::new(),
+                        redirect_uri: DUMMY_REDIRECT_URI.to_string(),
+                    },
+                )
+            };
+            let first = make_manager();
+            let second = make_manager();
+            let (result_a, result_b) = tokio::join!(first.prepare(), second.prepare());
+            let client_ids = (
+                first.config.read().await.client_id.clone(),
+                second.config.read().await.client_id.clone(),
+            );
+            let requests = mock.requests();
+            ([result_a, result_b], client_ids, requests)
+        })
+        .await;
+
+        for result in &results {
+            assert!(result.is_ok(), "prepare must succeed: {result:?}");
+        }
+        assert_eq!(client_ids.0.as_deref(), Some("registered-client"));
+        assert_eq!(client_ids.1.as_deref(), Some("registered-client"));
+        let registrations: Vec<&String> = requests
+            .iter()
+            .filter(|request| request.starts_with("POST /register "))
+            .collect();
+        assert_eq!(
+            registrations.len(),
+            1,
+            "concurrent prepare must register exactly once: {requests:?}"
+        );
     }
 }
