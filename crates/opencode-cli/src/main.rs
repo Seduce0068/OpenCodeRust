@@ -612,6 +612,34 @@ fn load_config_for_display(cwd: &Path) -> anyhow::Result<opencode_config::Config
     load_config(cwd)
 }
 
+/// `config --check` が出す固定メッセージ。設定値・パス・トークンを含まない。
+const CONFIG_VALID_MESSAGE: &str = "Configuration is valid";
+const CONFIG_INVALID_MESSAGE: &str = "Configuration is invalid";
+const CONFIG_CWD_UNAVAILABLE_MESSAGE: &str = "Cannot determine current directory";
+
+/// `opencoderust config --check` の本体。
+///
+/// 引数なしの `config`（設定表示）とは経路を完全に分離し、検証だけを行う。
+/// ローダのエラーは既に値・パス・トークンを含まないようサニタイズされているが、
+/// ここでは成功／失敗の固定文のみを扱い、エラー本文は再表示しない。
+fn check_config() -> anyhow::Result<()> {
+    // cwd 取得失敗は「設定が不正」ではなく別原因として区別する。
+    let current_dir =
+        std::env::current_dir().map_err(|_| anyhow::anyhow!(CONFIG_CWD_UNAVAILABLE_MESSAGE))?;
+    check_config_at(&current_dir)
+}
+
+/// `check_config` のテスト可能な中核。`Ok(())` が終了コード 0、`Err` が非 0 に対応する。
+fn check_config_at(cwd: &Path) -> anyhow::Result<()> {
+    match load_config_for_display(cwd) {
+        Ok(_) => {
+            println!("{CONFIG_VALID_MESSAGE}");
+            Ok(())
+        }
+        Err(_) => Err(anyhow::anyhow!(CONFIG_INVALID_MESSAGE)),
+    }
+}
+
 /// レガシー global TOML 移行が起動時に一度だけ実行されたことを示す番人。
 ///
 /// 破壊的な移行（`opencode.json` の書き出しと旧 TOML の削除）はプロセス起動時に
@@ -811,7 +839,10 @@ enum Commands {
         format: DbOutputFormat,
     },
     #[command(about = "Show configuration")]
-    Config,
+    Config {
+        #[arg(long)]
+        check: bool,
+    },
     #[command(about = "Manage credentials")]
     Auth {
         #[command(subcommand)]
@@ -1422,8 +1453,12 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             handle_db_command(action, query, format).await?;
         }
-        Some(Commands::Config) => {
-            show_config().await?;
+        Some(Commands::Config { check }) => {
+            if check {
+                check_config()?;
+            } else {
+                show_config().await?;
+            }
         }
         Some(Commands::Auth { action }) => {
             handle_auth_command(action).await?;
@@ -8496,6 +8531,108 @@ mod tests {
         invalidate_config_cache(&dir);
         let reloaded = config_for(&dir).expect("config_for after invalidate");
         assert_eq!(reloaded.model.as_deref(), Some("invalidate-after-longer"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CFGVAL-10 回帰テスト: 検証は `--check` 明示時のみ行い、引数なしの
+    /// `config` は従来どおり表示モード（check = false）のまま。
+    #[test]
+    fn config_check_flag_is_opt_in_and_display_stays_default() {
+        let cli = Cli::try_parse_from(["opencoderust", "config"]).unwrap();
+        match cli.command {
+            Some(Commands::Config { check }) => assert!(!check),
+            _ => panic!("expected Config variant"),
+        }
+
+        let cli = Cli::try_parse_from(["opencoderust", "config", "--check"]).unwrap();
+        match cli.command {
+            Some(Commands::Config { check }) => assert!(check),
+            _ => panic!("expected Config variant"),
+        }
+    }
+
+    /// CFGVAL-10 回帰テスト: 有効な設定では成功（終了コード 0 相当）。
+    #[test]
+    fn config_check_succeeds_for_valid_config() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        let _restore_explicit = RestoreEnv("OPENCODE_CONFIG", std::env::var_os("OPENCODE_CONFIG"));
+        let _restore_content = RestoreEnv(
+            "OPENCODE_CONFIG_CONTENT",
+            std::env::var_os("OPENCODE_CONFIG_CONTENT"),
+        );
+        let _restore_dir = RestoreEnv(
+            "OPENCODE_CONFIG_DIR",
+            std::env::var_os("OPENCODE_CONFIG_DIR"),
+        );
+        let _restore_managed = RestoreEnv(
+            "OPENCODE_TEST_MANAGED_CONFIG_DIR",
+            std::env::var_os("OPENCODE_TEST_MANAGED_CONFIG_DIR"),
+        );
+
+        let dir = temp_config_project("check-valid");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("OPENCODE_CONFIG_DIR", &dir);
+        std::env::set_var("OPENCODE_TEST_MANAGED_CONFIG_DIR", &dir);
+        std::env::remove_var("OPENCODE_CONFIG");
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        fs::write(
+            dir.join("opencode.json"),
+            r#"{"model":"check-valid-model"}"#,
+        )
+        .expect("write valid config");
+
+        assert!(check_config_at(&dir).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CFGVAL-10 回帰テスト: 不正な設定では失敗（終了コード非 0 相当）し、
+    /// メッセージに設定値・パスが漏れないこと。
+    #[test]
+    fn config_check_fails_for_invalid_config_without_value_or_path() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        let _restore_explicit = RestoreEnv("OPENCODE_CONFIG", std::env::var_os("OPENCODE_CONFIG"));
+        let _restore_content = RestoreEnv(
+            "OPENCODE_CONFIG_CONTENT",
+            std::env::var_os("OPENCODE_CONFIG_CONTENT"),
+        );
+        let _restore_dir = RestoreEnv(
+            "OPENCODE_CONFIG_DIR",
+            std::env::var_os("OPENCODE_CONFIG_DIR"),
+        );
+        let _restore_managed = RestoreEnv(
+            "OPENCODE_TEST_MANAGED_CONFIG_DIR",
+            std::env::var_os("OPENCODE_TEST_MANAGED_CONFIG_DIR"),
+        );
+
+        let dir = temp_config_project("check-invalid");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("OPENCODE_CONFIG_DIR", &dir);
+        std::env::set_var("OPENCODE_TEST_MANAGED_CONFIG_DIR", &dir);
+        std::env::remove_var("OPENCODE_CONFIG");
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+
+        const LEAK_CANARY: &str = "CFGVAL10-DO-NOT-LEAK-INVALID-VALUE";
+        fs::write(
+            dir.join("opencode.json"),
+            format!(r#"{{"compaction":{{"auto":"{LEAK_CANARY}"}}}}"#),
+        )
+        .expect("write invalid config");
+
+        let error = check_config_at(&dir)
+            .expect_err("wrong value type must make the check fail")
+            .to_string();
+        assert_eq!(error, CONFIG_INVALID_MESSAGE);
+        assert!(!error.contains(LEAK_CANARY));
+        assert!(!error.contains(&dir.to_string_lossy().into_owned()));
+        assert!(!error.contains("opencode.json"));
 
         let _ = fs::remove_dir_all(&dir);
     }
