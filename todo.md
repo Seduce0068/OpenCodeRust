@@ -707,6 +707,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 技術判断（現状維持、設計判断のため未変更）: コマンド timeout は
+  bash 2 分（opencode-tool の `DEFAULT_TIMEOUT_MS`、呼び出し側で上書き可）と
+  local-llm 5 分（`OPENCODE_LOCAL_LLM_TIMEOUT_SECS` で上書き可）で用途が異なり
+  （一般シェル vs モデルダウンロードを伴う推論）、不一致は意図的と判断。
+  limit=0 はサーバが Some(0)=空結果と明記し既存テストも固定しており、
+  TUI は 0 を送らないため実害なし。統一には API 契約変更が必要。
 - 2026-11-22 cross-skill 集約（swarm176、2 担当・5 件、観点: serde round-trip /
   エラーパス後始末）: 親が中 2 件を read で事実確認、5 件すべて即座 coding
   完了。R4 指摘なし。子の finding: untagged enum 構造上 protocol=Some の
