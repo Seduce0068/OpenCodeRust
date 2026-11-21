@@ -3054,6 +3054,9 @@ async fn load_plugin_auth_store(config: &opencode_config::Config) -> HashMap<Str
             return HashMap::new();
         }
     };
+    // STATE-01: CLI 起動時の初回登録は先勝ちセマンティクスを明示的に選択する。
+    // 同一プロセス内で後から作られる ServerState のローダーを優先したい場合は
+    // init_global_replace（後勝ち）への切り替えを呼び出し側で選べる。
     init_global(loader.hook_system());
 
     let cwd = match std::env::current_dir() {

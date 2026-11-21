@@ -548,21 +548,169 @@ impl Default for PluginRegistry {
 // Global Plugin System
 // ============================================================================
 
-static GLOBAL_PLUGIN_SYSTEM: std::sync::OnceLock<Arc<PluginSystem>> = std::sync::OnceLock::new();
+/// グローバル初期化の試行を識別する単調増加カウンタ。
+///
+/// ログや戻り値に載せるのはこの非機密な整数だけである。値・パス・トークン・
+/// ポインタアドレスは一切含めず、「どの世代が有効か」を観測するためだけに使う。
+static GLOBAL_INIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Initialize the global plugin system. Call once at startup.
-pub fn init_global(system: Arc<PluginSystem>) {
-    let existing = GLOBAL_PLUGIN_SYSTEM.get_or_init(|| Arc::clone(&system));
-    if !Arc::ptr_eq(existing, &system) {
-        tracing::debug!("global plugin system already initialized; ignoring duplicate init");
+fn next_global_generation() -> u64 {
+    GLOBAL_INIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+struct GlobalEntry {
+    generation: u64,
+    system: Arc<PluginSystem>,
+}
+
+/// 有効なグローバル PluginSystem。
+///
+/// 明示的な後勝ちの置き換えを許すため `OnceLock` ではなく
+/// `std::sync::RwLock<Option<_>>` を使う。読み取りは Arc のクローンだけなので
+/// ホットパス（ツール実行）でのロック保持は極めて短い。
+/// 書き込み側は代入しかしないため、poison 時も `into_inner()` で回復する。
+static GLOBAL_PLUGIN_SYSTEM: std::sync::RwLock<Option<GlobalEntry>> = std::sync::RwLock::new(None);
+
+/// グローバル PluginSystem の初期化／衝突解決の結果。
+///
+/// 世代番号は非機密の整数であり、値・パス・トークンをログやエラーに出さずに
+/// 「どのインスタンスが有効か」を呼び出し側へ伝えるために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalInitOutcome {
+    /// 指定インスタンスを有効なグローバルとしてインストールした。
+    Installed { generation: u64 },
+    /// 既存インスタンスを明示的に置き換えた（後勝ち）。
+    Replaced {
+        previous_generation: u64,
+        generation: u64,
+    },
+    /// 別のインスタンスが既に有効だったため、今回は無視した（先勝ち）。
+    IgnoredDuplicate {
+        active_generation: u64,
+        ignored_generation: u64,
+    },
+    /// 同じインスタンスが既に有効だったため、変更しなかった。
+    AlreadyActive { generation: u64 },
+}
+
+/// Initialize the global plugin system at startup.
+///
+/// The first instance wins. A conflicting second call is no longer silent: it
+/// is logged at `warn` level with the generations of the active and ignored
+/// instances, and is also reported through [`GlobalInitOutcome::IgnoredDuplicate`].
+/// No values, paths, tokens or pointer addresses are ever logged.
+///
+/// Callers that intentionally need the most recently created instance to win
+/// (for example when a second `ServerState` is built in the same process)
+/// should use [`init_global_replace`] instead.
+pub fn init_global(system: Arc<PluginSystem>) -> GlobalInitOutcome {
+    let mut guard = GLOBAL_PLUGIN_SYSTEM
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if guard.is_none() {
+        // 採番はロック取得後に行い、採番順と有効化順を一致させる。
+        let generation = next_global_generation();
+        *guard = Some(GlobalEntry { generation, system });
+        drop(guard);
+        tracing::info!(generation, "global plugin system initialized");
+        return GlobalInitOutcome::Installed { generation };
+    }
+
+    let generation = next_global_generation();
+
+    let active = guard.as_ref().expect("checked for None above");
+    let active_generation = active.generation;
+    let is_same_instance = Arc::ptr_eq(&active.system, &system);
+    drop(guard);
+
+    if is_same_instance {
+        tracing::debug!(
+            generation = active_generation,
+            "global plugin system already points to this instance"
+        );
+        GlobalInitOutcome::AlreadyActive {
+            generation: active_generation,
+        }
+    } else {
+        tracing::warn!(
+            active_generation,
+            ignored_generation = generation,
+            "global plugin system already initialized; ignoring duplicate init (first instance wins)"
+        );
+        GlobalInitOutcome::IgnoredDuplicate {
+            active_generation,
+            ignored_generation: generation,
+        }
+    }
+}
+
+/// Explicitly install `system` as the active global plugin system ("last wins").
+///
+/// Use this only when the caller intends to replace whatever instance is
+/// currently active, for example when constructing a new `ServerState` in a
+/// process that already bootstrapped a plugin system. The previously active
+/// hook set is dropped; the swap is logged at `info` level with both
+/// generations so it stays observable without exposing values, paths or tokens.
+pub fn init_global_replace(system: Arc<PluginSystem>) -> GlobalInitOutcome {
+    let mut guard = GLOBAL_PLUGIN_SYSTEM
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 採番はロック取得後に行い、採番順と有効化順を一致させる。
+    let generation = next_global_generation();
+
+    match guard.take() {
+        Some(previous) => {
+            let previous_generation = previous.generation;
+            *guard = Some(GlobalEntry { generation, system });
+            drop(guard);
+            tracing::info!(
+                previous_generation,
+                generation,
+                "global plugin system replaced (last instance wins)"
+            );
+            GlobalInitOutcome::Replaced {
+                previous_generation,
+                generation,
+            }
+        }
+        None => {
+            *guard = Some(GlobalEntry { generation, system });
+            drop(guard);
+            tracing::info!(generation, "global plugin system initialized");
+            GlobalInitOutcome::Installed { generation }
+        }
     }
 }
 
 /// Get the global plugin system, creating a default one if not initialized.
 pub fn global() -> Arc<PluginSystem> {
-    GLOBAL_PLUGIN_SYSTEM
-        .get_or_init(|| Arc::new(PluginSystem::new()))
-        .clone()
+    if let Some(active) = GLOBAL_PLUGIN_SYSTEM
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        return Arc::clone(&active.system);
+    }
+
+    let generation = next_global_generation();
+    let system = Arc::new(PluginSystem::new());
+    let mut guard = GLOBAL_PLUGIN_SYSTEM
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(active) = guard.as_ref() {
+        return Arc::clone(&active.system);
+    }
+    *guard = Some(GlobalEntry {
+        generation,
+        system: Arc::clone(&system),
+    });
+    drop(guard);
+    tracing::debug!(
+        generation,
+        "global plugin system auto-initialized with defaults"
+    );
+    system
 }
 
 /// Convenience: trigger a hook event on the global plugin system.
@@ -850,5 +998,206 @@ mod tests {
         let masked = redact_sensitive_text("token=abc123");
         assert_eq!(masked, "token=<redacted>");
         assert!(!masked.contains("[redacted]"));
+    }
+
+    // STATE-01: GLOBAL_PLUGIN_SYSTEM の衝突可視化と後勝ち API の回帰テスト。
+    mod global_init_tests {
+        use super::*;
+        use std::fmt::Write as _;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        /// ローカルなテスト実行を直列化し、プロセスグローバルな状態の
+        /// 順序依存によるフレークを防ぐ。
+        static GLOBAL_INIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+            GLOBAL_INIT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// `tracing-subscriber` を依存追加せずに WARN 本文を捕捉する最小バッファ。
+        #[derive(Clone, Default)]
+        struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+        impl LogBuffer {
+            fn entries(&self) -> Vec<(tracing::Level, String)> {
+                self.0.lock().expect("log buffer lock").clone()
+            }
+        }
+
+        struct CaptureVisitor(String);
+
+        impl Visit for CaptureVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let _ = writeln!(self.0, "{}={:?}", field.name(), value);
+            }
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                let _ = writeln!(self.0, "{}={value}", field.name());
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                let _ = writeln!(self.0, "{}={value}", field.name());
+            }
+        }
+
+        struct CaptureSubscriber(LogBuffer);
+
+        impl Subscriber for CaptureSubscriber {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                let mut visitor = CaptureVisitor(String::new());
+                event.record(&mut visitor);
+                self.0
+                     .0
+                    .lock()
+                    .expect("log buffer lock")
+                    .push((*event.metadata().level(), visitor.0));
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
+        }
+
+        /// STATE-01 回帰: 2 回目の init_global は黙って無視されず、
+        /// WARN と IgnoredDuplicate で有効インスタンスが観測できること。
+        #[test]
+        fn second_init_global_emits_warn_and_keeps_first_instance() {
+            let _guard = test_lock();
+            let first = Arc::new(PluginSystem::new());
+            let second = Arc::new(PluginSystem::new());
+
+            init_global(Arc::clone(&first));
+            // 他テストが先にグローバルを設定していても、この時点で有効インスタンスは固定される。
+            let active_before = global();
+
+            let logs = LogBuffer::default();
+            let subscriber = CaptureSubscriber(logs.clone());
+            let outcome =
+                tracing::subscriber::with_default(subscriber, || init_global(Arc::clone(&second)));
+
+            let (active_generation, ignored_generation) = match outcome {
+                GlobalInitOutcome::IgnoredDuplicate {
+                    active_generation,
+                    ignored_generation,
+                } => (active_generation, ignored_generation),
+                other => panic!("expected IgnoredDuplicate, got {other:?}"),
+            };
+            assert!(
+                ignored_generation > active_generation,
+                "generation numbers must be monotonic"
+            );
+            assert!(
+                Arc::ptr_eq(&global(), &active_before),
+                "first instance must stay active"
+            );
+
+            let entries = logs.entries();
+            let warn = entries
+                .iter()
+                .find(|(level, text)| {
+                    *level == tracing::Level::WARN && text.contains("already initialized")
+                })
+                .map(|(_, text)| text)
+                .expect("duplicate init must emit a WARN event");
+            assert!(warn.contains("active_generation="), "{warn}");
+            assert!(warn.contains("ignored_generation="), "{warn}");
+            assert!(
+                warn.contains(format!("active_generation={active_generation}").as_str()),
+                "{warn}"
+            );
+            assert!(
+                warn.contains(format!("ignored_generation={ignored_generation}").as_str()),
+                "{warn}"
+            );
+
+            // 値・パス・トークンがログに出ていないこと。
+            let lower = warn.to_lowercase();
+            for marker in ["token=", "bearer", "sk-", "ghp_", "/home/", "c:\\", "@"] {
+                assert!(
+                    !lower.contains(marker),
+                    "sensitive data leaked into warn log: {warn}"
+                );
+            }
+        }
+
+        /// STATE-01 回帰: 明示的な後勝ち API が有効インスタンスを切り替えること。
+        #[test]
+        fn init_global_replace_switches_active_instance() {
+            let _guard = test_lock();
+            let previous = Arc::new(PluginSystem::new());
+            let replacement = Arc::new(PluginSystem::new());
+
+            init_global_replace(Arc::clone(&previous));
+            let outcome = init_global_replace(Arc::clone(&replacement));
+
+            match outcome {
+                GlobalInitOutcome::Replaced {
+                    previous_generation,
+                    generation,
+                } => {
+                    assert!(
+                        generation > previous_generation,
+                        "generation numbers must be monotonic"
+                    );
+                }
+                other => panic!("expected Replaced, got {other:?}"),
+            }
+            assert!(
+                Arc::ptr_eq(&global(), &replacement),
+                "last instance must be active after replace"
+            );
+
+            // 置き換え後の通常 init は重複扱いとなり、有効インスタンスは変わらない。
+            let duplicate = init_global(Arc::clone(&previous));
+            assert!(matches!(
+                duplicate,
+                GlobalInitOutcome::IgnoredDuplicate { .. }
+            ));
+            assert!(
+                Arc::ptr_eq(&global(), &replacement),
+                "ignored duplicate must not change the active instance"
+            );
+        }
+
+        /// 同じ Arc を再登録しても衝突扱いせず、余計な WARN を出さないこと。
+        #[test]
+        fn reinit_with_same_instance_is_not_a_conflict() {
+            let _guard = test_lock();
+            let system = Arc::new(PluginSystem::new());
+            init_global_replace(Arc::clone(&system));
+
+            let logs = LogBuffer::default();
+            let subscriber = CaptureSubscriber(logs.clone());
+            let outcome =
+                tracing::subscriber::with_default(subscriber, || init_global(Arc::clone(&system)));
+
+            assert!(
+                matches!(outcome, GlobalInitOutcome::AlreadyActive { .. }),
+                "identical instance must not count as a conflict"
+            );
+            assert!(
+                !logs
+                    .entries()
+                    .iter()
+                    .any(|(level, _)| *level == tracing::Level::WARN),
+                "identical instance must not produce a conflict WARN"
+            );
+        }
     }
 }
