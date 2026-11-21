@@ -1,6 +1,7 @@
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub struct ClipboardContent {
@@ -211,44 +212,96 @@ fn read_image_from_clipboard() -> anyhow::Result<String> {
     Ok(STANDARD.encode(&data))
 }
 
+/// Owns the temporary file used by the macOS clipboard image read.
+///
+/// The path is unique per process and invocation (PID + nanoseconds), so
+/// concurrent reads cannot overwrite each other's file. `Drop` removes the
+/// file on success and on every early-return/error path; the file may never
+/// have been created (e.g. `osascript` failed before writing), so a missing
+/// file is intentionally ignored.
+struct TempImageGuard {
+    path: PathBuf,
+}
+
+impl TempImageGuard {
+    fn create() -> anyhow::Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "opencode_clipboard_image_{}_{}.png",
+            std::process::id(),
+            nanos
+        ));
+        // O_EXCL で予約し、同時実行しても同じパスを得ないようにする（R4）。
+        // 予約した空ファイルは osascript が `set eof 0` で上書きする。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| "failed to reserve clipboard image temp file")?;
+        Ok(Self { path })
+    }
+}
+
+/// AppleScript のダブルクォート文字列へ安全に埋め込めるようエスケープする。
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+impl Drop for TempImageGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Runs `f` with a unique temporary image path and guarantees cleanup via
+/// `TempImageGuard`, including when `f` returns an error.
+fn with_temp_image_path<T>(f: impl FnOnce(&Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let guard = TempImageGuard::create()?;
+    f(&guard.path)
+}
+
 fn read_image_macos() -> anyhow::Result<String> {
-    let temp_path = std::env::temp_dir().join("opencode_clipboard_image.png");
-    let temp_str = temp_path.to_str().context("temp path is not valid UTF-8")?;
+    with_temp_image_path(|temp_path| {
+        let temp_str = temp_path.to_str().context("temp path is not valid UTF-8")?;
+        let temp_str = escape_applescript_string(temp_str);
 
-    let script = format!(
-        concat!(
-            "set imageData to the clipboard as «class PNGf»\n",
-            "set filePath to POSIX file \"{}\"\n",
-            "set fileRef to open for access filePath with write permission\n",
-            "set eof fileRef to 0\n",
-            "write imageData to fileRef\n",
-            "close access fileRef"
-        ),
-        temp_str
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .context("failed to execute osascript for clipboard image")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "osascript clipboard image read failed with status {}",
-            output.status
+        let script = format!(
+            concat!(
+                "set imageData to the clipboard as «class PNGf»\n",
+                "set filePath to POSIX file \"{}\"\n",
+                "set fileRef to open for access filePath with write permission\n",
+                "set eof fileRef to 0\n",
+                "write imageData to fileRef\n",
+                "close access fileRef"
+            ),
+            temp_str
         );
-    }
 
-    let png_bytes =
-        std::fs::read(&temp_path).context("failed to read clipboard image temp file")?;
-    let _ = std::fs::remove_file(&temp_path);
+        let output = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .context("failed to execute osascript for clipboard image")?;
 
-    if png_bytes.is_empty() {
-        anyhow::bail!("clipboard image temp file was empty");
-    }
+        if !output.status.success() {
+            anyhow::bail!(
+                "osascript clipboard image read failed with status {}",
+                output.status
+            );
+        }
 
-    Ok(STANDARD.encode(&png_bytes))
+        let png_bytes =
+            std::fs::read(temp_path).context("failed to read clipboard image temp file")?;
+
+        if png_bytes.is_empty() {
+            anyhow::bail!("clipboard image temp file was empty");
+        }
+
+        Ok(STANDARD.encode(&png_bytes))
+    })
 }
 
 fn read_image_windows() -> anyhow::Result<String> {
@@ -284,6 +337,58 @@ fn read_image_windows() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_image_paths_are_unique() {
+        let a = TempImageGuard::create().unwrap();
+        let b = TempImageGuard::create().unwrap();
+        assert_ne!(a.path, b.path);
+        assert!(a
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn temp_image_file_is_removed_on_error() {
+        let captured = std::cell::RefCell::new(None);
+        let result: anyhow::Result<()> = with_temp_image_path(|path| {
+            *captured.borrow_mut() = Some(path.to_path_buf());
+            std::fs::write(path, b"png-bytes")?;
+            // Mirrors an osascript status failure / read failure: the guard
+            // must still remove the file when the callback exits with Err.
+            anyhow::bail!("simulated clipboard read failure");
+        });
+        assert!(result.is_err());
+
+        let path = captured
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("callback did not run");
+        assert!(!path.exists(), "temp file leaked after error path");
+    }
+
+    #[test]
+    fn temp_image_file_is_removed_after_success() {
+        let captured = std::cell::RefCell::new(None);
+        let result: anyhow::Result<()> = with_temp_image_path(|path| {
+            *captured.borrow_mut() = Some(path.to_path_buf());
+            std::fs::write(path, b"png-bytes")?;
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        let path = captured
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("callback did not run");
+        assert!(!path.exists(), "temp file leaked after success path");
+    }
 
     #[test]
     fn clipboard_content_holds_data_and_mime() {
