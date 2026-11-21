@@ -211,9 +211,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **compaction が Compacting 状態を終端化せず永続化**
-  — `routes.rs:900-912` / COMPACT-STATUS-STUCK / 高（事実確認済み）
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -270,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[compaction 状態終端化 1 件]** Compacting を Active に戻す
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[unwatch 整合性 1 件]** 失敗時も内部状態をクリーンアップ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[subagent 深さ復元 1 件]** 永続化ラウンドトリップで深さを保持
@@ -703,6 +702,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（compaction 状態の修正時、記録のみ）: 回帰テストが
+  loop_inner の呼び出しサイトを直接検証しておらず、既存の compaction 完了ログ
+  に summary（メッセージ先頭最大500文字）が残る（今回の差分外）。親が
+  trigger_compaction が None の失敗経路でも Compacting を終端化するよう修正。
 - 2026-11-22 R4 残存（subagent 深さ復元の修正時、記録のみ）: 復元後の
   MAX_SUBAGENT_DEPTH ガード実効化の自動テストが欠落（コード追跡では
   ctx.extra と disabled_tools の両方で効くと評価）。
