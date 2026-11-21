@@ -258,8 +258,6 @@ status: current
   — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
 - [ ] **シグナル終了で tracing WorkerGuard のフラッシュが飛ぶ**
   — `main.rs:1032-1034` / SHUTDOWN-09 / 中（speculation）
-- [ ] **設定ロード失敗時にサーバーバインド設定が無警告で既定値へ**
-  — `main.rs:107-115` / CFGVAL-02 / 中（事実確認済み）
 - [ ] **1 フィールドの型不正が設定全体破棄となり次アクションを示さない**
   — `config/loader.rs:89-95` / CFGVAL-03 / 中
 - [ ] **ネストしたキーの誤記がサイレントに無視される**
@@ -286,6 +284,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定ロード失敗警告 1 件]** 値非依存フォールバック通知
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider 警告/frontmatter/TUI join 3 件]** 値非露出の警告とスレッド回収
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin/設定警告 3 件]** kill フォールバックと非推奨キー警告
@@ -629,6 +629,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（設定ロード失敗警告の修正時、記録のみ）: 初期化前バッファ
+  経路は本番では到達不能（全呼び出しが TRACING_READY 後）でテスト専用。
+  直接 emit と replay でログ field 構成が異なる点、同一 cwd 重複を排除しない
+  点も low で記録のみ。
 - 2026-11-21 R4 残存（provider 警告/frontmatter の修正時、記録のみ）: frontmatter
   に不正値が複数ある場合、失敗フィールドが `<unknown>` にフォールバックする
   （値・本文は出ず、単一不正時は正しく特定できるため必須修正ではない）。
