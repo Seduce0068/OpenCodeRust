@@ -2835,10 +2835,19 @@ fn parse_no_auth(value: Option<&str>) -> bool {
 }
 
 /// 認証状態の通知文言（値非依存。トークン値も `OPENCODE_NO_AUTH` の値も混入させない）。
-const AUTH_DISABLED_NOTICE: &str =
-    "Authentication DISABLED via OPENCODE_NO_AUTH. Not safe for production.";
-const AUTH_ENABLED_NOTICE: &str =
-    "Authentication enabled with a random Bearer token (see server log).";
+///
+/// `opencode-server` の `ServerState::new` は `auth_enabled_from_env()` を起動時に一度だけ
+/// 読み、`auth_middleware` はその固定値を参照する。実行中に `OPENCODE_NO_AUTH` を
+/// 書き換えても実効の認証状態は変わらないため、利用者の誤解を避ける目的で両文言に
+/// その旨を明記する（設定値そのものは出力しない）。
+const AUTH_DISABLED_NOTICE: &str = concat!(
+    "Authentication DISABLED via OPENCODE_NO_AUTH. Not safe for production. ",
+    "Authentication state is fixed at startup; environment variable changes are not applied at runtime."
+);
+const AUTH_ENABLED_NOTICE: &str = concat!(
+    "Authentication enabled with a random Bearer token (see server log). ",
+    "Authentication state is fixed at startup; environment variable changes are not applied at runtime."
+);
 
 /// 現在の `OPENCODE_NO_AUTH` を fail-closed で判定し、表示する通知文言を返す。
 fn auth_status_notice() -> &'static str {
@@ -6982,6 +6991,23 @@ mod tests {
                 "OPENCODE_NO_AUTH={value:?} must keep the enabled notice (fail-closed)"
             );
         }
+    }
+
+    #[test]
+    fn auth_notice_states_authentication_is_fixed_at_startup() {
+        // STATE-09: 通知文言に「認証状態は起動時に確定し、環境変数の変更は実行中に
+        // 反映されない」旨が含まれることを固定する。定数ではなく期待リテラルで検証し、
+        // どちらかの文言から明記が消えた場合に検出できるようにする。
+        let expected = "Authentication state is fixed at startup; \
+                        environment variable changes are not applied at runtime.";
+        assert!(
+            AUTH_DISABLED_NOTICE.contains(expected),
+            "disabled notice must state that the auth state is fixed at startup"
+        );
+        assert!(
+            AUTH_ENABLED_NOTICE.contains(expected),
+            "enabled notice must state that the auth state is fixed at startup"
+        );
     }
 
     /// `XDG_CONFIG_HOME` を書き換えるテストを直列化する。
