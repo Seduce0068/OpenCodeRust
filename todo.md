@@ -170,8 +170,6 @@ status: current
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
   — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
-- [ ] **MCP 設定のディスク同期失敗が飲まれ古い状態が返る**
-  — `routes.rs:3859-3872` / ERRPATH-10 / 低
 - [ ] **APP_VERSION_DATE が 2026.02.23 固定で現在と 9 か月乖離**
   — `tui/branding.rs:3` / CONSTANTS-06 / 低（設計判断）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -277,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP 同期失敗警告 1 件]** ヘッダ伝播とワイヤ互換維持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[高優先: plugin/session 2 件]** init 競合の可視化と sync 削除スコープ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[入れ子キー/不正値警告 2 件]** ユーザー定義名のマスクと warn
@@ -636,6 +636,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 判断（MCP 同期警告の修正時）: ボディへ sync_warning を追加
+  すると TUI の HashMap<String, McpStatusInfo> deserialize が壊れるため、
+  親が固定文言ヘッダ x-mcp-sync-warning 方式へ変更（キー衝突・部分同期の
+  文言不一致も同時解消）。生エラー・パスはログ/wire の双方へ出さない。
 - 2026-11-21 R4 残存（plugin/session の修正時、記録のみ）: 明示削除が
   ストレージ失敗時も deleted:true を返し部分残存を放置し得る（API 契約変更を
   伴うため記録のみ）。init_global_replace は本番未使用で先勝ちが仕様。
