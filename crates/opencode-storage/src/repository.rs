@@ -354,10 +354,11 @@ impl SessionRepository {
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         let revert_json = session.revert.clone();
-        let permission_json = session
-            .permission
-            .as_ref()
-            .and_then(|p| serde_json::to_string(p).ok());
+        // create と同じく Json<&PermissionRuleset> としてバインドする。
+        // ここで serde_json::to_string して String にすると Json<String> として
+        // JSON 文字列リテラルが保存され、読み取り側の
+        // decode_json_field::<PermissionRuleset> が CorruptData になる（二重エンコード）。
+        let permission_json = session.permission.as_ref().map(sqlx::types::Json);
 
         let share_url = session.share.as_ref().map(|s| s.url.clone());
         let usage = session.usage.as_ref();
@@ -2357,6 +2358,57 @@ mod session_repository_restore_tests {
             .expect("session found");
         assert_eq!(loaded.revert, session.revert);
         assert_eq!(loaded.permission, session.permission);
+    }
+
+    /// create → update(Some(permission)) → get の往復で二重エンコードが起きないことを固定する。
+    /// 旧実装では update が `serde_json::to_string(p)` の String を `Json` で包んでいたため
+    /// JSON 文字列リテラルが保存され、get() が CorruptData を返していた。
+    #[tokio::test]
+    async fn permission_round_trips_through_update_without_double_encoding() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let repository = SessionRepository::new(database.pool().clone());
+
+        // create 時は permission なし。PATCH /session/:id/permission 相当の update で設定する。
+        let mut session = sample_session("permission-update-session");
+        repository.create(&session).await.expect("session created");
+
+        let expected = PermissionRuleset {
+            allow: vec!["read".to_string(), "list".to_string()],
+            deny: vec!["write".to_string()],
+            mode: Some("strict".to_string()),
+        };
+        session.permission = Some(expected.clone());
+        repository.update(&session).await.expect("session updated");
+
+        // 物理列が JSON オブジェクトであること（文字列リテラルでないこと）を直接固定する。
+        // 値そのものはログ・エラーに出さない。
+        let stored: String = sqlx::query_scalar("SELECT permission FROM sessions WHERE id = ?")
+            .bind("permission-update-session")
+            .fetch_one(database.pool())
+            .await
+            .expect("read stored permission column");
+        let is_json_object =
+            serde_json::from_str::<serde_json::Value>(&stored).is_ok_and(|value| value.is_object());
+        assert!(
+            is_json_object,
+            "permission must be stored as a JSON object, not a JSON string literal"
+        );
+
+        // 二重エンコードされていればここが CorruptData になる。
+        let loaded = repository
+            .get("permission-update-session")
+            .await
+            .expect("updated permission must remain decodable")
+            .expect("session found");
+        assert_eq!(loaded.permission, Some(expected));
+
+        // 起動時一覧で黙ってスキップされず、fail-loud の list() でも読めること。
+        let listed = repository
+            .list(None, 10)
+            .await
+            .expect("list works after permission update");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].permission, session.permission);
     }
 
     #[tokio::test]
