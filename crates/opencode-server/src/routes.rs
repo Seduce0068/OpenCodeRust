@@ -4870,6 +4870,8 @@ impl From<PtySessionStruct> for PtyInfo {
             id: session.id,
             command: session.command,
             cwd: session.cwd,
+            // 共有型 `opencode_types::PtyStatus` と同じ lowercase wire 名へ変換する。
+            // `Error` を含む全バリアントを網羅し、wire の "error" を落とさない。
             status: match session.status {
                 crate::pty::PtyStatus::Running => "running".to_string(),
                 crate::pty::PtyStatus::Exited => "exited".to_string(),
@@ -4940,6 +4942,43 @@ async fn delete_pty(
 ) -> Result<Json<bool>> {
     let deleted = state.pty_manager.delete_session(&id).await;
     Ok(Json(deleted))
+}
+
+#[cfg(test)]
+mod pty_status_wire_tests {
+    use super::*;
+
+    /// 回帰ガード: reader の Err 経路が publish する `Error` が
+    /// `"status":"error"` として wire へ出力され、共有型
+    /// `opencode_types::PtyStatus` へ復元されること（T-02）。
+    /// 値はすべてダミーで、トークン値や実パスは含めない。
+    #[test]
+    fn pty_error_status_survives_wire_conversion_to_shared_type() {
+        let session = PtySessionStruct {
+            id: "pty_dummy_error".to_string(),
+            command: "dummy-command".to_string(),
+            cwd: "/dummy/cwd".to_string(),
+            status: crate::pty::PtyStatus::Error,
+            env: HashMap::new(),
+            created_at: 1_700_000_000,
+        };
+
+        let info = PtyInfo::from(session);
+        assert_eq!(info.status, "error");
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"status\":\"error\""));
+
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let status_value = wire
+            .get("status")
+            .and_then(|value| value.as_str())
+            .expect("status must be a string on the wire")
+            .to_string();
+        let shared: opencode_types::PtyStatus =
+            serde_json::from_value(serde_json::Value::String(status_value)).unwrap();
+        assert_eq!(shared, opencode_types::PtyStatus::Error);
+    }
 }
 
 #[derive(Debug, Deserialize)]

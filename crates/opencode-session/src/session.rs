@@ -675,7 +675,10 @@ impl Session {
                 additions: row.summary_additions.unwrap_or(0),
                 deletions: row.summary_deletions.unwrap_or(0),
                 files: row.summary_files.unwrap_or(0),
-                diffs: None,
+                // `None` のまま保持すると直列化で diffs が省略され、
+                // types 側の復元（serde(default) 追加前）が失敗していた。
+                // 永続化経路でも必ず空配列を保持する。
+                diffs: Some(Vec::new()),
             })
         } else {
             None
@@ -1609,6 +1612,45 @@ mod tests {
         let diffs = session.diff();
         assert_eq!(diffs.len(), 2);
         assert_eq!(diffs[0].path, "src/main.rs");
+    }
+
+    /// 回帰: SessionRow 復元時に summary.diffs を None で残さず Some(空配列) にする。
+    /// これにより直列化で diffs が省略されず、types 側の復元が成功する。
+    #[test]
+    fn test_from_row_normalizes_missing_diffs_to_empty_vec() {
+        let row = SessionRow {
+            id: "ses_row".into(),
+            slug: "row".into(),
+            project_id: "project-1".into(),
+            directory: "/path".into(),
+            parent_id: None,
+            title: "Row".into(),
+            version: "1.0.0".into(),
+            time_created: 1_700_000_000_000,
+            time_updated: 1_700_000_000_001,
+            time_compacting: None,
+            time_archived: None,
+            share_url: None,
+            summary_additions: Some(4),
+            summary_deletions: Some(2),
+            summary_files: Some(1),
+            revert: None,
+            permission: None,
+        };
+
+        let session = Session::from_row(row);
+        let summary = session
+            .summary
+            .as_ref()
+            .expect("summary should be restored from row");
+        assert!(summary.diffs.as_ref().is_some_and(Vec::is_empty));
+
+        let value = serde_json::to_value(&session).expect("session should serialize");
+        assert_eq!(
+            value["summary"]["diffs"],
+            serde_json::json!([]),
+            "diffs must be present after serialization"
+        );
     }
 
     #[test]
