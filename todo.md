@@ -258,8 +258,6 @@ status: current
 - [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
   — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
-- [ ] **MCP OAuth manager が process-global で State 引数が未使用**
-  — `routes.rs:3769-3773` / STATE-03
 - [ ] **reset_processing が DB 全体の processing を書き換え**
   — `server.rs:672-674` / STATE-06
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
@@ -269,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP OAuth per-instance 1 件]** process-global を削除し状態を分離
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[part 冪等化 1 件]** 任意 ID 受け付けと再送重複の防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider キー統一 1 件]** /provider に providers エイリアスを追加
