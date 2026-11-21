@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T02:25:14+09:00"
+  at: "2026-11-22T02:48:58+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2990 件（all-features は 2989 件）
+  テスト総数 594 → 2994 件（all-features は 2993 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `agent`: 空モデル ID を type 付きエラーとして早期失敗させる
+  （swarm-coding R1-R6）
 - `config`: provider リストの明示的空配列によるクリアを可能化
   （swarm-coding R1-R6）
 - `provider` / `mcp`: retryable 判定の type フォールバックと SSE パース失敗の伝播
