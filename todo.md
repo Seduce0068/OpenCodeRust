@@ -241,8 +241,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **ストリームタスク異常終了で run_status が Busy のまま残る**
-  — `routes.rs:1901-1911` / STREAM-RUN-STATUS-ON-PANIC / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -267,6 +265,8 @@ status: current
 
 ## 完了
 
+- [x] **[run_status 復帰 1 件]** ストリーム異常終了で Idle に戻す
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[compaction 状態終端化 1 件]** Compacting を Active に戻す
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[unwatch 整合性 1 件]** 失敗時も内部状態をクリーンアップ
@@ -702,6 +702,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（run_status の修正時、記録のみ）: Idle 化が 2〜3 経路で
+  重複 broadcast される（状態自体は冪等）、tokio runtime 外の Drop では
+  Busy が残る（生成経路は常に runtime 内のため通常は発生しない）。親が
+  clear_prompt_task の戻り値で後続 Busy を保護する medium を直接修正。
 - 2026-11-22 R4 残存（compaction 状態の修正時、記録のみ）: 回帰テストが
   loop_inner の呼び出しサイトを直接検証しておらず、既存の compaction 完了ログ
   に summary（メッセージ先頭最大500文字）が残る（今回の差分外）。親が

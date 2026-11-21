@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T07:50:23+09:00"
+  at: "2026-11-22T08:08:41+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3039 件（all-features は 3038 件）
+  テスト総数 594 → 3041 件（all-features は 3040 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `server`: ストリーム異常終了時の run_status を Idle に復帰（後続 Busy 保護）
+  （swarm-coding R1-R6）
 - `session`: 明示開始された compaction の Compacting 状態を終端化
   （swarm-coding R1-R6）
 - `watcher`: unwatch 失敗時も監視登録とデバウンス表を整合させる
