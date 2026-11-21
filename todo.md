@@ -166,7 +166,7 @@ status: current
 
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
-- [ ] **設定検証手段が無く README も不正設定時の挙動を案内しない**
+- [ ] **設定検証コマンドが無い（README 案内は 2026-11-21 対応済み）**
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
   — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
@@ -247,8 +247,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **update_part が v2 の Part ワイヤ形式を受けられない**
-  — `routes.rs:3000-3019` / T-05 / 中（speculation）
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
@@ -636,6 +634,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 誤検知却下（T-05 update_part）: GET /message が返す parts は
+  `Vec<MessagePart>`（`SessionMessage.parts`）で、update_part が `MessagePart`
+  を要求するのは GET と対称で正しい。`message_v2::Part` は別経路の型で、
+  API 契約違反ではないため todo から削除。
 - 2026-11-21 R4 判断（MCP 同期警告の修正時）: ボディへ sync_warning を追加
   すると TUI の HashMap<String, McpStatusInfo> deserialize が壊れるため、
   親が固定文言ヘッダ x-mcp-sync-warning 方式へ変更（キー衝突・部分同期の
