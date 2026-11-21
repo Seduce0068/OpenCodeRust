@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **真値パーサーが箇所ごとに異なる（OPENCODE_AUTO_SHARE 未記載）**
-  — `cli/main.rs:1977-1982` / CFG2-08 / 低
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -243,8 +241,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **wellknown auth の環境変数ブロックリストが限定的**
-  — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -283,6 +279,8 @@ status: current
 
 ## 完了
 
+- [x] **[wellknown/真値 2 件]** ブロックリスト拡張と fail-closed 統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[inline config 文書 1 件]** 相対ファイル参照の基準を明記
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[空モデル ID 1 件]** type 付きエラー化と明示指定も検査
@@ -686,6 +684,9 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（wellknown/真値の修正時）: README の
+  OPENCODE_AUTO_SHARE が「終了時共有」と記載していたが実装は attach 時の
+  セッション作成直後（ローカル run は非対象）。親が実挙動へ修正。
 - 2026-11-22 R4 残存（空モデル ID の修正時、記録のみ）: 回帰テストが
   get_model_id 単体で、? 伝播の統合経路（execute/streaming）は未検証。
 
