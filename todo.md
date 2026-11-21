@@ -168,8 +168,6 @@ status: current
   — `cli/main.rs:1977-1982` / CFG2-08 / 低
 - [ ] **OPENCODE_CONFIG_CONTENT の {file:...} が cwd 基準で仕様未記載**
   — `config/loader.rs:45-57` / CFG2-09 / 低
-- [ ] **MCP SSE の JSON-RPC パース失敗が warn だけで待機側が timeout**
-  — `mcp/transport.rs:524-539` / ERR2-08 / 低（speculation）
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -251,8 +249,6 @@ status: current
   — `config/schema.rs:195-199` / CFG2-01 / 中
 - [ ] **wellknown auth の環境変数ブロックリストが限定的**
   — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
-- [ ] **parse_stream_error が code 必須で type ベース retryable を落とす**
-  — `provider.rs:632` / ERR2-03 / 中
 - [ ] **get_model_id の unwrap_or_default が空 model id を生成**
   — `agent/executor.rs:321-328` / ERR2-05 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -293,6 +289,8 @@ status: current
 
 ## 完了
 
+- [x] **[error retryable/SSE 2 件]** type フォールバックと失敗伝播
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[--project logLevel 1 件]** 起動時設定読み込み先の是正
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown/tools 2 件]** 検証共有と Deny 優先の決定的変換
@@ -688,6 +686,9 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 判断（error retryable/SSE の修正時）: 親が HttpTransport の
+  SSE-in-POST 経路でもパース失敗を握りつぶさず ProtocolError を返すよう修正
+  （SseTransport と同方針）。既存 code 経路の response_body は従来どおり。
 - 2026-11-22 R4 残存（--project logLevel の修正時、記録のみ）: 回帰テストが
   startup_log_level の再計算のみで main の init_tracing への配線を検証していない。
   Commands::Attach { dir } にも同種の問題があるが担当外のため未対応。親が
