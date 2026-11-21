@@ -12,14 +12,21 @@ use crate::context::{Message, MessagePart};
 use crate::theme::Theme;
 
 /// Render a user message with shared left gutter shape.
+///
+/// `available_width` は行全体の利用可能幅。`┃ ` ガターの分を差し引いて
+/// Markdown を描画し、表が端末幅を超えないようにする。
 pub fn render_user_message(
     msg: &Message,
     theme: &Theme,
     show_timestamps: bool,
     agent: Option<&str>,
+    available_width: usize,
 ) -> Vec<Line<'static>> {
+    const GUTTER_WIDTH: usize = 2; // "┃ "
+
     let mut lines = Vec::new();
     let border_char = "┃ ";
+    let markdown_width = available_width.saturating_sub(GUTTER_WIDTH);
     let border_style = Style::default().fg(user_border_color_for_agent(agent, theme));
 
     if msg.parts.is_empty() {
@@ -34,7 +41,7 @@ pub fn render_user_message(
             match part {
                 MessagePart::Text { text } => {
                     let md_renderer = MarkdownRenderer::new(theme.clone());
-                    let md_lines = md_renderer.to_lines(text);
+                    let md_lines = md_renderer.to_lines_with_width(text, markdown_width);
                     for md_line in md_lines {
                         let mut spans = vec![Span::styled(border_char, border_style)];
                         spans.extend(md_line.spans);

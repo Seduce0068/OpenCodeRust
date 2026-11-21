@@ -11,6 +11,9 @@ use super::markdown::MarkdownRenderer;
 use super::tool_call::ToolCallStatus;
 use crate::theme::Theme;
 
+/// `session.rs` の `MESSAGE_BLOCK_RIGHT_PADDING` と同じ値（private のためローカル定義）。
+const MESSAGE_BLOCK_RIGHT_PADDING: usize = 1;
+
 pub enum MessagePart {
     Text {
         content: String,
@@ -59,11 +62,12 @@ impl MessageView {
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let mut lines: Vec<Line> = Vec::new();
+        let available_width = usize::from(area.width).saturating_sub(MESSAGE_BLOCK_RIGHT_PADDING);
 
         for part in &self.parts {
             match part {
                 MessagePart::Text { content } => {
-                    lines.extend(self.render_text(content, theme));
+                    lines.extend(self.render_text(content, theme, available_width));
                 }
                 MessagePart::ToolCall {
                     name,
@@ -125,9 +129,14 @@ impl MessageView {
         frame.render_widget(paragraph, area);
     }
 
-    fn render_text(&self, content: &str, theme: &Theme) -> Vec<Line<'static>> {
+    fn render_text(
+        &self,
+        content: &str,
+        theme: &Theme,
+        available_width: usize,
+    ) -> Vec<Line<'static>> {
         let renderer = MarkdownRenderer::new(theme.clone()).with_concealed(self.concealed);
-        renderer.to_lines(content)
+        renderer.to_lines_with_width(content, available_width)
     }
 
     fn render_tool_call(
@@ -496,7 +505,7 @@ mod tests {
     #[test]
     fn render_text_returns_no_lines_for_empty_input() {
         let view = MessageView::new(MessageRole::User);
-        assert!(view.render_text("", &theme()).is_empty());
+        assert!(view.render_text("", &theme(), usize::MAX).is_empty());
     }
 
     #[test]
@@ -504,7 +513,7 @@ mod tests {
         let theme = theme();
         let view = MessageView::new(MessageRole::User);
 
-        let lines = view.render_text("hello", &theme);
+        let lines = view.render_text("hello", &theme, usize::MAX);
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 1);
@@ -516,7 +525,7 @@ mod tests {
     fn render_text_splits_multiline_content() {
         let view = MessageView::new(MessageRole::User);
 
-        let lines = view.render_text("first\nsecond\nthird", &theme());
+        let lines = view.render_text("first\nsecond\nthird", &theme(), usize::MAX);
 
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].spans[0].content.as_ref(), "first");
@@ -529,7 +538,7 @@ mod tests {
         let theme = theme();
         let view = MessageView::new(MessageRole::User);
 
-        let lines = view.render_text("# Title", &theme);
+        let lines = view.render_text("# Title", &theme, usize::MAX);
 
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
@@ -545,13 +554,13 @@ mod tests {
         let theme = theme();
         let md = "```rust\nfn main() {}\n```";
         let plain = MessageView::new(MessageRole::User);
-        let plain_text = lines_to_text(&plain.render_text(md, &theme));
+        let plain_text = lines_to_text(&plain.render_text(md, &theme, usize::MAX));
         assert!(plain_text.contains("fn main()"));
 
         // concealed は pub フィールド。代入値を読み取るため mut 宣言する。
         let mut concealed_view = MessageView::new(MessageRole::User);
         concealed_view.concealed = true;
-        let concealed_text = lines_to_text(&concealed_view.render_text(md, &theme));
+        let concealed_text = lines_to_text(&concealed_view.render_text(md, &theme, usize::MAX));
 
         assert!(concealed_text.contains("[rust - 1 lines]"));
         assert!(!concealed_text.contains("fn main()"));
@@ -578,6 +587,62 @@ mod tests {
         assert!(text.contains("Error: oops"));
         assert!(text.contains("m1"));
         assert!(text.contains("500ms"));
+    }
+
+    /// 表を含む Markdown が message 経路で端末幅を超えず、枠線が分断されないこと。
+    #[test]
+    fn table_markdown_in_message_path_respects_terminal_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        let theme = theme();
+        let markdown = concat!(
+            "| a very long first header | second long header |\n",
+            "| --- | --- |\n",
+            "| 0123456789012345678901234567890 | short |\n",
+        );
+        let terminal_width = 30usize;
+        let available = terminal_width.saturating_sub(MESSAGE_BLOCK_RIGHT_PADDING);
+
+        // 行生成経路: 全行が利用可能幅内に収まり、枠線が途中で切れないこと。
+        let view = MessageView::new(MessageRole::Assistant);
+        let lines = view.render_text(markdown, &theme, available);
+        assert!(!lines.is_empty());
+        let mut saw_top_frame = false;
+        for line in &lines {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let width = UnicodeWidthStr::width(text.as_str());
+            assert!(
+                width <= available,
+                "message line must fit terminal width: {text} ({width} > {available})"
+            );
+            if text.starts_with('┌') {
+                saw_top_frame = true;
+                assert!(text.ends_with('┐'), "table frame must not be split: {text}");
+            }
+            if text.starts_with('│') && text.contains('│') {
+                assert!(
+                    text.ends_with('│'),
+                    "table row frame must not be split: {text}"
+                );
+            }
+        }
+        assert!(saw_top_frame, "a full table frame should be rendered");
+
+        // 実際の Frame 描画でも上辺の枠が分断されずに残ること。
+        let mut rendered_view = MessageView::new(MessageRole::Assistant);
+        rendered_view.parts.push(MessagePart::Text {
+            content: markdown.to_string(),
+        });
+        let buffer_text = render_to_string(30, 12, |frame| {
+            rendered_view.render(frame, Rect::new(0, 0, 30, 12), &theme);
+        });
+        assert!(buffer_text
+            .lines()
+            .any(|row| row.starts_with('┌') && row.trim_end().ends_with('┐')));
     }
 
     // --- ツール出力の切り詰めマーカー ---

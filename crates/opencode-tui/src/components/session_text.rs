@@ -6,11 +6,26 @@ use ratatui::{
 use super::markdown::MarkdownRenderer;
 use crate::theme::Theme;
 
-/// Render a text part using markdown rendering
-pub fn render_text_part(text: &str, theme: &Theme, marker_color: Color) -> Vec<Line<'static>> {
+/// Render a text part using markdown rendering.
+///
+/// `available_width` は行全体の利用可能幅。`▸ ` / `  ` マーカー（2 列）の分を
+/// 差し引いて Markdown を描画する。
+pub fn render_text_part(
+    text: &str,
+    theme: &Theme,
+    marker_color: Color,
+    available_width: usize,
+) -> Vec<Line<'static>> {
+    const MARKER_WIDTH: usize = 2; // "▸ " / "  "
+
     let renderer = MarkdownRenderer::new(theme.clone());
+    let markdown_width = available_width.saturating_sub(MARKER_WIDTH);
     let mut with_marker = Vec::new();
-    for (idx, line) in renderer.to_lines(text).into_iter().enumerate() {
+    for (idx, line) in renderer
+        .to_lines_with_width(text, markdown_width)
+        .into_iter()
+        .enumerate()
+    {
         let marker = if idx == 0 { "▸ " } else { "  " };
         let mut spans = vec![Span::styled(marker, Style::default().fg(marker_color))];
         spans.extend(line.spans);
@@ -30,7 +45,10 @@ pub fn render_reasoning_part(
     theme: &Theme,
     collapsed: bool,
     preview_lines: usize,
+    available_width: usize,
 ) -> ReasoningRender {
+    const MARKER_WIDTH: usize = 2; // "  "
+
     let cleaned = text.replace("[REDACTED]", "").trim().to_string();
     if cleaned.is_empty() {
         return ReasoningRender {
@@ -41,7 +59,8 @@ pub fn render_reasoning_part(
 
     let mut lines = Vec::new();
     let renderer = MarkdownRenderer::new(theme.clone()).with_concealed(true);
-    let content_lines = renderer.to_lines(&cleaned);
+    let content_lines =
+        renderer.to_lines_with_width(&cleaned, available_width.saturating_sub(MARKER_WIDTH));
     let total_content_lines = content_lines.len();
     let collapsible = total_content_lines > preview_lines;
 
@@ -103,7 +122,7 @@ mod tests {
 
     #[test]
     fn render_text_part_returns_no_lines_for_empty_input() {
-        let lines = render_text_part("", &test_theme(), Color::Cyan);
+        let lines = render_text_part("", &test_theme(), Color::Cyan, usize::MAX);
         assert!(lines.is_empty());
     }
 
@@ -111,7 +130,7 @@ mod tests {
     fn render_text_part_prepends_marker_and_keeps_markdown_text() {
         let theme = test_theme();
         let marker = Color::Magenta;
-        let lines = render_text_part("hello", &theme, marker);
+        let lines = render_text_part("hello", &theme, marker, usize::MAX);
 
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
@@ -126,7 +145,7 @@ mod tests {
     fn render_text_part_uses_indent_marker_after_first_line() {
         let theme = test_theme();
         let marker = Color::Yellow;
-        let lines = render_text_part("first\nsecond\nthird", &theme, marker);
+        let lines = render_text_part("first\nsecond\nthird", &theme, marker, usize::MAX);
 
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].spans[0].content.as_ref(), "▸ ");
@@ -142,7 +161,7 @@ mod tests {
     #[test]
     fn render_text_part_keeps_markdown_heading_spans() {
         let theme = test_theme();
-        let lines = render_text_part("# Title", &theme, Color::Cyan);
+        let lines = render_text_part("# Title", &theme, Color::Cyan, usize::MAX);
 
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
@@ -158,7 +177,7 @@ mod tests {
     fn render_reasoning_part_returns_empty_for_blank_or_redacted_text() {
         let theme = test_theme();
         for input in ["", "   ", "[REDACTED]", " \n [REDACTED] \n "] {
-            let render = render_reasoning_part(input, &theme, false, 2);
+            let render = render_reasoning_part(input, &theme, false, 2, usize::MAX);
             assert!(render.lines.is_empty(), "input: {input:?}");
             assert!(!render.collapsible, "input: {input:?}");
         }
@@ -167,7 +186,7 @@ mod tests {
     #[test]
     fn render_reasoning_part_builds_header_and_muted_body_for_short_text() {
         let theme = test_theme();
-        let render = render_reasoning_part("alpha", &theme, false, 3);
+        let render = render_reasoning_part("alpha", &theme, false, 3, usize::MAX);
 
         assert!(!render.collapsible);
         assert_eq!(render.lines.len(), 2);
@@ -189,7 +208,7 @@ mod tests {
     #[test]
     fn render_reasoning_part_collapsed_shows_only_count_header() {
         let theme = test_theme();
-        let render = render_reasoning_part("one\ntwo\nthree", &theme, true, 2);
+        let render = render_reasoning_part("one\ntwo\nthree", &theme, true, 2, usize::MAX);
 
         assert!(render.collapsible);
         assert_eq!(render.lines.len(), 1);
@@ -203,7 +222,7 @@ mod tests {
     #[test]
     fn render_reasoning_part_expanded_shows_all_lines_and_footer() {
         let theme = test_theme();
-        let render = render_reasoning_part("one\ntwo\nthree", &theme, false, 2);
+        let render = render_reasoning_part("one\ntwo\nthree", &theme, false, 2, usize::MAX);
 
         assert!(render.collapsible);
         assert_eq!(render.lines.len(), 5);
@@ -220,7 +239,7 @@ mod tests {
     #[test]
     fn render_reasoning_part_removes_redacted_marker_from_body() {
         let theme = test_theme();
-        let render = render_reasoning_part("before [REDACTED] after", &theme, false, 3);
+        let render = render_reasoning_part("before [REDACTED] after", &theme, false, 3, usize::MAX);
 
         assert!(!render.collapsible);
         assert_eq!(render.lines.len(), 2);
@@ -230,8 +249,13 @@ mod tests {
     #[test]
     fn render_reasoning_part_conceals_and_mutes_code_blocks() {
         let theme = test_theme();
-        let render =
-            render_reasoning_part("```rust\nfn main() {}\nlet x = 1;\n```", &theme, false, 4);
+        let render = render_reasoning_part(
+            "```rust\nfn main() {}\nlet x = 1;\n```",
+            &theme,
+            false,
+            4,
+            usize::MAX,
+        );
 
         assert!(!render.collapsible);
         assert_eq!(render.lines.len(), 2);

@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::code_block::{CodeBlock, CodeTheme};
 use crate::theme::Theme;
@@ -63,7 +63,12 @@ impl TableBuilder {
         });
     }
 
-    fn render(mut self, lines: &mut Vec<Line<'static>>, theme: &Theme) {
+    /// 利用可能幅に収まるように列幅を決定して表を描画する。
+    ///
+    /// 枠線 (左右 2 + 列間 `col_count - 1` + 各列のパディング `2 * col_count`) の分を
+    /// 差し引いた幅がセル本文の上限。超過時は元の幅に比例してクランプし、
+    /// 1 列 1 文字でも確保できない場合はコードブロック風の平坦表示へフォールバックする。
+    fn render(mut self, lines: &mut Vec<Line<'static>>, theme: &Theme, available_width: usize) {
         self.finish_row();
         if self.rows.is_empty() {
             return;
@@ -83,9 +88,19 @@ impl TableBuilder {
         let mut widths = vec![1usize; col_count];
         for row in &self.rows {
             for (idx, cell) in row.cells.iter().enumerate() {
-                widths[idx] = widths[idx].max(cell_span_width(cell));
+                if idx < widths.len() {
+                    widths[idx] = widths[idx].max(cell_span_width(cell));
+                }
             }
         }
+
+        let frame_overhead = col_count.saturating_mul(3).saturating_add(1);
+        let max_content = available_width.saturating_sub(frame_overhead);
+        if max_content < col_count {
+            self.render_flat(lines, theme, available_width);
+            return;
+        }
+        let widths = clamp_column_widths(&widths, max_content);
 
         lines.push(table_border_line(
             '┌',
@@ -119,6 +134,127 @@ impl TableBuilder {
             theme.markdown_horizontal_rule,
         ));
     }
+
+    /// 枠線を描けないほど狭い端末向けの平坦表示。
+    /// コードブロックと同じ `│ ` のガターを付け、セルは ` │ ` で区切る。
+    /// `available_width` を守るため、各セルは残り幅へ切り詰める。
+    fn render_flat(self, lines: &mut Vec<Line<'static>>, theme: &Theme, available_width: usize) {
+        const GUTTER_WIDTH: usize = 2; // "│ "
+        const SEPARATOR_WIDTH: usize = 3; // " │ "
+
+        let border_style = Style::default().fg(theme.markdown_horizontal_rule);
+        for row in self.rows {
+            let cell_count = row.cells.len();
+            let overhead = GUTTER_WIDTH
+                .saturating_add(SEPARATOR_WIDTH.saturating_mul(cell_count.saturating_sub(1)));
+            let budget = available_width.saturating_sub(overhead);
+            let original_widths: Vec<usize> =
+                row.cells.iter().map(|cell| cell_span_width(cell)).collect();
+            let widths = distribute_flat_widths(&original_widths, budget);
+
+            let mut spans = vec![Span::styled("│ ", border_style)];
+            for (idx, (cell, width)) in row.cells.into_iter().zip(widths).enumerate() {
+                if idx > 0 {
+                    spans.push(Span::styled(" │ ", border_style));
+                }
+                spans.extend(truncate_spans_to_width(cell, width));
+            }
+            // ガターや区切り文字自体が幅を食い潰す極端に狭い場合も行幅を守る。
+            spans = truncate_spans_to_width(spans, available_width);
+            lines.push(Line::from(spans));
+        }
+    }
+}
+
+/// 平坦表示のセル本文に割り当てる幅を、元の幅に比例して配分する。
+/// 各列は 0 幅を許し、合計が `max_total` を超えないようにする。
+fn distribute_flat_widths(original: &[usize], max_total: usize) -> Vec<usize> {
+    let total: usize = original
+        .iter()
+        .fold(0usize, |acc, &w| acc.saturating_add(w));
+    if total <= max_total {
+        return original.to_vec();
+    }
+    if max_total == 0 {
+        return vec![0; original.len()];
+    }
+
+    let total_u128 = total as u128;
+    let max_u128 = max_total as u128;
+    let mut widths: Vec<usize> = original
+        .iter()
+        .map(|&w| (w as u128 * max_u128 / total_u128) as usize)
+        .collect();
+    let mut sum: usize = widths.iter().fold(0usize, |acc, &w| acc.saturating_add(w));
+
+    // 切り捨てで余った分を、元の幅の剰余が大きい列から順に配る。
+    let mut order: Vec<usize> = (0..original.len()).collect();
+    order.sort_by_key(|&idx| std::cmp::Reverse((original[idx] as u128 * max_u128) % total_u128));
+    let mut cursor = 0usize;
+    while sum < max_total && !order.is_empty() {
+        widths[order[cursor % order.len()]] += 1;
+        sum += 1;
+        cursor += 1;
+    }
+
+    debug_assert_eq!(widths.iter().sum::<usize>(), max_total);
+    widths
+}
+
+/// セル本文の幅合計が `max_total` を超えないよう、元の幅に比例して列幅を配分する。
+/// 各列は最低 1 文字を確保し、端数は元の幅の剰余が大きい列から順に配る。
+fn clamp_column_widths(original: &[usize], max_total: usize) -> Vec<usize> {
+    let count = original.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let total = original
+        .iter()
+        .fold(0usize, |acc, &width| acc.saturating_add(width));
+    if total <= max_total {
+        return original.to_vec();
+    }
+
+    let total_u128 = total as u128;
+    let max_u128 = max_total as u128;
+    let mut widths: Vec<usize> = original
+        .iter()
+        .map(|&width| {
+            let scaled = (width as u128 * max_u128 / total_u128) as usize;
+            scaled.max(1)
+        })
+        .collect();
+
+    // 切り捨ての逆で上限を超えた分を、幅の大きい列から削る。
+    let mut sum: usize = widths.iter().fold(0usize, |acc, &w| acc.saturating_add(w));
+    while sum > max_total {
+        let target = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| w > 1)
+            .max_by_key(|(_, &w)| w)
+            .map(|(idx, _)| idx);
+        match target {
+            Some(idx) => {
+                widths[idx] -= 1;
+                sum -= 1;
+            }
+            None => break,
+        }
+    }
+
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|&idx| std::cmp::Reverse((original[idx] as u128 * max_u128) % total_u128));
+    let mut remaining = max_total.saturating_sub(sum);
+    let mut cursor = 0usize;
+    while remaining > 0 {
+        widths[order[cursor % count]] += 1;
+        remaining -= 1;
+        cursor += 1;
+    }
+
+    debug_assert_eq!(widths.iter().sum::<usize>(), max_total);
+    widths
 }
 
 impl MarkdownRenderer {
@@ -137,12 +273,19 @@ impl MarkdownRenderer {
     }
 
     pub fn render(&self, text: &str, frame: &mut Frame, area: Rect) {
-        let lines = self.to_lines(text);
+        let lines = self.to_lines_with_width(text, usize::from(area.width));
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
 
+    /// 既存呼び出し互換のエントリポイント。利用可能幅を指定できないため表はクランプしない。
     pub fn to_lines(&self, text: &str) -> Vec<Line<'static>> {
+        self.to_lines_with_width(text, usize::MAX)
+    }
+
+    /// 利用可能幅を考虑到して Markdown を行列へ変換する。
+    /// 表は `available_width` に収まるよう列幅がクランプされる。
+    pub fn to_lines_with_width(&self, text: &str, available_width: usize) -> Vec<Line<'static>> {
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
         options.insert(Options::ENABLE_TABLES);
@@ -348,7 +491,7 @@ impl MarkdownRenderer {
                     }
                     TagEnd::Table => {
                         if let Some(tbl) = table.take() {
-                            tbl.render(&mut lines, &self.theme);
+                            tbl.render(&mut lines, &self.theme, available_width);
                         } else {
                             flush_line(&mut lines, &mut current);
                         }
@@ -545,7 +688,9 @@ fn table_row_line(
 
     spans.push(Span::styled("│", border_style));
     for (idx, width) in widths.iter().enumerate() {
-        let cell = row.cells.get(idx).cloned().unwrap_or_default();
+        // 列幅をクランプした結果、元のセル本文が width を超える場合は
+        // 表示幅いっぱいで切り詰める（枠線が折り返されないようにする）。
+        let cell = truncate_spans_to_width(row.cells.get(idx).cloned().unwrap_or_default(), *width);
         let cell_width = cell_span_width(&cell);
         let padding = width.saturating_sub(cell_width);
         let alignment = alignments.get(idx).copied().unwrap_or(Alignment::None);
@@ -579,6 +724,30 @@ fn table_row_line(
     }
 
     Line::from(spans)
+}
+
+/// Span 列を表示幅 `max_width` に収まるよう切り詰める（スタイルは保持）。
+fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    let mut result = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        if used >= max_width {
+            break;
+        }
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if used + w > max_width {
+                break;
+            }
+            text.push(ch);
+            used += w;
+        }
+        if !text.is_empty() {
+            result.push(span.content(std::borrow::Cow::Owned(text)));
+        }
+    }
+    result
 }
 
 fn cell_span_width(spans: &[Span<'static>]) -> usize {
@@ -831,6 +1000,72 @@ mod tests {
         assert_eq!(line_text(&lines[2]), "├────────┼────────┼────────┤");
         assert_eq!(line_text(&lines[3]), "│ longer │ longer │ longer │");
         assert_eq!(line_text(&lines[4]), "└────────┴────────┴────────┘");
+    }
+
+    #[test]
+    fn to_lines_with_width_clamps_wide_table_without_breaking_frame() {
+        let renderer = MarkdownRenderer::new(test_theme());
+        let markdown = concat!(
+            "| a very long first header | second long header |\n",
+            "| --- | --- |\n",
+            "| 0123456789012345678901234567890 | short |\n",
+            "| another fairly long body cell | tail |\n",
+        );
+        let available = 30usize;
+
+        let lines = renderer.to_lines_with_width(markdown, available);
+        let table_lines: Vec<&Line<'static>> =
+            lines.iter().filter(|line| !line_is_blank(line)).collect();
+        assert_eq!(table_lines.len(), 6);
+
+        for line in &table_lines {
+            let text = line_text(line);
+            let width = UnicodeWidthStr::width(text.as_str());
+            assert!(
+                width <= available,
+                "table line must fit in available width: {text} ({width} > {available})"
+            );
+            // 枠線文字が途中で折り返されず、行頭と行末に罫線が残っていることを固定する。
+            assert!(
+                matches!(text.chars().next(), Some('┌' | '│' | '├' | '└')),
+                "table line must start with a frame character: {text}"
+            );
+            assert!(
+                matches!(text.chars().last(), Some('┐' | '│' | '┤' | '┘')),
+                "table line must end with a frame character: {text}"
+            );
+        }
+        assert_eq!(table_lines[0].spans.len(), 1);
+        assert_eq!(table_lines[5].spans.len(), 1);
+    }
+
+    #[test]
+    fn to_lines_with_width_narrow_table_falls_back_to_flat_rows() {
+        let renderer = MarkdownRenderer::new(test_theme());
+        let markdown = "| Name | Age |\n| --- | --- |\n| Alice | 30 |";
+        let available = 6usize;
+
+        let lines = renderer.to_lines_with_width(markdown, available);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            let text = line_text(line);
+            let width = UnicodeWidthStr::width(text.as_str());
+            assert!(
+                width <= available,
+                "flat table line must fit available width: {text} ({width} > {available})"
+            );
+            assert!(
+                !text.contains('┌') && !text.contains('└'),
+                "too-narrow table must not emit a broken frame: {text}"
+            );
+            assert!(
+                text.starts_with('│'),
+                "flat table line must keep its gutter: {text}"
+            );
+        }
+        // 先頭セルから順に切り詰められ、末尾のセルは 0 幅になり得る。
+        assert_eq!(line_text(&lines[0]), "│ N │ ");
+        assert_eq!(line_text(&lines[1]), "│ A │ ");
     }
 
     #[test]
