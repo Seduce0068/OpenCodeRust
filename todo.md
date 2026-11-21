@@ -259,8 +259,6 @@ status: current
   — `routes.rs:237-246` / API-10 / 中（speculation）
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
-- [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
-  — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
 - [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
@@ -277,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[strict env 1 件]** opt-in で未定義参照を fail-closed 化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[DELETE 冪等性 1 件]** 404 を既削除として扱う
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown/真値 2 件]** ブロックリスト拡張と fail-closed 統一
@@ -684,6 +684,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（strict env の修正時、記録のみ）: 既定警告は変数名を出す
+  （値・パスなし、従来挙動）。連鎖 strict テストは inner 直呼びで実ロード経路
+  未検証。16 段超の連鎖で未展開参照が残る場合の fail-closed は不完全（極めて稀）。
+  親がコメント内 {env:VAR} の誤検出と README の連鎖明記を直接修正。
 - 2026-11-22 R4 残存（DELETE 冪等性の修正時、記録のみ）: 500/403 でサーバが
   session_id / パスを本文に埋める場合、既存 error_detail の tracing ログ側では
   マスクされない（今回の差分外）。親が 404 のボディ読み捨て（Keep-Alive
