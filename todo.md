@@ -260,13 +260,16 @@ status: current
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
 - [ ] **reset_processing が DB 全体の processing を書き換え**
   — `server.rs:672-674` / STATE-06
-- [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
+- [ ] **[残り]** custom fetch proxy が opencode-provider の process-global
+  （plugin loader / MCP OAuth は per-instance 化済み）
   — `server.rs:1037` / 既知残存
 
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
 ## 完了
 
+- [x] **[plugin loader per-instance 1 件]** process-global を削除し状態を分離
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP OAuth per-instance 1 件]** process-global を削除し状態を分離
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[part 冪等化 1 件]** 任意 ID 受け付けと再送重複の防止
