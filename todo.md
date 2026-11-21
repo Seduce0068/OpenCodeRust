@@ -245,8 +245,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **disabled/enabled_providers が上位の空配列でクリアできない**
-  — `config/schema.rs:195-199` / CFG2-01 / 中
 - [ ] **wellknown auth の環境変数ブロックリストが限定的**
   — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
 - [ ] **get_model_id の unwrap_or_default が空 model id を生成**
@@ -289,6 +287,8 @@ status: current
 
 ## 完了
 
+- [x] **[provider リスト 1 件]** 明示的空配列によるクリア
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[error retryable/SSE 2 件]** type フォールバックと失敗伝播
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[--project logLevel 1 件]** 起動時設定読み込み先の是正
@@ -686,6 +686,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（provider リストの修正時、記録のみ）: ExplicitStringList の
+  DerefMut が presence bit を迂回し得るが、現状の呼び出し箇所（as_slice().to_vec()
+  / into() / merge）では発生していない。公開 API 契約としての明記は今後の課題。
+  親が scope 外の型不一致 3 箇所（server/main/routes）を直接修正。
 - 2026-11-22 R4 判断（error retryable/SSE の修正時）: 親が HttpTransport の
   SSE-in-POST 経路でもパース失敗を握りつぶさず ProtocolError を返すよう修正
   （SseTransport と同方針）。既存 code 経路の response_body は従来どおり。
