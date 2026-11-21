@@ -90,6 +90,9 @@ fn http_client() -> reqwest::Client {
 /// 入り得る。`Status.url` や `Http` / `Parse` の message へ格納する前に必ず通す。
 /// 依存を増やさないため regex を使わず、区切り文字を基準にした最小走査で処理する。
 fn sanitize_error_text(input: &str) -> String {
+    // reqwest / url エラーのログ・エラー側マスクは山括弧形式 `<redacted>` に固定する。
+    // UI 表示側（opencode-tui）は `[redacted]` を用いる。共有定数を新設しない
+    // スコープのため、テストで値を固定して形式の漂移を検出する。
     const REDACTED: &str = "<redacted>";
     const SECRET_KEYS: &[&str] = &[
         "api_key",
@@ -600,6 +603,16 @@ mod tests {
             "userinfo separator leaked: {redacted}"
         );
         assert!(redacted.contains("host.example"), "{redacted}");
+    }
+
+    /// 回帰テスト（R2）: reqwest / url エラーのマスクは山括弧形式 `<redacted>` に固定する。
+    /// UI 表示側の `[redacted]` に漂移しないことを検出する。
+    #[test]
+    fn sanitize_error_text_uses_log_angle_bracket_marker() {
+        let masked = sanitize_error_text("token=abc123");
+        assert_eq!(masked, "token=<redacted>");
+        assert!(!masked.contains("[redacted]"));
+        assert!(!masked.contains("abc123"), "token value leaked: {masked}");
     }
 
     #[test]

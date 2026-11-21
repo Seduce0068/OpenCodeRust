@@ -318,6 +318,10 @@ fn unsupported(operation: &'static str) -> anyhow::Error {
     anyhow::Error::new(UnsupportedEndpointError { operation })
 }
 
+/// UI（toast / 描画）側のマスク文字列は角括弧形式 `[redacted]` に固定する。
+/// ログ・エラー側（opencode-plugin / opencode-server / opencode-mcp）は山括弧形式
+/// `<redacted>` を用いる。共有定数を新設しないスコープのため、各クレートの
+/// テストで値を固定して形式の漂移を検出する。
 const REDACTED: &str = "[redacted]";
 const SENSITIVE_KEY_PARTS: &[&str] = &[
     "token",
@@ -1253,6 +1257,19 @@ mod tests {
         assert!(detail.contains("401 Unauthorized"), "{detail}");
         assert!(!detail.contains("sk-dummy-secret-123"), "{detail}");
         assert!(detail.contains("[redacted]"), "{detail}");
+    }
+
+    /// 回帰テスト（R2）: UI 表示側のマスクは角括弧形式 `[redacted]` に固定する。
+    /// ログ側の `<redacted>` に漂移しないことを検出する。
+    #[test]
+    fn redacted_marker_is_ui_bracket_form() {
+        assert_eq!(REDACTED, "[redacted]");
+        assert_ne!(REDACTED, "<redacted>");
+
+        let mut value = serde_json::json!({ "token": "sk-dummy-secret-123" });
+        redact_sensitive(&mut value);
+        assert_eq!(value["token"].as_str(), Some("[redacted]"));
+        assert!(!value.to_string().contains("<redacted>"));
     }
 
     #[test]

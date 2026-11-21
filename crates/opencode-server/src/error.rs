@@ -52,6 +52,9 @@ fn is_secret_key(key: &str) -> bool {
 /// その際にファイルパス（`/...` / `C:\...` / URL）や認証トークン値がログへ
 /// 流出しないよう、該当する単語を `<redacted>` に置換する。
 pub(crate) fn redact_sensitive_detail(detail: &str) -> String {
+    // ログ側のマスクは山括弧形式 `<redacted>` に固定する。
+    // UI 表示側（opencode-tui）は `[redacted]` を用いる。共有定数を新設しない
+    // スコープのため、テストで値を固定して形式の漂移を検出する。
     const REDACTED: &str = "<redacted>";
     let mut words: Vec<&str> = Vec::new();
     let mut redact_next = false;
@@ -387,6 +390,19 @@ mod tests {
 
         let unspecified = provider_log_detail("openai", None);
         assert!(unspecified.contains("status=none"), "{unspecified}");
+    }
+
+    /// 回帰テスト（R2）: 内部エラーのログマスクは山括弧形式 `<redacted>` に固定する。
+    /// UI 表示側の `[redacted]` に漂移しないことを検出する。
+    #[test]
+    fn redact_sensitive_detail_uses_log_angle_bracket_marker() {
+        let masked = redact_sensitive_detail("token=abc123");
+        assert_eq!(
+            masked, "<redacted>",
+            "log mask must stay in angle-bracket form"
+        );
+        assert!(!masked.contains("[redacted]"));
+        assert!(!masked.contains("abc123"), "token value leaked: {masked}");
     }
 
     #[tokio::test]
