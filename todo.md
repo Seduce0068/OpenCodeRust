@@ -164,6 +164,10 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **unwatch エラーで監視登録とデバウンス表が不整合**
+  — `watcher/lib.rs:234-246` / WATCHER-UNWATCH-PARTIAL / 低
+- [ ] **Agent part の status が pending のまま更新されない**
+  — `session/message.rs:234-244` / AGENT-PART-PENDING / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -209,6 +213,9 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **compaction が Compacting 状態を終端化せず永続化**
+  — `routes.rs:900-912` / COMPACT-STATUS-STUCK / 高（事実確認済み）
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -239,6 +246,12 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **シェル実行失敗で optimistic メッセージが残存（Home 経路）**
+  — `tui/app.rs:2776-2781` / TUI-SHELL-OPTIMISTIC-LEAK / 中
+- [ ] **サブセッション復元で subagent 深さカウンタが 0 にリセット**
+  — `agent/executor.rs:102-121` / SUBAGENT-DEPTH-LOST / 中
+- [ ] **ストリームタスク異常終了で run_status が Busy のまま残る**
+  — `routes.rs:1901-1911` / STREAM-RUN-STATUS-ON-PANIC / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -263,6 +276,8 @@ status: current
 
 ## 完了
 
+- [x] **[境界 panic 6 件]** 1文字引用符・全角空白・オーバーフロー・巨大年
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[client_ip XFF 1 件]** 信頼プロキシ opt-in・fail-closed
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[limit クランプ通知 1 件]** x-limit-clamped と CORS expose
@@ -688,6 +703,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm168、2 担当・12 件、観点: 境界値 panic /
+  状態不整合）: 親が high 1 件（compaction 状態固定）を read で事実確認。
+  境界 panic 6 件は即座に coding 完了、state 不整合 5 件を高 1/中 3/低 2 で
+  triage。R4 は境界 panic 6 件すべて指摘なし。
 - 2026-11-22 R4 残存（client_ip XFF の修正時、記録のみ）: ログ非出力テストが
   ソース文字列の静的検査に依存（実 tracing subscriber での検証は未実施）。
   親が複数 XFF ヘッダ行の扱い（get_all の最後の行の最右 hop）を直接修正。

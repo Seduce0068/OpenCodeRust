@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T06:24:16+09:00"
+  at: "2026-11-22T06:46:28+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3026 件（all-features は 3025 件）
+  テスト総数 594 → 3032 件（all-features は 3031 件）
 
 ### Changed
 
@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `config` / `tool` / `session` / `core` / `codemode`: 境界値 panic の解消
+  （1文字引用符・全角空白・u32/u64 オーバーフロー・巨大年）
+  （swarm-coding R1-R6）
 - `server`: 信頼プロキシ設定時のみ X-Forwarded-For を尊重（opt-in・fail-closed）
   （swarm-coding R1-R6）
 - `server`: limit クランプの `x-limit-clamped` 通知と CORS expose
