@@ -10,6 +10,7 @@
 //! `Hook::new` でフックを作り `PluginSystem::register` に登録した上で、
 //! `HookContext` を渡して `trigger` / `trigger_collect` を呼び出す。
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -490,13 +491,16 @@ impl Default for PluginSystem {
     }
 }
 
+/// プラグインのメタデータとフック登録を定義するオブジェクトセーフなトレイト。
+///
+/// `#[async_trait]` が `register_hooks` を `Pin<Box<dyn Future + Send>>` を返す
+/// 形へ展開するため、実装者はボイラープレートなしで `Arc<dyn Plugin>` として
+/// 利用できる。
+#[async_trait]
 pub trait Plugin: Send + Sync {
     fn name(&self) -> &str;
     fn version(&self) -> &str;
-    fn register_hooks(
-        &self,
-        system: &PluginSystem,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    async fn register_hooks(&self, system: &PluginSystem);
 }
 
 pub struct PluginRegistry {

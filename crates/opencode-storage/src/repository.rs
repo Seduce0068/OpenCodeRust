@@ -766,14 +766,21 @@ impl MessageRepository {
     }
 }
 
+/// `todos` テーブルの DB 行型。
+///
+/// `opencode_types::TodoItem` はセッション ID と `u32` の position を持つ別用途の型のため、
+/// DB 表現は `TodoRow` として定義し、公開 API 互換のために `TodoItem` を alias として残す。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoItem {
+pub struct TodoRow {
     pub id: String,
     pub content: String,
     pub status: String,
     pub priority: String,
     pub position: i64,
 }
+
+/// 既存の公開 API (`opencode_storage::TodoItem`) を壊さないための後方互換 alias。
+pub type TodoItem = TodoRow;
 
 pub struct TodoRepository {
     pool: SqlitePool,
@@ -784,9 +791,9 @@ impl TodoRepository {
         Self { pool }
     }
 
-    pub async fn list_for_session(&self, session_id: &str) -> Result<Vec<TodoItem>, DatabaseError> {
+    pub async fn list_for_session(&self, session_id: &str) -> Result<Vec<TodoRow>, DatabaseError> {
         #[derive(FromRow)]
-        struct TodoRow {
+        struct TodoDbRow {
             todo_id: String,
             content: String,
             status: String,
@@ -794,7 +801,7 @@ impl TodoRepository {
             position: i64,
         }
 
-        let rows = sqlx::query_as::<_, TodoRow>(
+        let rows = sqlx::query_as::<_, TodoDbRow>(
             r#"SELECT todo_id, content, status, priority, position 
                FROM todos WHERE session_id = ? ORDER BY position ASC"#,
         )
@@ -805,7 +812,7 @@ impl TodoRepository {
 
         Ok(rows
             .into_iter()
-            .map(|row| TodoItem {
+            .map(|row| TodoRow {
                 id: row.todo_id,
                 content: row.content,
                 status: row.status,
@@ -822,7 +829,7 @@ impl TodoRepository {
     async fn upsert_todo<'e, E>(
         executor: E,
         session_id: &str,
-        todo: &TodoItem,
+        todo: &TodoRow,
     ) -> Result<(), DatabaseError>
     where
         E: Executor<'e, Database = sqlx::Sqlite>,
@@ -857,7 +864,7 @@ impl TodoRepository {
     }
 
     /// Todo を 1 件 UPSERT する（従来 API と同じ動作）。
-    pub async fn upsert(&self, session_id: &str, todo: &TodoItem) -> Result<(), DatabaseError> {
+    pub async fn upsert(&self, session_id: &str, todo: &TodoRow) -> Result<(), DatabaseError> {
         Self::upsert_todo(&self.pool, session_id, todo).await
     }
 
@@ -890,7 +897,7 @@ impl TodoRepository {
     pub async fn replace_for_session(
         &self,
         session_id: &str,
-        todos: &[TodoItem],
+        todos: &[TodoRow],
     ) -> Result<(), DatabaseError> {
         let mut tx = self
             .pool
