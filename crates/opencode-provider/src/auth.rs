@@ -57,12 +57,13 @@ pub enum AuthMethodType {
 /// Auth state behind a single lock so the active credential and the rotation pool
 /// can never drift apart.
 struct AuthState {
-    /// Legacy flat map. Always holds the currently active credential for each
-    /// provider. Runtime-only: rotation swaps this entry without touching `primary`.
+    /// Legacy flat map. Holds the currently active credential for each provider.
+    /// Rotation swaps this entry and mirrors the new active credential into
+    /// `primary` (and therefore `auth.json`).
     credentials: HashMap<String, AuthInfo>,
-    /// The credential registered for each provider, mirrored to `auth.json`.
-    /// Kept separate from `credentials` so a runtime rotation can never become
-    /// the credential restored on the next start.
+    /// The credential mirrored to `auth.json`. Starts as the registration-time
+    /// credential; a successful rotation promotes the newly active credential here
+    /// so it is restored on the next start. The rotation pool itself stays in memory.
     primary: HashMap<String, AuthInfo>,
     /// Additional credentials for round-robin rotation. In-memory only, so the
     /// on-disk auth file format stays backward compatible.
@@ -139,8 +140,9 @@ impl AuthManager {
         let data = serde_json::from_str::<HashMap<String, AuthInfo>>(&content)
             .map_err(|_| anyhow::anyhow!("failed to parse auth file {}", filepath.display()))?;
         *manager.state.write().await = AuthState {
-            // The on-disk entry is the registration-time primary. Runtime
-            // rotation starts from it but must never rewrite it.
+            // The on-disk entry is the last persisted primary (registration-time
+            // initially). A rotation starts from it and, on success, rewrites it
+            // with the newly active credential.
             credentials: data.clone(),
             primary: data,
             key_pool: HashMap::new(),
@@ -233,40 +235,60 @@ impl AuthManager {
         }
     }
 
-    /// Advance to the next credential for `provider_id` and make it active.
+    /// Advance to the next credential for `provider_id`, make it active and persist it.
     ///
-    /// Returns `true` when a rotation actually occurred. The log record contains
-    /// only the provider id and the reason — never a key or token value.
+    /// The newly active credential replaces the on-disk primary, so a restart restores
+    /// it as the active credential (the rotation pool itself stays in-memory only).
+    /// The durable write happens before the in-memory commit, so a persistence failure
+    /// leaves the active credential, the pool and the mirrored primary untouched.
+    ///
+    /// Returns `true` when a rotation actually occurred. Log records contain only the
+    /// provider id (plus the reason on success) — never a key or token value.
     pub async fn rotate_key(&self, provider_id: &str, reason: RotationReason) -> bool {
-        let rotated = {
-            let mut state = self.state.write().await;
-            let can_rotate = state.credentials.contains_key(provider_id)
-                && state
-                    .key_pool
-                    .get(provider_id)
-                    .is_some_and(|pool| !pool.is_empty());
-            if can_rotate {
-                let current = state
-                    .credentials
-                    .remove(provider_id)
-                    .expect("active credential was checked");
-                let next = {
-                    let pool = state
-                        .key_pool
-                        .get_mut(provider_id)
-                        .expect("non-empty pool was checked");
-                    let next = pool.pop_front().expect("pool was checked non-empty");
-                    pool.push_back(current);
-                    next
-                };
-                state.credentials.insert(provider_id.to_string(), next);
-            }
-            can_rotate
-        };
-        if rotated {
-            tracing::info!(provider_id, reason = ?reason, "rotated to next provider credential");
+        let mut state = self.state.write().await;
+        let can_rotate = state.credentials.contains_key(provider_id)
+            && state
+                .key_pool
+                .get(provider_id)
+                .is_some_and(|pool| !pool.is_empty());
+        if !can_rotate {
+            return false;
         }
-        rotated
+
+        // Build the would-be next state without committing it yet, so a failed
+        // durable write leaves every in-memory map unchanged (the try_* pattern).
+        let current = state
+            .credentials
+            .get(provider_id)
+            .expect("active credential was checked")
+            .clone();
+        let mut next_pool = state
+            .key_pool
+            .get(provider_id)
+            .expect("non-empty pool was checked")
+            .clone();
+        let next = next_pool.pop_front().expect("pool was checked non-empty");
+        next_pool.push_back(current);
+
+        let mut next_primary = state.primary.clone();
+        next_primary.insert(provider_id.to_string(), next.clone());
+
+        if self.persist_primary(&next_primary).await.is_err() {
+            // Fixed-text structured warn: only the provider id, never a key/token
+            // value or the persistence error (whose message carries a file path).
+            tracing::warn!(provider_id, "failed to persist auth store after rotation");
+            return false;
+        }
+
+        // Durably written: commit the active credential, the rotated pool and the
+        // mirrored primary together.
+        state.credentials.insert(provider_id.to_string(), next);
+        state.key_pool.insert(provider_id.to_string(), next_pool);
+        state.primary = next_primary;
+        drop(state);
+
+        tracing::info!(provider_id, reason = ?reason, "rotated to next provider credential");
+        true
     }
 
     /// Rotate (typically on 401/429) and return the newly active credential.
@@ -290,7 +312,8 @@ impl AuthManager {
     pub async fn try_set(&self, provider_id: &str, auth: AuthInfo) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
         let mut next_primary = state.primary.clone();
-        // An explicit set defines a new primary, unlike a runtime rotation.
+        // An explicit set defines a new primary and discards the pool, unlike a
+        // rotation which promotes the next pooled credential.
         next_primary.insert(provider_id.to_string(), auth.clone());
         self.persist_primary(&next_primary).await?;
         state
@@ -401,9 +424,9 @@ impl AuthManager {
         framed
     }
 
-    /// Write the registration-time primary to disk. Never writes the rotated
-    /// runtime-active credential. Takes no `self.state` lock: the caller supplies
-    /// the exact map to serialize.
+    /// Write the supplied primary map to disk. Takes no `self.state` lock: the
+    /// caller supplies the exact map to serialize, which already reflects any
+    /// committed rotation.
     async fn write_primary_file(&self, primary: &HashMap<String, AuthInfo>) -> anyhow::Result<()> {
         let Some(path) = self.filepath.as_ref() else {
             return Ok(());
@@ -413,8 +436,8 @@ impl AuthManager {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Persist only the passed registration-time primary, never the rotated
-        // runtime active credential held in `state.credentials`.
+        // Persist exactly the map supplied by the caller; no key/token value is
+        // added here, and the map is the primary after any committed rotation.
         let json = serde_json::to_vec_pretty(primary)?;
         tokio::fs::write(path, json).await?;
 
@@ -1043,8 +1066,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ERR_PATH-09: rotation now promotes the newly active credential to the
+    /// persisted primary. A later write must preserve that rotation, not revert it.
     #[tokio::test]
-    async fn rotation_does_not_persist_active_as_primary() {
+    async fn rotation_persists_active_as_primary_through_later_writes() {
         for mutation in ["add_key", "try_set", "try_remove"] {
             let dir = temp_auth_dir();
             let manager = AuthManager::load_from_file(&dir).await;
@@ -1061,8 +1086,8 @@ mod tests {
                 Some("DUMMY_KEY_SECONDARY")
             );
 
-            // A later write re-persists the store. The rotated active credential
-            // must not be promoted to the on-disk primary by any of these paths.
+            // A later write re-persists the store. The rotated credential is now
+            // the primary, so it must survive every one of these paths.
             match mutation {
                 "add_key" => manager.add_key("unrelated", api_key("OTHER")).await,
                 "try_set" => manager
@@ -1080,23 +1105,130 @@ mod tests {
                 .await
                 .expect("read persisted auth file");
             assert!(
-                raw.contains("DUMMY_KEY_PRIMARY"),
-                "{mutation}: registration-time primary must be persisted"
+                raw.contains("DUMMY_KEY_SECONDARY"),
+                "{mutation}: rotated credential must be the persisted primary"
             );
             assert!(
-                !raw.contains("DUMMY_KEY_SECONDARY"),
-                "{mutation}: rotated active must not be persisted"
+                !raw.contains("DUMMY_KEY_PRIMARY"),
+                "{mutation}: displaced credential lives only in the in-memory pool"
             );
 
             let reloaded = AuthManager::load_from_file(&dir).await;
             assert_eq!(
                 reloaded.get_api_key("openai").await.as_deref(),
-                Some("DUMMY_KEY_PRIMARY"),
-                "{mutation}: restart must restore the primary"
+                Some("DUMMY_KEY_SECONDARY"),
+                "{mutation}: restart must restore the rotated credential"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// ERR_PATH-09 regression: a successful rotation is durable and survives a restart.
+    #[tokio::test]
+    async fn rotation_persists_new_primary_across_restart() {
+        let dir = temp_auth_dir();
+        let auth_path = dir.join("auth.json");
+        let manager = AuthManager::load_from_file(&dir).await;
+        manager.add_key("openai", api_key("PRIMARY")).await;
+        manager.add_key("openai", api_key("SECONDARY")).await;
+
+        // Before rotation only the registration-time primary is on disk.
+        let before = tokio::fs::read_to_string(&auth_path)
+            .await
+            .expect("read persisted auth file");
+        assert!(before.contains("DUMMY_KEY_PRIMARY"));
+        assert!(!before.contains("DUMMY_KEY_SECONDARY"));
+
+        assert!(
+            manager
+                .rotate_key("openai", RotationReason::RateLimited)
+                .await
+        );
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_SECONDARY")
+        );
+
+        // After rotation the rotated credential is the on-disk primary.
+        let after = tokio::fs::read_to_string(&auth_path)
+            .await
+            .expect("read persisted auth file");
+        assert!(after.contains("DUMMY_KEY_SECONDARY"));
+        assert!(!after.contains("DUMMY_KEY_PRIMARY"));
+
+        // A restart restores the rotated credential; the pool is in-memory only.
+        let reloaded = AuthManager::load_from_file(&dir).await;
+        assert_eq!(
+            reloaded.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_SECONDARY")
+        );
+        assert_eq!(reloaded.key_count("openai").await, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ERR_PATH-09 regression: a failed durable write rolls back the active
+    /// credential, the pool and the mirrored primary, and leaks no key value.
+    #[tokio::test]
+    async fn failed_rotation_persist_rolls_back_in_memory_state() {
+        let dir = temp_auth_dir();
+        let auth_path = dir.join("auth.json");
+        let manager = AuthManager::with_filepath(auth_path.clone());
+
+        // Seed two credentials while the path is still writable.
+        manager
+            .try_set("openai", api_key("PRIMARY"))
+            .await
+            .expect("initial primary persist must succeed");
+        manager
+            .try_add_key("openai", api_key("SECONDARY"))
+            .await
+            .expect("pooled key persist must succeed");
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_PRIMARY")
+        );
+        assert_eq!(manager.key_count("openai").await, 2);
+
+        // Make the target path a directory so the rotation write fails deterministically.
+        std::fs::remove_file(&auth_path).expect("remove auth file");
+        std::fs::create_dir(&auth_path).expect("create directory at auth file path");
+
+        assert!(
+            !manager
+                .rotate_key("openai", RotationReason::Unauthorized)
+                .await,
+            "rotation must fail when persistence fails"
+        );
+
+        // Active credential and pool are unchanged.
+        assert_eq!(
+            manager.get_api_key("openai").await.as_deref(),
+            Some("DUMMY_KEY_PRIMARY")
+        );
+        assert_eq!(manager.key_count("openai").await, 2);
+
+        // Error reporting never leaks a key value.
+        let last_error = manager
+            .last_persist_error()
+            .await
+            .expect("persist error recorded");
+        for secret in ["DUMMY_KEY_PRIMARY", "DUMMY_KEY_SECONDARY"] {
+            assert!(!last_error.contains(secret), "key value leaked: {secret}");
+        }
+
+        // The mirrored primary is rolled back too: after restoring a writable path,
+        // a later successful write must still persist PRIMARY, not SECONDARY.
+        std::fs::remove_dir(&auth_path).expect("remove directory at auth file path");
+        manager.add_key("unrelated", api_key("OTHER")).await;
+        let raw = tokio::fs::read_to_string(&auth_path)
+            .await
+            .expect("read persisted auth file");
+        assert!(raw.contains("DUMMY_KEY_PRIMARY"));
+        assert!(!raw.contains("DUMMY_KEY_SECONDARY"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
