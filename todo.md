@@ -217,14 +217,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **auth store 永続化失敗時にメモリ状態が更新済みのまま残る**
-  — `provider/auth.rs:200-218` / ERRPATH-02 / 中（事実確認済み）
-- [ ] **MCP OAuth ログアウト時のディスク削除失敗が飲まれる**
-  — `mcp_oauth.rs:683-694` / ERRPATH-03 / 中（事実確認済み）
-- [ ] **models.dev サイズ超過を警告しつつパース利用、キャッシュ書込失敗も飲む**
-  — `provider/models.rs:208-223` / ERRPATH-04 / 中（事実確認済み）
-- [ ] **session_input.metadata の JSON パース失敗が黙って None 化**
-  — `storage/repository.rs:1035-1037` / ERRPATH-05 / 中（事実確認済み）
 - [ ] **同一名 OUTPUT_TOKEN_MAX が 8192 と 32000 で食い違う**
   — `session/llm.rs:19` vs `provider/transform.rs:70` / CONSTANTS-01 / 高
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
@@ -296,6 +288,8 @@ status: current
 
 ## 完了
 
+- [x] **[永続化/境界 4 件]** 認証整合・ログアウト・models 境界・metadata
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[移行 fingerprint 1 件]** 起動時一度きりの設計意図を確認・復元
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[完了ログ/variant キャッシュ 2 件]** request_id 明示と無効化
@@ -627,6 +621,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（永続化/境界の修正時、記録のみ）: auth.json が非アトミック
+  書き込みで chmod も事後実行（途中失敗・権限露出の懸念）。ログアウト失敗時に
+  静的ヘッダー併用サーバーへ古い OAuth マネージャが注入され得る。
+  親が remove_oauth の戻り値をディスク削除成否のみへ修正し、再起動相当の
+  回帰テストを追加。
 - 2026-11-21 cross-skill 集約（swarm116、2 担当・20 件、観点: 定数整合 /
   エラー経路と回復）: 親が 5 件の根拠を read で事実確認し、高 5 / 中 23 /
   低 5 を追記。特に models.dev の「サイズ超過と警告しつつ利用」は矛盾が
