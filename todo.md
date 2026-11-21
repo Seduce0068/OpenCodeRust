@@ -247,8 +247,6 @@ status: current
 
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
-- [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
-  — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
 - [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
   — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
@@ -269,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[shutdown キュー終端化 1 件]** プロンプト abort と再スケジュール停止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[APP_VERSION_DATE 1 件]** 2026.11.21 へ同期（固定ラベル方針明記）
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[シグナル終了時フラッシュ 1 件]** graceful shutdown で既にカバー
@@ -634,6 +634,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 判断（shutdown キュー終端化の修正時）: abort が
+  PromptTaskCleanup::drop 経由で再 spawn する指摘に対し、親がキュー ID を
+  abort 前に drain し shutting_down フラグで Drop / recover の再スケジュール
+  を二段で停止。回収経路の非 redact ログは到達しなくなった。既知 flaky
+  （readiness subscriber 競合）は --test-threads=1 で 2929 件 green を確認。
 - 2026-11-21 事実確認（WorkerGuard フラッシュ）: server.rs の
   wait_for_os_shutdown が Ctrl-C / SIGTERM を捕捉し graceful shutdown 後に
   main が正常リターンするため `_log_guard` の Drop が走る。SHUTDOWN-09 は
