@@ -218,14 +218,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **サーバに graceful shutdown / シグナル処理が無い**
-  — `server.rs:2092-2096` / SHUTDOWN-01 / 高（事実確認済み）
-- [ ] **TUI がローカルサーバを即 abort（in-flight HTTP/永続化が強制切断）**
-  — `main.rs:1416-1423` / SHUTDOWN-02 / 高（事実確認済み）
-- [ ] **サーバ終了時のfinal session flush が無い**
-  — `server.rs:873-921` / SHUTDOWN-03 / 高（事実確認済み）
-- [ ] **設定警告が tracing 初期化前に発行されキャッシュで再発しない**
-  — `main.rs:1022-1034` / CFGVAL-01 / 高（事実確認済み）
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
@@ -306,6 +298,8 @@ status: current
 
 ## 完了
 
+- [x] **[graceful shutdown 4 件]** シグナル・flush・設定警告 replay
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[移行/マスク/timeout 3 件]** バックアップ順序と形式の明記
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[定数整合 6 件]** 単一情報源化と SSE バックオフ文書修正
@@ -643,6 +637,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（graceful/警告 replay の修正時、記録のみ）: final flush の
+  回帰テストが呼出回数のみで生エラー非露出を実際には検証していない。
+  親が TUI の早期 return 時に停止シーケンスが飛ぶ問題と signal feature
+  コメントの矛盾を直接修正。
 - 2026-11-21 cross-skill 集約（swarm120、2 担当・19 件、観点: シャットダウン /
   設定検証と案内）: 親が 4 件の root を read で事実確認（graceful shutdown 不在、
   TUI abort、final flush 不在、設定警告の初期化前発行）、高 5 / 中 17 / 低 3 を
