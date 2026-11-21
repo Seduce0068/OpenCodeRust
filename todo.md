@@ -247,8 +247,6 @@ status: current
   — `mcp/oauth.rs:441-496` / RES-04 / 中
 - [ ] **POST /prompt に冪等キーが無く再送で二重実行**
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
-- [ ] **add_message_part が毎回 UUID を採番し再送で重複**
-  — `routes.rs:1407` / API-06 / 中（speculation）
 - [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
   — `tui/api.rs:681-693` / API-08 / 中
 - [ ] **limit 上限クランプが黙って行われ通知手段が無い**
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[part 冪等化 1 件]** 任意 ID 受け付けと再送重複の防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider キー統一 1 件]** /provider に providers エイリアスを追加
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[SessionRow status 1 件]** レガシー行がライフサイクル状態を保持
@@ -684,6 +684,8 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（part 冪等化の修正時）: 親が重複分岐でも persist を再試行
+  し、sanitize_part_id で Unicode Cf（RLO/ZWSP/BOM 等）と空白のみも除外。
 - 2026-11-22 R4 残存（provider キーの修正時、記録のみ）: all.clone() による
   ペイロード約 2 倍は後方互換のための受容済みトレードオフ。
   /config/providers との組み立てロジック重複、回帰テストが純粋関数のみで
