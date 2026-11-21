@@ -255,9 +255,6 @@ status: current
 
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
-- [ ] **mdns 子プロセスがシグナル時に孤児化** — `main.rs:2919-2920` / SHUTDOWN-05 / 中
-- [ ] **plugin shutdown RPC 失敗時に kill フォールバックをスキップ**
-  — `plugin/client.rs:568-574` / SHUTDOWN-06 / 中
 - [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
   — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
 - [ ] **シグナル終了で tracing WorkerGuard のフラッシュが飛ぶ**
@@ -268,12 +265,8 @@ status: current
   — `config/loader.rs:89-95` / CFGVAL-03 / 中
 - [ ] **ネストしたキーの誤記がサイレントに無視される**
   — `config/loader.rs:945-975` / CFGVAL-04 / 中
-- [ ] **非推奨キー mode / tools / autoshare が警告なしで移行**
-  — `config/loader.rs:1801-1862` / CFGVAL-05 / 中
 - [ ] **Markdown frontmatter パース失敗で全メタデータが黙って失われる**
   — `config/loader.rs:1193-1209` / CFGVAL-06 / 中
-- [ ] **明示指定の OPENCODE_CONFIG が存在しない場合に無警告で無視**
-  — `config/loader.rs:64-68` / CFGVAL-07 / 中
 - [ ] **同一レイヤーの provider/providers 衝突が警告なしで破棄**
   — `config/schema.rs:1493-1497` / CFGVAL-08 / 中
 - [ ] **不正な入れ子値（oauth/environment/headers）が無警告で捨てられる**
@@ -298,6 +291,8 @@ status: current
 
 ## 完了
 
+- [x] **[plugin/設定警告 3 件]** kill フォールバックと非推奨キー警告
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[graceful shutdown 4 件]** シグナル・flush・設定警告 replay
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[移行/マスク/timeout 3 件]** バックアップ順序と形式の明記
