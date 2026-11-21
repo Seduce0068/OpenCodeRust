@@ -5757,17 +5757,32 @@ pub struct HealthResponse {
     pub version: String,
     /// `/global/health` 互換の健全性フラグ。`status == "ok"` と同期する。
     pub healthy: bool,
+    /// readiness 失敗時にのみ設定する原因種別。
+    /// `busy` / `corrupt` / `closed` / `uninitialized` / `other` の固定語のみ。
+    /// 成功時（liveness を含む）は `skip_serializing_if` で省略され、
+    /// 既存の `{status, version, healthy}` wire format を維持する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// 旧公開型名を維持するための別名。統合後も同一 JSON を返す。
 pub type GlobalHealthResponse = HealthResponse;
 
-/// `status` から統一スキーマのレスポンスを組み立てる。
+/// `status` から統一スキーマのレスポンスを組み立てる（reason なし）。
 fn health_response(status: &str) -> HealthResponse {
+    health_response_with_reason(status, None)
+}
+
+/// readiness 失敗時に reason コードを添えたレスポンスを組み立てる。
+///
+/// `reason` が `None` のときは既存の `{status, version, healthy}` と同じ
+/// JSON になる（新フィールドは `skip_serializing_if` で省略）。
+fn health_response_with_reason(status: &str, reason: Option<&str>) -> HealthResponse {
     HealthResponse {
         status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         healthy: status == "ok",
+        reason: reason.map(str::to_string),
     }
 }
 
@@ -5779,37 +5794,86 @@ async fn health() -> Json<HealthResponse> {
     Json(health_response("ok"))
 }
 
+/// `ping()` の失敗から原因種別コード（`busy` / `corrupt` / `closed` / `other`）を導出する。
+///
+/// `InputRepository::ping()` は sqlx エラーを `DatabaseError::QueryError(String)` へ
+/// 畳み込むため、variant だけでは SQLITE_BUSY / corrupt / closed pool を切り分けられない。
+/// ここで文字列を「分類のためだけに」読み、固定コード以外を一切外へ出さない。
+/// エラー本文・DB パス・トークン値はログにもレスポンスにも渡さない。
+///
+/// 根拠（sqlx 0.9 実コード）:
+/// - `SqliteError` の Display は `(code: N) message`（code 5=BUSY, 6=LOCKED,
+///   11=CORRUPT, 26=NOTADB）。
+/// - `sqlx::Error::PoolClosed` の Display は
+///   "attempted to acquire a connection on a closed pool"。
+fn readiness_failure_reason(err: &opencode_storage::DatabaseError) -> &'static str {
+    use opencode_storage::DatabaseError;
+
+    match err {
+        // ping() は現在この variant を返さないが、将来の永続化側変更に備える。
+        DatabaseError::CorruptData(_) => "corrupt",
+        _ => classify_ping_error_text(&err.to_string()),
+    }
+}
+
+/// 分類専用の内部ヘルパ。戻り値は固定の reason コードだけ。
+fn classify_ping_error_text(text: &str) -> &'static str {
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("closed pool") || lowered.contains("pool closed") {
+        "closed"
+    } else if lowered.contains("(code: 5)")
+        || lowered.contains("(code: 6)")
+        || lowered.contains("database is locked")
+        || lowered.contains("database table is locked")
+    {
+        "busy"
+    } else if lowered.contains("(code: 11)")
+        || lowered.contains("(code: 26)")
+        || lowered.contains("malformed")
+        || lowered.contains("not a database")
+    {
+        "corrupt"
+    } else {
+        "other"
+    }
+}
+
 /// Readiness probe。DB が利用可能かを実際のクエリで確認する。
 ///
 /// `ServerState` は DB プールを直接保持しないため、`pub(crate)` な
 /// `input_repo` 経由で軽量な `ping()`（`SELECT 1`）を発行する。
 /// キュー内容をフェッチしないため、保留中プロンプトが溜まっていても
 /// 応答は遅延せず、接続不可・プールクローズ・ロック等でのみ失敗する。
-/// 利用可能なら 200、それ以外は 503 を返す。
+/// 利用可能なら 200、それ以外は 503 を返す。失敗時は構造化 `reason` を
+/// warn フィールドと 503 ボディの両方に載せる（生エラー文言は載せない）。
 async fn readiness(State(state): State<Arc<ServerState>>) -> Response {
-    let db_ok = match &state.input_repo {
+    let failure_reason = match &state.input_repo {
         Some(repo) => match repo.ping().await {
-            Ok(_) => true,
-            Err(_) => {
-                // エラー文字列をログへ載せず、失敗事実だけを記録する。
-                tracing::warn!("readiness probe: database query failed");
-                false
+            Ok(_) => None,
+            Err(err) => {
+                let reason = readiness_failure_reason(&err);
+                // エラー文字列は `{}` / `?` で一切フォーマットしない。
+                // 記録するのは固定コードの `reason` と汎用メッセージだけ。
+                tracing::warn!(reason = reason, "readiness probe: database query failed");
+                Some(reason)
             }
         },
         None => {
-            tracing::warn!("readiness probe: database repository is not initialized");
-            false
+            tracing::warn!(
+                reason = "uninitialized",
+                "readiness probe: database repository is not initialized"
+            );
+            Some("uninitialized")
         }
     };
 
-    if db_ok {
-        (StatusCode::OK, Json(health_response("ok"))).into_response()
-    } else {
-        (
+    match failure_reason {
+        None => (StatusCode::OK, Json(health_response("ok"))).into_response(),
+        Some(reason) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(health_response("error")),
+            Json(health_response_with_reason("error", Some(reason))),
         )
-            .into_response()
+            .into_response(),
     }
 }
 
@@ -7836,6 +7900,63 @@ mod api_alias_tests {
 #[cfg(test)]
 mod health_tests {
     use super::*;
+    use std::fmt::Write as _;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// `tracing-subscriber` を依存追加せずに warn の構造化フィールドを捕捉する
+    /// 最小バッファ（既存 `plugin_loader_registration_tests` と同じ方式）。
+    #[derive(Clone, Default)]
+    struct ReasonLogBuffer(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl ReasonLogBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("log buffer lock").clone()
+        }
+    }
+
+    struct ReasonVisitor(ReasonLogBuffer);
+
+    impl Visit for ReasonVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct ReasonCaptureSubscriber {
+        buffer: ReasonLogBuffer,
+    }
+
+    impl Subscriber for ReasonCaptureSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut ReasonVisitor(self.buffer.clone()));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
 
     /// レスポンスボディを JSON として読み取る。
     async fn response_body(resp: Response) -> serde_json::Value {
@@ -7914,6 +8035,119 @@ mod health_tests {
         let body = response_body(resp).await;
         assert_eq!(body["status"], "error");
         assert_eq!(body["healthy"].as_bool(), Some(false));
+    }
+
+    /// 回帰ガード: ping 失敗を固定 reason コードへ分類できること。
+    /// ここでは sqlx 0.9 の Display 形式を模した文字列を使い、文言依存を明示する。
+    #[test]
+    fn readiness_failure_reason_maps_known_ping_errors() {
+        use opencode_storage::DatabaseError;
+
+        assert_eq!(
+            readiness_failure_reason(&DatabaseError::QueryError(
+                "Query error: error returned from database: (code: 5) database is locked".into()
+            )),
+            "busy"
+        );
+        assert_eq!(
+            readiness_failure_reason(&DatabaseError::QueryError(
+                "Query error: error returned from database: (code: 11) database disk image is malformed"
+                    .into()
+            )),
+            "corrupt"
+        );
+        assert_eq!(
+            readiness_failure_reason(&DatabaseError::CorruptData("payload".into())),
+            "corrupt"
+        );
+        assert_eq!(
+            readiness_failure_reason(&DatabaseError::QueryError(
+                "Query error: attempted to acquire a connection on a closed pool".into()
+            )),
+            "closed"
+        );
+        assert_eq!(
+            readiness_failure_reason(&DatabaseError::QueryError(
+                "Query error: unexpected failure".into()
+            )),
+            "other"
+        );
+    }
+
+    /// 回帰ガード: ping 失敗時に構造化 `reason` が warn へ記録され、
+    /// 同一コードが 503 ボディにも載ること。生エラー文言は漏れないこと。
+    #[tokio::test]
+    async fn readiness_warn_records_reason_for_ping_failure() {
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let pool = db.pool().clone();
+        let mut state = ServerState::new();
+        state.input_repo = Some(opencode_storage::InputRepository::new(pool.clone()));
+        pool.close().await;
+
+        let buffer = ReasonLogBuffer::default();
+        let subscriber = ReasonCaptureSubscriber {
+            buffer: buffer.clone(),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+        let resp = readiness(State(Arc::new(state))).await;
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let text = buffer.text();
+        assert!(
+            text.contains("reason=closed"),
+            "structured reason missing: {text}"
+        );
+        assert!(
+            !text.contains("closed pool"),
+            "raw sqlx error text must not reach logs: {text}"
+        );
+
+        let body = response_body(resp).await;
+        assert_eq!(body["reason"], "closed");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["healthy"].as_bool(), Some(false));
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// 回帰ガード: repo 未初期化も `uninitialized` として記録されること。
+    #[tokio::test]
+    async fn readiness_warn_records_uninitialized_reason() {
+        let buffer = ReasonLogBuffer::default();
+        let subscriber = ReasonCaptureSubscriber {
+            buffer: buffer.clone(),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+        let resp = readiness(State(Arc::new(ServerState::new()))).await;
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_body(resp).await;
+        assert_eq!(body["reason"], "uninitialized");
+        let text = buffer.text();
+        assert!(text.contains("reason=uninitialized"), "{text}");
+    }
+
+    /// 回帰ガード: 成功時は既存の `{status, version, healthy}` のみで、
+    /// `reason` フィールドが現れないこと（wire format 非破壊）。
+    #[tokio::test]
+    async fn readiness_success_keeps_existing_health_schema() {
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let mut state = ServerState::new();
+        state.input_repo = Some(opencode_storage::InputRepository::new(db.pool().clone()));
+
+        let resp = readiness(State(Arc::new(state))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["healthy"].as_bool(), Some(true));
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            body.get("reason").is_none(),
+            "reason must be omitted on success"
+        );
     }
 }
 
