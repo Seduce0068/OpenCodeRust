@@ -164,12 +164,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **TodoManager の writer_locks に削除経路が無い**
-  — `session/todo.rs:83-89` / RES-05 / 低
 - [ ] **LSP diagnostics/file_versions が close 後に残存**
   — `lsp/lib.rs:320-323` / RES-06 / 低
-- [ ] **PluginLoader 再ロードで clients/trusted_scripts が累加**
-  — `plugin/loader.rs:206-232` / RES-07 / 低
 - [ ] **macOS クリップボード画像の一時ファイルが失敗経路で残存**
   — `tui/clipboard.rs:214-245` / RES-08 / 低
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
@@ -285,6 +281,8 @@ status: current
 
 ## 完了
 
+- [x] **[リソース累積 2 件]** writer_lock 回収と plugin レジストリ排水
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[メッセージ wire 統一 1 件]** get_message を list_messages と同一化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース上限 2 件]** TUI レスポンスキューと MCP ログのリング化
@@ -664,6 +662,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（リソース累積の修正時、記録のみ）: shutdown_all が
+  clients/auth_bridges を別クリティカルセクションで排水するため並行 load_all
+  の bridge が失われる可能性（本番呼び出しなし）。hook_system の古い hook も
+  残存し得る。親が clear の writer_lock 削除が待機者を無視する medium を修正。
 - 2026-11-21 R4 判断（リソース上限の修正時）: restart 経路でもログを破棄し、
   remove が close 失敗時にステータス/ログ更新をスキップする問題を修正。
   Disconnected ログは意図的に消去（再接続で stale 履歴を残さない方針）。
