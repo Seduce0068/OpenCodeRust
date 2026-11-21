@@ -247,8 +247,6 @@ status: current
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
 - [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
   — `tui/api.rs:681-693` / API-08 / 中
-- [ ] **limit 上限クランプが黙って行われ通知手段が無い**
-  — `routes.rs:237-246` / API-10 / 中（speculation）
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
@@ -266,6 +264,8 @@ status: current
 
 ## 完了
 
+- [x] **[limit クランプ通知 1 件]** x-limit-clamped と CORS expose
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth TTL 1 件]** 放置フローを回収し期限切れを明示エラー化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin loader per-instance 1 件]** process-global を削除し状態を分離
@@ -687,6 +687,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（limit クランプ通知の修正時、記録のみ）: 回帰テストが
+  ハンドラ直呼びで、axum が (HeaderMap, Json) を合成する実 HTTP レスポンス
+  経由の検証は未実施。親が x-limit-clamped / x-mcp-sync-warning を
+  cors_layer の expose_headers へ追加する medium を直接修正。
 - 2026-11-22 R4 残存（OAuth TTL の修正時、記録のみ）: 回収済み state の
   callback が FlowExpired ではなく NoPendingAuth になる（tombstone が必要）、
   再起動後にディスクのみ残ったフローには TTL が効かない（AuthEntry 側に
