@@ -674,7 +674,11 @@ impl ServerState {
     }
 
     /// 終了したタスクのハンドルを削除する。後続タスクのハンドルは残す。
-    pub(crate) fn clear_prompt_task(&self, session_id: &str, task_id: tokio::task::Id) {
+    ///
+    /// 自分のハンドルを削除できた場合のみ `true` を返す。後続タスクが既に
+    /// 登録済みで自分のハンドルが残っていない場合は `false` とし、呼び出し側が
+    /// 後続実行の Busy を誤って Idle に戻さないようにする（R4）。
+    pub(crate) fn clear_prompt_task(&self, session_id: &str, task_id: tokio::task::Id) -> bool {
         let mut tasks = self
             .running_prompt_tasks
             .lock()
@@ -684,6 +688,9 @@ impl ServerState {
             .is_some_and(|handle| handle.id() == task_id)
         {
             tasks.remove(session_id);
+            true
+        } else {
+            false
         }
     }
 

@@ -2293,7 +2293,25 @@ struct PromptTaskCleanup {
 
 impl Drop for PromptTaskCleanup {
     fn drop(&mut self) {
-        self.state.clear_prompt_task(&self.session_id, self.task_id);
+        let cleared_own_task = self.state.clear_prompt_task(&self.session_id, self.task_id);
+
+        // ストリームタスクが panic / 早期ドロップした場合でも Busy が残らないよう
+        // run_status を Idle に戻す。ただし後続タスクが既に登録済みで自分の
+        // ハンドルを消せなかった場合は、後続の Busy を誤って消さないようスキップ
+        // する（R4）。Drop は同期なので tokio runtime が有る場合だけ async に
+        // 引き継ぎ、無い場合は固定文言のみログに出す（機微値は出さない）。
+        if cleared_own_task {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let state = self.state.clone();
+                let session_id = self.session_id.clone();
+                handle.spawn(async move {
+                    set_session_run_status(&state, &session_id, SessionRunStatus::Idle).await;
+                });
+            } else {
+                tracing::warn!("no tokio runtime for prompt run-status cleanup");
+            }
+        }
+
         // graceful shutdown 中は再スケジュールしない（二重実行防止）。
         if self.state.shutting_down.load(Ordering::Acquire) {
             if let Some(queue_id) = &self.queue_id {
@@ -7761,6 +7779,94 @@ mod abort_tests {
             drop_body.contains("queue_finalized"),
             "cleanup must skip already finalized items: {drop_body}"
         );
+    }
+
+    /// STREAM-RUN-STATUS-ON-PANIC 回帰の待機ヘルパ。
+    /// Drop が spawn した Idle 化が反映されるまでポーリングする。
+    async fn assert_run_status_idle(state: &Arc<ServerState>, session_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = state
+                .session_run_status
+                .read()
+                .await
+                .get(session_id)
+                .cloned();
+            if status.is_none() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cleanup drop must reset run status to idle: {status:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// キュー ID が無いタスクでも、Drop が Busy を Idle（エントリ削除）へ戻す。
+    #[tokio::test]
+    async fn prompt_cleanup_drop_resets_busy_status_without_queue_id() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id.clone()
+        };
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+        let spawned = tokio::spawn(async {});
+        let task_id = spawned.id();
+        // 自分のハンドルを登録し、clear_prompt_task が true を返すようにする（R4）。
+        state.register_prompt_task(session_id.clone(), spawned.abort_handle());
+        let _ = spawned.await;
+        let cleanup = PromptTaskCleanup {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            queue_id: None,
+            claimed: Arc::new(AtomicBool::new(false)),
+            queue_finalized: Arc::new(AtomicBool::new(false)),
+        };
+        drop(cleanup);
+        assert_run_status_idle(&state, &session_id).await;
+    }
+
+    /// キュー ID あり・shutting_down 中でも Idle 化し、通常完了 / abort 経路の
+    /// Idle 設定と二重になっても壊れない（冪等）こと。
+    #[tokio::test]
+    async fn prompt_cleanup_drop_resets_busy_status_with_queue_id_idempotently() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id.clone()
+        };
+        state.shutting_down.store(true, Ordering::Release);
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+        let spawned = tokio::spawn(async {});
+        let task_id = spawned.id();
+        state.register_prompt_task(session_id.clone(), spawned.abort_handle());
+        let _ = spawned.await;
+        let cleanup = PromptTaskCleanup {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            queue_id: Some("cleanup-test-queue".to_string()),
+            claimed: Arc::new(AtomicBool::new(true)),
+            queue_finalized: Arc::new(AtomicBool::new(true)),
+        };
+        drop(cleanup);
+        assert_run_status_idle(&state, &session_id).await;
+
+        // 既に Idle の状態での再実行（正常完了 / abort + 複数 Drop）も安全。
+        set_session_run_status(&state, &session_id, SessionRunStatus::Idle).await;
+        let cleanup_again = PromptTaskCleanup {
+            state: state.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            queue_id: None,
+            claimed: Arc::new(AtomicBool::new(false)),
+            queue_finalized: Arc::new(AtomicBool::new(false)),
+        };
+        drop(cleanup_again);
+        assert_run_status_idle(&state, &session_id).await;
     }
 }
 
