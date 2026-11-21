@@ -164,6 +164,18 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **リモート wellknown 設定が parse_jsonc 検証をバイパス**
+  — `config/wellknown.rs:181-198` / CFG2-05 / 低
+- [ ] **tui --project 時に元 cwd の logLevel で tracing 初期化**
+  — `cli/main.rs:1260-1272` / CFG2-07 / 低
+- [ ] **真値パーサーが箇所ごとに異なる（OPENCODE_AUTO_SHARE 未記載）**
+  — `cli/main.rs:1977-1982` / CFG2-08 / 低
+- [ ] **OPENCODE_CONFIG_CONTENT の {file:...} が cwd 基準で仕様未記載**
+  — `config/loader.rs:45-57` / CFG2-09 / 低
+- [ ] **ディレクトリ走査順に依存して同名 command/plugin の勝者が変わる**
+  — `config/loader.rs:1371-1383` / CFG2-10 / 低
+- [ ] **MCP SSE の JSON-RPC パース失敗が warn だけで待機側が timeout**
+  — `mcp/transport.rs:524-539` / ERR2-08 / 低（speculation）
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -211,6 +223,11 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **MCP tools/list_changed フラグが失敗時に消耗しツール一覧が固定**
+  — `mcp/client.rs:789-790` / ERR2-01 / 高（事実確認済み）
+- [ ] **Anthropic SSE の error イベントが型境界で完全に失われる**
+  — `provider/stream.rs:307-381` / ERR2-02 / 高（事実確認済み）
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -241,6 +258,26 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **disabled/enabled_providers が上位の空配列でクリアできない**
+  — `config/schema.rs:195-199` / CFG2-01 / 中
+- [ ] **legacy tools -> permission 変換が HashMap 順序に依存**
+  — `config/loader.rs:2199-2221` / CFG2-02 / 中
+- [ ] **legacy mode -> agent 移行が既存の明示 mode を上書き**
+  — `config/loader.rs:2184-2194` / CFG2-03 / 中
+- [ ] **README の設定優先順が実装と逆で主要ソースが欠落**
+  — `README.md:142-158` / CFG2-04 / 中
+- [ ] **wellknown auth の環境変数ブロックリストが限定的**
+  — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
+- [ ] **parse_stream_error が code 必須で type ベース retryable を落とす**
+  — `provider.rs:632` / ERR2-03 / 中
+- [ ] **usage デコード失敗が 0 に丸められ課金統計が狂う**
+  — `openai.rs:854-855` / ERR2-04 / 中
+- [ ] **get_model_id の unwrap_or_default が空 model id を生成**
+  — `agent/executor.rs:321-328` / ERR2-05 / 中
+- [ ] **リトライでプラグインフックの外部副作用が二重発火**
+  — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
+- [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
+  — `openai.rs:1026-1083` / ERR2-07 / 中（speculation）
 - [ ] **OAuth 放置フローの一時状態に TTL/回収が無い**
   — `mcp/oauth.rs:441-496` / RES-04 / 中
 - [ ] **DELETE 系が存在しないリソースに 404（冪等性の解釈差）**
@@ -660,6 +697,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 cross-skill 集約（swarm147、2 担当・18 件、観点: 設定/environment /
+  エラー伝播と型境界）: 親が high 2 件（tools_changed フラグ消耗、
+  Anthropic SSE error イベント消失）を read で事実確認、高 2 / 中 15 / 低 7
+  を追記。rustxng MCP は禁止されたためローカルコードレビューのみ実施。
 - 2026-11-21 R4 残存（LSP/一時ファイルの修正時、記録のみ）: reader の
   publishDiagnostics が close 後に diagnostics を復活し得る点、unregister
   テストが 1 クライアントのみの点は未対応。親が O_EXCL 予約・AppleScript
