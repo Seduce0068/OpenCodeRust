@@ -71,13 +71,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **[M-02]** 共有型の重複定義と serde_json 往復による変換
-  - 事実確認済み（2026-11-18、shared-type-worker）: serde 往復で session 側の `usage` /
-    `synthetic` / `ignored` が消えることを一時テストで実証。ただし session は types に非依存で、
-    型集約には types 側フィールド追加＋session の依存追加＋server.rs の From 置換が
-    必要（大幅変更）。推奨: types/message.rs へ3フィールド追加 → session を
-    `pub use` 化 → server.rs を明示 From へ（H-10 の非アトミック書き出しと
-    同一箇所、同時対応が効率的）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -276,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[共有型集約 1 件]** types 単一情報源化を既存実装として確認
+  （2026-11-21、親が実コードで事実確認）
 - [x] **[OpenAI UTF-8 境界 1 件]** per-chunk デコードの廃止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[Markdown 表/wrap_spans 2 件]** 幅クランプの本番配線と wide char 境界
