@@ -168,10 +168,6 @@ status: current
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **messages テーブルの provider_id/cost 列が永続化経路で常に未設定**
   — `storage/repository.rs:566-608` / T-06 / 低
-- [ ] **GitWatcher イベント待ちが 2 秒固定 timeout**
-  — `core/git_watcher.rs:82-95` / TESTREL-04 / 低
-- [ ] **ENV_OVERRIDE_LOCK 範囲外で env を直接書き換え**
-  — `config/loader.rs:4362-4369` / TESTREL-06 / 低
 - [ ] **設定検証手段が無く README も不正設定時の挙動を案内しない**
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
@@ -262,10 +258,6 @@ status: current
 
 - [ ] **update_part が v2 の Part ワイヤ形式を受けられない**
   — `routes.rs:3000-3019` / T-05 / 中（speculation）
-- [ ] **watcher 再帰サブウォッチのアタッチ待ちが固定 sleep 依存**
-  — `watcher/lib.rs:596-605` / TESTREL-01 / 中
-- [ ] **watcher unwatch 後の負の検証が 300ms 固定**
-  — `watcher/lib.rs:569-576` / TESTREL-02 / 中
 - [ ] **plugin チャンク overflow テストが 150ms timeout + 50ms sleep 依存**
   — `plugin/client.rs:872-894` / TESTREL-03 / 中
 - [ ] **bash プロセツリキル検証が 600ms 固定 sleep 依存**
@@ -302,6 +294,8 @@ status: current
 
 ## 完了
 
+- [x] **[テスト信頼性 4 件]** env 直列化・時間依存の解消
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[共有型 3 件]** AgentColor 正規化・diffs 既定値・PtyStatus 集約
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[permission 二重エンコード 1 件]** PATCH 後の CorruptData を解消
@@ -651,6 +645,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（テスト信頼性の修正時、記録のみ）: config の env ロックが
+  2 テストモジュールで分離しているが変数名が衝突しないため実害なし。
+  親が unwatch 負の検証で in-flight の遅延イベントを誤検知する問題を修正。
 - 2026-11-21 cross-skill 集約（swarm125、2 担当・13 件、観点: 型境界/所有権 /
   テスト信頼性）: 親が T-01 の二重エンコードを read で事実確認（create は
   `Json<T>`、update は `Json<String>` で保存され decode が CorruptData）。
