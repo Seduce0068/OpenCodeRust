@@ -730,7 +730,8 @@ impl ServerState {
             Err(error) => return Err(error),
         });
         state.auth_manager = auth_manager.clone();
-        load_plugin_auth_store(&server_url, auth_manager.clone()).await;
+        // ERRPATH-08: ビルトイン認証プラグインのロード失敗は起動中止（fail-closed）。
+        load_plugin_auth_store(&server_url, auth_manager.clone()).await?;
 
         // 起動時の config 読み込みと BootstrapConfig 変換は
         // `build_initial_provider_registry` に集約する。401/429 ローテーション後の
@@ -1592,28 +1593,65 @@ fn auth_data_dir() -> PathBuf {
         .join("data")
 }
 
-async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>) {
+/// ビルトイン（認証系）プラグインのロード結果を fail-closed に処理する。
+///
+/// `load_builtins` が失敗した場合、生エラー（ファイルパスやトークンを含みうる）を
+/// 一切ログへ出さず、固定文言の構造化 warn のみを記録して `Err` を返す。
+/// 呼び出し側は `?` で伝播させ、認証プラグインが欠落したまま起動しないようにする。
+fn handle_builtin_plugin_load<E>(result: Result<(), E>) -> anyhow::Result<()> {
+    if result.is_err() {
+        tracing::warn!(
+            event = "builtin_plugin_load_failed",
+            error = "[REDACTED]",
+            "Failed to load builtin auth plugins; aborting startup"
+        );
+        return Err(anyhow::anyhow!("failed to load builtin auth plugins"));
+    }
+    Ok(())
+}
+
+/// ビルトイン認証プラグイン・設定プラグイン・認証ブリッジを起動時に初期化する。
+///
+/// ビルトインのロード失敗は fail-closed（固定 warn + `Err` 伝播で起動中止）。
+/// それ以外の初期化失敗は従来どおり warn のみで継続するが、どの経路も
+/// 生エラー・値・パス・トークンをログやエラーへ出さない。
+async fn load_plugin_auth_store(
+    server_url: &str,
+    auth_manager: Arc<AuthManager>,
+) -> anyhow::Result<()> {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
-        Err(error) => {
-            tracing::warn!(%error, "failed to get current directory for plugin bootstrap");
-            return;
+        Err(_) => {
+            tracing::warn!(
+                event = "plugin_bootstrap_cwd_failed",
+                error = "[REDACTED]",
+                "Failed to get the current directory for plugin bootstrap"
+            );
+            return Ok(());
         }
     };
 
     let config = match load_config(&cwd) {
         Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(%error, "failed to load config for plugin bootstrap");
-            return;
+        Err(_) => {
+            tracing::warn!(
+                event = "plugin_bootstrap_config_failed",
+                error = "[REDACTED]",
+                "Failed to load config for plugin bootstrap"
+            );
+            return Ok(());
         }
     };
 
     let loader = match PluginLoader::new() {
         Ok(loader) => Arc::new(loader),
-        Err(error) => {
-            tracing::warn!(%error, "failed to initialize plugin loader");
-            return;
+        Err(_) => {
+            tracing::warn!(
+                event = "plugin_loader_init_failed",
+                error = "[REDACTED]",
+                "Failed to initialize the plugin loader"
+            );
+            return Ok(());
         }
     };
     // STATE-01: グローバル PluginSystem は先勝ちセマンティクスを明示的に選択する。
@@ -1629,15 +1667,17 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
         server_url: server_url.to_string(),
     };
 
-    if let Err(error) = loader.load_builtins(&context).await {
-        tracing::warn!(%error, "failed to load builtin auth plugins");
-    }
+    // ERRPATH-08: 認証プラグインの欠落は起動中止対象。設定プラグインの
+    // load_all と異なり、ここでは Err を伝播させてサイレント起動を防ぐ。
+    handle_builtin_plugin_load(loader.load_builtins(&context).await)?;
 
-    if !config.plugin.is_empty() {
-        if let Err(error) = loader.load_all(&config.plugin, &context).await {
-            tracing::warn!(%error, "failed to load configured plugins");
-            return;
-        }
+    if !config.plugin.is_empty() && loader.load_all(&config.plugin, &context).await.is_err() {
+        tracing::warn!(
+            event = "configured_plugins_load_failed",
+            error = "[REDACTED]",
+            "Failed to load configured plugins"
+        );
+        return Ok(());
     }
 
     routes::set_plugin_loader(loader.clone());
@@ -1649,7 +1689,7 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
                 sync_custom_fetch_proxy(&provider_id, bridge.clone(), result.has_custom_fetch);
 
                 if let Some(api_key) = result.api_key {
-                    if let Err(error) = auth_manager
+                    if auth_manager
                         .try_set(
                             &provider_id,
                             AuthInfo::Api {
@@ -1657,26 +1697,40 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
                             },
                         )
                         .await
+                        .is_err()
                     {
-                        tracing::warn!(provider = %provider_id, %error, "failed to persist plugin auth credentials");
+                        tracing::warn!(
+                            event = "plugin_auth_persist_failed",
+                            error = "[REDACTED]",
+                            "Failed to persist plugin auth credentials"
+                        );
                     }
                     // TS parity: copilot auth can power both standard and enterprise providers.
-                    if provider_id == "github-copilot" {
-                        if let Err(error) = auth_manager
+                    if provider_id == "github-copilot"
+                        && auth_manager
                             .try_set("github-copilot-enterprise", AuthInfo::Api { key: api_key })
                             .await
-                        {
-                            tracing::warn!(%error, "failed to persist enterprise plugin auth credentials");
-                        }
+                            .is_err()
+                    {
+                        tracing::warn!(
+                            event = "plugin_auth_persist_failed",
+                            error = "[REDACTED]",
+                            "Failed to persist enterprise plugin auth credentials"
+                        );
                     }
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 sync_custom_fetch_proxy(&provider_id, bridge.clone(), false);
-                tracing::warn!(provider = provider_id, %error, "failed to load plugin auth");
+                tracing::warn!(
+                    event = "plugin_auth_load_failed",
+                    error = "[REDACTED]",
+                    "Failed to load plugin auth"
+                );
             }
         }
     }
+    Ok(())
 }
 
 impl Default for ServerState {
@@ -4799,5 +4853,106 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+    }
+
+    // ERRPATH-08 回帰: tracing コアのみで最小 Subscriber を構成し、
+    // 固定 warn 以外の情報（生エラー・パス・トークン）が出ないことを検証する。
+    struct CapturingSubscriber {
+        events: Arc<StdMutex<Vec<String>>>,
+    }
+
+    struct EventFieldCollector<'a>(&'a mut String);
+
+    impl tracing::field::Visit for EventFieldCollector<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?};", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut rendered = String::new();
+            event.record(&mut EventFieldCollector(&mut rendered));
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(rendered);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// ERRPATH-08 回帰: ビルトインロード失敗は起動を中止し、固定 warn のみで
+    /// 生エラー（値・パス・トークン）を一切出さないこと。
+    #[test]
+    fn builtin_plugin_load_failure_is_fail_closed_without_raw_error() {
+        let raw_error = "token-abc123 /home/user/.cache/opencode/auth.json";
+        let result: Result<(), String> = Err(raw_error.to_string());
+
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            events: Arc::clone(&events),
+        };
+        let outcome =
+            tracing::subscriber::with_default(subscriber, || handle_builtin_plugin_load(result));
+
+        // (1) fail-closed: 固定文言の Err が返り、生エラーを含まない。
+        let error = outcome.expect_err("builtin load failure must abort startup");
+        let message = error.to_string();
+        assert_eq!(message, "failed to load builtin auth plugins");
+        assert!(!message.contains(raw_error));
+
+        // (2)(4) ログは固定 warn 1 件のみ。値・パス・トークンは出ない。
+        let rendered = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(rendered.len(), 1, "exactly one fixed warn must be recorded");
+        let line = &rendered[0];
+        assert!(line.contains("builtin_plugin_load_failed"));
+        assert!(line.contains("[REDACTED]"));
+        assert!(!line.contains("token-abc123"));
+        assert!(!line.contains("/home/user"));
+    }
+
+    /// ERRPATH-08 回帰: ビルトインロード成功時は Err も warn も出ないこと。
+    #[test]
+    fn builtin_plugin_load_success_continues() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            events: Arc::clone(&events),
+        };
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            handle_builtin_plugin_load(Ok::<(), String>(()))
+        });
+        assert!(outcome.is_ok());
+        assert!(events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    /// ERRPATH-08 回帰: 呼び出し側の `?` で起動処理が中断される構造であること。
+    #[test]
+    fn builtin_plugin_load_failure_propagates_via_question_mark() {
+        fn startup_step(result: Result<(), String>) -> anyhow::Result<()> {
+            handle_builtin_plugin_load(result)?;
+            Ok(())
+        }
+        assert!(startup_step(Err("secret-value".to_string())).is_err());
+        assert!(startup_step(Ok(())).is_ok());
     }
 }

@@ -38,6 +38,15 @@ pub enum PluginLoaderError {
     #[error("subprocess error: {0}")]
     Subprocess(#[from] PluginSubprocessError),
 
+    /// A plugin subprocess failed to spawn (or failed its initialize handshake).
+    ///
+    /// Deliberately a unit variant: the spec, the `file://` cache path and the
+    /// raw subprocess error can all embed credential-bearing locations, so none
+    /// of them is retained here or emitted to the logs. Callers need only the
+    /// failure signal in order to fail closed.
+    #[error("failed to spawn plugin subprocess")]
+    PluginSpawnFailed,
+
     #[error("npm install failed: {0}")]
     NpmInstall(String),
 
@@ -119,6 +128,33 @@ impl PluginLoader {
         specs: &[String],
         context: &PluginContext,
     ) -> Result<(), PluginLoaderError> {
+        self.load_all_with_spawn(
+            specs,
+            context,
+            |runtime, host, plugin, ctx, cwd| async move {
+                PluginSubprocess::spawn(runtime, &host, &plugin, ctx, cwd.as_deref()).await
+            },
+        )
+        .await
+    }
+
+    /// [`Self::load_all`] with the subprocess spawner injected.
+    ///
+    /// Keeping the spawn behind a parameter lets the failure path be tested
+    /// without launching a real JS runtime. Production callers always go
+    /// through [`Self::load_all`], which supplies [`PluginSubprocess::spawn`].
+    /// Owned arguments are passed to `spawn` so the returned future never
+    /// borrows from this closure.
+    async fn load_all_with_spawn<F, Fut>(
+        &self,
+        specs: &[String],
+        context: &PluginContext,
+        spawn: F,
+    ) -> Result<(), PluginLoaderError>
+    where
+        F: Fn(JsRuntime, String, String, PluginContext, Option<PathBuf>) -> Fut,
+        Fut: std::future::Future<Output = Result<PluginSubprocess, PluginSubprocessError>>,
+    {
         // Collect npm packages that need installing
         let npm_specs: Vec<&str> = specs
             .iter()
@@ -144,7 +180,8 @@ impl PluginLoader {
             }
         }
 
-        // Spawn each plugin
+        // Spawn each plugin. A single failure aborts the whole load so callers
+        // can fail closed (notably for the built-in auth plugins).
         for spec in specs {
             let plugin_path = self.resolve_plugin(spec)?;
             // For npm packages (non file:// specs), set cwd to the npm dir
@@ -154,12 +191,15 @@ impl PluginLoader {
             } else {
                 None
             };
-            match PluginSubprocess::spawn(
+            match spawn(
                 self.runtime,
-                self.host_script_path.to_str().unwrap_or("plugin-host.ts"),
-                &plugin_path,
+                self.host_script_path
+                    .to_str()
+                    .unwrap_or("plugin-host.ts")
+                    .to_string(),
+                plugin_path,
                 context.clone(),
-                cwd.as_deref(),
+                cwd,
             )
             .await
             {
@@ -191,8 +231,17 @@ impl PluginLoader {
                     let mut clients = self.clients.write().await;
                     clients.push(client);
                 }
-                Err(e) => {
-                    tracing::error!(spec = spec.as_str(), error = %e, "failed to load TS plugin");
+                Err(_) => {
+                    // Fail closed: the spec, the file:// cache path and the raw
+                    // subprocess error are deliberately never logged — any of
+                    // them can embed a credential-bearing location. Emit only
+                    // a fixed event name plus a [REDACTED] placeholder.
+                    tracing::error!(
+                        event = "plugin_subprocess_spawn_failed",
+                        error = "[REDACTED]",
+                        "Failed to spawn plugin subprocess"
+                    );
+                    return Err(PluginLoaderError::PluginSpawnFailed);
                 }
             }
         }
@@ -1414,6 +1463,177 @@ mod tests {
         assert!(
             status.success(),
             "child must exit successfully once both pipes are drained"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R5 regression: fail-closed handling of plugin spawn failures
+    // -----------------------------------------------------------------------
+
+    use std::fmt::Write as _;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// Minimal tracing capture so no `tracing-subscriber` dev-dependency is needed.
+    #[derive(Clone, Default)]
+    struct SpawnLogBuffer(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl SpawnLogBuffer {
+        fn lines(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    struct SpawnCaptureVisitor(String);
+
+    impl Visit for SpawnCaptureVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = writeln!(self.0, "{}={:?}", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let _ = writeln!(self.0, "{}={}", field.name(), value);
+        }
+    }
+
+    struct SpawnCaptureSubscriber(SpawnLogBuffer);
+
+    impl Subscriber for SpawnCaptureSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::ERROR
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = SpawnCaptureVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                 .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// `PluginLoader` directly, without runtime detection or cache writes.
+    fn test_loader() -> PluginLoader {
+        PluginLoader {
+            clients: RwLock::new(Vec::new()),
+            auth_bridges: RwLock::new(HashMap::new()),
+            hook_system: Arc::new(PluginSystem::new()),
+            runtime: JsRuntime::Node,
+            host_script_path: PathBuf::from("/nonexistent/plugin-host.ts"),
+            trusted_scripts: StdRwLock::new(Vec::new()),
+        }
+    }
+
+    fn test_context() -> PluginContext {
+        PluginContext {
+            worktree: "/test/worktree".to_string(),
+            directory: "/test/worktree".to_string(),
+            server_url: "http://127.0.0.1:0".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_all_returns_err_on_first_spawn_failure() {
+        let loader = test_loader();
+        // file:// specs avoid npm install; the injected spawn always fails.
+        let specs: Vec<String> = vec![
+            "file:///secret/token-plugin-one.ts".to_string(),
+            "file:///secret/token-plugin-two.ts".to_string(),
+        ];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_spawn = std::sync::Arc::clone(&calls);
+
+        let err = loader
+            .load_all_with_spawn(&specs, &test_context(), move |_, _, _, _, _| {
+                let calls = std::sync::Arc::clone(&calls_for_spawn);
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<PluginSubprocess, _>(PluginSubprocessError::NotRunning)
+                }
+            })
+            .await
+            .expect_err("spawn 失敗は Err を返すべき");
+
+        assert!(
+            matches!(&err, PluginLoaderError::PluginSpawnFailed),
+            "値を保持しない専用バリアントが返るべき: {err}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "最初の失敗で即 return し、後続の spawn は試みられないべき"
+        );
+    }
+
+    #[test]
+    fn load_all_spawn_failure_log_is_fixed_and_redacted() {
+        let secret_spec = "file:///home/user/.cache/opencode/token-abc123/plugin.ts";
+        let raw_error = "secret-raw-error /home/user/.cache/opencode/auth.json token-abc123";
+        let specs = vec![secret_spec.to_string()];
+        let raw_error_for_spawn = std::sync::Arc::new(raw_error.to_string());
+
+        let logs = SpawnLogBuffer::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime for the regression test");
+        // Install the subscriber around block_on so it is active exactly while
+        // the future is polled (the event is emitted on poll, not on creation).
+        let outcome =
+            tracing::subscriber::with_default(SpawnCaptureSubscriber(logs.clone()), || {
+                runtime.block_on(test_loader().load_all_with_spawn(
+                    &specs,
+                    &test_context(),
+                    |_, _, _, _, _| {
+                        let raw_error = std::sync::Arc::clone(&raw_error_for_spawn);
+                        async move {
+                            Err::<PluginSubprocess, _>(PluginSubprocessError::Protocol(
+                                (*raw_error).clone(),
+                            ))
+                        }
+                    },
+                ))
+            });
+
+        assert!(outcome.is_err(), "spawn 失敗は Err を返すべき");
+        let rendered = logs.lines().join("\n");
+        assert!(
+            rendered.contains("plugin_subprocess_spawn_failed"),
+            "固定の event 名が記録されるべき: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "固定の [REDACTED] が記録されるべき: {rendered}"
+        );
+        assert!(!rendered.contains(secret_spec), "spec が漏れた: {rendered}");
+        assert!(
+            !rendered.contains("token-abc123"),
+            "パス/トークンが漏れた: {rendered}"
+        );
+        assert!(
+            !rendered.contains("secret-raw-error"),
+            "生エラーが漏れた: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/home/user"),
+            "キャッシュパスが漏れた: {rendered}"
         );
     }
 }
