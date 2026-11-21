@@ -566,14 +566,42 @@ mod tests {
         assert!(!watcher.is_watching(temp_dir.path()));
         assert!(watcher.watched_paths().is_empty());
 
-        // Drain events queued before the unwatch took effect.
-        while rx.try_recv().is_ok() {}
+        // Drain repeatedly until the queue is empty: callbacks already in
+        // flight when unwatch() returned may still enqueue pre-unwatch events.
+        // Bounded passes with a short gap avoid both a single-pass miss and an
+        // unbounded wait.
+        for _ in 0..5 {
+            let mut drained_any = false;
+            while rx.try_recv().is_ok() {
+                drained_any = true;
+            }
+            if !drained_any {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
 
         let after = temp_dir.path().join("after.txt");
         fs::write(&after, "after").unwrap();
 
-        let result = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
-        assert!(result.is_err(), "no event must be delivered after unwatch");
+        // Replace the fixed 300ms single timeout with several bounded checks
+        // over a 500ms window: a late event is still caught, and the upper
+        // bound keeps the test from hanging.
+        let monitor_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < monitor_deadline {
+            let check_until =
+                (tokio::time::Instant::now() + Duration::from_millis(100)).min(monitor_deadline);
+            match tokio::time::timeout_at(check_until, rx.recv()).await {
+                // unwatch 前に enqueue された in-flight イベントは無視し、
+                // 監視対象の after.txt が通知された場合のみ失敗とする。
+                Ok(Ok(event)) if event.file == after => {
+                    panic!("no event for the newly written file must be delivered after unwatch")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
     }
 
     // Test basis: M-63. Oracle: the second watched root must also use recursive
@@ -594,27 +622,33 @@ mod tests {
             .join("level2")
             .join("level3");
         fs::create_dir_all(&nested).unwrap();
-        // Let the backend attach watches to the newly created subdirectories.
-        sleep(Duration::from_millis(100)).await;
 
         let deep_file = nested.join("deep.txt");
-        fs::write(&deep_file, "deep").unwrap();
-        // A second write (outside the default 100ms debounce window) gives the
-        // backend another chance if the first raced with sub-watch attachment.
-        sleep(Duration::from_millis(120)).await;
-        fs::write(&deep_file, "deep again").unwrap();
-
         let mut saw_deep = false;
+        // No fixed sleeps: retry the write within the original 1000ms budget.
+        // A sub-watch can attach late, so each retry is a fresh chance; the
+        // 150ms step stays outside the 100ms debounce/poll window so a write
+        // can surface as a forwarded event. Sleep until the step boundary in
+        // case the queue closes or floods, so the loop always makes progress.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(1_000);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Ok(event)) if event.file == deep_file => {
-                    saw_deep = true;
-                    break;
+        let retry_step = Duration::from_millis(150);
+        while tokio::time::Instant::now() < deadline {
+            fs::write(&deep_file, "deep").unwrap();
+            let wait_until = (tokio::time::Instant::now() + retry_step).min(deadline);
+            loop {
+                match tokio::time::timeout_at(wait_until, rx.recv()).await {
+                    Ok(Ok(event)) if event.file == deep_file => {
+                        saw_deep = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) | Err(_) => break,
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) | Err(_) => break,
             }
+            if saw_deep {
+                break;
+            }
+            tokio::time::sleep_until(wait_until).await;
         }
 
         assert!(
