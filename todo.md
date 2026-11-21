@@ -164,10 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **LSP diagnostics/file_versions が close 後に残存**
-  — `lsp/lib.rs:320-323` / RES-06 / 低
-- [ ] **macOS クリップボード画像の一時ファイルが失敗経路で残存**
-  — `tui/clipboard.rs:214-245` / RES-08 / 低
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -279,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[LSP/一時ファイル 2 件]** close_document と RAII ガード
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[PTY セッション回収 1 件]** reaped フラグと async 側 prune
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース累積 2 件]** writer_lock 回収と plugin レジストリ排水
@@ -662,6 +660,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（LSP/一時ファイルの修正時、記録のみ）: reader の
+  publishDiagnostics が close 後に diagnostics を復活し得る点、unregister
+  テストが 1 クライアントのみの点は未対応。親が O_EXCL 予約・AppleScript
+  エスケープ・通知成功后のマップ削除を直接修正。
 - 2026-11-21 R4 残存（PTY 回収の修正時、記録のみ）: prune 回帰テストは
   resources: None の合成エントリのみで、実 JoinHandle/Sender/writer の強参照
   解放を直接検証していない（検証ギャップ）。親が child mutex poison 時に

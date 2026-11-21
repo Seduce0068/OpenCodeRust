@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T23:17:02+09:00"
+  at: "2026-11-21T23:37:21+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2959 件（all-features は 2958 件）
+  テスト総数 594 → 2964 件（all-features は 2963 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `lsp` / `tui`: close_document と一時ファイル RAII の追加（リソース回収）
+  （swarm-coding R1-R6）
 - `server`: 終端 PTY セッションの回収（zombie 化・リソース残存を防止）
   （swarm-coding R1-R6）
 - `session` / `plugin`: リソース累積の解消（writer_lock / clients / trusted_scripts）
