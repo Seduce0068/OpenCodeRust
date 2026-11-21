@@ -36,11 +36,32 @@ impl Default for McpOAuthConfig {
     }
 }
 
+/// Maximum lifetime of an in-flight authorization flow.
+///
+/// Flows abandoned by a client (or left behind by a restart) must not keep
+/// their PKCE verifier / CSRF state resident in memory and on disk forever.
+const FLOW_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// OAuth フローの有効期限。環境変数 `OPENCODE_MCP_OAUTH_FLOW_TTL_SECS` に
+/// 正の整数を設定した場合のみ上書きし、不正値・0 は既定値へフォールバックする
+/// （AGENTS.md §4 の設定外部化方針）。
+fn flow_ttl() -> std::time::Duration {
+    std::env::var("OPENCODE_MCP_OAUTH_FLOW_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(FLOW_TTL)
+}
+
 /// Transient state kept during an in-progress authorization flow.
 #[derive(Debug)]
 struct PendingAuth {
     pkce_verifier: String,
     csrf_state: String,
+    /// When the flow was issued. Used by [`McpOAuthManager::reclaim_expired_pending`]
+    /// to bound how long a stale flow may occupy memory and disk.
+    created_at: std::time::Instant,
 }
 
 /// Outcome of discovery plus dynamic client registration for one server.
@@ -121,6 +142,10 @@ pub enum OAuthError {
     TokenRefresh(String),
     #[error("No pending auth flow")]
     NoPendingAuth,
+    /// An expired flow was addressed by `finish_auth`. The message is fixed:
+    /// it never carries the state, token, URL or storage path.
+    #[error("OAuth authorization flow has expired")]
+    FlowExpired,
     #[error("CSRF state mismatch")]
     StateMismatch,
     #[error("No refresh token available")]
@@ -172,6 +197,47 @@ impl McpOAuthManager {
     /// storage key — it is never logged or included in an error message.
     fn flow_disk_key(&self, state: &str) -> String {
         format!("{}-oauth-flow-{}", self.mcp_name, state)
+    }
+
+    /// Reclaim in-memory flows older than [`flow_ttl`], together with their
+    /// disk records.
+    ///
+    /// Called at the flow entry points so a client that abandons the flow (or a
+    /// process that is later restarted while a flow is still fresh in memory)
+    /// cannot accumulate stale state. Only entries carrying an in-memory
+    /// `created_at` can be aged out; a restart clears that memory, so records
+    /// whose flow was already abandoned before the restart remain on disk until
+    /// `remove_auth` is called.
+    ///
+    /// Returns the states that were reclaimed so `finish_auth` can distinguish
+    /// an expired flow from one that never existed. The returned values are
+    /// internal only — they are never logged or embedded in an error message.
+    async fn reclaim_expired_pending(&self) -> Result<Vec<String>, OAuthError> {
+        let expired: Vec<String> = {
+            let pending = self.pending.read().await;
+            pending
+                .iter()
+                .filter(|(_, auth)| auth.created_at.elapsed() >= flow_ttl())
+                .map(|(state, _)| state.clone())
+                .collect()
+        };
+        if expired.is_empty() {
+            return Ok(expired);
+        }
+
+        // Remove the disk record first: if persistence fails we keep the
+        // in-memory entry (still marked expired) and surface the error, so a
+        // later call retries instead of silently accepting a stale flow.
+        for state in &expired {
+            auth::try_remove(&self.flow_disk_key(state)).await?;
+        }
+        {
+            let mut pending = self.pending.write().await;
+            for state in &expired {
+                pending.remove(state);
+            }
+        }
+        Ok(expired)
     }
 
     /// Records the RFC 8707 resource indicator from discovered endpoints.
@@ -439,6 +505,10 @@ impl McpOAuthManager {
     /// and CSRF state are persisted both in-memory and on disk so that
     /// `finish_auth` can complete the exchange even after a process restart.
     pub async fn start_auth(&self) -> Result<String, OAuthError> {
+        // Age out abandoned flows before issuing a new state. Called before
+        // taking the write lock below, so it cannot deadlock on `pending`.
+        self.reclaim_expired_pending().await?;
+
         // One write lock spans state issuance, disk persistence and the in-memory
         // update. Concurrent calls can no longer interleave their PKCE/CSRF
         // values or overwrite each other's pending flow.
@@ -489,6 +559,7 @@ impl McpOAuthManager {
             PendingAuth {
                 pkce_verifier: pkce_verifier.secret().clone(),
                 csrf_state: csrf_state.secret().clone(),
+                created_at: std::time::Instant::now(),
             },
         );
         drop(pending);
@@ -498,6 +569,14 @@ impl McpOAuthManager {
     /// Complete the authorization flow by exchanging the authorization code
     /// for tokens.
     pub async fn finish_auth(&self, code: &str, state: &str) -> Result<(), OAuthError> {
+        // Age out stale flows first. If the requested `state` was among them,
+        // reject it with a fixed error before any token exchange; the state
+        // value itself is never echoed back.
+        let reclaimed = self.reclaim_expired_pending().await?;
+        if reclaimed.iter().any(|expired| expired == state) {
+            return Err(OAuthError::FlowExpired);
+        }
+
         // Recover verifier + expected state.
         let (verifier_secret, expected_state) = {
             let pending = self.pending.read().await;
@@ -1225,6 +1304,103 @@ mod tests {
         assert!(!state.is_empty());
         assert_eq!(stored_state.as_deref(), Some(state.as_str()));
         assert_eq!(stored_verifier.as_deref(), Some(verifier.as_str()));
+    }
+
+    /// RES-04 regression: a flow older than `FLOW_TTL` is reclaimed from both
+    /// memory and disk, and `finish_auth` rejects it with a fixed error that
+    /// carries no state, token, URL or storage path.
+    #[tokio::test]
+    async fn expired_pending_is_reclaimed_and_rejected() {
+        let store = TestAuthFile::new("ttl-expired", false);
+        let manager = manager_with(dummy_config());
+
+        with_isolated_store(&store, || {
+            let manager = &manager;
+            async move {
+                let url = manager.start_auth().await?;
+                let parsed = url::Url::parse(&url).expect("authorization URL must parse");
+                let state = parsed
+                    .query_pairs()
+                    .find(|(key, _)| key.as_ref() == "state")
+                    .map(|(_, value)| value.into_owned())
+                    .expect("authorization URL must carry a state");
+                let flow_key = manager.flow_disk_key(&state);
+
+                // Fresh flow: present in memory and persisted on disk.
+                assert!(manager.pending.read().await.contains_key(&state));
+                assert!(auth::try_get(&flow_key).await?.is_some());
+
+                // Age the entry past the TTL.
+                {
+                    let mut pending = manager.pending.write().await;
+                    pending.get_mut(&state).expect("pending flow").created_at =
+                        std::time::Instant::now() - FLOW_TTL - std::time::Duration::from_secs(1);
+                }
+
+                let err = manager
+                    .finish_auth("dummy-code", &state)
+                    .await
+                    .expect_err("an expired state must never reach token exchange");
+                assert!(matches!(err, OAuthError::FlowExpired));
+                // Fixed wording: no state value, URL or path is disclosed.
+                assert_eq!(err.to_string(), "OAuth authorization flow has expired");
+                assert!(!err.to_string().contains(state.as_str()));
+                assert!(!err.to_string().contains(DUMMY_AUTH_URL));
+
+                assert!(manager.pending.read().await.get(&state).is_none());
+                assert!(auth::try_get(&flow_key).await?.is_none());
+                Ok::<_, OAuthError>(())
+            }
+        })
+        .await
+        .expect("expired-flow scenario must run");
+    }
+
+    /// RES-04 regression: reclamation ages out only expired flows. A fresh
+    /// flow keeps both its in-memory entry and its state-keyed disk record.
+    #[tokio::test]
+    async fn reclaim_only_removes_expired_entries() {
+        let store = TestAuthFile::new("ttl-mixed", false);
+        let manager = manager_with(dummy_config());
+
+        with_isolated_store(&store, || {
+            let manager = &manager;
+            async move {
+                // Two concurrent flows, each with its own in-memory entry and
+                // state-keyed disk record.
+                let (first, second) = tokio::join!(manager.start_auth(), manager.start_auth());
+                let _ = (first?, second?);
+
+                let mut states: Vec<String> =
+                    manager.pending.read().await.keys().cloned().collect();
+                states.sort();
+                assert_eq!(states.len(), 2, "both flows must be pending");
+                let expired_state = states[0].clone();
+                let fresh_state = states[1].clone();
+                let expired_key = manager.flow_disk_key(&expired_state);
+                let fresh_key = manager.flow_disk_key(&fresh_state);
+
+                {
+                    let mut pending = manager.pending.write().await;
+                    pending
+                        .get_mut(&expired_state)
+                        .expect("first pending flow")
+                        .created_at =
+                        std::time::Instant::now() - FLOW_TTL - std::time::Duration::from_secs(1);
+                }
+
+                let reclaimed = manager.reclaim_expired_pending().await?;
+                assert_eq!(reclaimed, vec![expired_state.clone()]);
+
+                assert!(manager.pending.read().await.get(&expired_state).is_none());
+                assert!(manager.pending.read().await.get(&fresh_state).is_some());
+                assert!(auth::try_get(&expired_key).await?.is_none());
+                assert!(auth::try_get(&fresh_key).await?.is_some());
+                Ok::<_, OAuthError>(())
+            }
+        })
+        .await
+        .expect("mixed reclaim scenario must run");
     }
 
     #[test]
