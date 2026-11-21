@@ -2057,15 +2057,82 @@ impl<B> OnResponse<B> for RequestCompletionLog {
     }
 }
 
-/// `into_make_service_with_connect_info` が挿入したピアアドレスから IP だけを取り出す。
+/// `OPENCODE_TRUSTED_PROXIES` の値をパースし、信頼するプロキシの IP リストを返す純粋関数。
+///
+/// カンマ区切りの各トークンを trim して `IpAddr` としてパースする。
+/// 未設定・空文字・1 つでも不正なトークンがある場合は空リストを返す
+/// （fail-closed: XFF を一切信頼せずピア IP を使う）。
+/// 環境変数を直接読まないため、単体テストから値を渡して検証できる。
+fn parse_trusted_proxies(value: Option<&str>) -> Vec<IpAddr> {
+    let Some(raw) = value else {
+        return Vec::new();
+    };
+    let mut proxies = Vec::new();
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        match trimmed.parse::<IpAddr>() {
+            Ok(ip) => proxies.push(ip),
+            Err(_) => return Vec::new(),
+        }
+    }
+    proxies
+}
+
+/// 起動時に `OPENCODE_TRUSTED_PROXIES` を一度だけパースして保持する。
+/// リクエスト処理中は環境変数を再読しない（起動後の変更で信頼判定が変わらないようにする）。
+static TRUSTED_PROXIES: LazyLock<Vec<IpAddr>> = LazyLock::new(|| {
+    parse_trusted_proxies(std::env::var("OPENCODE_TRUSTED_PROXIES").ok().as_deref())
+});
+
+/// ピア IP と `X-Forwarded-For` から最終的なクライアント IP を決定する純粋関数。
+///
+/// - 信頼リストが空、またはピアが信頼リストに無い場合はピア IP を返す
+///   （既定では XFF を信頼しないためスプーフィングを許さない）。
+/// - 信頼できるピアの場合は XFF の最右（最後の hop）だけを trim して `IpAddr`
+///   としてパースし、成功ならその IP、失敗ならピア IP を返す（fail-closed）。
+///
+/// ヘッダ値・IP 値・パスをログやエラーに出力しない。
+fn resolve_client_ip(
+    peer: Option<IpAddr>,
+    forwarded_for: Option<&str>,
+    trusted_proxies: &[IpAddr],
+) -> Option<IpAddr> {
+    let peer_ip = peer?;
+    if trusted_proxies.is_empty() || !trusted_proxies.contains(&peer_ip) {
+        return Some(peer_ip);
+    }
+    forwarded_for
+        .and_then(|value| value.rsplit(',').next())
+        .map(str::trim)
+        .and_then(|hop| hop.parse::<IpAddr>().ok())
+        .or(Some(peer_ip))
+}
+
+/// `into_make_service_with_connect_info` が挿入したピアアドレスから IP を取り出し、
+/// 信頼できるプロキシ経由の場合のみ `X-Forwarded-For` の最右 IP を採用する。
 ///
 /// ConnectInfo が無い経路（例: 直接 Router を呼ぶテスト）でも panic せず `None` を返す。
 /// 実装差を吸収するため `ConnectInfo<SocketAddr>` と `SocketAddr` の両方を確認する。
 fn client_ip_from_request(request: &Request<axum::body::Body>) -> Option<IpAddr> {
-    if let Some(info) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return Some(info.0.ip());
-    }
-    request.extensions().get::<SocketAddr>().map(SocketAddr::ip)
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip())
+        .or_else(|| request.extensions().get::<SocketAddr>().map(SocketAddr::ip));
+
+    // 複数ヘッダ行がある場合は最後の行（最も信頼できるプロキシが追加した
+    // 行）の最右 hop を使う。get() だと最初の行（攻撃者送信分）を拾う（R4）。
+    let forwarded_for = request
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .next_back();
+
+    resolve_client_ip(peer, forwarded_for, &TRUSTED_PROXIES)
 }
 
 /// サニタイズ済み request id をレスポンスヘッダへ安全に変換する。
@@ -4143,6 +4210,101 @@ mod tests {
 
         request.extensions_mut().insert(ConnectInfo(addr));
         assert_eq!(client_ip_from_request(&request), Some(addr.ip()));
+    }
+
+    // ---- OBS-10: X-Forwarded-For を信頼プロキシ経由でのみ尊重する回帰テスト ----
+
+    #[test]
+    fn trusted_proxy_xff_uses_rightmost_hop() {
+        let trusted: Vec<IpAddr> = vec!["127.0.0.1".parse().expect("valid ip")];
+        let peer = Some("127.0.0.1".parse::<IpAddr>().expect("valid ip"));
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.1, 198.51.100.7"), &trusted),
+            Some("198.51.100.7".parse::<IpAddr>().expect("valid ip")),
+            "rightmost XFF hop must win for a trusted peer"
+        );
+        // 単一 hop と前後の空白も trim されて解決されること。
+        assert_eq!(
+            resolve_client_ip(peer, Some("  203.0.113.9  "), &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().expect("valid ip"))
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_xff_is_ignored() {
+        let trusted: Vec<IpAddr> = vec!["127.0.0.1".parse().expect("valid ip")];
+        let peer = Some("10.0.0.9".parse::<IpAddr>().expect("valid ip"));
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.1"), &trusted),
+            peer,
+            "XFF from an untrusted peer must never override the peer IP"
+        );
+    }
+
+    #[test]
+    fn invalid_or_missing_xff_falls_back_to_peer() {
+        let peer_ip: IpAddr = "127.0.0.1".parse().expect("valid ip");
+        let peer = Some(peer_ip);
+        let trusted: Vec<IpAddr> = vec![peer_ip];
+        assert_eq!(resolve_client_ip(peer, Some("not-an-ip"), &trusted), peer);
+        assert_eq!(resolve_client_ip(peer, Some(""), &trusted), peer);
+        assert_eq!(resolve_client_ip(peer, None, &trusted), peer);
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.1, garbage"), &trusted),
+            peer,
+            "a malformed rightmost hop must fall back to the peer"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_config_is_fail_closed_when_unset_or_invalid() {
+        assert!(
+            parse_trusted_proxies(None).is_empty(),
+            "unset config must keep the empty (peer-only) behavior"
+        );
+        assert!(parse_trusted_proxies(Some("")).is_empty());
+        assert!(
+            parse_trusted_proxies(Some("127.0.0.1,not-an-ip")).is_empty(),
+            "any invalid token invalidates the whole config (fail-closed)"
+        );
+        // 未設定（空の信頼リスト）では XFF の有無にかかわらずピア IP のまま。
+        let peer = Some("10.0.0.9".parse::<IpAddr>().expect("valid ip"));
+        assert_eq!(
+            resolve_client_ip(peer, Some("203.0.113.1"), &[]),
+            peer,
+            "unset config must preserve existing behavior"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_config_parses_comma_separated_ips() {
+        let parsed = parse_trusted_proxies(Some(" 127.0.0.1 , 10.0.0.1 , ::1 "));
+        assert_eq!(
+            parsed,
+            vec![
+                "127.0.0.1".parse::<IpAddr>().expect("valid ip"),
+                "10.0.0.1".parse::<IpAddr>().expect("valid ip"),
+                "::1".parse::<IpAddr>().expect("valid ip"),
+            ]
+        );
+    }
+
+    #[test]
+    fn client_ip_resolution_never_logs_header_values_or_ips() {
+        let source = include_str!("server.rs");
+        for marker in [
+            "fn parse_trusted_proxies(",
+            "fn resolve_client_ip(",
+            "fn client_ip_from_request(",
+        ] {
+            let body = source_fn_body(source, marker);
+            assert!(
+                !body.contains("tracing::")
+                    && !body.contains("println!")
+                    && !body.contains("eprintln!"),
+                "{marker} must not emit logs containing header values or IPs"
+            );
+        }
     }
 
     #[test]
