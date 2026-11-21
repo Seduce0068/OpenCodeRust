@@ -3298,19 +3298,23 @@ fn provider_routes() -> Router<Arc<ServerState>> {
 #[derive(Debug, Serialize)]
 pub struct ProviderListResponse {
     pub all: Vec<ProviderInfo>,
+    /// `/config/providers` と同じトップレベルキー。`all` のエイリアス。
+    /// 既存クライアント互換のため `all` は維持したまま、新規クライアントは
+    /// この `providers` キーを統一的に利用できる。
+    pub providers: Vec<ProviderInfo>,
     #[serde(rename = "default")]
     pub default_model: HashMap<String, String>,
     pub connected: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderInfo {
     pub id: String,
     pub name: String,
     pub models: Vec<ModelInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -3479,11 +3483,24 @@ async fn list_providers(State(state): State<Arc<ServerState>>) -> Json<ProviderL
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .list_models();
+    Json(build_provider_list_response(models, &variant_lookup))
+}
+
+/// `/provider` レスポンスを組み立てる純粋関数。
+///
+/// `all` は不変のまま維持し、`providers` には同一の `Vec<ProviderInfo>` を
+/// クローンして設定する（後方互換のため `all` キーは削除しない）。
+/// 入力は provider ID / model ID / variant 名のみで、トークン値やパスは
+/// 含めないため、ログやエラーへ流出することはない。
+fn build_provider_list_response(
+    models: Vec<opencode_provider::ModelInfo>,
+    variant_lookup: &ModelVariantLookup,
+) -> ProviderListResponse {
     let mut provider_map: HashMap<String, Vec<ModelInfo>> = HashMap::new();
     for m in models {
         let provider_id = m.provider.clone();
         let model_id = m.id.clone();
-        let variants = variants_for_model(&variant_lookup, &provider_id, &model_id);
+        let variants = variants_for_model(variant_lookup, &provider_id, &model_id);
         provider_map
             .entry(provider_id.clone())
             .or_default()
@@ -3502,16 +3519,87 @@ async fn list_providers(State(state): State<Arc<ServerState>>) -> Json<ProviderL
             models,
         })
         .collect();
+    let providers = all.clone();
     let connected: Vec<String> = all.iter().map(|p| p.id.clone()).collect();
     let default_model: HashMap<String, String> = all
         .iter()
         .filter_map(|p| p.models.first().map(|m| (p.id.clone(), m.id.clone())))
         .collect();
-    Json(ProviderListResponse {
+    ProviderListResponse {
         all,
+        providers,
         default_model,
         connected,
-    })
+    }
+}
+
+#[cfg(test)]
+mod provider_list_response_tests {
+    use super::*;
+
+    /// テスト専用のモデル情報。トークン値やパスは含めず、ログ・エラーへも出さない。
+    fn sample_model(id: &str, provider: &str) -> opencode_provider::ModelInfo {
+        opencode_provider::ModelInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: provider.to_string(),
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            supports_vision: false,
+            supports_tools: true,
+            cost_per_million_input: 0.0,
+            cost_per_million_output: 0.0,
+        }
+    }
+
+    /// API-07 回帰ガード: `/provider` レスポンスには `all` と同一内容の
+    /// `providers` キーが存在し、既存の `default` / `connected` の形状が
+    /// 不変であること。
+    #[test]
+    fn provider_list_response_has_providers_alias_equal_to_all() {
+        let lookup = ModelVariantLookup::new();
+        let models = vec![
+            sample_model("model-a", "alpha"),
+            sample_model("model-b", "alpha"),
+            sample_model("model-c", "beta"),
+        ];
+
+        let response = build_provider_list_response(models, &lookup);
+        let value = serde_json::to_value(&response).expect("response must serialize");
+
+        let all = value.get("all").expect("`all` key must exist");
+        let providers = value
+            .get("providers")
+            .expect("`providers` alias key must exist");
+        assert_eq!(all, providers, "`providers` must mirror `all` exactly");
+
+        let default = value
+            .get("default")
+            .and_then(|entry| entry.as_object())
+            .expect("`default` must remain an object");
+        assert_eq!(
+            default.get("alpha").and_then(|entry| entry.as_str()),
+            Some("model-a")
+        );
+        assert_eq!(
+            default.get("beta").and_then(|entry| entry.as_str()),
+            Some("model-c")
+        );
+
+        let connected = value
+            .get("connected")
+            .and_then(|entry| entry.as_array())
+            .expect("`connected` must remain an array");
+        assert_eq!(connected.len(), 2);
+        for provider_id in ["alpha", "beta"] {
+            assert!(
+                connected
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(provider_id)),
+                "`connected` must still list provider ids: {provider_id}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
