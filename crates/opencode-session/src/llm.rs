@@ -16,7 +16,14 @@ use crate::retry::{self, ApiErrorInfo};
 use crate::snapshot::{Snapshot, SnapshotPatch};
 use crate::{MessageError, MessageInfo, MessageUsage, MessageWithParts, Part};
 
-pub const OUTPUT_TOKEN_MAX: u64 = 8192;
+/// Default upper bound for generated output tokens.
+///
+/// This is an alias of `opencode_provider::OUTPUT_TOKEN_MAX` so the session and
+/// provider crates share a single source of truth. The upstream TypeScript
+/// default is `Flag.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32_000`; keeping
+/// one constant prevents the two layers from silently diverging (the previous
+/// session-local value of 8192 had no documented rationale).
+pub const OUTPUT_TOKEN_MAX: u64 = opencode_provider::OUTPUT_TOKEN_MAX;
 
 /// Doom loop detection threshold: if the last N tool calls are identical,
 /// trigger a permission ask.
@@ -2070,6 +2077,29 @@ fn part_to_content_part(part: &Part) -> Option<opencode_provider::ContentPart> {
 mod tests {
     use super::*;
     use opencode_provider::ToolDefinition;
+
+    // -----------------------------------------------------------------------
+    // R2: OUTPUT_TOKEN_MAX の単一情報源化（session == provider）回帰テスト
+    // -----------------------------------------------------------------------
+
+    /// session 側の既定値が provider 側の定数へ別名化されており、
+    /// 両クレートの既定値が将来も食い違わないことを固定する。
+    #[test]
+    fn test_output_token_max_matches_provider_constant() {
+        assert_eq!(OUTPUT_TOKEN_MAX, opencode_provider::OUTPUT_TOKEN_MAX);
+    }
+
+    /// `resolve_model_limits` の output フォールバックが共有定数を参照すること。
+    /// モデル情報も agent 上限も無い場合に実際の既定値を検証する。
+    #[test]
+    fn test_resolve_model_limits_default_output_uses_shared_constant() {
+        let input = make_stream_input();
+        let provider = RateLimitProvider {
+            error: std::sync::Mutex::new(None),
+        };
+        let limits = resolve_model_limits(&input, &provider);
+        assert_eq!(limits.max_output, opencode_provider::OUTPUT_TOKEN_MAX);
+    }
 
     fn make_tool(name: &str) -> ToolDefinition {
         ToolDefinition {

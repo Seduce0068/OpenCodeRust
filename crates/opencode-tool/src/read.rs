@@ -4,11 +4,11 @@ use tokio::fs;
 use walkdir::WalkDir;
 
 use crate::tool::parse_usize_arg;
+use crate::truncation::MAX_BYTES;
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
-const MAX_BYTES: usize = 50 * 1024;
 
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",
@@ -870,5 +870,12 @@ mod tests {
             matches!(&mapped, ToolError::FileNotFound(_)),
             "NotFound は従来どおり FileNotFound であること: {mapped}"
         );
+    }
+
+    /// 読み取り上限は `truncation::MAX_BYTES` を import して使うため
+    /// 単一情報源であり、その値が従来どおり 50 KiB であることを固定する。
+    #[test]
+    fn read_byte_limit_uses_shared_default() {
+        assert_eq!(MAX_BYTES, 50 * 1024);
     }
 }

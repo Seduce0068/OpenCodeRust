@@ -2597,7 +2597,16 @@ async fn select_model(
     Ok(())
 }
 
-const DEFAULT_PLUGIN_SERVER_URL: &str = "http://127.0.0.1:4096";
+/// プラグイン認証ブリッジが使うサーバ URL。
+///
+/// `OPENCODE_SERVER_URL` 未設定時は server クレートの共有デフォルトへ
+/// フォールバックする（URL リテラルの重複を避けるための単一経路）。
+fn plugin_server_url(configured: Option<&str>) -> String {
+    configured.map_or_else(
+        || opencode_server::DEFAULT_SERVER_URL.to_owned(),
+        str::to_owned,
+    )
+}
 
 async fn setup_providers(config: &opencode_config::Config) -> anyhow::Result<ProviderRegistry> {
     let auth_store = load_plugin_auth_store(config).await;
@@ -2746,8 +2755,8 @@ async fn load_plugin_auth_store(config: &opencode_config::Config) -> HashMap<Str
         }
     };
     let directory = cwd.to_string_lossy().to_string();
-    let server_url =
-        std::env::var("OPENCODE_SERVER_URL").unwrap_or_else(|_| DEFAULT_PLUGIN_SERVER_URL.into());
+    let configured_server_url = std::env::var("OPENCODE_SERVER_URL").ok();
+    let server_url = plugin_server_url(configured_server_url.as_deref());
     let context = PluginContext {
         worktree: directory.clone(),
         directory,
@@ -6655,6 +6664,15 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn plugin_server_url_uses_shared_default_and_honors_override() {
+        assert_eq!(plugin_server_url(None), opencode_server::DEFAULT_SERVER_URL);
+        assert_eq!(
+            plugin_server_url(Some("http://example.test:1234")),
+            "http://example.test:1234"
+        );
     }
 
     #[test]

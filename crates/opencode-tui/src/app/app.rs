@@ -4150,7 +4150,8 @@ fn resync_todos_from_server(context: &Arc<AppContext>) {
 const SSE_INITIAL_RETRY_MS: u64 = 400;
 /// 指数バックオフの上限。
 const SSE_MAX_RETRY_MS: u64 = 30_000;
-/// 上限までのシフト数（400ms * 2^7 = 51.2s で 30s へ丸められる）。
+/// 上限までのシフト数（400ms * 2^8 = 102.4s、30s 上限へ丸められる）。
+/// シフト 7（51.2s）の時点で既に上限を超えるため、実効待機は 7 以降すべて 30s。
 const SSE_MAX_BACKOFF_SHIFT: u32 = 8;
 /// 同時再接続を分散するためのジッタ上限。
 const SSE_JITTER_MAX_MS: u64 = 250;
@@ -5013,6 +5014,19 @@ mod tests {
         assert_eq!(sse_backoff_base_ms(1), SSE_INITIAL_RETRY_MS * 2);
         assert_eq!(sse_backoff_base_ms(2), SSE_INITIAL_RETRY_MS * 4);
         assert!(sse_backoff_base_ms(3) > sse_backoff_base_ms(2));
+        assert_eq!(sse_backoff_base_ms(u32::MAX), SSE_MAX_RETRY_MS);
+    }
+
+    #[test]
+    fn sse_backoff_is_capped_at_thirty_seconds() {
+        // 実装の上限シフトは 2^8（=102.4s）。コメントと定数の不一致を固定する。
+        assert_eq!(SSE_MAX_BACKOFF_SHIFT, 8);
+        assert_eq!(SSE_MAX_RETRY_MS, 30_000);
+        // シフト 6（25.6s）は未達、シフト 7（51.2s→30s 丸め）以降は頭打ち。
+        assert!(sse_backoff_base_ms(SSE_MAX_BACKOFF_SHIFT - 2) < SSE_MAX_RETRY_MS);
+        for attempt in (SSE_MAX_BACKOFF_SHIFT - 1)..=SSE_MAX_BACKOFF_SHIFT + 2 {
+            assert_eq!(sse_backoff_base_ms(attempt), SSE_MAX_RETRY_MS);
+        }
         assert_eq!(sse_backoff_base_ms(u32::MAX), SSE_MAX_RETRY_MS);
     }
 

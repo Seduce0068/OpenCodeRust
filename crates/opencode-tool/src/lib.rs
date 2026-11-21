@@ -64,6 +64,12 @@ pub mod websearch;
 /// ファイルへ書き込む `write` ツール。
 pub mod write;
 
+/// ファイルごとに表示する LSP 診断の上限。
+/// `write` / `apply_patch` / `edit` が共有する単一情報源。
+/// `lsp` 無効時は利用箇所がないため `dead_code` のみ抑制し、定義は常に残す。
+#[cfg_attr(not(feature = "lsp"), allow(dead_code))]
+pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
+
 /// 外部ディレクトリ判定のオプションと種別。
 pub use external_directory::{
     assert_external_directory, ExternalDirectoryKind, ExternalDirectoryOptions,
@@ -72,3 +78,19 @@ pub use external_directory::{
 pub use registry::*;
 /// `Tool` トレイトと実行コンテキストを再エクスポート。
 pub use tool::*;
+
+#[cfg(test)]
+mod constants_tests {
+    /// 50 KiB の共通既定は `truncation::MAX_BYTES` に集約され、
+    /// `read` と `bash` はそこを参照する。値が変わらないことを固定する。
+    #[test]
+    fn shared_output_byte_limit_is_pinned() {
+        assert_eq!(crate::truncation::MAX_BYTES, 50 * 1024);
+    }
+
+    /// LSP 診断上限の単一情報源が 20 であることを固定する。
+    #[test]
+    fn max_diagnostics_per_file_is_pinned() {
+        assert_eq!(crate::MAX_DIAGNOSTICS_PER_FILE, 20);
+    }
+}

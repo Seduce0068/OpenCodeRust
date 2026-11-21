@@ -67,6 +67,10 @@ pub struct ReasoningContent {
 
 /// The TS source uses `Flag.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32_000`.
 /// We default to 32_000 to match the TS constant.
+///
+/// This is the single source of truth for the output-token cap: the session
+/// crate's `OUTPUT_TOKEN_MAX` is an alias of this constant, so changing this
+/// value also updates the session request default and compaction fallback.
 pub const OUTPUT_TOKEN_MAX: u64 = 32_000;
 
 const WIDELY_SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
