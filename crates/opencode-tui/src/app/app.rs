@@ -2741,7 +2741,7 @@ impl App {
         match self.context.current_route() {
             Route::Home => {
                 let optimistic_session_id = self.create_optimistic_session();
-                let _opt_id = self.append_optimistic_user_message(
+                let opt_id = self.append_optimistic_user_message(
                     &optimistic_session_id,
                     &user_line,
                     agent.clone(),
@@ -2774,6 +2774,7 @@ impl App {
                 self.ensure_session_view(&session.id);
 
                 if let Err(err) = client.execute_shell(&session.id, command.clone(), None) {
+                    self.remove_optimistic_message(&session.id, &opt_id);
                     self.alert_dialog
                         .set_message(&format!("Failed to execute shell command:\n{}", err));
                     self.alert_dialog.open();
@@ -4674,6 +4675,8 @@ fn default_export_filename(title: &str, session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
 
     #[test]
     fn modal_single_char_shortcuts_ignore_ctrl_and_alt() {
@@ -5160,5 +5163,159 @@ mod tests {
         ));
         assert_eq!(screen_lines, captured);
         assert!(selection.is_active());
+    }
+
+    /// TTY を必要としない `App` を組み立てる（テスト専用）。
+    ///
+    /// 固定ビューポートの `Terminal` を使うため raw mode / alternate screen へ
+    /// 入らず、`submit_shell_command` の実コードをそのまま呼び出せる。
+    fn headless_app(context: Arc<AppContext>) -> App {
+        let prompt = Prompt::new(context.clone());
+        let (_event_tx, event_rx) = mpsc::channel();
+        let terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 8, 8)),
+            },
+        )
+        .expect("fixed-viewport headless terminal");
+        App {
+            context,
+            state: AppState::default(),
+            terminal,
+            event_rx,
+            sse_shutdown: Arc::new(AtomicBool::new(false)),
+            sse_listener: None,
+            input_shutdown: Arc::new(AtomicBool::new(false)),
+            input_listener: None,
+            prompt,
+            selection: Selection::new(),
+            session_view: None,
+            active_session_id: None,
+            command_palette: CommandPalette::new(),
+            slash_popup: SlashCommandPopup::new(),
+            leader_state: LeaderKeyState::new(),
+            model_select: ModelSelectDialog::new(),
+            agent_select: AgentSelectDialog::new(),
+            alert_dialog: AlertDialog::info(""),
+            help_dialog: HelpDialog::new(),
+            session_list_dialog: SessionListDialog::new(),
+            session_rename_dialog: SessionRenameDialog::new(),
+            session_export_dialog: SessionExportDialog::new(),
+            prompt_stash_dialog: PromptStashDialog::new(),
+            skill_list_dialog: SkillListDialog::new(),
+            theme_list_dialog: ThemeListDialog::new(),
+            status_dialog: StatusDialog::new(),
+            mcp_dialog: McpDialog::new(),
+            timeline_dialog: TimelineDialog::new(),
+            fork_dialog: ForkDialog::new(),
+            provider_dialog: ProviderDialog::new(),
+            subagent_dialog: SubagentDialog::new(),
+            tag_dialog: TagDialog::new(),
+            permission_prompt: PermissionPrompt::new(),
+            question_prompt: QuestionPrompt::new(),
+            pending_question_requests: VecDeque::new(),
+            active_question_request: None,
+            toast: Toast::new(),
+            screen_lines: Vec::new(),
+            available_models: HashSet::new(),
+            model_variants: HashMap::new(),
+            model_variant_selection: HashMap::new(),
+            pending_initial_submit: false,
+            pending_session_sync: None,
+            last_session_sync: Instant::now(),
+            last_aux_sync: Instant::now(),
+            event_caused_change: true,
+        }
+    }
+
+    /// `create_session` は成功させ、`/shell` は失敗させるローカル HTTP スタブ。
+    ///
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_create_ok_shell_fail_api() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        let shell_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub_hits = Arc::clone(&shell_hits);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let (status, body) = if first_line.contains("/shell") {
+                    stub_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        "500 Internal Server Error",
+                        r#"{"type":"error","message":"shell failed"}"#,
+                    )
+                } else if first_line.contains("/session") {
+                    (
+                        "200 OK",
+                        r#"{"id":"ses_stub_1","slug":"s","project_id":"p","directory":"","parent_id":null,"title":"t","version":"1","time":{"created":0,"updated":0,"compacting":null,"archived":null},"revert":null}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), shell_hits)
+    }
+
+    #[test]
+    fn home_shell_failure_removes_optimistic_message() {
+        let (base_url, shell_hits) = spawn_create_ok_shell_fail_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        context.navigate(Route::Home);
+
+        let mut app = headless_app(context.clone());
+        app.submit_shell_command("echo probe".to_string())
+            .expect("submit_shell_command must not fail hard");
+
+        let session_ctx = context.session.read();
+        let messages = session_ctx
+            .messages
+            .get("ses_stub_1")
+            .expect("promoted session messages");
+        assert!(
+            messages.iter().all(|m| !m.id.starts_with("local_user_")),
+            "optimistic user message must be removed when execute_shell fails"
+        );
+        assert!(
+            messages.iter().all(|m| m.content != "$ echo probe"),
+            "optimistic shell line must not remain after execute_shell failure"
+        );
+        assert!(
+            shell_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the stub /shell endpoint must actually be reached (500 path)"
+        );
     }
 }
