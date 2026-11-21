@@ -243,8 +243,6 @@ status: current
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
   — `openai.rs:1026-1083` / ERR2-07 / 中（speculation）
-- [ ] **OAuth 放置フローの一時状態に TTL/回収が無い**
-  — `mcp/oauth.rs:441-496` / RES-04 / 中
 - [ ] **POST /prompt に冪等キーが無く再送で二重実行**
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
 - [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[OAuth TTL 1 件]** 放置フローを回収し期限切れを明示エラー化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin loader per-instance 1 件]** process-global を削除し状態を分離
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP OAuth per-instance 1 件]** process-global を削除し状態を分離
@@ -687,6 +687,11 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（OAuth TTL の修正時、記録のみ）: 回収済み state の
+  callback が FlowExpired ではなく NoPendingAuth になる（tombstone が必要）、
+  再起動後にディスクのみ残ったフローには TTL が効かない（AuthEntry 側に
+  発行時刻が必要）、回収失敗で新規 start_auth が全て失敗し得る。親が
+  FLOW_TTL を OPENCODE_MCP_OAUTH_FLOW_TTL_SECS で外部化。
 - 2026-11-22 R4 指摘（part 冪等化の修正時）: 親が重複分岐でも persist を再試行
   し、sanitize_part_id で Unicode Cf（RLO/ZWSP/BOM 等）と空白のみも除外。
 - 2026-11-22 R4 残存（provider キーの修正時、記録のみ）: all.clone() による
