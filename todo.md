@@ -258,10 +258,6 @@ status: current
 
 - [ ] **update_part が v2 の Part ワイヤ形式を受けられない**
   — `routes.rs:3000-3019` / T-05 / 中（speculation）
-- [ ] **plugin チャンク overflow テストが 150ms timeout + 50ms sleep 依存**
-  — `plugin/client.rs:872-894` / TESTREL-03 / 中
-- [ ] **bash プロセツリキル検証が 600ms 固定 sleep 依存**
-  — `tool/bash.rs:1200-1209` / TESTREL-05 / 中
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
@@ -294,6 +290,8 @@ status: current
 
 ## 完了
 
+- [x] **[テスト信頼性 2 件]** overflow 同期と心拍の継続観測
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[テスト信頼性 4 件]** env 直列化・時間依存の解消
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[共有型 3 件]** AgentColor 正規化・diffs 既定値・PtyStatus 集約
@@ -645,6 +643,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（overflow/心拍テストの修正時、記録のみ）: plugin の
+  1ms ポーリングと 100ms グレースが極端なスケジューラ遅延で競合し得る。
+  bash の心拍停止は子孫終了の代理指標で、metadata 失敗が 0 と丸められる。
+  親がチャンク容量 128 を STREAM_CHUNK_BUFFER 定数で単一情報源化。
 - 2026-11-21 R4 残存（テスト信頼性の修正時、記録のみ）: config の env ロックが
   2 テストモジュールで分離しているが変数名が衝突しないため実害なし。
   親が unwatch 負の検証で in-flight の遅延イベントを誤検知する問題を修正。
