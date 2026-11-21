@@ -166,8 +166,6 @@ status: current
 
 - [ ] **真値パーサーが箇所ごとに異なる（OPENCODE_AUTO_SHARE 未記載）**
   — `cli/main.rs:1977-1982` / CFG2-08 / 低
-- [ ] **OPENCODE_CONFIG_CONTENT の {file:...} が cwd 基準で仕様未記載**
-  — `config/loader.rs:45-57` / CFG2-09 / 低
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -285,6 +283,8 @@ status: current
 
 ## 完了
 
+- [x] **[inline config 文書 1 件]** 相対ファイル参照の基準を明記
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[空モデル ID 1 件]** type 付きエラー化と明示指定も検査
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider リスト 1 件]** 明示的空配列によるクリア
