@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lsp_types::{
-    ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, InitializeParams, Range, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -508,6 +508,30 @@ impl LspClient {
         Ok(())
     }
 
+    /// Closes a previously opened document.
+    ///
+    /// Drops both the tracked version and any cached diagnostics for `path`,
+    /// then notifies the server with `textDocument/didClose`. Calling this for
+    /// a file that was never opened is harmless: the removals are no-ops and
+    /// the notification lets the server discard any state it still holds.
+    pub async fn close_document(&self, path: &Path) -> Result<(), LspError> {
+        let uri = path_to_uri(path)?;
+
+        let params = DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri },
+        };
+
+        // 通知を先に送り、成功後にローカル状態を削除する（R4）。
+        // 失敗時にサーバーは open のままなのにローカルだけ消える乖離を防ぐ。
+        self.notify("textDocument/didClose", serde_json::to_value(params)?)
+            .await?;
+
+        self.file_versions.write().await.remove(path);
+        self.diagnostics.write().await.remove(path);
+
+        Ok(())
+    }
+
     pub async fn get_diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
         self.diagnostics
             .read()
@@ -963,6 +987,14 @@ impl LspClientRegistry {
         self.clients.write().await.insert(id, client);
     }
 
+    /// Removes the client registered under `id`, returning it if present.
+    ///
+    /// The returned `Arc` is handed back to the caller so dropping the last
+    /// reference runs `LspClient::drop` and reaps the server process.
+    pub async fn unregister(&self, id: &str) -> Option<Arc<LspClient>> {
+        self.clients.write().await.remove(id)
+    }
+
     pub async fn get(&self, id: &str) -> Option<Arc<LspClient>> {
         self.clients.read().await.get(id).cloned()
     }
@@ -1119,6 +1151,91 @@ mod tests {
         let registry = LspClientRegistry::default();
         let clients = registry.list().await;
         assert!(clients.is_empty());
+    }
+
+    /// Builds a client backed by a stub child so `notify` can be exercised
+    /// without launching a real language server.
+    #[cfg(unix)]
+    fn stub_client() -> LspClient {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        drop(stdout);
+
+        let (event_tx, _) = broadcast::channel(16);
+        LspClient {
+            root: PathBuf::from("/tmp"),
+            stdin: Arc::new(Mutex::new(stdin)),
+            request_id: Arc::new(Mutex::new(0)),
+            pending_responses: Arc::new(RwLock::new(HashMap::new())),
+            diagnostics: Arc::new(RwLock::new(HashMap::new())),
+            file_versions: Arc::new(RwLock::new(HashMap::new())),
+            event_tx,
+            child: Some(child),
+            reader_handle: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_document_clears_version_and_diagnostics() {
+        let client = stub_client();
+        let path = Path::new("/tmp/project/src/main.rs");
+
+        // Seed the same entries that `open_document` and publishDiagnostics
+        // would have created.
+        client
+            .file_versions
+            .write()
+            .await
+            .insert(path.to_path_buf(), 3);
+        client
+            .diagnostics
+            .write()
+            .await
+            .insert(path.to_path_buf(), vec![Diagnostic::default()]);
+        assert!(client.file_versions.read().await.contains_key(path));
+        assert!(client.diagnostics.read().await.contains_key(path));
+
+        client.close_document(path).await.unwrap();
+
+        assert!(
+            !client.file_versions.read().await.contains_key(path),
+            "file version survived close_document"
+        );
+        assert!(
+            !client.diagnostics.read().await.contains_key(path),
+            "diagnostics survived close_document"
+        );
+        // Closing an unknown file must stay harmless and must not resurrect
+        // either map.
+        client
+            .close_document(Path::new("/tmp/project/src/other.rs"))
+            .await
+            .unwrap();
+        assert!(client.file_versions.read().await.is_empty());
+        assert!(client.diagnostics.read().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unregister_removes_only_the_requested_client() {
+        let registry = LspClientRegistry::new();
+        let client = Arc::new(stub_client());
+        registry.register("rust-analyzer".to_string(), client).await;
+        assert!(registry.get("rust-analyzer").await.is_some());
+
+        let removed = registry.unregister("rust-analyzer").await;
+        assert!(removed.is_some());
+        assert!(registry.get("rust-analyzer").await.is_none());
+        assert!(registry.unregister("rust-analyzer").await.is_none());
     }
 
     #[test]
