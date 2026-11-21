@@ -217,8 +217,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **同一名 OUTPUT_TOKEN_MAX が 8192 と 32000 で食い違う**
-  — `session/llm.rs:19` vs `provider/transform.rs:70` / CONSTANTS-01 / 高
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
@@ -260,22 +258,12 @@ status: current
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
 - [ ] **ビルトイン auth プラグインのロード失敗を warn のみで起動継続**
   — `server.rs:1512-1521` / ERRPATH-08 / 中（設計判断）
-- [ ] **SSE バックオフのコメントが 2^7、実装は 2^8 で不一致**
-  — `tui/app.rs:4153-4154` / CONSTANTS-02 / 中
 - [ ] **マスク文字列が TUI `[redacted]`、他は `<redacted>` で不統一**
   — `tui/api.rs:321` 等 / CONSTANTS-03 / 中（設計判断）
 - [ ] **WebSearch 個別 timeout 25 秒が定数化されず client 30 秒と不一致**
   — `tool/websearch.rs:26,263` / CONSTANTS-04 / 中
 - [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
   — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
-- [ ] **JSON-RPC フレーム上限 10MiB/64行/8192B が mcp/plugin で重複**
-  — `mcp/transport.rs:13` / CONSTANTS-07 / 中
-- [ ] **MAX_DIAGNOSTICS_PER_FILE=20 が tool 内で 3 重定義**
-  — `tool/{write,apply_patch,edit/tool}.rs` / CONSTANTS-08 / 中
-- [ ] **デフォルトサーバ URL 127.0.0.1:4096 が cli/server で重複**
-  — `cli/main.rs:2600` / CONSTANTS-09 / 中
-- [ ] **50KiB 出力上限が read/truncation/bash で独立定義**
-  — `tool/{read,truncation,bash}.rs` / CONSTANTS-10 / 中
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
 - [ ] **MCP OAuth manager が process-global で State 引数が未使用**
   — `routes.rs:3769-3773` / STATE-03
@@ -288,6 +276,8 @@ status: current
 
 ## 完了
 
+- [x] **[定数整合 6 件]** 単一情報源化と SSE バックオフ文書修正
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[永続化/境界 4 件]** 認証整合・ログアウト・models 境界・metadata
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[移行 fingerprint 1 件]** 起動時一度きりの設計意図を確認・復元
