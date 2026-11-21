@@ -787,7 +787,13 @@ impl McpClient {
     /// Call this after operations that might trigger notifications.
     pub async fn refresh_tools_if_needed(&self) -> Result<(), McpClientError> {
         if self.tools_changed.swap(false, Ordering::SeqCst) {
-            self.load_tools().await?;
+            if let Err(err) = self.load_tools().await {
+                // Restore the pending flag: `call_tool` discards this Result via
+                // `.ok()`, so without the restore the stale catalog would stay
+                // pinned and never be reloaded.
+                self.tools_changed.store(true, Ordering::SeqCst);
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -1698,6 +1704,64 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "fresh");
     }
+
+    #[tokio::test]
+    async fn refresh_tools_if_needed_restores_flag_on_load_failure() {
+        let tool_registry = Arc::new(McpToolRegistry::new());
+        let client = McpClient::new("server-a".to_string(), tool_registry.clone());
+
+        // 空のトランスポートは receive() が None を返すため load_tools が失敗する。
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(MockTransport::new(vec![])));
+        }
+
+        client
+            .handle_notification(JsonRpcNotification {
+                jsonrpc: "2.0".to_string(),
+                method: "notifications/tools/list_changed".to_string(),
+                params: None,
+            })
+            .await;
+
+        assert!(
+            client.refresh_tools_if_needed().await.is_err(),
+            "load_tools の失敗は呼び出し側へ伝わること"
+        );
+        assert!(
+            client.tools_changed.load(Ordering::SeqCst),
+            "ロード失敗時に tools_changed が復元されること"
+        );
+
+        // 復元されたフラグにより、トランスポート回復後の再ロードが保証されること。
+        // 先頭の失敗ロードが id=1 を使ったため、ここでのリクエストは id=2 になる。
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: 2,
+            result: Some(serde_json::json!({
+                "tools": [{ "name": "fresh", "description": "fresh tool", "inputSchema": { "type": "object" } }]
+            })),
+            error: None,
+        };
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(MockTransport::new(vec![(
+                Duration::from_millis(0),
+                Some(JsonRpcMessage::Response(response)),
+            )])));
+        }
+
+        client
+            .refresh_tools_if_needed()
+            .await
+            .expect("reload should succeed once the transport recovers");
+
+        assert!(!client.tools_changed.load(Ordering::SeqCst));
+        let tools = tool_registry.list_for_server("server-a").await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "fresh");
+    }
+
     struct HangingTransport;
 
     #[async_trait]

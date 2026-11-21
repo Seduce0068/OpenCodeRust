@@ -10,6 +10,9 @@ use crate::{
 };
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+/// SSE 行バッファの上限（他アダプタの SseLineBuffer と同値）。改行を送らない
+/// 上流や不正レスポンスによる際限ない成長を防ぐ（R4）。
+const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 /// 構造化エラーへ渡すレスポンスヘッダから機微情報を除外する。
 ///
@@ -263,6 +266,12 @@ impl Provider for AnthropicProvider {
                     match chunks.next().await {
                         Some(Ok(bytes)) => {
                             // 生バイトのままバッファへ積み、行が確定してからデコードする。
+                            // 上限超過は行が確定しないままの成長を防ぐため即エラーとする。
+                            if buffer.len().saturating_add(bytes.len()) > MAX_SSE_BUFFER_BYTES {
+                                return Err(ProviderError::ApiError(
+                                    "anthropic SSE line buffer exceeded limit".to_string(),
+                                ));
+                            }
                             buffer.extend_from_slice(bytes.as_ref());
                             pending.extend(drain_anthropic_sse_events(
                                 &mut buffer,
@@ -521,6 +530,24 @@ mod tests {
         assert!(matches!(
             result.choices[0].message.content,
             Content::Text(ref text) if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn sse_error_data_line_surfaces_as_stream_error() {
+        let mut buffer = Vec::new();
+        let mut parser = crate::stream::AnthropicSseParser::new();
+
+        buffer.extend_from_slice(b"event: error\n");
+        buffer.extend_from_slice(
+            b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n",
+        );
+        let events = drain_anthropic_sse_events(&mut buffer, &mut parser, false);
+
+        assert_eq!(events.len(), 1, "error イベントが黙って捨てられないこと");
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Error(detail) if detail == "overloaded_error: Overloaded"
         ));
     }
 

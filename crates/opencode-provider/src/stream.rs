@@ -236,6 +236,17 @@ pub struct AnthropicEvent {
     pub delta: Option<AnthropicDelta>,
     pub content_block: Option<AnthropicContentBlock>,
     pub message: Option<AnthropicMessage>,
+    /// `event: error` のペイロード。`type` と `message` を保持する。
+    pub error: Option<AnthropicError>,
+}
+
+/// Anthropic `error` SSE イベントのペイロード。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicError {
+    /// 非標準ペイロードで `type` が欠けても error イベントを捨てない（R4）。
+    #[serde(default, rename = "type")]
+    pub error_type: String,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +385,24 @@ impl AnthropicSseParser {
             "message_stop" => {
                 self.finished = true;
                 return Some(StreamEvent::Done);
+            }
+            "error" => {
+                // error は終端イベント。後続のイベントを抑制するため finished を立てる。
+                self.finished = true;
+                // error.type と message を値に依存しない形式で結合する。
+                // 生のレスポンス本文やトークン値は保持せず、構造化された 2 項目だけを使う。
+                // error オブジェクト欠落 / type 空でも固定トークンを残し、
+                // 情報が完全に消える空文字列 Error を出さない（R4）。
+                let detail = match event.error {
+                    Some(error) if !error.error_type.is_empty() => match error.message {
+                        Some(message) if !message.is_empty() => {
+                            format!("{}: {}", error.error_type, message)
+                        }
+                        _ => error.error_type,
+                    },
+                    _ => event.event_type.clone(),
+                };
+                return Some(StreamEvent::Error(detail));
             }
             _ => {}
         }
@@ -586,6 +615,30 @@ mod tests {
         let stop = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         assert!(matches!(parser.push(stop), Some(StreamEvent::Done)));
         assert!(parser.push(r#"{"type":"message_stop"}"#).is_none());
+    }
+
+    #[test]
+    fn anthropic_parser_maps_error_event_to_stream_error() {
+        let mut parser = AnthropicSseParser::new();
+        let data = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        match parser.push(data) {
+            Some(StreamEvent::Error(detail)) => {
+                assert_eq!(detail, "overloaded_error: Overloaded");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+        // error は終端イベント。finished が立ち、後続イベントは抑制されること。
+        assert!(parser.push(r#"{"type":"message_stop"}"#).is_none());
+    }
+
+    #[test]
+    fn anthropic_parser_error_without_message_uses_error_type_only() {
+        let mut parser = AnthropicSseParser::new();
+        let data = r#"{"type":"error","error":{"type":"rate_limit_error"}}"#;
+        assert!(matches!(
+            parser.push(data),
+            Some(StreamEvent::Error(detail)) if detail == "rate_limit_error"
+        ));
     }
 
     #[test]
