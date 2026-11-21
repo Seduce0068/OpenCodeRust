@@ -5,7 +5,8 @@ use tokio::fs;
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[cfg(feature = "lsp")]
-const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
+use crate::MAX_DIAGNOSTICS_PER_FILE;
+
 #[cfg(feature = "lsp")]
 const MAX_PROJECT_DIAGNOSTICS_FILES: usize = 5;
 
