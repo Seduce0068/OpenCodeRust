@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T21:28:32+09:00"
+  at: "2026-11-21T22:00:04+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2939 件（all-features は 2938 件）
+  テスト総数 594 → 2945 件（all-features は 2944 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tui`: compact / revert / fork の API 契約不一致を修正（操作の失敗を解消）
+  （swarm-coding R1-R6）
 - `server` / `plugin`: ビルトイン認証プラグインのロード失敗を fail-closed 化
   （swarm-coding R1-R6）
 - `provider`: 認証キーローテーションを永続化（失敗時ロールバック）

@@ -219,13 +219,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **TUI compact が未登録の /compact を叩き期待型も異なる**
-  — `tui/api.rs:1100` / API-01 / 高（事実確認済み）
-- [ ] **revert レスポンスが TUI 期待の success ではなく SessionInfo**
-  — `tui/api.rs:265` / API-02 / 高（事実確認済み）
-- [ ] **fork の message_id が TUI はクエリ、サーバは JSON body**
-  — `tui/api.rs:1137` / API-03 / 高（事実確認済み）
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -298,6 +291,8 @@ status: current
 
 ## 完了
 
+- [x] **[TUI API 契約 3 件]** compact/revert/fork の不一致を解消
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[ビルトイン auth fail-closed 1 件]** load_all の Err 伝播と redact
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[rotate_key 永続化 1 件]** persist-before-commit とロールバック
