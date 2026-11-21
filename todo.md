@@ -247,8 +247,6 @@ status: current
   — `openai.rs:1026-1083` / ERR2-07 / 中（speculation）
 - [ ] **OAuth 放置フローの一時状態に TTL/回収が無い**
   — `mcp/oauth.rs:441-496` / RES-04 / 中
-- [ ] **DELETE 系が存在しないリソースに 404（冪等性の解釈差）**
-  — `routes.rs:586` / API-04 / 中（speculation）
 - [ ] **POST /prompt に冪等キーが無く再送で二重実行**
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
 - [ ] **add_message_part が毎回 UUID を採番し再送で重複**
@@ -279,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[DELETE 冪等性 1 件]** 404 を既削除として扱う
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown/真値 2 件]** ブロックリスト拡張と fail-closed 統一
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[inline config 文書 1 件]** 相対ファイル参照の基準を明記
@@ -684,6 +684,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（DELETE 冪等性の修正時、記録のみ）: 500/403 でサーバが
+  session_id / パスを本文に埋める場合、既存 error_detail の tracing ログ側では
+  マスクされない（今回の差分外）。親が 404 のボディ読み捨て（Keep-Alive
+  コネクションのプール復帰）を直接修正。
 - 2026-11-22 R4 指摘（wellknown/真値の修正時）: README の
   OPENCODE_AUTO_SHARE が「終了時共有」と記載していたが実装は attach 時の
   セッション作成直後（ローカル run は非対象）。親が実挙動へ修正。
