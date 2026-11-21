@@ -14,7 +14,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock as TokioRwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify, RwLock as TokioRwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::{OnResponse, TraceLayer};
@@ -2061,8 +2061,143 @@ fn redact_token(_token: &str) -> String {
     "[REDACTED]".to_string()
 }
 
+/// graceful shutdown をプログラムから要求するためのハンドル。
+///
+/// TUI がローカルサーバを停止するときに使う。トークン値・URL・パスは保持しない。
+#[derive(Debug, Clone)]
+pub struct ShutdownHandle {
+    tx: watch::Sender<bool>,
+}
+
+/// `ShutdownHandle` からの停止要求を受け取る側。
+#[derive(Debug, Clone)]
+pub struct ShutdownSignal {
+    rx: watch::Receiver<bool>,
+}
+
+impl ShutdownHandle {
+    /// graceful shutdown を要求する（冪等）。
+    pub fn request_shutdown(&self) {
+        // 受信側が全てドロップ済みなら Err になるが、要求済みとして扱って無視する。
+        let _ = self.tx.send(true);
+    }
+}
+
+impl ShutdownSignal {
+    /// 停止要求が来るまで待つ（埋め込み利用・テスト向けの公開 API）。
+    pub async fn wait(self) {
+        wait_for_programmatic_shutdown(self).await
+    }
+}
+
+/// 停止要求ハンドルと受信用シグナルのペアを作る。
+pub fn shutdown_channel() -> (ShutdownHandle, ShutdownSignal) {
+    let (tx, rx) = watch::channel(false);
+    (ShutdownHandle { tx }, ShutdownSignal { rx })
+}
+
+/// OS の終了シグナル（Ctrl-C と、unix では SIGTERM）を待つ。
+///
+/// `tokio` の `signal` feature が必要（ワークスペースの `Cargo.toml` で有効化済み）。
+async fn wait_for_os_shutdown() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(stream) => stream,
+                Err(_) => {
+                    // SIGTERM ハンドラを登録できない環境でも Ctrl-C は扱う。
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// プログラムからの停止要求（または送信側の全ドロップ）を待つ。
+async fn wait_for_programmatic_shutdown(mut signal: ShutdownSignal) {
+    while !*signal.rx.borrow_and_update() {
+        if signal.rx.changed().await.is_err() {
+            // これ以上要求は来ないため、停止へ進んでハングを防ぐ。
+            break;
+        }
+    }
+}
+
+/// `axum::serve(...).with_graceful_shutdown(...)` に渡す future を組み立てる。
+fn graceful_shutdown_future(
+    programmatic: ShutdownSignal,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    graceful_shutdown_future_with_os(wait_for_os_shutdown(), programmatic)
+}
+
+/// OS シグナル側を注入可能にした本体（回帰テスト用）。
+async fn graceful_shutdown_future_with_os<OS>(os_signal: OS, programmatic: ShutdownSignal)
+where
+    OS: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::select! {
+        _ = os_signal => {}
+        _ = wait_for_programmatic_shutdown(programmatic) => {}
+    }
+}
+
+/// graceful shutdown 完了後の最終セッション flush。
+///
+/// 生エラー文字列にはトークン値やストレージパスが含まれうるため一切ログへ出さず、
+/// 固定の redact 済み構造化 warn のみを記録する。
+async fn finalize_session_flush<F>(flush: F)
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    if flush.await.is_err() {
+        tracing::warn!(
+            event = "final_session_flush_failed",
+            error = "[REDACTED]",
+            "Final session flush during graceful shutdown failed"
+        );
+    }
+}
+
 pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
     let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
+    // serve / web / acp の共通経路。OS シグナルのみで停止する。
+    // `_guard` を関数末尾まで生かし、送信側ドロップによる誤停止を防ぐ。
+    let (_guard, signal) = shutdown_channel();
+    serve_with_shutdown(addr, state, signal).await
+}
+
+pub async fn run_server_with_state(
+    addr: SocketAddr,
+    state: Arc<ServerState>,
+) -> anyhow::Result<()> {
+    let (_guard, signal) = shutdown_channel();
+    serve_with_shutdown(addr, state, signal).await
+}
+
+/// TUI がローカルサーバを起動する経路。プログラムからの停止要求も受け付ける。
+pub async fn run_server_with_shutdown(
+    addr: SocketAddr,
+    shutdown: ShutdownSignal,
+) -> anyhow::Result<()> {
+    let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
+    serve_with_shutdown(addr, state, shutdown).await
+}
+
+/// ルーター構築から graceful shutdown + 最終 flush までの共通実装。
+async fn serve_with_shutdown(
+    addr: SocketAddr,
+    state: Arc<ServerState>,
+    shutdown: ShutdownSignal,
+) -> anyhow::Result<()> {
     routes::resume_queued_prompts(state.clone()).await?;
 
     if state.auth_enabled {
@@ -2083,55 +2218,24 @@ pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
         .layer(state.cors_layer())
         .layer(TraceLayer::new_for_http().on_response(RequestCompletionLog))
         .layer(middleware::from_fn(request_span_middleware))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!("Server listening on {}", addr);
 
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(graceful_shutdown_future(shutdown))
+    .await;
 
-    Ok(())
-}
+    // serve が成功した場合もエラー終了した場合も、ここで最終状態を永続化する。
+    // graceful shutdown が完了していれば全 in-flight リクエストは終了済み。
+    finalize_session_flush(state.sync_sessions_to_storage()).await;
 
-pub async fn run_server_with_state(
-    addr: SocketAddr,
-    state: Arc<ServerState>,
-) -> anyhow::Result<()> {
-    routes::resume_queued_prompts(state.clone()).await?;
-    if state.auth_enabled {
-        if let Some(token) = &state.auth_token {
-            tracing::info!("Authentication enabled. Token: {}", redact_token(token));
-        }
-    }
-    // 認証無効化の警告は CLI 側（run_server_command）に一本化している。
-
-    let app = routes::router()
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<Arc<ServerState>>,
-             request: Request<axum::body::Body>,
-             next: Next| async move { auth_middleware(state, request, next).await },
-        ))
-        .layer(state.cors_layer())
-        .layer(TraceLayer::new_for_http().on_response(RequestCompletionLog))
-        .layer(middleware::from_fn(request_span_middleware))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    tracing::info!("Server listening on {}", addr);
-
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-
+    serve_result?;
     Ok(())
 }
 
@@ -4278,5 +4382,62 @@ mod tests {
             assert_eq!(session_role(&stored), expected);
             assert_eq!(stored_role(&expected), stored);
         }
+    }
+
+    /// R2 回帰: graceful shutdown future が OS シグナル側の完了で終了すること。
+    #[tokio::test]
+    async fn graceful_shutdown_future_completes_on_os_signal() {
+        let (_handle, signal) = shutdown_channel();
+        let (os_tx, os_rx) = tokio::sync::oneshot::channel::<()>();
+        let future = graceful_shutdown_future_with_os(
+            async move {
+                let _ = os_rx.await;
+            },
+            signal,
+        );
+        os_tx.send(()).expect("os signal injection must succeed");
+        tokio::time::timeout(Duration::from_secs(2), future)
+            .await
+            .expect("graceful shutdown future must complete on os signal");
+    }
+
+    /// R2 回帰: graceful shutdown future がプログラム側の停止要求で終了すること。
+    #[tokio::test]
+    async fn graceful_shutdown_future_completes_on_programmatic_request() {
+        let (handle, signal) = shutdown_channel();
+        let future = graceful_shutdown_future_with_os(std::future::pending::<()>(), signal);
+        handle.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), future)
+            .await
+            .expect("graceful shutdown future must complete on stop request");
+    }
+
+    /// R2 回帰: 最終 flush が必ず await され、失敗が呼び出し側へ漏れないこと。
+    #[tokio::test]
+    async fn final_session_flush_is_awaited_and_failure_is_contained() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observable = calls.clone();
+        let flush = async move {
+            observable.fetch_add(1, Ordering::SeqCst);
+            // 生エラー文字列に値・パスが含まれても、ログへは出さない。
+            Err::<(), _>(anyhow::anyhow!("secret=token path=/tmp/secret"))
+        };
+        finalize_session_flush(flush).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "flush must be awaited exactly once"
+        );
+
+        let calls_ok = Arc::new(AtomicUsize::new(0));
+        let observable_ok = calls_ok.clone();
+        finalize_session_flush(async move {
+            observable_ok.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        assert_eq!(calls_ok.load(Ordering::SeqCst), 1);
     }
 }

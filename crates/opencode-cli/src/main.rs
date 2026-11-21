@@ -17,7 +17,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 use opencode_agent::{AgentExecutor, AgentInfo, AgentRegistry};
@@ -41,6 +42,7 @@ use opencode_storage::{Database, MessageRepository, SessionRepository};
 use opencode_tool::skill::list_available_skills;
 use opencode_tool::{create_default_registry, ToolContext};
 use opencode_types::{MessagePart, Session, SessionMessage};
+use tracing_subscriber::layer::SubscriberExt;
 
 /// CLI で明示指定されたサーバ起動オプションのみを保持する。
 /// 未指定（`None` / 空ベクタ）は `config.server.*` を採用する。
@@ -149,15 +151,75 @@ impl std::fmt::Debug for ConfigFingerprint {
 
 /// プロセス全体で共有する設定キャッシュ。キーは設定読み込みに使った cwd。
 ///
-/// 値は (fingerprint, config)。`load_config` は呼ぶたびに設定ファイルを
-/// 読み直してパースするため、従来は 1 プロセス内で最大 11 回の二重パースが
-/// 発生していた。cwd をキーにしているのは、`run` / `tui` / `acp` が起動後に
-/// `set_current_dir` で cwd を切り替え、その後の `load_config` が別の設定を
-/// 返す従来挙動を維持するため。fingerprint により、同一プロセス内で設定
-/// ファイルが書き換えられた場合も再起動なしで再ロードされる。
-static CONFIG_CACHE: OnceLock<
-    RwLock<HashMap<PathBuf, (ConfigFingerprint, opencode_config::Config)>>,
-> = OnceLock::new();
+/// 値は (fingerprint, config, 保留中の診断)。`load_config` は呼ぶたびに設定
+/// ファイルを読み直してパースするため、従来は 1 プロセス内で最大 11 回の
+/// 二重パースが発生していた。cwd をキーにしているのは、`run` / `tui` / `acp`
+/// が起動後に `set_current_dir` で cwd を切り替え、その後の `load_config` が
+/// 別の設定を返す従来挙動を維持するため。fingerprint により、同一プロセス内
+/// で設定ファイルが書き換えられた場合も再起動なしで再ロードされる。
+///
+/// 3 番目の要素は CFGVAL-01 対策：tracing 初期化前の初回ロードで発行された
+/// WARN を値非依存の整形行として保持し、初期化後に 1 回だけ再発火する。
+type CachedConfig = (ConfigFingerprint, opencode_config::Config, Vec<String>);
+
+static CONFIG_CACHE: OnceLock<RwLock<HashMap<PathBuf, CachedConfig>>> = OnceLock::new();
+
+/// `init_tracing` が完了したかどうか。true の間は WARN を直接 tracing へ流し、
+/// スコープ付き捕捉を行わない（二重発行を防ぐ）。
+static TRACING_READY: AtomicBool = AtomicBool::new(false);
+
+/// 捕捉した診断行を書き込むスコープ付きライタ。
+#[derive(Clone)]
+struct ConfigDiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for ConfigDiagnosticWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 与えられた処理の間だけ WARN をスコープ付き subscriber で捕捉し、
+/// tracing が整形したメッセージ行として返す。
+///
+/// グローバル default は変更しないため、`init_tracing` の `try_init` と競合
+/// しない。対象 5 警告はすべてキー名／変数名／静的本文のみをログに出し、
+/// トークン値やパスは含まない。したがって保持する行にも値・パスは現れない。
+fn capture_config_diagnostics<F, T>(f: F) -> (T, Vec<String>)
+where
+    F: FnOnce() -> T,
+{
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = ConfigDiagnosticWriter(Arc::clone(&buffer));
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::WARN)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_level(false)
+                .with_target(false)
+                .with_writer(move || writer.clone()),
+        );
+    let value = tracing::subscriber::with_default(subscriber, f);
+    let bytes = buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let messages = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    (value, messages)
+}
 
 /// `opencode-config` の `detect_worktree_stop` と同じ範囲（直近の `.git` まで）
 /// を計算する。見つからなければファイルシステムの最上位までを範囲にする。
@@ -379,7 +441,7 @@ fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
     {
         let guard = cache.read().unwrap_or_else(|e| e.into_inner());
         match guard.get(cwd) {
-            Some((cached_fingerprint, config)) if cached_fingerprint == &fingerprint => {
+            Some((cached_fingerprint, config, _)) if cached_fingerprint == &fingerprint => {
                 return Ok(config.clone())
             }
             _ => {}
@@ -391,12 +453,56 @@ fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
     // JSON 存在ガード下では再移行が no-op で、余分な再ロードを誘発するだけだから。
     invalidate_config_cache(cwd);
 
-    let config = load_config(cwd)?;
-    cache
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(cwd.to_path_buf(), (fingerprint, config.clone()));
+    // CFGVAL-01: init_tracing 前の初回ロードでは WARN が捨てられるため、
+    // スコープ付き subscriber で捕捉してキャッシュに預ける。初期化後は
+    // 直接 tracing へ流し、同じ警告を捕捉・再発火で二重に出さない。
+    let (load_result, diagnostics) = if TRACING_READY.load(Ordering::Relaxed) {
+        (load_config(cwd), Vec::new())
+    } else {
+        capture_config_diagnostics(|| load_config(cwd))
+    };
+    let config = load_result?;
+    cache.write().unwrap_or_else(|e| e.into_inner()).insert(
+        cwd.to_path_buf(),
+        (fingerprint, config.clone(), diagnostics),
+    );
     Ok(config)
+}
+
+/// 起動初期（tracing 未初期化）に捕捉してキャッシュへ保存した診断を、
+/// tracing 初期化後に 1 回だけ再発火する。
+///
+/// 保存されているのは値非依存の整形行のみで、トークン値・パスは含まれない。
+/// 再発火後にバッファをクリアするため、二重表示や次回以降の再発火は起きない。
+pub(crate) fn replay_config_diagnostics(cwd: &Path) {
+    let Some(cache) = CONFIG_CACHE.get() else {
+        return;
+    };
+    let diagnostics = {
+        let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_mut(cwd)
+            .map(|(_, _, pending)| std::mem::take(pending))
+            .unwrap_or_default()
+    };
+    for message in diagnostics {
+        // 保存済み本文をそのまま message フィールドとして流す（値は含まない）。
+        tracing::warn!("{message}");
+    }
+}
+
+#[cfg(test)]
+fn cached_config_diagnostics(cwd: &Path) -> Vec<String> {
+    CONFIG_CACHE
+        .get()
+        .and_then(|cache| {
+            cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(cwd)
+                .map(|(_, _, diagnostics)| diagnostics.clone())
+        })
+        .unwrap_or_default()
 }
 
 /// `config` サブコマンド用。キャッシュを完全にバイパスして `load_config` の
@@ -1033,6 +1139,15 @@ async fn main() -> anyhow::Result<()> {
     let (_log_path, _log_guard) =
         opencode_util::init_tracing(startup_log_level.as_deref(), None, tracing_print);
 
+    // CFGVAL-01: 上の config_for は tracing 初期化前に走るため WARN が捨てられ、
+    // さらにキャッシュが再ロードを防ぐ。ここで初期化完了を宣言してから、
+    // キャッシュに預けた診断を 1 回だけ再発火させ、対象 5 警告を届ける。
+    // 再発火後はバッファをクリアし、以降のロードは tracing へ直接出力する。
+    TRACING_READY.store(true, Ordering::Relaxed);
+    if let Some(cwd) = &cwd {
+        replay_config_diagnostics(cwd);
+    }
+
     match cli.command {
         Some(Commands::Tui {
             project,
@@ -1328,6 +1443,34 @@ fn clear_tui_auth_token_env() {
     std::env::remove_var(TUI_AUTH_TOKEN_ENV);
 }
 
+/// TUI 終了時にローカルサーバの graceful shutdown を待つ上限。
+///
+/// この時間を超えた場合にのみ `abort()` する（in-flight HTTP / 永続化を切る最終手段）。
+const LOCAL_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ローカルサーバの停止方針: 停止要求 -> 期限付き join -> 期限超過時のみ abort。
+async fn stop_local_server(
+    shutdown: &opencode_server::ShutdownHandle,
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    timeout: Duration,
+) {
+    // 1) まず停止要求を送り、サーバ側の graceful shutdown を発動させる。
+    shutdown.request_shutdown();
+    let Some(mut handle) = handle else {
+        return;
+    };
+    // 2) in-flight リクエストと final flush が終わるまで期限付きで待つ。
+    if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+        // 3) 期限超過時のみ強制終了する。値・URL・パスはログへ出さない。
+        tracing::warn!(
+            event = "local_server_shutdown_timeout",
+            "Local server did not stop within the grace period; forcing abort"
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
 async fn run_tui(
     project: Option<PathBuf>,
     model: Option<String>,
@@ -1351,6 +1494,7 @@ async fn run_tui(
     }
 
     let mut server_handle = None;
+    let mut server_shutdown = None;
     let mut mdns_publisher: Option<MdnsPublisher> = None;
     let base_url = if let Some(url) = attach_url {
         url
@@ -1374,15 +1518,21 @@ async fn run_tui(
         };
         let addr: SocketAddr = format!("{}:{}", bind_host, bind_port).parse()?;
         let server_url = format!("http://{}:{}", client_host, bind_port);
-        // TUI のローカルサーバは run_server_command を通らず run_server を直接 spawn
-        // するため、CLI と同じ fail-closed 判定の認証状態通知をここで 1 回出す。
+        // TUI のローカルサーバは run_server_command を通らず
+        // run_server_with_shutdown を直接 spawn するため、
+        // CLI と同じ fail-closed 判定の認証状態通知をここで 1 回出す。
         // attach（外部サーバへ接続する経路）ではローカルサーバを起動しないので出さない。
         emit_auth_status_notice();
         eprintln!("Starting local server for TUI at {}", server_url);
         opencode_server::set_cors_whitelist(runtime.cors);
-        let mut handle = tokio::spawn(async move { opencode_server::run_server(addr).await });
+        let (shutdown, signal) = opencode_server::shutdown_channel();
+        let mut handle =
+            tokio::spawn(
+                async move { opencode_server::run_server_with_shutdown(addr, signal).await },
+            );
         wait_for_server_ready(&server_url, Duration::from_secs(90), Some(&mut handle)).await?;
         server_handle = Some(handle);
+        server_shutdown = Some(shutdown);
         mdns_publisher = start_mdns_publisher_if_needed(
             runtime.mdns,
             &bind_host,
@@ -1413,16 +1563,74 @@ async fn run_tui(
         std::env::set_var("OPENCODE_TUI_SESSION", session_id);
     }
 
+    // TUI タスクが panic / 早期 return しても停止シーケンスを必ず通すため、
+    // ここでは `?` せず結果を保持し、関数末尾で返す。
     let run_result = tokio::task::spawn_blocking(opencode_tui::run_tui)
         .await
-        .map_err(|e| anyhow::anyhow!("TUI task panicked: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("TUI task panicked: {}", e));
 
+    // 停止要求 -> 期限付き join -> 期限超過時のみ abort の順を守る。
+    // 即 abort だと in-flight HTTP とセッション永続化が途中で切れていた。
+    let shutdown = server_shutdown.take();
+    let handle = server_handle.take();
+    match (shutdown, handle) {
+        (Some(shutdown), handle) => {
+            stop_local_server(&shutdown, handle, LOCAL_SERVER_SHUTDOWN_TIMEOUT).await;
+        }
+        (None, Some(handle)) => {
+            // 停止要求ハンドルが無い経路は想定外。ハングを避けるため回収する。
+            handle.abort();
+            let _ = handle.await;
+        }
+        (None, None) => {}
+    }
+    // mDNS の解除はサーバ停止シーケンス完了後に行う。
     drop(mdns_publisher);
-    if let Some(handle) = server_handle {
-        handle.abort();
+
+    run_result?
+}
+
+#[cfg(test)]
+mod local_server_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// R2 回帰: 即 abort せず、停止要求を送ってから join すること。
+    #[tokio::test]
+    async fn stop_local_server_requests_shutdown_before_join() {
+        let (shutdown, signal) = opencode_server::shutdown_channel();
+        let observed = Arc::new(AtomicBool::new(false));
+        let flag = observed.clone();
+        let handle = tokio::spawn(async move {
+            signal.wait().await;
+            flag.store(true, Ordering::SeqCst);
+            Ok::<(), anyhow::Error>(())
+        });
+
+        stop_local_server(&shutdown, Some(handle), Duration::from_secs(2)).await;
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "graceful stop request must be observed before join completes"
+        );
     }
 
-    run_result
+    /// R2 回帰: 終了しないタスクは期限を過ぎた後でのみ abort されること。
+    #[tokio::test]
+    async fn stop_local_server_aborts_only_after_timeout() {
+        let (shutdown, _signal) = opencode_server::shutdown_channel();
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let grace = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        stop_local_server(&shutdown, Some(handle), grace).await;
+        assert!(
+            started.elapsed() >= grace,
+            "abort must not happen before the grace period elapses"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2893,8 +3101,8 @@ fn write_auth_status_notice<W: Write>(writer: &mut W) -> io::Result<()> {
 /// 認証状態通知を stderr へ 1 回出す。
 ///
 /// `run_server_command`（serve / web / acp）と `run_tui` のローカルサーバ起動前の
-/// 両方から呼ぶ。TUI は `run_server_command` を通らず `run_server` を直接 spawn
-/// するため、ここを共有しないと `OPENCODE_NO_AUTH` の警告が出ない。
+/// 両方から呼ぶ。TUI は `run_server_command` を通らず `run_server_with_shutdown`
+/// を直接 spawn するため、ここを共有しないと `OPENCODE_NO_AUTH` の警告が出ない。
 fn emit_auth_status_notice() {
     let _ = write_auth_status_notice(&mut io::stderr());
 }
@@ -7780,6 +7988,113 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp config project");
         dir
+    }
+
+    /// CFGVAL-01 回帰テスト。
+    ///
+    /// tracing 未初期化の初回ロードで対象 5 警告を捕捉できること、キャッシュ
+    /// ヒットでも失われないこと、初期化後の再発火で 1 回だけ届くことを固定
+    /// する。トークン値・パスが診断に含まれないことも同時に検証する。
+    #[test]
+    fn config_diagnostics_survive_cache_hit_and_replay_without_values() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        let _restore_undefined = RestoreEnv(
+            "CFGVAL_UNDEFINED_VAR_FOR_WARNING",
+            std::env::var_os("CFGVAL_UNDEFINED_VAR_FOR_WARNING"),
+        );
+        std::env::remove_var("CFGVAL_UNDEFINED_VAR_FOR_WARNING");
+
+        let dir = temp_config_project("diag-replay");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        // 低優先の global が providers.*、高優先の project が provider.* を使い、
+        // provider 表記衝突警告を確実に発生させる。
+        let global_dir = dir.join("opencode");
+        fs::create_dir_all(&global_dir).expect("create global config dir");
+        fs::write(
+            global_dir.join("opencode.json"),
+            r#"{"providers":{"cfgval-dup":{"api_key":"sk-CFGVAL-SECRET-GLOBAL"}}}"#,
+        )
+        .expect("write global config");
+        fs::write(
+            dir.join("opencode.json"),
+            r#"{
+                "cfgval_unknown_key": {"token": "sk-CFGVAL-SECRET-UNKNOWN"},
+                "model": "cfgval-model-{env:CFGVAL_UNDEFINED_VAR_FOR_WARNING}",
+                "mcp": {"cfgval-server": {"command": ["cfgval-tool"], "protocol": "auto"}},
+                "experimental": {"mcp_timeout": 2500},
+                "provider": {"cfgval-dup": {"api_key": "sk-CFGVAL-SECRET-PROJECT"}}
+            }"#,
+        )
+        .expect("write project config");
+
+        let loaded = config_for(&dir).expect("initial config_for");
+        assert_eq!(
+            loaded.model.as_deref(),
+            Some("cfgval-model-"),
+            "undefined env must expand to empty without blocking startup"
+        );
+
+        let stored = cached_config_diagnostics(&dir);
+        let expected = [
+            "unknown configuration key ignored; startup continues",
+            "undefined environment variable in config expanded to an empty string; startup continues",
+            "mcp.protocol auto mode is unimplemented; normalizing to the legacy protocol (value not logged)",
+            "experimental.mcp_timeout is deprecated; use mcp.timeout instead (value not logged)",
+            "provider config spelling conflict; higher-precedence layer wins",
+        ];
+        for needle in expected {
+            assert!(
+                stored.iter().any(|line| line.contains(needle)),
+                "missing diagnostic {needle:?}: {stored:?}"
+            );
+        }
+        for secret in [
+            "sk-CFGVAL-SECRET-GLOBAL",
+            "sk-CFGVAL-SECRET-UNKNOWN",
+            "sk-CFGVAL-SECRET-PROJECT",
+        ] {
+            assert!(
+                !stored.iter().any(|line| line.contains(secret)),
+                "token value leaked into diagnostics: {stored:?}"
+            );
+        }
+        let dir_text = dir.to_string_lossy();
+        assert!(
+            !stored.iter().any(|line| line.contains(dir_text.as_ref())),
+            "path leaked into diagnostics: {stored:?}"
+        );
+
+        // 2 回目はキャッシュヒット（再ロードなし）でも診断が残ること。
+        let _cached = config_for(&dir).expect("cache hit config_for");
+        assert_eq!(
+            cached_config_diagnostics(&dir),
+            stored,
+            "cache hit must not discard pending diagnostics"
+        );
+
+        // 再発火は tracing 経由で 1 回だけ行われ、バッファはクリアされる。
+        let (_, replayed) = capture_config_diagnostics(|| replay_config_diagnostics(&dir));
+        for needle in expected {
+            assert!(
+                replayed.iter().any(|line| line.contains(needle)),
+                "replay lost {needle:?}: {replayed:?}"
+            );
+        }
+        assert!(
+            cached_config_diagnostics(&dir).is_empty(),
+            "replay must clear pending diagnostics to avoid duplicates"
+        );
+        let (_, replayed_twice) = capture_config_diagnostics(|| replay_config_diagnostics(&dir));
+        assert!(
+            replayed_twice.is_empty(),
+            "replay must not emit the same diagnostics twice"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
