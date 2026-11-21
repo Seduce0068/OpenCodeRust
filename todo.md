@@ -164,6 +164,14 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **TOML→JSON 移行で JSON 書込後のバックアップ失敗が成功扱い**
+  — `config/loader.rs:509-545` / ERRPATH-07 / 低
+- [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
+  — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
+- [ ] **MCP 設定のディスク同期失敗が飲まれ古い状態が返る**
+  — `routes.rs:3859-3872` / ERRPATH-10 / 低
+- [ ] **APP_VERSION_DATE が 2026.02.23 固定で現在と 9 か月乖離**
+  — `tui/branding.rs:3` / CONSTANTS-06 / 低（設計判断）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -209,6 +217,16 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **auth store 永続化失敗時にメモリ状態が更新済みのまま残る**
+  — `provider/auth.rs:200-218` / ERRPATH-02 / 中（事実確認済み）
+- [ ] **MCP OAuth ログアウト時のディスク削除失敗が飲まれる**
+  — `mcp_oauth.rs:683-694` / ERRPATH-03 / 中（事実確認済み）
+- [ ] **models.dev サイズ超過を警告しつつパース利用、キャッシュ書込失敗も飲む**
+  — `provider/models.rs:208-223` / ERRPATH-04 / 中（事実確認済み）
+- [ ] **session_input.metadata の JSON パース失敗が黙って None 化**
+  — `storage/repository.rs:1035-1037` / ERRPATH-05 / 中（事実確認済み）
+- [ ] **同一名 OUTPUT_TOKEN_MAX が 8192 と 32000 で食い違う**
+  — `session/llm.rs:19` vs `provider/transform.rs:70` / CONSTANTS-01 / 高
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
@@ -244,6 +262,28 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
+  — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
+- [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
+  — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
+- [ ] **ビルトイン auth プラグインのロード失敗を warn のみで起動継続**
+  — `server.rs:1512-1521` / ERRPATH-08 / 中（設計判断）
+- [ ] **SSE バックオフのコメントが 2^7、実装は 2^8 で不一致**
+  — `tui/app.rs:4153-4154` / CONSTANTS-02 / 中
+- [ ] **マスク文字列が TUI `[redacted]`、他は `<redacted>` で不統一**
+  — `tui/api.rs:321` 等 / CONSTANTS-03 / 中（設計判断）
+- [ ] **WebSearch 個別 timeout 25 秒が定数化されず client 30 秒と不一致**
+  — `tool/websearch.rs:26,263` / CONSTANTS-04 / 中
+- [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
+  — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
+- [ ] **JSON-RPC フレーム上限 10MiB/64行/8192B が mcp/plugin で重複**
+  — `mcp/transport.rs:13` / CONSTANTS-07 / 中
+- [ ] **MAX_DIAGNOSTICS_PER_FILE=20 が tool 内で 3 重定義**
+  — `tool/{write,apply_patch,edit/tool}.rs` / CONSTANTS-08 / 中
+- [ ] **デフォルトサーバ URL 127.0.0.1:4096 が cli/server で重複**
+  — `cli/main.rs:2600` / CONSTANTS-09 / 中
+- [ ] **50KiB 出力上限が read/truncation/bash で独立定義**
+  — `tool/{read,truncation,bash}.rs` / CONSTANTS-10 / 中
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
 - [ ] **MCP OAuth manager が process-global で State 引数が未使用**
   — `routes.rs:3769-3773` / STATE-03
@@ -587,6 +627,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 cross-skill 集約（swarm116、2 担当・20 件、観点: 定数整合 /
+  エラー経路と回復）: 親が 5 件の根拠を read で事実確認し、高 5 / 中 23 /
+  低 5 を追記。特に models.dev の「サイズ超過と警告しつつ利用」は矛盾が
+  明確。設計判断が必要な fail-open 系は speculation と明記。
 - 2026-11-21 R4 判断（移行 fingerprint の修正時）: loader の JSON 存在ガードに
   より旧 TOML の再移行は設計上行われない。R2 の fingerprint 追跡は無効かつ
   余分な再ロードを誘発したため R5 で OnceLock へ復元。既存 JSON を上書き
