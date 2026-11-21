@@ -233,7 +233,8 @@ fn session_routes() -> Router<Arc<ServerState>> {
 ///
 /// 極端な値（例: `?limit=18446744073709551615`）が巨大リポジトリの全走査や
 /// 全メッセージのシリアライズを誘発するのを防ぐ安全上限。超過時はこの値へ
-/// クランプする方針を採り、レスポンスの wire format は変更しない。
+/// クランプする。JSON ボディの wire format は変更せず、クランプの通知は
+/// [`LIMIT_CLAMPED_HEADER`] ヘッダで行う。
 const MAX_LIMIT: usize = 5000;
 
 /// クエリの `limit` を [`MAX_LIMIT`] 以下へクランプする純粋ヘルパ。
@@ -243,6 +244,29 @@ const MAX_LIMIT: usize = 5000;
 /// - `Some(0)` はそのまま `Some(0)`（`limit=0` の既存意味論を維持）
 fn clamp_limit(limit: Option<usize>) -> Option<usize> {
     limit.map(|v| v.min(MAX_LIMIT))
+}
+
+/// クライアントが要求した `limit` が [`MAX_LIMIT`] を超えてクランプされたことを
+/// 通知するレスポンスヘッダ名。既存の [`MCP_SYNC_WARNING_HEADER`] と同じ固定
+/// ヘッダ方式を採用し、JSON ボディ形状は変更しない。
+pub const LIMIT_CLAMPED_HEADER: &str = "x-limit-clamped";
+
+/// クランプ通知ヘッダの固定値。要求値・パス・トークンは一切含めない。
+const LIMIT_CLAMPED_VALUE: &str = "true";
+
+/// 元の `limit` が `Some(v)` かつ `v > MAX_LIMIT` の場合にのみ、
+/// 固定値 [`LIMIT_CLAMPED_VALUE`] の通知ヘッダを付けた [`HeaderMap`] を返す。
+///
+/// 未指定 (`None`)・上限以下・上限ちょうどではヘッダを付けない。
+/// ヘッダ値は固定文字列のみで、機微情報は載せない。
+fn build_limit_clamp_headers(original_limit: Option<usize>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if matches!(original_limit, Some(v) if v > MAX_LIMIT) {
+        if let Ok(value) = LIMIT_CLAMPED_VALUE.parse() {
+            headers.insert(LIMIT_CLAMPED_HEADER, value);
+        }
+    }
+    headers
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,18 +392,21 @@ async fn persist_sessions_if_enabled(state: &Arc<ServerState>) {
 async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ListSessionsQuery>,
-) -> Result<Json<Vec<SessionInfo>>> {
+) -> Result<(HeaderMap, Json<Vec<SessionInfo>>)> {
+    // クランプ判定は元の query.limit に対して行う（クランプ後の値では検出できない）。
+    let headers = build_limit_clamp_headers(query.limit);
+    let limit = clamp_limit(query.limit);
     let filter = opencode_session::SessionFilter {
         directory: query.directory,
         roots: query.roots.unwrap_or(false),
         start: query.start,
         search: query.search,
-        limit: clamp_limit(query.limit),
+        limit,
     };
     let manager = state.sessions.lock().await;
     let sessions = manager.list_filtered(filter);
     let infos: Vec<SessionInfo> = sessions.into_iter().map(session_to_info).collect();
-    Ok(Json(infos))
+    Ok((headers, Json(infos)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8240,6 +8267,97 @@ mod limit_clamp_tests {
     fn limit_zero_is_preserved() {
         // limit=0 の既存意味論（空結果）を維持する。
         assert_eq!(clamp_limit(Some(0)), Some(0));
+    }
+
+    /// 回帰ガード: クランプ通知ヘッダは上限超過時のみ固定値 "true" で出現し、
+    /// 未指定・上限以下・上限ちょうどでは出ないこと。
+    #[test]
+    fn clamp_header_only_when_exceeding_max() {
+        let header = |limit: Option<usize>| {
+            build_limit_clamp_headers(limit)
+                .get(LIMIT_CLAMPED_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(header(None), None);
+        assert_eq!(header(Some(0)), None);
+        assert_eq!(header(Some(1)), None);
+        assert_eq!(header(Some(MAX_LIMIT - 1)), None);
+        assert_eq!(header(Some(MAX_LIMIT)), None);
+        assert_eq!(header(Some(MAX_LIMIT + 1)), Some("true".to_owned()));
+        assert_eq!(header(Some(usize::MAX)), Some("true".to_owned()));
+    }
+
+    /// 回帰ガード: ヘッダ値は固定文字列のみで、要求値・パス・トークンを出さない。
+    #[test]
+    fn clamp_header_value_is_fixed_and_non_sensitive() {
+        let secret_token = "sk-supersecret-token-value";
+        let secret_path = "/home/user/.secrets/auth.json";
+        let headers = build_limit_clamp_headers(Some(usize::MAX));
+        let value = headers
+            .get(LIMIT_CLAMPED_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("clamped request must carry the header");
+        assert_eq!(value, LIMIT_CLAMPED_VALUE);
+        assert_eq!(value, "true");
+        let max_value = usize::MAX.to_string();
+        let serialized = format!("{headers:?}");
+        for forbidden in [secret_token, secret_path, max_value.as_str()] {
+            assert!(
+                !serialized.contains(forbidden),
+                "header leaked {forbidden}: {serialized}"
+            );
+        }
+    }
+
+    /// 回帰ガード: list_sessions は JSON ボディを Vec<SessionInfo> のまま返し、
+    /// クランプ時のみヘッダが出る（ハンドラ経由の確認）。
+    #[tokio::test]
+    async fn list_sessions_keeps_body_shape_and_signals_clamp() {
+        let state = Arc::new(ServerState::new());
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".");
+        }
+
+        let query = |limit: Option<usize>| {
+            Query(ListSessionsQuery {
+                directory: None,
+                roots: None,
+                start: None,
+                search: None,
+                limit,
+            })
+        };
+
+        // クランプ時: ヘッダ "true" + ボディは Vec<SessionInfo> のまま。
+        let (headers, Json(infos)) =
+            list_sessions(State(state.clone()), query(Some(MAX_LIMIT + 1)))
+                .await
+                .expect("list_sessions must succeed");
+        assert_eq!(
+            headers
+                .get(LIMIT_CLAMPED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        let infos: Vec<SessionInfo> = infos;
+        assert_eq!(infos.len(), 1);
+        assert!(!infos[0].id.is_empty());
+
+        // 上限ちょうど: ヘッダなし、ボディ形状不変。
+        let (headers, Json(infos)) = list_sessions(State(state.clone()), query(Some(MAX_LIMIT)))
+            .await
+            .expect("list_sessions must succeed");
+        assert!(headers.get(LIMIT_CLAMPED_HEADER).is_none());
+        let _: Vec<SessionInfo> = infos;
+
+        // 未指定: ヘッダなし、ボディ形状不変。
+        let (headers, Json(infos)) = list_sessions(State(state.clone()), query(None))
+            .await
+            .expect("list_sessions must succeed");
+        assert!(headers.get(LIMIT_CLAMPED_HEADER).is_none());
+        let _: Vec<SessionInfo> = infos;
     }
 }
 

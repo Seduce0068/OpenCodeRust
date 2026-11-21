@@ -1911,7 +1911,12 @@ impl ServerState {
             .allow_headers(cors_allow_headers())
             // ブラウザの fetch から相関 ID を読めるようにする（allow_headers は
             // リクエスト側の許可のみでレスポンスヘッダの露出は制御しない）。
-            .expose_headers([HeaderName::from_static("x-request-id")])
+            .expose_headers([
+                HeaderName::from_static("x-request-id"),
+                // ブラウザからクランプ通知 / MCP 同期警告を読めるようにする（R4）。
+                HeaderName::from_static(routes::LIMIT_CLAMPED_HEADER),
+                HeaderName::from_static(routes::MCP_SYNC_WARNING_HEADER),
+            ])
     }
 }
 
