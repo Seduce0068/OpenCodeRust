@@ -67,8 +67,9 @@ impl ConfigLoader {
             return Ok(());
         }
 
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {:?}", path))?;
+        // パスにはユーザー識別子が含まれ得るためエラーへ埋め込まない。
+        let content =
+            fs::read_to_string(path).with_context(|| "Failed to read config file".to_string())?;
 
         // `{env:VAR}` resolves from the merged top-level `env` map first
         // (config-scoped values, including this file's own `env` object), then
@@ -84,10 +85,13 @@ impl ConfigLoader {
         // Apply {file:path} substitution
         let base_dir = path.parent().unwrap_or(Path::new("."));
         let content = resolve_file_references(&content, base_dir)
-            .with_context(|| format!("Failed to resolve file references in: {:?}", path))?;
+            .with_context(|| "Failed to resolve file references".to_string())?;
 
+        // Never include the config path here: it can contain user identifiers.
+        // `parse_jsonc` carries only a sanitized field path and never the serde
+        // error body, which may embed the offending value.
         let config: Config = parse_jsonc(&content)
-            .with_context(|| format!("Failed to parse config file: {:?}", path))?;
+            .map_err(|error| anyhow::anyhow!("Failed to parse config file: {error}"))?;
 
         self.config.merge(config);
         self.config_paths.push(path.to_path_buf());
@@ -929,15 +933,10 @@ fn resolve_file_references(text: &str, base_dir: &Path) -> Result<String> {
             base_dir.join(&file_path_str)
         };
 
-        // The error names the reference and path only. File contents are
-        // never copied into an error or log message.
-        let content = fs::read_to_string(&resolved).with_context(|| {
-            format!(
-                "bad file reference: \"{}\" - {} does not exist",
-                full_match,
-                resolved.display()
-            )
-        })?;
+        // 参照トークンにも解決先パスにもユーザー識別子が含まれ得るため、
+        // エラーへは埋め込まず固定文言のみを返す。ファイル本文も出さない。
+        let content =
+            fs::read_to_string(&resolved).with_context(|| "bad file reference".to_string())?;
         let content = content.trim();
 
         // Use the shared serde_json escaper instead of the old hand-written
@@ -964,9 +963,12 @@ fn parse_jsonc(content: &str) -> Result<Config> {
         allow_trailing_commas: true,
         ..Default::default()
     };
-    let parsed = parse_to_serde_value::<Option<serde_json::Value>>(content, &parse_options)
-        .with_context(|| "Failed to parse JSONC")?
-        .context("Config content is empty")?;
+    // JSONC syntax errors can echo invalid source text. Surface only a fixed
+    // category so no config value reaches an error chain or a log.
+    let parsed = match parse_to_serde_value::<Option<serde_json::Value>>(content, &parse_options) {
+        Ok(value) => value.context("Config content is empty")?,
+        Err(_parse_error) => return Err(anyhow::anyhow!("Failed to parse JSONC")),
+    };
 
     // Warn about (but never reject) unknown top-level keys. Only the key name
     // is logged -- never its value, which may hold secrets. Ignoring unknown
@@ -978,7 +980,124 @@ fn parse_jsonc(content: &str) -> Result<Config> {
         );
     }
 
-    serde_json::from_value(parsed).with_context(|| "Failed to parse config JSON")
+    match serde_json::from_value::<Config>(parsed.clone()) {
+        Ok(config) => Ok(config),
+        Err(_serde_error) => {
+            // `_serde_error` is deliberately dropped: serde embeds the offending
+            // value in its Display text (for example an api_key with the wrong
+            // JSON type). Only a sanitized field path is allowed through.
+            match failing_config_field_path(&parsed) {
+                Some(path) => Err(anyhow::anyhow!(
+                    "Failed to parse config JSON at field: {path}"
+                )),
+                None => Err(anyhow::anyhow!("Failed to parse config JSON")),
+            }
+        }
+    }
+}
+
+/// Locate the field responsible for a `Config` deserialization failure.
+///
+/// Serde's error text is never used: it can embed the offending value (for
+/// example an API key with the wrong JSON type), which must not reach logs or
+/// errors. Instead the parsed value is probed: removing a key that makes the
+/// whole config deserialize identifies the failing field by name only. Nested
+/// objects are examined first so the most specific path (`server.port`) wins.
+/// Returns `None` when no safe, unambiguous path can be found.
+fn failing_config_field_path(value: &serde_json::Value) -> Option<String> {
+    if serde_json::from_value::<Config>(value.clone()).is_ok() {
+        return None;
+    }
+    let mut path: Vec<String> = Vec::new();
+    find_failing_field_path::<Config>(value, &mut path)
+}
+
+/// Recursive probe behind [`failing_config_field_path`].
+///
+/// `path` addresses the object currently being inspected in `root`. Each
+/// candidate is applied to a fresh clone of `root` and validated against the
+/// real deserializer, so only key names -- never values -- influence the
+/// result.
+fn find_failing_field_path<T: serde::de::DeserializeOwned>(
+    root: &serde_json::Value,
+    path: &mut Vec<String>,
+) -> Option<String> {
+    let mut current = root;
+    for segment in path.iter() {
+        current = current.get(segment.as_str())?;
+    }
+    let object = current.as_object()?;
+
+    // Prefer the deepest culprit so nested paths such as `server.port` are
+    // reported instead of just the containing object.
+    for (key, child) in object {
+        if !child.is_object() || !is_safe_field_segment(key) {
+            continue;
+        }
+        path.push(key.clone());
+        let found = find_failing_field_path::<T>(root, path);
+        path.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+
+    // No deeper field explains the failure: test key removal at this level.
+    for key in object.keys() {
+        if !is_safe_field_segment(key) {
+            continue;
+        }
+        let mut candidate = root.clone();
+        let Some(target) = value_at_path_mut(&mut candidate, path) else {
+            continue;
+        };
+        let Some(map) = target.as_object_mut() else {
+            continue;
+        };
+        map.remove(key.as_str());
+        if serde_json::from_value::<T>(candidate).is_err() {
+            continue;
+        }
+        let mut segments = path.clone();
+        segments.push(key.clone());
+        let joined = segments.join(".");
+        if is_safe_field_path(&joined) {
+            return Some(joined);
+        }
+    }
+
+    None
+}
+
+/// Navigate to a mutable value addressed by object keys only.
+fn value_at_path_mut<'a>(
+    root: &'a mut serde_json::Value,
+    path: &[String],
+) -> Option<&'a mut serde_json::Value> {
+    let mut current = root;
+    for segment in path {
+        current = current.get_mut(segment.as_str())?;
+    }
+    Some(current)
+}
+
+/// A single key is loggable only in identifier-like form. Dots are permitted
+/// because they separate nested segments.
+fn is_safe_field_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 64
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Complete paths stay within the same safe alphabet and length bound.
+fn is_safe_field_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 64
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Returns the names of top-level keys in a parsed config that `Config` does
@@ -2346,6 +2465,70 @@ mod tests {
             vec!["a.md".to_string(), "b.md".to_string()]
         );
         assert_eq!(config.plugin, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    /// Regression: a type mismatch must surface the failing field path (keys
+    /// only) and never the invalid value or the config file path.
+    #[test]
+    fn type_error_reports_field_path_without_value_or_file_path() {
+        const INVALID_VALUE: &str = "DO-NOT-LOG-THIS-INVALID-TOKEN-VALUE";
+        let temp = TestDir::new("opencode_config_type_error_redaction");
+        let config_path = temp.path.join("opencode.json");
+        fs::write(
+            &config_path,
+            format!(r#"{{"compaction": {{"auto": "{INVALID_VALUE}"}}}}"#),
+        )
+        .unwrap();
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let error = loader
+            .load_from_file(&config_path)
+            .expect_err("a wrong field type must fail to parse")
+            .to_string();
+
+        assert!(
+            error.contains("compaction.auto"),
+            "field path missing from error: {error}"
+        );
+        assert!(
+            !error.contains(INVALID_VALUE),
+            "invalid value leaked into error: {error}"
+        );
+        let full_path = temp.path.to_string_lossy().into_owned();
+        assert!(!error.contains(&full_path), "config path leaked: {error}");
+        assert!(
+            !error.contains("opencode.json"),
+            "config file name leaked: {error}"
+        );
+    }
+
+    /// Field paths are restricted to a safe alphabet and length so a crafted
+    /// key cannot inject newlines or unbounded text into an error message.
+    #[test]
+    fn field_path_extraction_rejects_unsafe_key_names() {
+        assert!(is_safe_field_segment("server"));
+        assert!(is_safe_field_segment("port"));
+        assert!(is_safe_field_segment("some_key-1"));
+        assert!(is_safe_field_segment("dot.ted"));
+        assert!(!is_safe_field_segment(""));
+        assert!(!is_safe_field_segment("has space"));
+        assert!(!is_safe_field_segment("has\nnewline"));
+        assert!(!is_safe_field_segment("has/slash"));
+        assert!(!is_safe_field_segment(&"a".repeat(65)));
+
+        assert!(is_safe_field_path("server.port"));
+        assert!(!is_safe_field_path("server.po\nrt"));
+        assert!(!is_safe_field_path(&"a".repeat(65)));
+    }
+
+    /// The generic fallback and the top-level path both stay value-free.
+    #[test]
+    fn type_error_never_includes_invalid_value() {
+        let error = parse_jsonc(r#"{"theme": 12345}"#)
+            .expect_err("wrong type must fail")
+            .to_string();
+        assert!(error.contains("theme"), "key should be reported: {error}");
+        assert!(!error.contains("12345"), "invalid value leaked: {error}");
     }
 
     #[test]

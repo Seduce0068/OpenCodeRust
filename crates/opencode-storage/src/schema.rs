@@ -125,10 +125,20 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL,
 
     -- Provider/model info
+    -- NOTE: The insert/upsert paths in repository.rs write only
+    -- (id, session_id, role, created_at, data, metadata, usage); these
+    -- normalized columns are never populated and MessageRow never reads them.
+    -- They are legacy placeholders. Do not read these columns as authoritative.
+    -- For token counts and cost, the `usage` column (MessageUsage JSON) is the single source of truth.
+    -- Provider/model have no current JSON equivalent either. Any future use of
+    -- these normalized columns must first add the missing writes. The schema is
+    -- unchanged; this comment only records the current reality.
     provider_id TEXT,
     model_id TEXT,
 
-    -- Token usage
+    -- Token usage (legacy placeholders; see the note above)
+    -- Never written by insert/upsert. `usage` (MessageUsage JSON) is the only
+    -- source of truth for these values.
     tokens_input INTEGER DEFAULT 0,
     tokens_output INTEGER DEFAULT 0,
     tokens_reasoning INTEGER DEFAULT 0,
@@ -156,10 +166,20 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL,
 
     -- Provider/model info
+    -- NOTE: The insert/upsert paths in repository.rs write only
+    -- (id, session_id, role, created_at, data, metadata, usage); these
+    -- normalized columns are never populated and MessageRow never reads them.
+    -- They are legacy placeholders. Do not read these columns as authoritative.
+    -- For token counts and cost, the `usage` column (MessageUsage JSON) is the single source of truth.
+    -- Provider/model have no current JSON equivalent either. Any future use of
+    -- these normalized columns must first add the missing writes. The schema is
+    -- unchanged; this comment only records the current reality.
     provider_id TEXT,
     model_id TEXT,
 
-    -- Token usage
+    -- Token usage (legacy placeholders; see the note above)
+    -- Never written by insert/upsert. `usage` (MessageUsage JSON) is the only
+    -- source of truth for these values.
     tokens_input INTEGER DEFAULT 0,
     tokens_output INTEGER DEFAULT 0,
     tokens_reasoning INTEGER DEFAULT 0,
@@ -721,6 +741,30 @@ mod tests {
             assert!(
                 !statement.to_ascii_lowercase().contains("user_version"),
                 "スキーマ DDL に user_version 操作を含めないこと"
+            );
+        }
+    }
+
+    /// 正規化列は insert/upsert で書き込まれず、トークン/コストは `usage`
+    /// (MessageUsage JSON) が唯一の情報源である旨をスキーマ内に明記しておく
+    /// （DDL 自体は変更しない）。
+    #[test]
+    fn normalized_message_columns_are_documented_as_non_authoritative() {
+        for ddl in [
+            CREATE_MESSAGES_TABLE,
+            CREATE_MESSAGES_TABLE_WITH_METADATA_USAGE,
+        ] {
+            assert!(
+                ddl.contains("Never written by insert/upsert"),
+                "tokens/cost 列が未書き込みである旨を明記すること"
+            );
+            assert!(
+                ddl.contains("is the single source of truth"),
+                "`usage` JSON がトークン/コストの唯一の情報源である旨を明記すること"
+            );
+            assert!(
+                ddl.contains("Do not read these columns as authoritative"),
+                "正規化列を参照しない旨を明記すること"
             );
         }
     }
