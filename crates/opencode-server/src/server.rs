@@ -52,6 +52,12 @@ pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
 /// `x-request-id` ヘッダ値の最大長（文字数）。超過分は先頭のみ採用する。
 const MAX_REQUEST_ID_LEN: usize = 128;
 
+/// `/control/response` が保持する未消費レスポンスの最大数（RES-02）。
+///
+/// 外部 HTTP から無制限に積めるため、超過分は古い項目から破棄して
+/// メモリ使用量を一定に保つ。
+pub(crate) const MAX_TUI_RESPONSE_QUEUE: usize = 256;
+
 /// `ask()` の待機 future が abort 等でドロップされたときに pending map から
 /// エントリを削除するガード。
 ///
@@ -511,7 +517,8 @@ pub struct ServerState {
     /// Kept as an instance field rather than removed: `/control/response` is a
     /// registered HTTP route (external API) documented as part of the TUI
     /// bridge, so removing it would be a breaking change even though this
-    /// codebase currently has no consumer that pops from the queue.
+    /// codebase currently has no consumer that pops from the queue. Entries
+    /// are bounded by [`MAX_TUI_RESPONSE_QUEUE`] (oldest dropped on overflow).
     pub(crate) tui_response_queue: Mutex<VecDeque<serde_json::Value>>,
     /// Wakeup signal for future response consumers (per-instance).
     pub(crate) tui_response_notify: Notify,

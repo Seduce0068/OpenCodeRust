@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +9,11 @@ use crate::oauth::McpOAuthManager;
 use crate::protocol::*;
 use crate::tool::McpToolRegistry;
 use crate::transport::{HttpTransport, McpTransport, SseTransport, StdioTransport};
+
+/// Per-server log-line cap (RES-03), matching `opencode-server`'s
+/// `MAX_LOG_ENTRIES` (200). Older lines are dropped so reconnect storms
+/// cannot grow the in-memory log without limit.
+const MAX_LOG_ENTRIES: usize = 200;
 
 // ---------------------------------------------------------------------------
 // McpStatus – mirrors the TS discriminated union `MCP.Status`
@@ -916,7 +921,7 @@ pub struct McpClientRegistry {
     /// disabled.  Entries here may not have a corresponding client.
     statuses: RwLock<HashMap<String, McpStatus>>,
     connection_configs: RwLock<HashMap<String, RegistryConnectionConfig>>,
-    logs: RwLock<HashMap<String, Vec<String>>>,
+    logs: RwLock<HashMap<String, VecDeque<String>>>,
     /// OAuth managers keyed by server name. A client must only ever receive
     /// its own server's manager, otherwise a bearer token could be sent to a
     /// different OAuth-protected server.
@@ -960,12 +965,15 @@ impl McpClientRegistry {
 
     async fn log_event(&self, name: &str, message: impl Into<String>) {
         let line = format!("[{}] {}", Utc::now().to_rfc3339(), message.into());
-        self.logs
-            .write()
-            .await
-            .entry(name.to_string())
-            .or_default()
-            .push(line);
+        let mut logs = self.logs.write().await;
+        let entries = logs.entry(name.to_string()).or_default();
+        entries.push_back(line);
+        // Bounded ring buffer: keep only the newest lines, matching the
+        // per-server cap used by the OAuth manager. Timestamp/debounce
+        // behavior of the existing event stream is unchanged.
+        while entries.len() > MAX_LOG_ENTRIES {
+            entries.pop_front();
+        }
     }
 
     // -- Client management ---------------------------------------------------
@@ -1140,14 +1148,23 @@ impl McpClientRegistry {
         self.clients.read().await.get(name).cloned()
     }
 
+    /// RES-03: per-server ログを破棄する（remove / restart の共通処理）。
+    async fn drop_server_log(&self, name: &str) {
+        self.logs.write().await.remove(name);
+    }
+
     pub async fn remove(&self, name: &str) -> Result<(), McpClientError> {
         let client = self.clients.write().await.remove(name);
-        if let Some(client) = client {
-            client.close().await?;
-        }
+        // close が失敗してもクライアントは既に map から削除済みのため、
+        // ステータスとログの整合性を先に回復してからエラーを返す。
+        let close_result = match client {
+            Some(client) => client.close().await,
+            None => Ok(()),
+        };
         self.set_status(name, McpStatus::Disabled).await;
-        self.log_event(name, "Disconnected").await;
-        Ok(())
+        // 切断ログを残す意味はないため、消去してから状態を完了させる。
+        self.drop_server_log(name).await;
+        close_result
     }
 
     pub async fn list(&self) -> Vec<(String, Arc<McpClient>)> {
@@ -1168,7 +1185,7 @@ impl McpClientRegistry {
             .read()
             .await
             .get(name)
-            .cloned()
+            .map(|entries| entries.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -1188,6 +1205,8 @@ impl McpClientRegistry {
         if let Some(client) = self.clients.write().await.remove(name) {
             client.close().await?;
         }
+        // 再接続前に古い接続のログを破棄する（RES-03）。
+        self.drop_server_log(name).await;
 
         match config {
             RegistryConnectionConfig::Stdio(config) => self.add_stdio(config).await,
@@ -1963,5 +1982,52 @@ mod tests {
             &beta
         ));
         assert!(!registry.remove_oauth_manager("alpha").await);
+    }
+
+    /// RES-03 regression: the per-server log is a bounded ring buffer that
+    /// evicts the oldest lines and keeps insertion order.
+    #[tokio::test]
+    async fn log_event_bounds_per_server_log() {
+        let registry = McpClientRegistry::new();
+        let extra = 5usize;
+        let total = MAX_LOG_ENTRIES + extra;
+        for index in 0..total {
+            registry.log_event("alpha", format!("entry-{index}")).await;
+        }
+
+        let logs = registry.logs.read().await;
+        let entries = logs.get("alpha").expect("alpha log must exist");
+        assert_eq!(entries.len(), MAX_LOG_ENTRIES);
+        assert!(
+            entries
+                .front()
+                .expect("oldest line")
+                .ends_with(format!("entry-{extra}").as_str()),
+            "oldest lines must be dropped first"
+        );
+        assert!(
+            entries
+                .back()
+                .expect("newest line")
+                .ends_with(format!("entry-{}", total - 1).as_str()),
+            "newest line must be retained"
+        );
+    }
+
+    /// RES-03 regression: removing a server must drop its log so a reconnect
+    /// starts with a clean history instead of accumulating old entries.
+    #[tokio::test]
+    async fn remove_drops_per_server_log() {
+        let registry = McpClientRegistry::new();
+        registry.log_event("alpha", "before removal").await;
+        assert_eq!(registry.get_logs("alpha").await.len(), 1);
+
+        registry
+            .remove("alpha")
+            .await
+            .expect("removing a server without a client must succeed");
+
+        assert!(registry.get_logs("alpha").await.is_empty());
+        assert!(!registry.logs.read().await.contains_key("alpha"));
     }
 }
