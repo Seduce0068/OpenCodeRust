@@ -212,6 +212,19 @@ struct LegacySseParserState {
     reasoning_open: bool,
 }
 
+// usage のデコード失敗はトークン値を一切ログに出さず、同一ストリーム内では
+// 最初の 1 回だけ固定文言の構造化 warn を出す。
+fn warn_usage_decode_failure_once(warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        event = "provider_usage_decode_failed",
+        "usage decode failed"
+    );
+}
+
 impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_config(OpenAIConfig {
@@ -794,6 +807,7 @@ impl OpenAIProvider {
         let mut reasoning = String::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<RawUsage> = None;
+        let mut usage_warned = false;
         // tool_calls keyed by index: (id, name, arguments)
         let mut tool_calls: HashMap<u32, (Option<String>, Option<String>, String)> = HashMap::new();
 
@@ -851,8 +865,15 @@ impl OpenAIProvider {
                     }
                 }
             }
-            if let Some(u) = chunk.get("usage") {
-                usage = serde_json::from_value(u.clone()).ok();
+            // `usage: null` は「このチャンクに利用量なし」という正常な表現のため、
+            // デコード失敗として警告しない（R4）。
+            if let Some(u @ serde_json::Value::Object(_)) = chunk.get("usage") {
+                match serde_json::from_value::<RawUsage>(u.clone()) {
+                    Ok(parsed) => usage = Some(parsed),
+                    // 失敗時に None で上書きすると直前の有効 usage が消え、
+                    // 課金メータリングが 0 として扱われるため保持する。
+                    Err(_) => warn_usage_decode_failure_once(&mut usage_warned),
+                }
             }
         }
 
@@ -1157,6 +1178,66 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    // tracing-subscriber を依存に追加せず、WARN イベントだけを捕捉する最小限の Subscriber。
+    #[derive(Clone, Default)]
+    struct UsageWarnCapture {
+        events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct UsageWarnVisitor {
+        event: Option<String>,
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for UsageWarnVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = Some(value.to_owned()),
+                "message" => self.message = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for UsageWarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = UsageWarnVisitor {
+                event: None,
+                message: None,
+            };
+            event.record(&mut visitor);
+            self.events.lock().expect("mutex poisoned").push((
+                visitor.event.unwrap_or_default(),
+                visitor.message.unwrap_or_default(),
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     struct NoopProxy;
 
     #[async_trait]
@@ -1267,6 +1348,49 @@ mod tests {
                 completion_tokens: 2
             }
         ));
+    }
+
+    #[test]
+    fn reassemble_sse_chunks_warns_once_on_invalid_usage_and_keeps_last_valid_usage() {
+        let capture = UsageWarnCapture::default();
+        let body = concat!(
+            "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n",
+            "data: {\"usage\":{\"prompt_tokens\":\"leak-marker-42\"}}\n",
+            "data: {\"usage\":null}\n",
+            "data: {\"usage\":{\"completion_tokens\":\"leak-marker-43\"}}\n",
+            "\n"
+        );
+
+        let result = tracing::subscriber::with_default(capture.clone(), || {
+            OpenAIProvider::reassemble_sse_chunks(body).expect("SSE should reassemble")
+        });
+
+        let usage = result.usage.expect("last valid usage should be retained");
+        assert_eq!(usage.prompt_tokens, Some(3));
+        assert_eq!(usage.completion_tokens, Some(4));
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "repeated failures must warn only once");
+        assert_eq!(events[0].0, "provider_usage_decode_failed");
+        assert!(events[0].1.contains("usage decode failed"));
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
+    }
+
+    #[test]
+    fn reassemble_sse_chunks_accepts_valid_usage_without_warning() {
+        let capture = UsageWarnCapture::default();
+        let body =
+            "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}\n";
+
+        let result = tracing::subscriber::with_default(capture.clone(), || {
+            OpenAIProvider::reassemble_sse_chunks(body).expect("SSE should reassemble")
+        });
+
+        let usage = result.usage.expect("valid usage should be reflected");
+        assert_eq!(usage.prompt_tokens, Some(5));
+        assert_eq!(usage.completion_tokens, Some(6));
+        assert_eq!(usage.total_tokens, Some(11));
+        assert!(capture.events.lock().expect("mutex poisoned").is_empty());
     }
 
     #[test]

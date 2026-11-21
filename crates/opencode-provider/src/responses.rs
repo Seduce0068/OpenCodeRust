@@ -402,6 +402,33 @@ pub struct OutputTokensDetails {
     pub reasoning_tokens: Option<u64>,
 }
 
+// usage のデコード失敗はトークン値を一切ログに出さず、同一コンテキスト内では
+// 最初の 1 回だけ固定文言の構造化 warn を出す。
+fn warn_usage_decode_failure_once(warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        event = "provider_usage_decode_failed",
+        "usage decode failed"
+    );
+}
+
+fn parse_responses_usage(value: Option<&Value>, warned: &mut bool) -> ResponsesUsage {
+    let Some(value @ serde_json::Value::Object(_)) = value else {
+        // null / 欠落は「利用量なし」の正常表現のため警告しない（R4）。
+        return ResponsesUsage::default();
+    };
+    match serde_json::from_value::<ResponsesUsage>(value.clone()) {
+        Ok(usage) => usage,
+        Err(_) => {
+            warn_usage_decode_failure_once(warned);
+            ResponsesUsage::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming Chunk Types (12+ discriminated types)
 // ---------------------------------------------------------------------------
@@ -1333,11 +1360,8 @@ impl OpenAIResponsesLanguageModel {
             .unwrap_or_default();
         let (parts, has_function_call, logprobs) = parse_output_items(&output);
 
-        let usage = body
-            .get("usage")
-            .cloned()
-            .and_then(|v| serde_json::from_value::<ResponsesUsage>(v).ok())
-            .unwrap_or_default();
+        let mut usage_warned = false;
+        let usage = parse_responses_usage(body.get("usage"), &mut usage_warned);
 
         let incomplete_reason = body
             .get("incomplete_details")
@@ -2450,6 +2474,66 @@ mod runtime_tests {
         CustomFetchRequest, CustomFetchResponse, CustomFetchStreamResponse,
     };
 
+    // tracing-subscriber を依存に追加せず、WARN イベントだけを捕捉する最小限の Subscriber。
+    #[derive(Clone, Default)]
+    struct UsageWarnCapture {
+        events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct UsageWarnVisitor {
+        event: Option<String>,
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for UsageWarnVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = Some(value.to_owned()),
+                "message" => self.message = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for UsageWarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = UsageWarnVisitor {
+                event: None,
+                message: None,
+            };
+            event.record(&mut visitor);
+            self.events.lock().expect("mutex poisoned").push((
+                visitor.event.unwrap_or_default(),
+                visitor.message.unwrap_or_default(),
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     struct FakeCustomFetchProxy;
 
     #[async_trait]
@@ -2549,6 +2633,53 @@ mod runtime_tests {
             extract_sse_data(&second).as_deref(),
             Some("{\"type\":\"response.completed\"}")
         );
+    }
+
+    #[test]
+    fn parse_responses_usage_warns_once_and_defaults_on_invalid_usage() {
+        let capture = UsageWarnCapture::default();
+        let invalid = json!({"input_tokens": "leak-marker-42", "output_tokens": 2});
+        let mut warned = false;
+
+        let (first, second) = tracing::subscriber::with_default(capture.clone(), || {
+            (
+                parse_responses_usage(Some(&invalid), &mut warned),
+                parse_responses_usage(Some(&invalid), &mut warned),
+            )
+        });
+
+        assert_eq!(first.input_tokens, 0);
+        assert_eq!(first.output_tokens, 0);
+        assert_eq!(second.input_tokens, 0);
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "repeated failures must warn only once");
+        assert_eq!(events[0].0, "provider_usage_decode_failed");
+        assert!(events[0].1.contains("usage decode failed"));
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
+    }
+
+    #[test]
+    fn parse_responses_usage_accepts_valid_usage_without_warning() {
+        let capture = UsageWarnCapture::default();
+        let valid = json!({
+            "input_tokens": 7,
+            "output_tokens": 8,
+            "input_tokens_details": {"cached_tokens": 2}
+        });
+        let mut warned = false;
+
+        let usage = tracing::subscriber::with_default(capture.clone(), || {
+            parse_responses_usage(Some(&valid), &mut warned)
+        });
+
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(
+            usage.input_tokens_details.and_then(|d| d.cached_tokens),
+            Some(2)
+        );
+        assert!(capture.events.lock().expect("mutex poisoned").is_empty());
     }
 
     #[test]

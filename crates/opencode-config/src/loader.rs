@@ -1439,15 +1439,23 @@ fn load_plugins_from_dir(dir: &Path) -> Vec<String> {
             continue;
         }
         if let Ok(entries) = fs::read_dir(&subdir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext == "ts" || ext == "js" {
-                        // Convert to file:// URL like TS does
-                        let url = format!("file://{}", path.display());
-                        plugins.push(url);
-                    }
-                }
+            // `fs::read_dir` order is unspecified. Sort candidate paths so the
+            // later name-based deduplication (deduplicate_plugins keeps the
+            // last entry) always retains the same file, e.g. `foo.ts` rather
+            // than whichever extension the filesystem enumerated last.
+            let mut paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .map(|ext| ext == "ts" || ext == "js")
+                        .unwrap_or(false)
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                // Convert to file:// URL like TS does
+                plugins.push(format!("file://{}", path.display()));
             }
         }
     }
@@ -1456,9 +1464,15 @@ fn load_plugins_from_dir(dir: &Path) -> Vec<String> {
 }
 
 /// Recursively find all .md files in a directory.
+///
+/// Results are returned sorted by path. `fs::read_dir` yields entries in an
+/// unspecified, filesystem-dependent order; downstream loaders deduplicate by
+/// derived name (keeping one entry), so they must see a stable order to pick a
+/// deterministic winner regardless of the environment (CFG2-10).
 fn glob_md_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut results = Vec::new();
     glob_md_files_recursive(dir, &mut results)?;
+    results.sort();
     Ok(results)
 }
 
@@ -4716,6 +4730,123 @@ theme = "dark"
             !text.contains("does not exist") && !text.contains("explicitly specified config file"),
             "find-up candidates must not warn when absent: {text}"
         );
+    }
+
+    // ---- CFG2-10: ディレクトリ走査順に依存しない決定的な勝者 --------------
+
+    fn write_test_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    /// glob_md_files は作成順（read_dir 順）によらず常にパス順で返す。
+    #[test]
+    fn glob_md_files_returns_path_sorted_results() {
+        let temp = TestDir::new("opencode_glob_sorted");
+        // わざと辞書順ではない作成順にする。
+        write_test_file(&temp.path.join("commands/zeta.md"), "z");
+        write_test_file(&temp.path.join("commands/alpha.md"), "a");
+        write_test_file(&temp.path.join("commands/nested/omega.md"), "o");
+        write_test_file(&temp.path.join("commands/nested/beta.md"), "b");
+
+        let files = glob_md_files(&temp.path).expect("glob must succeed");
+        let expected = vec![
+            temp.path.join("commands/alpha.md"),
+            temp.path.join("commands/nested/beta.md"),
+            temp.path.join("commands/nested/omega.md"),
+            temp.path.join("commands/zeta.md"),
+        ];
+        assert_eq!(files, expected, "glob_md_files must return sorted paths");
+    }
+
+    /// 同名プラグイン（foo.ts / foo.js）はファイルシステムの列挙順にかかわらず
+    /// 常に同じものが勝つ。
+    #[test]
+    fn load_plugins_from_dir_winner_is_creation_order_independent() {
+        fn build(order: &[&str]) -> TestDir {
+            let temp = TestDir::new("opencode_plugin_order");
+            let dir = temp.path.join("plugin");
+            for name in order {
+                write_test_file(&dir.join(name), "// plugin");
+            }
+            temp
+        }
+
+        let js_first = build(&["foo.js", "foo.ts"]);
+        let ts_first = build(&["foo.ts", "foo.js"]);
+
+        let a = load_plugins_from_dir(&js_first.path);
+        let b = load_plugins_from_dir(&ts_first.path);
+
+        // 生のリスト自体がソート済みで、作成順に依存しない。
+        let mut sorted = a.clone();
+        sorted.sort();
+        assert_eq!(a, sorted, "plugin paths must be returned sorted");
+        // 一時ディレクトリ名が異なるため、ディレクトリ部分を除いて比較する。
+        let tails = |paths: &Vec<String>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| {
+                    p.rsplit('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .collect()
+        };
+        assert_eq!(
+            tails(&a),
+            tails(&b),
+            "plugin scan must not depend on read_dir order"
+        );
+
+        // 名前による dedup 後も同じ勝者が残る（"foo.js" < "foo.ts" なので foo.ts）。
+        let dedup_a = deduplicate_plugins(a);
+        let dedup_b = deduplicate_plugins(b);
+        assert_eq!(
+            tails(&dedup_a),
+            tails(&dedup_b),
+            "dedup winner must be deterministic"
+        );
+        assert_eq!(dedup_a.len(), 1);
+        assert!(
+            dedup_a[0].ends_with("foo.ts"),
+            "expected foo.ts to be the deterministic winner"
+        );
+    }
+
+    /// 同名コマンド（command/foo.md と commands/foo.md）も作成順に依存しない。
+    #[test]
+    fn load_commands_from_dir_winner_is_creation_order_independent() {
+        fn build(order: &[(&str, &str)]) -> TestDir {
+            let temp = TestDir::new("opencode_command_order");
+            for (rel, body) in order {
+                write_test_file(&temp.path.join(rel), body);
+            }
+            temp
+        }
+
+        let a_dir = build(&[
+            ("command/foo.md", "from command"),
+            ("commands/foo.md", "from commands"),
+        ]);
+        let b_dir = build(&[
+            ("commands/foo.md", "from commands"),
+            ("command/foo.md", "from command"),
+        ]);
+
+        let a = load_commands_from_dir(&a_dir.path);
+        let b = load_commands_from_dir(&b_dir.path);
+
+        let a_foo = a.get("foo").expect("foo command");
+        let b_foo = b.get("foo").expect("foo command");
+        assert_eq!(a_foo.template.as_deref(), Some("from commands"));
+        assert_eq!(b_foo.template.as_deref(), Some("from commands"));
     }
 }
 
