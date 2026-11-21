@@ -672,21 +672,40 @@ impl McpOAuthManager {
         self.connect(server_name).await
     }
 
+    /// Delete the persisted credentials and the in-memory OAuth state for a
+    /// server.
+    ///
+    /// Returns `true` when the on-disk deletion succeeded, regardless of
+    /// whether local in-memory state was present (e.g. after a restart).
+    /// A deletion failure returns `false` and deliberately keeps the cached
+    /// managers: dropping them would let a later connect rebuild a manager from
+    /// the credentials still on disk. The authorization marker is cleared so a
+    /// reconnect reports `needs_auth` until the user authenticates again.
     pub async fn remove_oauth(&self, server_name: &str) -> bool {
-        let removed = self
-            .oauth_states
-            .write()
-            .await
-            .remove(server_name)
-            .is_some();
-
-        // Logging out must actually delete the stored credentials, otherwise a
-        // later connect would silently reuse the old tokens. Delete from disk
-        // regardless of whether this process holds a cached client.
-        self.oauth_clients.write().await.remove(server_name);
+        // Delete from disk *before* touching any in-memory state. The previous
+        // implementation logged a deletion failure and still cleared
+        // `oauth_states`, `oauth_clients` and the registry manager, so a later
+        // connect could silently reuse the credentials left on disk while
+        // logout was reported as successful.
         if let Err(error) = opencode_mcp::auth::remove(server_name).await {
-            tracing::warn!(server = server_name, %error, "failed to delete stored MCP OAuth credentials");
+            // Log only the error kind: no token values, URLs or paths.
+            tracing::warn!(
+                server = server_name,
+                kind = ?error.kind(),
+                "failed to delete stored MCP OAuth credentials; logout not completed"
+            );
+            self.oauth_states.write().await.remove(server_name);
+            self.mark_needs_auth_after_failed_logout(server_name).await;
+            return false;
         }
+
+        // The return value reflects only the on-disk deletion: in-memory state
+        // may be empty after a restart even though a stale token was on disk.
+        self.oauth_states.write().await.remove(server_name);
+
+        // The stored credentials are gone, so the in-process managers can be
+        // dropped safely: a fresh one can no longer load stale tokens.
+        self.oauth_clients.write().await.remove(server_name);
 
         // The client registry keeps its own Arc for add_http/add_sse and
         // registry.restart. Drop it too, so a logout cannot leave a stale
@@ -730,7 +749,47 @@ impl McpOAuthManager {
                 .insert(server_name.to_string(), info);
         }
 
-        removed
+        true
+    }
+
+    /// Downgrade a server to `needs_auth` after an incomplete logout.
+    ///
+    /// Only a fixed message is stored: no token values, URLs or paths.
+    async fn mark_needs_auth_after_failed_logout(&self, server_name: &str) {
+        let Some(managed) = self.servers.read().await.get(server_name).cloned() else {
+            return;
+        };
+        let mut info = self
+            .statuses
+            .read()
+            .await
+            .get(server_name)
+            .cloned()
+            .unwrap_or_else(|| McpServerInfo {
+                name: server_name.to_string(),
+                status: "needs_auth".to_string(),
+                tools: 0,
+                resources: 0,
+                error: None,
+                oauth_required: managed.config.oauth_required(),
+                oauth_status: None,
+            });
+        info.oauth_status = None;
+        if managed.config.oauth_required() {
+            info.status = if managed.enabled {
+                "needs_auth".to_string()
+            } else {
+                "disabled".to_string()
+            };
+            info.error = Some(
+                "failed to delete stored MCP OAuth credentials; re-authentication required"
+                    .to_string(),
+            );
+        }
+        self.statuses
+            .write()
+            .await
+            .insert(server_name.to_string(), info);
     }
 
     async fn managed_server(&self, server_name: &str) -> Result<ManagedServer, McpOAuthError> {
@@ -897,6 +956,97 @@ mod tests {
         let _ = std::fs::remove_file(&auth_file);
     }
 
+    /// A failed on-disk deletion must not be reported as a successful logout,
+    /// and must not discard the cached managers that still track the
+    /// credentials left on disk.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_oauth_failure_keeps_managers_and_requires_auth() {
+        let _guard = auth_store_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "opencode-mcp-auth-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        // Reading a directory as the credential store fails, so the disk
+        // deletion performed by remove_oauth cannot succeed.
+        let unreadable_store = dir.join("not-a-file");
+        std::fs::create_dir_all(&unreadable_store).expect("create unreadable store directory");
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &unreadable_store);
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+        {
+            let mut states = manager.oauth_states.write().await;
+            states.insert(
+                "remote".to_string(),
+                McpOAuthState {
+                    server_name: "remote".to_string(),
+                    authorization_url: "https://idp.example.com/authorize".to_string(),
+                    client_id: None,
+                    status: McpOAuthStatus::Authorized,
+                },
+            );
+        }
+        let cached = Arc::new(RealOAuthManager::new(
+            "remote".to_string(),
+            "https://example.com/mcp".to_string(),
+            RealOAuthConfig::default(),
+        ));
+        manager
+            .oauth_clients
+            .write()
+            .await
+            .insert("remote".to_string(), cached.clone());
+        manager.clients.set_oauth_manager("remote", cached).await;
+        manager
+            .log_event("remote", "info", "before failed logout")
+            .await;
+
+        assert!(
+            !manager.remove_oauth("remote").await,
+            "failed disk deletion must not be reported as a successful logout"
+        );
+        assert!(
+            manager.oauth_clients.read().await.contains_key("remote"),
+            "failed logout must keep the cached OAuth manager"
+        );
+        assert!(
+            manager.clients.has_oauth_manager("remote").await,
+            "failed logout must keep the registry manager"
+        );
+        assert!(
+            !manager.get_logs("remote").await.expect("logs").is_empty(),
+            "failed logout must not discard the per-server log"
+        );
+
+        let status = manager.get_server("remote").await.expect("server exists");
+        assert_eq!(status.status, "needs_auth");
+        assert_eq!(status.oauth_status, None);
+        let reconnect = manager.connect("remote").await.expect("connect result");
+        assert_eq!(
+            reconnect.status, "needs_auth",
+            "reconnect must require re-authentication while credentials remain on disk"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
     /// Logout must also evict the manager cached by the client registry, which
     /// `add_http`/`add_sse` and `registry.restart` would otherwise keep using.
     #[allow(clippy::await_holding_lock)]
@@ -950,6 +1100,40 @@ mod tests {
         assert!(
             !manager.clients.has_oauth_manager("remote").await,
             "logout must drop the manager registry entry"
+        );
+
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_oauth_returns_true_when_only_disk_credentials_exist() {
+        let _guard = auth_store_lock();
+        let auth_file = temp_auth_file("logout-disk-only");
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        // 再起動直後を想定: メモリの oauth_states は空だがディスクに資格情報が残る。
+        let stored = serde_json::json!({
+            "remote": { "access_token": "dummy-token" }
+        });
+        std::fs::write(&auth_file, stored.to_string()).expect("seed auth file");
+        let manager = McpOAuthManager::new();
+        assert!(
+            manager.oauth_states.read().await.is_empty(),
+            "in-memory state must start empty"
+        );
+
+        assert!(
+            manager.remove_oauth("remote").await,
+            "successful disk deletion must be reported even without in-memory state"
+        );
+        assert!(
+            opencode_mcp::auth::try_get("remote")
+                .await
+                .expect("read auth store")
+                .is_none(),
+            "credential must be removed from disk"
         );
 
         let _ = std::fs::remove_file(&auth_file);

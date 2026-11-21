@@ -944,6 +944,30 @@ impl TodoRepository {
     }
 }
 
+/// `session_input.metadata` を復元する。NULL は「値なし」、破損 JSON は fail-loud。
+///
+/// `SessionRow::decode_json_field` / `decode_message_json_field` と同じ方針で、
+/// パース失敗時は黙って `None` にせず `DatabaseError::CorruptData` を返す。
+/// serde のエラー詳細には保存値（メタデータの内容＝トークン値等）が含まれうるため、
+/// ここで破棄し、warn / エラーにはフィールド名と入力 ID だけを載せる。
+/// パス情報は一切扱わない。
+fn decode_input_metadata(
+    input_id: &str,
+    raw: Option<&str>,
+) -> Result<Option<serde_json::Value>, DatabaseError> {
+    match raw {
+        None => Ok(None),
+        Some(value) => serde_json::from_str(value).map(Some).map_err(|_| {
+            tracing::warn!(
+                field = "metadata",
+                input_id = %input_id,
+                "failed to parse stored session_input JSON field"
+            );
+            DatabaseError::CorruptData("session input has invalid metadata JSON".to_string())
+        }),
+    }
+}
+
 #[derive(Clone)]
 pub struct InputRepository {
     pool: SqlitePool,
@@ -1025,20 +1049,21 @@ impl InputRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| opencode_types::SessionInput {
+        let mut inputs = Vec::with_capacity(rows.len());
+        for row in rows {
+            // 破損 metadata は黙って None にせず CorruptData として報告する（fail-loud）。
+            let metadata = decode_input_metadata(&row.id, row.metadata.as_deref())?;
+            inputs.push(opencode_types::SessionInput {
                 id: row.id,
                 session_id: row.session_id,
                 prompt: row.prompt,
                 delivery: row.delivery,
-                metadata: row
-                    .metadata
-                    .and_then(|value| serde_json::from_str(&value).ok()),
+                metadata,
                 status: row.status,
                 created_at: row.created_at as u64,
-            })
-            .collect())
+            });
+        }
+        Ok(inputs)
     }
 
     pub async fn claim_pending(&self, id: &str) -> Result<bool, DatabaseError> {
@@ -1097,20 +1122,21 @@ impl InputRepository {
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| opencode_types::SessionInput {
+        let mut inputs = Vec::with_capacity(rows.len());
+        for row in rows {
+            // 破損 metadata は黙って None にせず CorruptData として報告する（fail-loud）。
+            let metadata = decode_input_metadata(&row.id, row.metadata.as_deref())?;
+            inputs.push(opencode_types::SessionInput {
                 id: row.id,
                 session_id: row.session_id,
                 prompt: row.prompt,
                 delivery: row.delivery,
-                metadata: row
-                    .metadata
-                    .and_then(|value| serde_json::from_str(&value).ok()),
+                metadata,
                 status: row.status,
                 created_at: row.created_at as u64,
-            })
-            .collect())
+            });
+        }
+        Ok(inputs)
     }
 
     pub async fn mark_as_promoted(&self, id: &str) -> Result<(), DatabaseError> {
@@ -1726,7 +1752,9 @@ mod message_repository_tests {
 
 #[cfg(test)]
 mod input_repository_tests {
+    use super::log_capture::{CaptureSubscriber, LogBuffer};
     use super::InputRepository;
+    use crate::database::DatabaseError;
     use crate::Database;
 
     #[tokio::test]
@@ -1826,6 +1854,110 @@ mod input_repository_tests {
         assert!(repository.claim_pending(&first.id).await.unwrap());
         repository.mark_as_failed(&first.id).await.unwrap();
         assert!(repository.claim_pending(&second.id).await.unwrap());
+    }
+
+    /// 破損 metadata を持つ pending 行を 1 件シードする（FK 制約を満たすため session も作る）。
+    async fn seed_input_with_metadata(database: &Database, input_id: &str, metadata_json: &str) {
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+        sqlx::query(
+            "INSERT INTO session_input (id, session_id, prompt, delivery, metadata, status, created_at) \
+             VALUES (?, 'session-1', 'prompt', NULL, ?, 'pending', 1)",
+        )
+        .bind(input_id)
+        .bind(metadata_json)
+        .execute(database.pool())
+        .await
+        .expect("input row seeded");
+    }
+
+    #[tokio::test]
+    async fn list_pending_reports_corrupt_metadata_as_corrupt_data() {
+        let database = Database::in_memory().await.expect("database initializes");
+        seed_input_with_metadata(&database, "corrupt-input", "{\"broken\":").await;
+        let repository = InputRepository::new(database.pool().clone());
+
+        let result = repository.list_pending("session-1").await;
+        assert!(
+            matches!(result, Err(DatabaseError::CorruptData(_))),
+            "corrupt metadata must be reported as CorruptData, not silently become None"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pending_all_reports_corrupt_metadata_as_corrupt_data() {
+        let database = Database::in_memory().await.expect("database initializes");
+        seed_input_with_metadata(&database, "corrupt-input", "not-json").await;
+        let repository = InputRepository::new(database.pool().clone());
+
+        let result = repository.list_pending_all().await;
+        assert!(
+            matches!(result, Err(DatabaseError::CorruptData(_))),
+            "corrupt metadata must be reported as CorruptData, not silently become None"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_metadata_is_restored_by_both_list_methods() {
+        let database = Database::in_memory().await.expect("database initializes");
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) VALUES ('session-1', 'project-1', 'test', '.', 'Test', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("session row exists");
+
+        let repository = InputRepository::new(database.pool().clone());
+        let metadata = serde_json::json!({"source": "unit-test", "nested": {"key": "value"}});
+        let enqueued = repository
+            .enqueue("session-1", "prompt", None, Some(&metadata))
+            .await
+            .expect("input enqueued");
+
+        let pending = repository
+            .list_pending("session-1")
+            .await
+            .expect("list_pending works");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, enqueued.id);
+        assert_eq!(pending[0].metadata, Some(metadata.clone()));
+
+        let all = repository
+            .list_pending_all()
+            .await
+            .expect("list_pending_all works");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].metadata, Some(metadata));
+    }
+
+    /// 破損 metadata の保存値（トークン値）が CorruptData / warn に漏れない回帰テスト。
+    #[tokio::test]
+    async fn corrupt_metadata_value_does_not_leak_into_error_or_warn() {
+        const SENTINEL_TOKEN: &str = "SENTINEL_INPUT_METADATA_TOKEN";
+        let database = Database::in_memory().await.expect("database initializes");
+        let corrupt_json = format!("{{\"api_key\":\"{SENTINEL_TOKEN}\" broken");
+        seed_input_with_metadata(&database, "leak-check-input", &corrupt_json).await;
+
+        let repository = InputRepository::new(database.pool().clone());
+        let logs = LogBuffer::default();
+        let guard = tracing::subscriber::set_default(CaptureSubscriber::new(logs.clone()));
+        let result = repository.list_pending("session-1").await;
+        drop(guard);
+
+        let error = result.expect_err("corrupt metadata must fail");
+        assert!(
+            matches!(&error, DatabaseError::CorruptData(_)),
+            "corrupt metadata must be CorruptData"
+        );
+        let combined = format!("{error} {}", logs.text());
+        assert!(
+            !combined.contains(SENTINEL_TOKEN),
+            "metadata の保存値（トークン値）を error / warn に出さないこと"
+        );
     }
 }
 

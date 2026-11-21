@@ -3983,7 +3983,13 @@ async fn mcp_authenticate(Path(name): Path<String>) -> Result<Json<McpStatusInfo
 async fn remove_mcp_auth(Path(name): Path<String>) -> Result<Json<serde_json::Value>> {
     let manager = get_mcp_oauth_manager();
     ensure_mcp_server_registered(manager, &name).await?;
-    manager.remove_oauth(&name).await;
+    // ディスク上の認証情報削除に失敗した場合は success を返さない。
+    // 古いトークンが残ったまま「ログアウト済み」と誤認されるのを防ぐ。
+    if !manager.remove_oauth(&name).await {
+        return Err(ApiError::InternalError(
+            "failed to delete stored MCP OAuth credentials".to_string(),
+        ));
+    }
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
