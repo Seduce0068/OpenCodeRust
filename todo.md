@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **TOML→JSON 移行で JSON 書込後のバックアップ失敗が成功扱い**
-  — `config/loader.rs:509-545` / ERRPATH-07 / 低
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
   — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
 - [ ] **MCP 設定のディスク同期失敗が飲まれ古い状態が返る**
@@ -258,10 +256,6 @@ status: current
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
 - [ ] **ビルトイン auth プラグインのロード失敗を warn のみで起動継続**
   — `server.rs:1512-1521` / ERRPATH-08 / 中（設計判断）
-- [ ] **マスク文字列が TUI `[redacted]`、他は `<redacted>` で不統一**
-  — `tui/api.rs:321` 等 / CONSTANTS-03 / 中（設計判断）
-- [ ] **WebSearch 個別 timeout 25 秒が定数化されず client 30 秒と不一致**
-  — `tool/websearch.rs:26,263` / CONSTANTS-04 / 中
 - [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
   — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
@@ -276,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[移行/マスク/timeout 3 件]** バックアップ順序と形式の明記
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[定数整合 6 件]** 単一情報源化と SSE バックオフ文書修正
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[永続化/境界 4 件]** 認証整合・ログアウト・models 境界・metadata
