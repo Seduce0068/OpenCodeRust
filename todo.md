@@ -164,6 +164,14 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **TodoManager の writer_locks に削除経路が無い**
+  — `session/todo.rs:83-89` / RES-05 / 低
+- [ ] **LSP diagnostics/file_versions が close 後に残存**
+  — `lsp/lib.rs:320-323` / RES-06 / 低
+- [ ] **PluginLoader 再ロードで clients/trusted_scripts が累加**
+  — `plugin/loader.rs:206-232` / RES-07 / 低
+- [ ] **macOS クリップボード画像の一時ファイルが失敗経路で残存**
+  — `tui/clipboard.rs:214-245` / RES-08 / 低
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -211,6 +219,13 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **TUI compact が未登録の /compact を叩き期待型も異なる**
+  — `tui/api.rs:1100` / API-01 / 高（事実確認済み）
+- [ ] **revert レスポンスが TUI 期待の success ではなく SessionInfo**
+  — `tui/api.rs:265` / API-02 / 高（事実確認済み）
+- [ ] **fork の message_id が TUI はクエリ、サーバは JSON body**
+  — `tui/api.rs:1137` / API-03 / 高（事実確認済み）
+
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -241,6 +256,28 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **PTY セッションが自然終了しても HashMap に残存**
+  — `server/pty.rs:156-189` / RES-01 / 中
+- [ ] **tui_response_queue に pop するコンシューマが無く無限成長**
+  — `routes.rs:5636-5649` / RES-02 / 中
+- [ ] **MCP per-server ログ Vec に上限が無く再接続ごとに増加**
+  — `mcp/client.rs:961-969` / RES-03 / 中
+- [ ] **OAuth 放置フローの一時状態に TTL/回収が無い**
+  — `mcp/oauth.rs:441-496` / RES-04 / 中
+- [ ] **DELETE 系が存在しないリソースに 404（冪等性の解釈差）**
+  — `routes.rs:586` / API-04 / 中（speculation）
+- [ ] **POST /prompt に冪等キーが無く再送で二重実行**
+  — `routes.rs:1991-1999` / API-05 / 中（speculation）
+- [ ] **add_message_part が毎回 UUID を採番し再送で重複**
+  — `routes.rs:1407` / API-06 / 中（speculation）
+- [ ] **provider 一覧のトップレベルキーが /provider と /config/providers で不一致**
+  — `routes.rs:3302` / API-07 / 中
+- [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
+  — `tui/api.rs:681-693` / API-08 / 中
+- [ ] **単一メッセージ取得と list_messages で wire が camel/snake に分岐**
+  — `routes.rs:3003-3012` / API-09 / 中
+- [ ] **limit 上限クランプが黙って行われ通知手段が無い**
+  — `routes.rs:237-246` / API-10 / 中（speculation）
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
@@ -634,6 +671,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 cross-skill 集約（swarm140、2 担当・18 件、観点: HTTP API 契約 /
+  リソース寿命）: 親が API high 3 件（compact URL / revert レスポンス型 /
+  fork 引数 transports）を read で事実確認、高 3 / 中 15 / 低 4 を追記。
+  TUI のユーザー操作（compact / undo / fork）が実際に失敗する明確なバグ。
 - 2026-11-21 R4 残存（ビルトイン auth fail-closed の修正時、記録のみ）:
   fail-closed の実起動経路（new_with_storage_for_url）を通る統合テストが無く、
   ヘルパーのみの検証。CLI 経路は warn + 継続のまま（担当外・server と不一致）。
