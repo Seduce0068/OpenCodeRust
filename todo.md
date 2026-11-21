@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **unwatch エラーで監視登録とデバウンス表が不整合**
-  — `watcher/lib.rs:234-246` / WATCHER-UNWATCH-PARTIAL / 低
 - [ ] **Agent part の status が pending のまま更新されない**
   — `session/message.rs:234-244` / AGENT-PART-PENDING / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -272,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[unwatch 整合性 1 件]** 失敗時も内部状態をクリーンアップ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[subagent 深さ復元 1 件]** 永続化ラウンドトリップで深さを保持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[optimistic メッセージ残存 1 件]** Home 経路の失敗時 cleanup
