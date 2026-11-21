@@ -164,6 +164,9 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **TUI 入力スレッドが終了時に join されない** — `tui/app.rs:248-274` / SHUTDOWN-08 / 低
+- [ ] **設定検証手段が無く README も不正設定時の挙動を案内しない**
+  — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
   — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
 - [ ] **MCP 設定のディスク同期失敗が飲まれ古い状態が返る**
@@ -215,6 +218,14 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **サーバに graceful shutdown / シグナル処理が無い**
+  — `server.rs:2092-2096` / SHUTDOWN-01 / 高（事実確認済み）
+- [ ] **TUI がローカルサーバを即 abort（in-flight HTTP/永続化が強制切断）**
+  — `main.rs:1416-1423` / SHUTDOWN-02 / 高（事実確認済み）
+- [ ] **サーバ終了時のfinal session flush が無い**
+  — `server.rs:873-921` / SHUTDOWN-03 / 高（事実確認済み）
+- [ ] **設定警告が tracing 初期化前に発行されキャッシュで再発しない**
+  — `main.rs:1022-1034` / CFGVAL-01 / 高（事実確認済み）
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
@@ -250,6 +261,31 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
+  — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
+- [ ] **mdns 子プロセスがシグナル時に孤児化** — `main.rs:2919-2920` / SHUTDOWN-05 / 中
+- [ ] **plugin shutdown RPC 失敗時に kill フォールバックをスキップ**
+  — `plugin/client.rs:568-574` / SHUTDOWN-06 / 中
+- [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
+  — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
+- [ ] **シグナル終了で tracing WorkerGuard のフラッシュが飛ぶ**
+  — `main.rs:1032-1034` / SHUTDOWN-09 / 中（speculation）
+- [ ] **設定ロード失敗時にサーバーバインド設定が無警告で既定値へ**
+  — `main.rs:107-115` / CFGVAL-02 / 中（事実確認済み）
+- [ ] **1 フィールドの型不正が設定全体破棄となり次アクションを示さない**
+  — `config/loader.rs:89-95` / CFGVAL-03 / 中
+- [ ] **ネストしたキーの誤記がサイレントに無視される**
+  — `config/loader.rs:945-975` / CFGVAL-04 / 中
+- [ ] **非推奨キー mode / tools / autoshare が警告なしで移行**
+  — `config/loader.rs:1801-1862` / CFGVAL-05 / 中
+- [ ] **Markdown frontmatter パース失敗で全メタデータが黙って失われる**
+  — `config/loader.rs:1193-1209` / CFGVAL-06 / 中
+- [ ] **明示指定の OPENCODE_CONFIG が存在しない場合に無警告で無視**
+  — `config/loader.rs:64-68` / CFGVAL-07 / 中
+- [ ] **同一レイヤーの provider/providers 衝突が警告なしで破棄**
+  — `config/schema.rs:1493-1497` / CFGVAL-08 / 中
+- [ ] **不正な入れ子値（oauth/environment/headers）が無警告で捨てられる**
+  — `config/schema.rs:1229-1239` / CFGVAL-09 / 中
 - [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
   — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
@@ -607,6 +643,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 cross-skill 集約（swarm120、2 担当・19 件、観点: シャットダウン /
+  設定検証と案内）: 親が 4 件の root を read で事実確認（graceful shutdown 不在、
+  TUI abort、final flush 不在、設定警告の初期化前発行）、高 5 / 中 17 / 低 3 を
+  追記。既知の PluginLoader::shutdown_all 未呼び出しとは別の指摘に絞った。
 - 2026-11-21 R4 残存（永続化/境界の修正時、記録のみ）: auth.json が非アトミック
   書き込みで chmod も事後実行（途中失敗・権限露出の懸念）。ログアウト失敗時に
   静的ヘッダー併用サーバーへ古い OAuth マネージャが注入され得る。
