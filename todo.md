@@ -263,8 +263,6 @@ status: current
   — `routes.rs:3302` / API-07 / 中
 - [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
   — `tui/api.rs:681-693` / API-08 / 中
-- [ ] **単一メッセージ取得と list_messages で wire が camel/snake に分岐**
-  — `routes.rs:3003-3012` / API-09 / 中
 - [ ] **limit 上限クランプが黙って行われ通知手段が無い**
   — `routes.rs:237-246` / API-10 / 中（speculation）
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
@@ -287,6 +285,8 @@ status: current
 
 ## 完了
 
+- [x] **[メッセージ wire 統一 1 件]** get_message を list_messages と同一化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[リソース上限 2 件]** TUI レスポンスキューと MCP ログのリング化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI API 契約 3 件]** compact/revert/fork の不一致を解消
