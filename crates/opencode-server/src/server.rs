@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock;
 use std::sync::{Arc, LazyLock};
@@ -520,6 +521,8 @@ pub struct ServerState {
     /// 実行中プロンプトがキュー由来の場合のキュー項目 ID。
     /// abort 時に項目を終端化するため、`running_prompt_tasks` と同じセッション単位で管理する。
     pub(crate) running_prompt_queue_ids: StdMutex<HashMap<String, String>>,
+    /// graceful shutdown 中はキュー回収の再スケジュールを止める（二重実行防止）。
+    pub(crate) shutting_down: AtomicBool,
     /// セッションごとの実行状態（旧プロセス共有 static `SESSION_RUN_STATUS`）。
     pub(crate) session_run_status: TokioRwLock<HashMap<String, routes::SessionRunStatus>>,
     /// セッションごとのプロンプト直列化ロック（旧プロセス共有 static `PROMPT_LOCKS`）。
@@ -562,6 +565,7 @@ impl ServerState {
             tui_response_notify: Notify::new(),
             running_prompt_tasks: StdMutex::new(HashMap::new()),
             running_prompt_queue_ids: StdMutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
             session_run_status: TokioRwLock::new(HashMap::new()),
             prompt_locks: TokioRwLock::new(HashMap::new()),
             project_metadata: TokioRwLock::new(HashMap::new()),
@@ -642,6 +646,72 @@ impl ServerState {
             .is_some_and(|handle| handle.id() == task_id)
         {
             tasks.remove(session_id);
+        }
+    }
+
+    /// graceful shutdown 時に実行中プロンプトを中断し、キュー項目を終端化する。
+    ///
+    /// `tokio::spawn` されたプロンプトタスクは `with_graceful_shutdown` の待機対象
+    /// 外のため、ここで明示的に abort する。あわせてキュー由来の項目を
+    /// `mark_as_failed` で `failed` へ遷移させ、再起動時の `reset_processing`
+    /// → `resume_queued_prompts` による二重実行を防ぐ。
+    ///
+    /// - タスクはすべて abort し、登録を解除する（abort 自体は失敗しない）。
+    /// - キュー項目は終端化に成功したものだけ登録を解除する。
+    /// - 失敗時は生エラー・キュー id・パス・トークンを一切出さず、固定文言の
+    ///   構造化 warn のみを記録する（秘密情報がログへ漏れる経路を作らない）。
+    pub(crate) async fn abort_running_prompts_and_finalize_queue(&self) {
+        // 再スケジュールを止めてから回収する（Drop / recover の二段構え）。
+        self.shutting_down.store(true, Ordering::Release);
+        // 先にキュー ID をすべて取り出して回収担当になる。こうするとタスクの
+        // Drop（PromptTaskCleanup）が take_prompt_queue_id で None を見て再 spawn
+        // しないため、graceful shutdown 後にプロンプトが復活しない。
+        let queue_ids: Vec<(String, String)> = {
+            let mut ids = self
+                .running_prompt_queue_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ids.drain().collect()
+        };
+
+        // 実行中タスクをすべて abort し、登録をクリアする。
+        {
+            let mut tasks = self
+                .running_prompt_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (_session_id, handle) in tasks.drain() {
+                handle.abort();
+            }
+        }
+
+        if queue_ids.is_empty() {
+            return;
+        }
+
+        let Some(repo) = self.input_repo.as_ref() else {
+            // ストレージ未設定の埋め込み利用では終端化できないため、固定 warn のみ。
+            // 正常に終端化できていないので登録は残す（成功時のみ解除する方針を維持）。
+            tracing::warn!(
+                event = "shutdown_queue_finalize_failed",
+                error = "[REDACTED]",
+                "Failed to finalize a running queued prompt during graceful shutdown"
+            );
+            return;
+        };
+
+        for (_session_id, queue_id) in queue_ids {
+            if repo.mark_as_failed(&queue_id).await.is_ok() {
+                // キュー登録は先頭で drain 済み（Drop の再 spawn を防ぐため）。
+                // ここでは終端化結果だけを扱い、登録の再削除は行わない。
+            } else {
+                // 生エラー・キュー id は出さない固定 warn。
+                tracing::warn!(
+                    event = "shutdown_queue_finalize_failed",
+                    error = "[REDACTED]",
+                    "Failed to finalize a running queued prompt during graceful shutdown"
+                );
+            }
         }
     }
 
@@ -2277,8 +2347,12 @@ async fn serve_with_shutdown(
     .with_graceful_shutdown(graceful_shutdown_future(shutdown))
     .await;
 
+    // graceful shutdown が完了していれば全 in-flight HTTP リクエストは終了済みだが、
+    // tokio::spawn されたプロンプトタスクは待機対象外のため先に明示的に中断し、
+    // キュー項目を failed へ終端化して再起動時の二重実行を防ぐ。
+    state.abort_running_prompts_and_finalize_queue().await;
+
     // serve が成功した場合もエラー終了した場合も、ここで最終状態を永続化する。
-    // graceful shutdown が完了していれば全 in-flight リクエストは終了済み。
     finalize_session_flush(state.sync_sessions_to_storage()).await;
 
     serve_result?;
@@ -4572,5 +4646,158 @@ mod tests {
         })
         .await;
         assert_eq!(calls_ok.load(Ordering::SeqCst), 1);
+    }
+
+    /// shutdown 終端化テスト用に、インメモリ DB と input_repo を持つ ServerState を作る。
+    async fn shutdown_test_state() -> (ServerState, Database, InputRepository) {
+        let mut state = ServerState::new();
+        let db = Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let repo = InputRepository::new(db.pool().clone());
+        state.input_repo = Some(repo.clone());
+        (state, db, repo)
+    }
+
+    /// `session_input.session_id` の外部キー制約を満たす保存済みセッションを作る。
+    async fn store_session(state: &ServerState, db: &Database) -> String {
+        let (session, stored) = {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.create("default", ".");
+            let stored = stored_session_from_session(&session);
+            (session, stored)
+        };
+        SessionRepository::new(db.pool().clone())
+            .create(&stored)
+            .await
+            .expect("stored session must exist for the foreign key");
+        session.id
+    }
+
+    /// R2 回帰: shutdown 時に実行中タスクが abort され、キュー項目が failed へ
+    /// 終端化されて登録がクリアされること。
+    #[tokio::test]
+    async fn shutdown_aborts_prompts_and_finalizes_queue_registrations() {
+        let (state, db, repo) = shutdown_test_state().await;
+        let session_id = store_session(&state, &db).await;
+
+        let input = repo
+            .enqueue(&session_id, "queued prompt", Some("queue"), None)
+            .await
+            .expect("enqueue succeeds");
+        assert!(repo.claim_pending(&input.id).await.expect("claim succeeds"));
+        state.register_prompt_queue_id(session_id.clone(), input.id.clone());
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id, task.abort_handle());
+
+        state.abort_running_prompts_and_finalize_queue().await;
+
+        // タスクが abort されたこと。
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task should stop after shutdown abort");
+        assert!(outcome.unwrap_err().is_cancelled());
+
+        // 登録がクリアされたこと。
+        assert!(state
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(state
+            .running_prompt_queue_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+
+        // キュー項目が failed へ遷移したこと。
+        // reset_processing で processing を pending に戻しても list_pending_all に
+        // 現れなければ、終端化済み（failed）で再起動時に再実行されないと確認できる。
+        repo.reset_processing().await.expect("reset succeeds");
+        let pending = repo.list_pending_all().await.expect("list succeeds");
+        assert!(
+            pending.iter().all(|item| item.id != input.id),
+            "finalized queue item must not be resumable after restart"
+        );
+    }
+
+    /// R2 回帰: 複数の実行中キュー項目がすべて終端化・解除されること。
+    #[tokio::test]
+    async fn shutdown_finalizes_all_running_queue_items() {
+        let (state, db, repo) = shutdown_test_state().await;
+        let mut inputs = Vec::new();
+        let mut tasks = Vec::new();
+
+        for _ in 0..2 {
+            let session_id = store_session(&state, &db).await;
+            let input = repo
+                .enqueue(&session_id, "queued prompt", Some("queue"), None)
+                .await
+                .expect("enqueue succeeds");
+            assert!(repo.claim_pending(&input.id).await.expect("claim succeeds"));
+            state.register_prompt_queue_id(session_id.clone(), input.id.clone());
+            let task = tokio::spawn(std::future::pending::<()>());
+            state.register_prompt_task(session_id, task.abort_handle());
+            inputs.push(input.id);
+            tasks.push(task);
+        }
+
+        state.abort_running_prompts_and_finalize_queue().await;
+
+        for task in tasks {
+            let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("task should stop after shutdown abort");
+            assert!(outcome.unwrap_err().is_cancelled());
+        }
+        assert!(state
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(state
+            .running_prompt_queue_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+
+        repo.reset_processing().await.expect("reset succeeds");
+        let pending = repo.list_pending_all().await.expect("list succeeds");
+        for id in inputs {
+            assert!(
+                pending.iter().all(|item| item.id != id),
+                "every finalized queue item must be terminal"
+            );
+        }
+    }
+
+    /// R2 回帰: ストレージ未設定でもタスク abort は実行され、パニックしないこと。
+    /// 終端化に成功していないためキュー登録は残す（成功時のみ解除する方針）。
+    #[tokio::test]
+    async fn shutdown_without_storage_still_aborts_running_tasks() {
+        let state = ServerState::new();
+        let session_id = "session-without-storage".to_string();
+        let task = tokio::spawn(std::future::pending::<()>());
+        state.register_prompt_task(session_id.clone(), task.abort_handle());
+        state.register_prompt_queue_id(session_id, "queue-without-storage".to_string());
+
+        state.abort_running_prompts_and_finalize_queue().await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task should stop after shutdown abort");
+        assert!(outcome.unwrap_err().is_cancelled());
+        assert!(state
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        // キュー ID は先頭で drain される（Drop の再 spawn を防ぐため）。
+        assert!(state
+            .running_prompt_queue_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 }
