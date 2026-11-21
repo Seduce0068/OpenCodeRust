@@ -170,8 +170,6 @@ status: current
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
   — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
-- [ ] **APP_VERSION_DATE が 2026.02.23 固定で現在と 9 か月乖離**
-  — `tui/branding.rs:3` / CONSTANTS-06 / 低（設計判断）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[APP_VERSION_DATE 1 件]** 2026.11.21 へ同期（固定ラベル方針明記）
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[シグナル終了時フラッシュ 1 件]** graceful shutdown で既にカバー
   （2026-11-21、親が実コードで事実確認）
 - [x] **[MCP 同期失敗警告 1 件]** ヘッダ伝播とワイヤ互換維持
