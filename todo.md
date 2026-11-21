@@ -172,15 +172,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **CLI auth_status_notice が毎回 env を読み server 固定値と食い違う**
-  — `main.rs:2728-2733` / STATE-09
 - [ ] **migrate_global_config_once が fingerprint 更新と独立**
   — `main.rs:403-417` / STATE-10
-- [ ] **401/429 rotation が本番未配線で全テストがヘルパ API のみ** — `server.rs:754-757` / TG-01
-- [ ] **rotation の非漏洩がシグネチャ文字列検査のみ** — `server.rs:3891-3911` / TG-02
-- [ ] **shutdown テストの create() フック保持アサーションが常に真**
-  — `session.rs:1754-1759` / TG-03
-- [ ] **`$/progress` の deadline 延長分岐が未テスト** — `client.rs:760-762` / TG-04
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -261,10 +254,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **環境変数の反映タイミングが未明記（RUST_LOG/NO_AUTH/DATA_DIR 等）**
-  — `README.md:156-177` / OBS-05
-- [ ] **readiness の 200 が migrated を保証する記述と実装が不一致**
-  — `README.md:218-219` / OBS-06
 - [ ] **完了ログとエラーが request_id/correlation_id で結合できない**
   — `server.rs:1828-1851` / OBS-07
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
@@ -281,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[認証通知/設定反映 3 件]** 起動時固定と README 追随
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[readiness/TUI env 2 件]** 失敗 reason と RAII 復元
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[loader warn/redact 1 件]** 重複登録の可視化とキー正規化
@@ -606,6 +597,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 指摘（認証通知/設定反映の修正時）: README の表で環境変数行が
+  restart_required に現れる誤解を与える旨を指摘され、親が「PATCH 対象外」
+  列へ修正済み。
 - 2026-11-21 R4 残存（readiness/TUI env の修正時、記録のみ）: ping reason の
   分類が sqlx Display のサブストリング依存で、実 sqlite の BUSY/CORRUPT を
   通す統合テストが無い。RestoreTuiEnv のテストはローカル helper のみで
