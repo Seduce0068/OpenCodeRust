@@ -40,6 +40,7 @@ use opencode_storage::InputRepository;
 use opencode_storage::{Database, MessageRepository, SessionRepository};
 
 use crate::error::ApiError;
+use crate::mcp_oauth::McpOAuthManager;
 use crate::pty::PtyManager;
 use crate::routes;
 
@@ -508,6 +509,9 @@ pub struct ServerState {
     pub(crate) auth_enabled: bool,
     pub permission_broker: Arc<PermissionBroker>,
     pub question_broker: Arc<QuestionBroker>,
+    /// Per-instance MCP OAuth manager（旧 process-global static から移行）。
+    /// OAuth フロー状態・登録済みサーバ・接続状態を `ServerState` の寿命に紐付ける。
+    pub(crate) mcp_oauth_manager: Arc<McpOAuthManager>,
     /// Per-instance queue of pending TUI requests (was a process-global static).
     pub(crate) tui_request_queue: Mutex<VecDeque<routes::TuiRequest>>,
     /// Wakeup signal for `get_next_tui_request` waiters (per-instance).
@@ -566,6 +570,7 @@ impl ServerState {
             auth_enabled,
             permission_broker,
             question_broker,
+            mcp_oauth_manager: Arc::new(McpOAuthManager::new()),
             tui_request_queue: Mutex::new(VecDeque::new()),
             tui_request_notify: Notify::new(),
             tui_response_queue: Mutex::new(VecDeque::new()),
@@ -3395,6 +3400,44 @@ mod tests {
         assert!(!std::ptr::eq(&first.pty_manager, &second.pty_manager));
         assert!(first.pty_manager.list_sessions().await.is_empty());
         assert!(second.pty_manager.list_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_manager_is_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        // 同一プロセスに複数の ServerState があっても OAuth フロー状態を共有しない。
+        assert!(!Arc::ptr_eq(
+            &first.mcp_oauth_manager,
+            &second.mcp_oauth_manager
+        ));
+
+        first
+            .mcp_oauth_manager
+            .add_server(
+                "first-only".to_string(),
+                crate::mcp_oauth::McpRuntimeConfig::Remote(crate::mcp_oauth::RemoteMcpConfig {
+                    url: "https://example.test/mcp".to_string(),
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                false,
+            )
+            .await;
+
+        assert!(first
+            .mcp_oauth_manager
+            .list_servers()
+            .await
+            .iter()
+            .any(|server| server.name == "first-only"));
+        assert!(second
+            .mcp_oauth_manager
+            .list_servers()
+            .await
+            .iter()
+            .all(|server| server.name != "first-only"));
     }
 
     #[test]

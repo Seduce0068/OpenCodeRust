@@ -4183,10 +4183,13 @@ const MCP_SYNC_WARNING: &str =
 /// `GET /mcp` JSON body shape. The value is a fixed, non-sensitive string.
 pub const MCP_SYNC_WARNING_HEADER: &str = "x-mcp-sync-warning";
 
-static MCP_OAUTH_MANAGER: std::sync::OnceLock<McpOAuthManager> = std::sync::OnceLock::new();
-
-fn get_mcp_oauth_manager() -> &'static McpOAuthManager {
-    MCP_OAUTH_MANAGER.get_or_init(McpOAuthManager::new)
+/// MCP OAuth manager を保持する `ServerState` から取得する。
+///
+/// 旧実装は `OnceLock` の process-global static を参照していたため、同一プロセス内の
+/// 別 `ServerState`（TUI 埋め込み再起動等）が OAuth フロー状態を共有していた。
+/// 常にリクエストの `ServerState` 経由で取得する。
+fn get_mcp_oauth_manager(state: &ServerState) -> &McpOAuthManager {
+    &state.mcp_oauth_manager
 }
 
 impl From<McpServerInfoStruct> for McpStatusInfo {
@@ -4231,9 +4234,9 @@ fn build_mcp_status_response(
 }
 
 async fn get_mcp_status(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
 ) -> (HeaderMap, Json<HashMap<String, McpStatusInfo>>) {
-    let manager = get_mcp_oauth_manager();
+    let manager = get_mcp_oauth_manager(&state);
     let sync_result = sync_mcp_from_disk(manager).await;
     let servers = manager.list_servers().await;
     let (headers, body) = build_mcp_status_response(sync_result, servers);
@@ -4272,10 +4275,10 @@ pub struct McpConfigInput {
 }
 
 async fn add_mcp_server(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Json(req): Json<AddMcpRequest>,
 ) -> Result<Json<HashMap<String, McpStatusInfo>>> {
-    let manager = get_mcp_oauth_manager();
+    let manager = get_mcp_oauth_manager(&state);
     let (runtime, enabled) = parse_runtime_from_request(req.config)?;
     manager.add_server(req.name.clone(), runtime, enabled).await;
     if enabled {
@@ -4293,18 +4296,21 @@ async fn add_mcp_server(
     Ok(Json(result))
 }
 
-async fn start_mcp_auth(Path(name): Path<String>) -> Result<Json<serde_json::Value>> {
-    let manager = get_mcp_oauth_manager();
+async fn start_mcp_auth(
+    State(state): State<Arc<ServerState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
-    let state = manager
+    let oauth_state = manager
         .start_oauth(&name)
         .await
         .map_err(mcp_error_to_api_error)?;
 
     Ok(Json(serde_json::json!({
-        "authorization_url": state.authorization_url,
-        "client_id": state.client_id,
-        "status": state.status
+        "authorization_url": oauth_state.authorization_url,
+        "client_id": oauth_state.client_id,
+        "status": oauth_state.status
     })))
 }
 
@@ -4319,27 +4325,31 @@ pub struct McpAuthCallbackRequest {
 }
 
 async fn mcp_auth_callback(
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<McpAuthCallbackRequest>,
 ) -> Result<Json<McpStatusInfo>> {
     // The caller must echo back the state it received. Without this check,
     // handle_callback would compare the stored state against itself and a
     // code-only callback could complete the authorization flow.
-    let state = req.state.as_deref().ok_or_else(|| {
+    let oauth_state = req.state.as_deref().ok_or_else(|| {
         ApiError::BadRequest("mcp oauth callback requires the state parameter".to_string())
     })?;
-    let manager = get_mcp_oauth_manager();
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     let server_info = manager
-        .handle_callback(&name, &req.code, Some(state))
+        .handle_callback(&name, &req.code, Some(oauth_state))
         .await
         .map_err(mcp_error_to_api_error)?;
 
     Ok(Json(McpStatusInfo::from(server_info)))
 }
 
-async fn mcp_authenticate(Path(name): Path<String>) -> Result<Json<McpStatusInfo>> {
-    let manager = get_mcp_oauth_manager();
+async fn mcp_authenticate(
+    State(state): State<Arc<ServerState>>,
+    Path(name): Path<String>,
+) -> Result<Json<McpStatusInfo>> {
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     let server_info = manager
         .authenticate(&name)
@@ -4349,8 +4359,11 @@ async fn mcp_authenticate(Path(name): Path<String>) -> Result<Json<McpStatusInfo
     Ok(Json(McpStatusInfo::from(server_info)))
 }
 
-async fn remove_mcp_auth(Path(name): Path<String>) -> Result<Json<serde_json::Value>> {
-    let manager = get_mcp_oauth_manager();
+async fn remove_mcp_auth(
+    State(state): State<Arc<ServerState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     // ディスク上の認証情報削除に失敗した場合は success を返さない。
     // 古いトークンが残ったまま「ログアウト済み」と誤認されるのを防ぐ。
@@ -4363,10 +4376,10 @@ async fn remove_mcp_auth(Path(name): Path<String>) -> Result<Json<serde_json::Va
 }
 
 async fn connect_mcp(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<bool>> {
-    let manager = get_mcp_oauth_manager();
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     manager
         .connect(&name)
@@ -4376,10 +4389,10 @@ async fn connect_mcp(
 }
 
 async fn disconnect_mcp(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<bool>> {
-    let manager = get_mcp_oauth_manager();
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     manager
         .disconnect(&name)
@@ -4394,8 +4407,11 @@ pub struct McpLogsResponse {
     pub logs: Vec<McpServerLogEntry>,
 }
 
-async fn get_mcp_logs(Path(name): Path<String>) -> Result<Json<McpLogsResponse>> {
-    let manager = get_mcp_oauth_manager();
+async fn get_mcp_logs(
+    State(state): State<Arc<ServerState>>,
+    Path(name): Path<String>,
+) -> Result<Json<McpLogsResponse>> {
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     let logs = manager
         .get_logs(&name)
@@ -4412,10 +4428,10 @@ pub struct McpRestartResponse {
 }
 
 async fn restart_mcp(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<McpRestartResponse>> {
-    let manager = get_mcp_oauth_manager();
+    let manager = get_mcp_oauth_manager(&state);
     ensure_mcp_server_registered(manager, &name).await?;
     let server = manager
         .restart(&name)
@@ -7073,6 +7089,7 @@ mod mcp_callback_tests {
     #[tokio::test]
     async fn callback_without_state_returns_bad_request() {
         let result = mcp_auth_callback(
+            State(Arc::new(ServerState::new())),
             Path("remote".to_string()),
             Json(McpAuthCallbackRequest {
                 code: "dummy-code".to_string(),
