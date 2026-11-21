@@ -2,6 +2,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
@@ -36,7 +37,11 @@ pub struct PtyOutput {
     pub is_error: bool,
 }
 
-struct PtySessionInner {
+/// Heavy, process-backed resources owned by a real PTY session.
+///
+/// Kept in a separate bundle so the lifecycle metadata can also be built in
+/// unit tests without spawning an OS process (RES-01).
+struct PtyResources {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     /// Shared child handle: the reader thread reaps it on EOF/error, and
@@ -46,9 +51,21 @@ struct PtySessionInner {
     /// so the child can be signalled from another thread while the reader is
     /// blocked in `wait()` holding the `child` lock.
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    reader_handle: JoinHandle<()>,
+}
+
+struct PtySessionInner {
+    /// `Some` for real PTY sessions, `None` for synthetic entries used by the
+    /// prune regression tests. Dropping this bundle releases the JoinHandle,
+    /// writer and child strong references (RES-01).
+    resources: Option<PtyResources>,
     /// Terminal status published by the reader thread on EOF/error. Read
     /// paths copy this into the returned `PtySession` (M-43).
     status: Arc<Mutex<PtyStatus>>,
+    /// Set by the reader thread only after `child.wait()` has returned and the
+    /// child lock guard has been dropped. Pruning checks this flag so an entry
+    /// is never reclaimed while the reader still holds the child lock (RES-01).
+    reaped: Arc<AtomicBool>,
     /// Retained output buffer for replay on WebSocket connect.
     output_buffer: Arc<Mutex<Vec<u8>>>,
     /// Cumulative byte count of all output ever produced (including trimmed bytes).
@@ -56,7 +73,24 @@ struct PtySessionInner {
     cursor: Arc<Mutex<usize>>,
     /// Broadcast channel for live PTY output to WebSocket subscribers.
     output_tx: broadcast::Sender<Vec<u8>>,
-    reader_handle: JoinHandle<()>,
+}
+
+impl PtySessionInner {
+    /// A session is reclaimable only when the reader has published a terminal
+    /// status *and* finished reaping the child. `reaped` is written after the
+    /// `child` lock guard is dropped, so observing it guarantees pruning cannot
+    /// race with the reader holding that lock (RES-01).
+    fn is_reclaimable(&self) -> bool {
+        if !self.reaped.load(Ordering::SeqCst) {
+            return false;
+        }
+        match self.status.lock() {
+            Ok(guard) => matches!(*guard, PtyStatus::Exited | PtyStatus::Error),
+            Err(poisoned) => {
+                matches!(*poisoned.into_inner(), PtyStatus::Exited | PtyStatus::Error)
+            }
+        }
+    }
 }
 
 /// Copy the reader-published terminal status into the snapshot returned to
@@ -77,12 +111,41 @@ impl PtyManager {
         }
     }
 
+    /// Remove sessions whose reader has published a terminal status and
+    /// completed child reaping. Dropping the entry releases the `JoinHandle`,
+    /// broadcast `Sender` and writer strong references (RES-01).
+    ///
+    /// Pruning is driven from async accessors rather than from the blocking
+    /// reader thread: that thread holds the `child` lock while calling
+    /// `wait()`, so deleting from it would invert the lock order and risk a
+    /// deadlock. Here only the `sessions` write lock is taken and `child` is
+    /// never touched.
+    async fn prune_finished_sessions(&self) {
+        let mut sessions = self.sessions.write().await;
+        let finished: Vec<String> = sessions
+            .iter()
+            .filter(|(_, (_, inner))| inner.is_reclaimable())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            // `remove` drops the whole entry, including `PtyResources` and the
+            // broadcast `Sender`. The reader has already finished, so no abort
+            // or extra `wait()` is needed here.
+            sessions.remove(&id);
+        }
+    }
+
     pub async fn create_session(
         &self,
         command: &str,
         cwd: Option<&str>,
         env: Option<HashMap<String, String>>,
     ) -> Result<PtySession, PtyError> {
+        // Reclaim entries left behind by readers that already reached a
+        // terminal status (RES-01). This runs before any new session is added,
+        // so the map cannot grow monotonically across successive creates.
+        self.prune_finished_sessions().await;
+
         let id = format!("pty_{}", uuid::Uuid::new_v4().simple());
         let env_map = env.unwrap_or_default();
         let cwd_str = cwd.unwrap_or(".").to_string();
@@ -133,6 +196,9 @@ impl PtyManager {
         let child: Box<dyn portable_pty::Child + Send> = child;
         let child = Arc::new(Mutex::new(child));
         let status: Arc<Mutex<PtyStatus>> = Arc::new(Mutex::new(PtyStatus::Running));
+        // Completion signal for pruning: set only after the reader has reaped
+        // the child and released the `child` lock (RES-01).
+        let reaped: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         let writer = master
             .take_writer()
@@ -148,6 +214,7 @@ impl PtyManager {
         let tx_clone = output_tx.clone();
         let child_clone = child.clone();
         let status_clone = status.clone();
+        let reaped_clone = reaped.clone();
 
         // Spawn a blocking task to continuously read PTY output, buffer it,
         // and broadcast to any connected WebSocket subscribers. Once the
@@ -182,10 +249,21 @@ impl PtyManager {
             // reaping: `wait()` below may block, and the end status must
             // already be visible to `PtyInfo` read paths when that happens.
             *status_clone.lock().unwrap() = final_status;
-            // Reap the child so it does not linger as a zombie.
-            if let Ok(mut child) = child_clone.lock() {
+            // Reap the child so it does not linger as a zombie. A poisoned
+            // mutex must not skip wait(): that would mark the entry reaped
+            // while leaving an unreaped child (R4). Recover the inner guard.
+            {
+                let mut child = child_clone
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let _ = child.wait();
+                // Release the child lock before signalling reaping, so a
+                // pruner observing `reaped` can never block on this lock.
+                drop(child);
             }
+            // Signal completion only after `wait()` returned. Pruning must
+            // never remove an entry before the child has been reaped (RES-01).
+            reaped_clone.store(true, Ordering::SeqCst);
         });
 
         let session = PtySession {
@@ -197,16 +275,21 @@ impl PtyManager {
             created_at: chrono::Utc::now().timestamp(),
         };
 
-        let inner = PtySessionInner {
+        let resources = PtyResources {
             master: Mutex::new(master),
             writer,
             child,
             killer: Mutex::new(killer),
+            reader_handle,
+        };
+
+        let inner = PtySessionInner {
+            resources: Some(resources),
             status,
+            reaped,
             output_buffer,
             cursor,
             output_tx,
-            reader_handle,
         };
 
         self.sessions
@@ -226,6 +309,11 @@ impl PtyManager {
     }
 
     pub async fn list_sessions(&self) -> Vec<PtySession> {
+        // Reclaim finished entries before snapshotting so callers never
+        // observe terminal sessions that are no longer backed by a process
+        // (RES-01).
+        self.prune_finished_sessions().await;
+
         self.sessions
             .read()
             .await
@@ -266,22 +354,24 @@ impl PtyManager {
             sessions.remove(id)
         };
         if let Some((_, inner)) = removed {
-            // Best-effort cancellation only: `JoinHandle::abort` cannot
-            // interrupt a `spawn_blocking` closure that is already running.
-            // In practice it is `kill()` below that unblocks the reader's
-            // blocking `read()`.
-            inner.reader_handle.abort();
-            // Signal via the independent killer: this works even while the
-            // reader is blocked in `wait()` holding the `child` lock (M-43).
-            let _ = inner.killer.lock().unwrap().kill();
-            // Reap on a blocking thread so the killed child is not left as a
-            // zombie (this covers the forced-kill path above).
-            let child = inner.child.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut child) = child.lock() {
-                    let _ = child.wait();
-                }
-            });
+            if let Some(resources) = inner.resources {
+                // Best-effort cancellation only: `JoinHandle::abort` cannot
+                // interrupt a `spawn_blocking` closure that is already running.
+                // In practice it is `kill()` below that unblocks the reader's
+                // blocking `read()`.
+                resources.reader_handle.abort();
+                // Signal via the independent killer: this works even while the
+                // reader is blocked in `wait()` holding the `child` lock (M-43).
+                let _ = resources.killer.lock().unwrap().kill();
+                // Reap on a blocking thread so the killed child is not left as a
+                // zombie (this covers the forced-kill path above).
+                let child = resources.child.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut child) = child.lock() {
+                        let _ = child.wait();
+                    }
+                });
+            }
             true
         } else {
             false
@@ -294,17 +384,19 @@ impl PtyManager {
             .get(id)
             .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))?;
 
-        inner
-            .master
-            .lock()
-            .unwrap()
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PtyError::IoError(e.to_string()))?;
+        if let Some(resources) = &inner.resources {
+            resources
+                .master
+                .lock()
+                .unwrap()
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| PtyError::IoError(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -316,7 +408,12 @@ impl PtyManager {
             let (_, inner) = sessions
                 .get(id)
                 .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))?;
-            inner.writer.clone()
+            inner
+                .resources
+                .as_ref()
+                .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))?
+                .writer
+                .clone()
         };
 
         tokio::task::spawn_blocking(move || {
@@ -373,12 +470,19 @@ impl PtyManager {
             (buf.clone(), buffer_start, cursor)
         };
 
+        let writer = inner
+            .resources
+            .as_ref()
+            .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))?
+            .writer
+            .clone();
+
         Ok(PtySubscription {
             buffer: buffer_snapshot,
             buffer_start,
             cursor,
             rx: inner.output_tx.subscribe(),
-            writer: inner.writer.clone(),
+            writer,
         })
     }
 }
@@ -425,6 +529,45 @@ mod tests {
     // process, so these tests deliberately never call it. Only the value types'
     // serde behaviour and the lookup/error paths of an empty `PtyManager` are
     // exercised. All values below are dummies, never real credentials or tokens.
+
+    /// Build a synthetic session entry without spawning a process: the heavy
+    /// resources are absent (`resources: None`) while the lifecycle metadata
+    /// (`status` / `reaped`) is fully controllable for prune tests (RES-01).
+    fn synthetic_session(
+        id: &str,
+        status: PtyStatus,
+        reaped: bool,
+    ) -> (PtySession, PtySessionInner) {
+        let session = PtySession {
+            id: id.to_string(),
+            command: "dummy-command".to_string(),
+            cwd: "/dummy/cwd".to_string(),
+            status: PtyStatus::Running,
+            env: HashMap::new(),
+            created_at: 1_700_000_000,
+        };
+        let (output_tx, _) = broadcast::channel::<Vec<u8>>(4);
+        let inner = PtySessionInner {
+            resources: None,
+            status: Arc::new(Mutex::new(status)),
+            reaped: Arc::new(AtomicBool::new(reaped)),
+            output_buffer: Arc::new(Mutex::new(Vec::new())),
+            cursor: Arc::new(Mutex::new(0)),
+            output_tx,
+        };
+        (session, inner)
+    }
+
+    /// Insert synthetic entries directly into a fresh manager's map.
+    async fn manager_with(entries: Vec<(PtySession, PtySessionInner)>) -> PtyManager {
+        let manager = PtyManager::new();
+        let mut sessions = manager.sessions.write().await;
+        for entry in entries {
+            sessions.insert(entry.0.id.clone(), entry);
+        }
+        drop(sessions);
+        manager
+    }
 
     #[tokio::test]
     async fn new_manager_starts_with_no_sessions() {
@@ -587,5 +730,73 @@ mod tests {
         assert_eq!(decoded, PtyStatus::Error);
         let shared: opencode_types::PtyStatus = decoded;
         assert_eq!(shared, opencode_types::PtyStatus::Error);
+    }
+
+    #[test]
+    fn reclaim_decision_requires_terminal_status_and_completed_reap() {
+        let make = |status: PtyStatus, reaped: bool| PtySessionInner {
+            resources: None,
+            status: Arc::new(Mutex::new(status)),
+            reaped: Arc::new(AtomicBool::new(reaped)),
+            output_buffer: Arc::new(Mutex::new(Vec::new())),
+            cursor: Arc::new(Mutex::new(0)),
+            output_tx: broadcast::channel::<Vec<u8>>(1).0,
+        };
+
+        // Terminal status alone is not enough: the reader may still be inside
+        // `wait()` holding the child lock.
+        assert!(!make(PtyStatus::Exited, false).is_reclaimable());
+        assert!(!make(PtyStatus::Error, false).is_reclaimable());
+        // A running reader is never reclaimable even if the flag is set.
+        assert!(!make(PtyStatus::Running, true).is_reclaimable());
+        assert!(!make(PtyStatus::Running, false).is_reclaimable());
+        // Only reaped terminal sessions are reclaimable.
+        assert!(make(PtyStatus::Exited, true).is_reclaimable());
+        assert!(make(PtyStatus::Error, true).is_reclaimable());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_prunes_reaped_terminal_sessions_and_keeps_running() {
+        let manager = manager_with(vec![
+            synthetic_session("pty_exited_done", PtyStatus::Exited, true),
+            synthetic_session("pty_error_done", PtyStatus::Error, true),
+            synthetic_session("pty_running_live", PtyStatus::Running, true),
+            synthetic_session("pty_exited_waiting", PtyStatus::Exited, false),
+        ])
+        .await;
+
+        let listed = manager.list_sessions().await;
+        let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
+
+        // Reaped terminal entries disappear from the list (RES-01).
+        assert!(!ids.contains(&"pty_exited_done"));
+        assert!(!ids.contains(&"pty_error_done"));
+        // Running entries remain, and terminal-but-not-yet-reaped entries are
+        // kept so the reader can finish `wait()` before cleanup.
+        assert!(ids.contains(&"pty_running_live"));
+        assert!(ids.contains(&"pty_exited_waiting"));
+        assert_eq!(listed.len(), 2);
+
+        // The prune is persistent: a second list is stable and get_session on
+        // a reclaimed id is now a miss.
+        assert_eq!(manager.list_sessions().await.len(), 2);
+        assert!(manager.get_session("pty_exited_done").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_session_preserves_existing_behaviour() {
+        let manager = manager_with(vec![synthetic_session(
+            "pty_delete_me",
+            PtyStatus::Running,
+            false,
+        )])
+        .await;
+
+        // Existing entry is removed and reported as deleted.
+        assert!(manager.delete_session("pty_delete_me").await);
+        assert!(manager.get_session("pty_delete_me").await.is_none());
+        // Repeated deletion of a missing id still returns false.
+        assert!(!manager.delete_session("pty_delete_me").await);
+        assert!(manager.list_sessions().await.is_empty());
     }
 }
