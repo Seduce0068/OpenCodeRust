@@ -13,10 +13,15 @@ sidebar, dialogs, shortcuts, and theme system.
 
 - `APP_NAME`: `OpenCodeRust`
 - `APP_SHORT_NAME`: `opencoderust`
-- `APP_VERSION_DATE`: `2026.02.23`
+- `APP_VERSION_DATE`: `2026.11.21`
 - `APP_TAGLINE`: `A Rust implementation of OpenCode`
 
 Defined in: `crates/opencode-tui/src/branding.rs`
+
+`APP_VERSION_DATE` is a fixed release-date label, not a value injected via
+`env!` at build time. Build-time injection would need Cargo build-script
+setup and CI changes, which are intentionally out of scope here; update the
+constant and this document together on each release.
 
 ## Responsibilities
 
