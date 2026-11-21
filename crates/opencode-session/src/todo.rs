@@ -247,8 +247,32 @@ impl TodoManager {
             return;
         }
 
-        let mut state = self.state.write().await;
-        state.remove(session_id);
+        {
+            let mut state = self.state.write().await;
+            state.remove(session_id);
+        }
+
+        // RES-05: `clear()` is the session-deletion equivalent, so release the
+        // per-session writer lock as well. Otherwise every session that has ever
+        // been touched keeps a `Mutex` alive in `writer_locks` forever.
+        // The early return above intentionally leaves the entry in place on a
+        // failed delete: the session's todos still exist in that case.
+        //
+        // 方針 (M-61 / R5 回帰対策): 待機者が居るときはレジストリから削除しない。
+        // DB I/O 中に T2 が writer_lock() で旧 Arc (L1) を取得して L1.lock() で
+        // 待機している間に clear が L1 を消すと、T3 が新規 Arc (L2) を作り、
+        // T2(L1) と T3(L2) が同一セッションで並走して直列化保証が壊れる。
+        // writer_lock() はレジストリの Mutex を保持している間だけ Arc を配るため、
+        // ここで registry を握ったまま strong_count を読めば check-then-remove は
+        // 原子的で、読み取り後に新規待機者が割り込むことはない。
+        // 基準値 2 = clear が保持する `lock` + レジストリが保持するクローン。
+        // `_guard` は Arc をクローンしないため strong_count には数えない。
+        // 3 以上 = 別の writer が Arc を取得済み（待機者が居る）ので削除しない。
+        // この場合エントリは残るが、次回待機者無しで clear されたときに回収される。
+        let mut registry = self.writer_locks.lock().await;
+        if Arc::strong_count(&lock) == 2 {
+            registry.remove(session_id);
+        }
     }
 
     /// Change one todo's status and return whether the entry still exists in
@@ -524,6 +548,117 @@ mod tests {
             assert_eq!(row.status, expected[position].status);
             assert_eq!(row.priority, expected[position].priority);
         }
+    }
+
+    /// RES-05: `clear()` はセッション削除相当の API なので、
+    /// セッション単位の writer ロックもレジストリから解放されることを検証する。
+    #[tokio::test]
+    async fn clear_releases_session_writer_lock() {
+        let manager = TodoManager::new();
+        manager
+            .update(SESSION, vec![todo("A", "pending", "medium")])
+            .await;
+        assert!(manager.writer_locks.lock().await.contains_key(SESSION));
+
+        manager.clear(SESSION).await;
+
+        assert!(
+            !manager.writer_locks.lock().await.contains_key(SESSION),
+            "clear must remove the per-session writer lock registry entry"
+        );
+        assert!(
+            manager.writer_locks.lock().await.is_empty(),
+            "no writer lock entry may accumulate after the session is cleared"
+        );
+        assert!(manager.get(SESSION).await.is_empty());
+
+        // 削除後に同じセッションへ書き込んでも新しいロックが作られ、
+        // clear はそのエントリも同様に解放する。
+        manager.add(SESSION, todo("B", "pending", "low")).await;
+        assert!(manager.writer_locks.lock().await.contains_key(SESSION));
+        manager.clear(SESSION).await;
+        assert!(manager.writer_locks.lock().await.is_empty());
+    }
+
+    /// DB 失敗で clear が早期 return した場合はセッションが残存するため、
+    /// writer ロックも保持したままであることを検証する (RES-05 / R4 指摘 (5))。
+    #[tokio::test]
+    async fn failed_clear_keeps_session_writer_lock() {
+        let database = test_database().await;
+        let manager = TodoManager::with_database(database.pool().clone());
+        manager
+            .update(SESSION, vec![todo("A", "pending", "medium")])
+            .await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_clear BEFORE DELETE ON todos \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .execute(database.pool())
+        .await
+        .expect("delete trigger created");
+
+        manager.clear(SESSION).await;
+
+        assert!(
+            manager.writer_locks.lock().await.contains_key(SESSION),
+            "a failed delete must not evict the lock of a still-live session"
+        );
+        assert_eq!(manager.get(SESSION).await.len(), 1);
+    }
+
+    /// clear の DB I/O 中に待機者が旧 writer ロックの Arc を取得している場合、
+    /// レジストリから削除せず後続 writer と同じロックを共有することを検証する
+    /// (R4 medium / M-61・R5 回帰)。
+    #[tokio::test]
+    async fn clear_keeps_writer_lock_when_waiter_is_present() {
+        let database = test_database().await;
+        let mut manager = TodoManager::with_database(database.pool().clone());
+        manager
+            .update(SESSION, vec![todo("A", "pending", "medium")])
+            .await;
+
+        manager.db_delay = Duration::from_millis(500);
+        let manager = Arc::new(manager);
+        let started = Arc::clone(&manager.db_started);
+        let waiter_acquired = Arc::new(tokio::sync::Notify::new());
+
+        let clearer = Arc::clone(&manager);
+        let clear_task = tokio::spawn(async move { clearer.clear(SESSION).await });
+
+        // clear が DB フェーズ（遅延）に入ったことを確認する。
+        tokio::time::timeout(Duration::from_millis(1000), started.notified())
+            .await
+            .expect("clear reached its DB phase");
+
+        // 待機者: レジストリから現在の Arc を取得し、mutex 取得でブロックする。
+        // この Arc により strong_count は clear + registry + waiter の 3 になる。
+        let waiter_manager = Arc::clone(&manager);
+        let acquired = Arc::clone(&waiter_acquired);
+        let waiter_task = tokio::spawn(async move {
+            let lock = waiter_manager.writer_lock(SESSION).await;
+            assert_eq!(Arc::strong_count(&lock), 3, "clear + registry + waiter");
+            acquired.notify_one();
+            // clear が guard を握っているためここで待機する。
+            let _guard = lock.lock().await;
+        });
+
+        // 待機者が Arc を掴み、mutex 待ちに入るのを待つ。
+        tokio::time::timeout(Duration::from_millis(1000), waiter_acquired.notified())
+            .await
+            .expect("waiter acquired the writer lock Arc");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        clear_task.await.expect("clear task");
+
+        // 待機者が居たため clear はレジストリからロックを削除してはならない。
+        // 削除してしまうと後続 writer が新規 Arc を作り、待機者と並走する。
+        assert!(
+            manager.writer_locks.lock().await.contains_key(SESSION),
+            "clear must keep the registry entry while a waiter holds the old Arc"
+        );
+
+        waiter_task.await.expect("waiter task");
     }
 
     /// DB 書き込みが遅延している間も get() が state の read lock を取得でき、

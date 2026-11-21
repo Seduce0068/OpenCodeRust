@@ -264,20 +264,14 @@ impl PluginLoader {
         let copilot_path = cache_dir.join("builtin-copilot-auth.ts");
         write_script_atomic(&copilot_path, BUILTIN_COPILOT_AUTH.as_bytes())?;
 
-        {
-            let mut trusted = self
-                .trusted_scripts
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            trusted.push(TrustedScript {
-                path: codex_path.clone(),
-                expected_hash: script_hash(BUILTIN_CODEX_AUTH.as_bytes()),
-            });
-            trusted.push(TrustedScript {
-                path: copilot_path.clone(),
-                expected_hash: script_hash(BUILTIN_COPILOT_AUTH.as_bytes()),
-            });
-        }
+        self.trust_script(TrustedScript {
+            path: codex_path.clone(),
+            expected_hash: script_hash(BUILTIN_CODEX_AUTH.as_bytes()),
+        });
+        self.trust_script(TrustedScript {
+            path: copilot_path.clone(),
+            expected_hash: script_hash(BUILTIN_COPILOT_AUTH.as_bytes()),
+        });
 
         let specs = vec![file_url(&codex_path)?, file_url(&copilot_path)?];
         self.load_all(&specs, context).await
@@ -293,12 +287,18 @@ impl PluginLoader {
         Arc::clone(&self.hook_system)
     }
 
-    /// Shut down all plugin subprocesses.
+    /// Shut down all plugin subprocesses and drop their registries.
+    ///
+    /// RES-07: `shutdown_all()` used to leave `clients` / `auth_bridges` populated,
+    /// so every reload pushed another client onto the old ones. Both registries
+    /// are now taken (i.e. drained) before the best-effort shutdown so a
+    /// concurrent reload can neither observe nor append to stale entries.
     pub async fn shutdown_all(&self) {
-        let clients = self.clients.read().await;
+        let clients = std::mem::take(&mut *self.clients.write().await);
+        let _auth_bridges = std::mem::take(&mut *self.auth_bridges.write().await);
         for client in clients.iter() {
             if let Err(e) = client.shutdown().await {
-                tracing::warn!(plugin = client.name(), error = %e, "error shutting down plugin");
+                log_shutdown_failure(&e);
             }
         }
     }
@@ -314,6 +314,26 @@ impl PluginLoader {
     }
 
     // -- Private helpers ----------------------------------------------------
+
+    /// Register a cache script for launch-time verification.
+    ///
+    /// RES-07: `load_builtins()` can run more than once during reloads. Without
+    /// this check every run appended another `TrustedScript` for the same path,
+    /// growing the verification list on each reload. Identity is the pair
+    /// `(path, expected_hash)`: a different hash at the same path (or the same
+    /// hash at a different path) is a genuinely distinct entry.
+    fn trust_script(&self, script: TrustedScript) {
+        let mut trusted = self
+            .trusted_scripts
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let duplicate = trusted.iter().any(|existing| {
+            existing.path == script.path && existing.expected_hash == script.expected_hash
+        });
+        if !duplicate {
+            trusted.push(script);
+        }
+    }
 
     async fn register_client_hooks(&self, client: Arc<PluginSubprocess>) {
         for hook_name in client.hooks() {
@@ -453,6 +473,21 @@ impl PluginLoader {
             .join("opencode")
             .join("plugins")
     }
+}
+
+/// Emit a fixed, value-independent warning when a plugin subprocess fails to
+/// shut down.
+///
+/// The error originates from plugin-controlled RPC responses and may embed
+/// tokens, URLs or credential-bearing paths. The value is deliberately never
+/// formatted into the event: only a fixed event name and a `[REDACTED]`
+/// placeholder reach the logs, matching the fail-closed spawn-failure path.
+fn log_shutdown_failure<E: std::fmt::Display>(_error: &E) {
+    tracing::warn!(
+        event = "plugin_shutdown_failed",
+        error = "[REDACTED]",
+        "error shutting down plugin"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,5 +1670,186 @@ mod tests {
             !rendered.contains("/home/user"),
             "キャッシュパスが漏れた: {rendered}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2 regression: resource accumulation across reloads (RES-07)
+    // -----------------------------------------------------------------------
+
+    /// WARN 以上のイベントを捕捉して redaction を検証するサブスクライバ。
+    struct WarnCaptureSubscriber(SpawnLogBuffer);
+
+    impl Subscriber for WarnCaptureSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = SpawnCaptureVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                 .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn trust_script_deduplicates_same_path_and_hash() {
+        let loader = test_loader();
+        let path = PathBuf::from("/cache/plugin.ts");
+        let hash = [7u8; 32];
+
+        loader.trust_script(TrustedScript {
+            path: path.clone(),
+            expected_hash: hash,
+        });
+        loader.trust_script(TrustedScript {
+            path: path.clone(),
+            expected_hash: hash,
+        });
+        assert_eq!(
+            loader.trusted_scripts.read().unwrap().len(),
+            1,
+            "同一 path+hash は 1 エントリだけ保持されるべき"
+        );
+
+        loader.trust_script(TrustedScript {
+            path: path.clone(),
+            expected_hash: [8u8; 32],
+        });
+        assert_eq!(
+            loader.trusted_scripts.read().unwrap().len(),
+            2,
+            "同一 path でも hash が違えば別エントリ"
+        );
+
+        loader.trust_script(TrustedScript {
+            path: PathBuf::from("/cache/other.ts"),
+            expected_hash: hash,
+        });
+        assert_eq!(
+            loader.trusted_scripts.read().unwrap().len(),
+            3,
+            "同一 hash でも path が違えば別エントリ"
+        );
+    }
+
+    #[test]
+    fn shutdown_failure_log_is_fixed_and_redacted() {
+        let raw_error =
+            String::from("secret-token /home/user/.cache/opencode/auth.json token-abc123");
+        let logs = SpawnLogBuffer::default();
+        tracing::subscriber::with_default(WarnCaptureSubscriber(logs.clone()), || {
+            log_shutdown_failure(&raw_error);
+        });
+
+        let rendered = logs.lines().join("\n");
+        assert!(
+            rendered.contains("plugin_shutdown_failed"),
+            "固定の event 名が記録されるべき: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "固定の [REDACTED] が記録されるべき: {rendered}"
+        );
+        assert!(
+            !rendered.contains("secret-token"),
+            "トークンが漏れた: {rendered}"
+        );
+        assert!(
+            !rendered.contains("token-abc123"),
+            "トークンが漏れた: {rendered}"
+        );
+        assert!(!rendered.contains("/home/user"), "パスが漏れた: {rendered}");
+        assert!(!rendered.contains("auth.json"), "パスが漏れた: {rendered}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_all_clears_registries_and_reload_does_not_accumulate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// テスト終了時に PATH を必ず元へ戻すガード。
+        struct PathGuard(Option<std::ffi::OsString>);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                if let Some(path) = self.0.take() {
+                    std::env::set_var("PATH", path);
+                }
+            }
+        }
+
+        let dir = unique_temp_dir("mock-node");
+        let node = dir.join("node");
+        // `node` の最小スタンドイン。initialize のリクエストフレームを読み飛ばし、
+        // 固定の handshake レスポンスを返す。実ランタイムやプラグインは起動しない。
+        let script = concat!(
+            "#!/bin/sh\n",
+            "IFS= read -r _header || true\n",
+            "IFS= read -r _blank || true\n",
+            "body='{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"name\":\"mock-plugin\",\"hooks\":[],",
+            "\"auth\":{\"provider\":\"mock-provider\",\"methods\":[]}},\"error\":null}'\n",
+            "printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"\n",
+        );
+        std::fs::write(&node, script).expect("mock node script");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700))
+            .expect("mock node is executable");
+
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = dir.as_os_str().to_os_string();
+        new_path.push(":");
+        new_path.push(&old_path);
+        std::env::set_var("PATH", new_path);
+        let _path_guard = PathGuard(Some(old_path));
+
+        let loader = test_loader();
+        let specs = vec!["file:///mock/plugin.ts".to_string()];
+
+        loader
+            .load_all(&specs, &test_context())
+            .await
+            .expect("initial load");
+        assert_eq!(loader.clients().await.len(), 1);
+        assert_eq!(loader.auth_bridges().await.len(), 1);
+
+        loader.shutdown_all().await;
+        assert!(
+            loader.clients().await.is_empty(),
+            "shutdown_all は clients を空にすべき"
+        );
+        assert!(
+            loader.auth_bridges().await.is_empty(),
+            "shutdown_all は auth_bridges も空にすべき"
+        );
+
+        loader
+            .load_all(&specs, &test_context())
+            .await
+            .expect("reload");
+        assert_eq!(
+            loader.clients().await.len(),
+            1,
+            "再ロードで古い client が累積してはいけない"
+        );
+        assert_eq!(loader.auth_bridges().await.len(), 1);
+
+        loader.shutdown_all().await;
+        assert!(loader.clients().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
