@@ -1,6 +1,12 @@
 pub const APP_NAME: &str = "OpenCodeRust";
 pub const APP_SHORT_NAME: &str = "opencoderust";
-pub const APP_VERSION_DATE: &str = "2026.02.23";
+/// Build date label shown in the TUI footer and sidebar.
+///
+/// This is a fixed release-date label, not a value injected via `env!` at
+/// build time. Build-time injection would require Cargo build-script setup
+/// and CI changes, which are intentionally out of scope here; keep this
+/// constant in sync with `docs/opencode-tui.md` on each release instead.
+pub const APP_VERSION_DATE: &str = "2026.11.21";
 pub const APP_TAGLINE: &str = "A Rust implementation of OpenCode";
 
 #[cfg(test)]
@@ -16,12 +22,12 @@ mod tests {
 
     #[test]
     fn branding_version_date_is_dot_separated_numeric() {
-        assert_eq!(APP_VERSION_DATE, "2026.02.23");
+        assert_eq!(APP_VERSION_DATE, "2026.11.21");
         assert_eq!(APP_VERSION_DATE.len(), 10);
         assert_eq!(APP_VERSION_DATE.matches('.').count(), 2);
 
         let segments: Vec<&str> = APP_VERSION_DATE.split('.').collect();
-        assert_eq!(segments, ["2026", "02", "23"]);
+        assert_eq!(segments, ["2026", "11", "21"]);
         for segment in segments {
             assert!(segment.len() >= 2);
             assert!(segment.chars().all(|c| c.is_ascii_digit()));
