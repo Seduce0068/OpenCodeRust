@@ -23,7 +23,12 @@ walkdir = { workspace = true }
 syntect = { workspace = true }
 
 # TUI dependencies
-ratatui = "0.30"
+# 既定 feature (all-widgets / macros / layout-cache / underline-color) は不要なため
+# 無効化し、実際に使う crossterm (CrosstermBackend + std) のみを明示的に有効化する。
+# TestBackend と ratatui-widgets の標準ウィジェットは feature 不要で常時利用可。
+# ratatui-macros / calendar / underline_color は未使用。termina / termwiz 等の
+# 未使用バックエンドも明示的に有効化しない限り有効にならない。
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 nucleo-matcher = { workspace = true }
 similar = { workspace = true }

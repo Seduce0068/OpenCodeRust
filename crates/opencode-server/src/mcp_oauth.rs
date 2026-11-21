@@ -805,6 +805,21 @@ pub enum McpOAuthError {
 mod tests {
     use super::*;
 
+    /// Derive the disk key under which the real OAuth manager persists the csrf
+    /// state and PKCE verifier for a flow. `start_auth` stores them under
+    /// `{mcp_name}-oauth-flow-{state}` (`McpOAuthManager::flow_disk_key`), where
+    /// `mcp_name` is the server name and `state` is the `state` query parameter
+    /// of the authorization URL it issued. Tests must read with the same key.
+    fn flow_key_for(server_name: &str, authorization_url: &str) -> String {
+        let parsed = url::Url::parse(authorization_url).expect("authorization URL must parse");
+        let state = parsed
+            .query_pairs()
+            .find(|(key, _)| key.as_ref() == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization URL must carry a state");
+        format!("{server_name}-oauth-flow-{state}")
+    }
+
     #[tokio::test]
     async fn remote_server_requires_auth_before_connecting() {
         let manager = McpOAuthManager::new();
@@ -1419,7 +1434,8 @@ mod tests {
             state.authorization_url
         );
 
-        let stored_state = opencode_mcp::auth::try_get_oauth_state("remote")
+        let flow_key = flow_key_for("remote", &state.authorization_url);
+        let stored_state = opencode_mcp::auth::try_get_oauth_state(&flow_key)
             .await
             .expect("read auth store")
             .expect("persisted csrf state");
@@ -1474,8 +1490,9 @@ mod tests {
 
         // Each callback stores that server's tokens and connects immediately.
         for name in ["alpha", "beta"] {
-            manager.start_oauth(name).await.expect("start oauth");
-            let state = opencode_mcp::auth::try_get_oauth_state(name)
+            let oauth_state = manager.start_oauth(name).await.expect("start oauth");
+            let flow_key = flow_key_for(name, &oauth_state.authorization_url);
+            let state = opencode_mcp::auth::try_get_oauth_state(&flow_key)
                 .await
                 .expect("read auth store")
                 .expect("csrf state");
@@ -1551,8 +1568,9 @@ mod tests {
             )
             .await;
 
-        manager.start_oauth("remote").await.expect("start oauth");
-        let stored_state = opencode_mcp::auth::try_get_oauth_state("remote")
+        let oauth_state = manager.start_oauth("remote").await.expect("start oauth");
+        let flow_key = flow_key_for("remote", &oauth_state.authorization_url);
+        let stored_state = opencode_mcp::auth::try_get_oauth_state(&flow_key)
             .await
             .expect("read auth store")
             .expect("csrf state");
@@ -2083,7 +2101,8 @@ mod tests {
             .await;
 
         let first = manager.start_oauth("remote").await.expect("first flow");
-        let first_state = opencode_mcp::auth::try_get_oauth_state("remote")
+        let first_flow_key = flow_key_for("remote", &first.authorization_url);
+        let first_state = opencode_mcp::auth::try_get_oauth_state(&first_flow_key)
             .await
             .expect("read auth store")
             .expect("first csrf state");
@@ -2094,7 +2113,8 @@ mod tests {
 
         manager.remove_oauth("remote").await;
         let second = manager.start_oauth("remote").await.expect("second flow");
-        let second_state = opencode_mcp::auth::try_get_oauth_state("remote")
+        let second_flow_key = flow_key_for("remote", &second.authorization_url);
+        let second_state = opencode_mcp::auth::try_get_oauth_state(&second_flow_key)
             .await
             .expect("read auth store")
             .expect("second csrf state");
