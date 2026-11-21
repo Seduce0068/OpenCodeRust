@@ -23,13 +23,19 @@ pub struct PtyInfo {
 }
 
 /// PTY（疑似端末）の実行状態。
+///
+/// server 側の PTY reader は EOF ではなく `Err` を検知したときに `Error` を
+/// publish し、wire 上は `"error"` として出力される。共有型を信頼する境界で
+/// unknown variant として落ちないよう、この共有型にも `Error` を持たせる。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PtyStatus {
     /// プロセスが実行中。
     Running,
-    /// プロセスが終了済み。
+    /// プロセスが正常終了済み。
     Exited,
+    /// プロセスが読み取りエラー等の異常で終了した。
+    Error,
 }
 
 /// PTY 新規作成時にクライアントが渡す任意指定の入力。
@@ -84,5 +90,38 @@ mod tests {
         let serialized = serde_json::to_string(&info).unwrap();
         let deserialized: PtyInfo = serde_json::from_str(&serialized).unwrap();
         assert_eq!(info, deserialized);
+    }
+
+    /// 回帰ガード: server の reader が publish する wire 値 `"error"` が
+    /// 共有型 `PtyStatus` へ復元され、再直列化でも落ちないこと。
+    #[test]
+    fn pty_status_error_wire_value_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&PtyStatus::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PtyStatus>("\"error\"").unwrap(),
+            PtyStatus::Error
+        );
+    }
+
+    /// 回帰ガード: `"status":"error"` を含む PtyInfo が共有型で復元できること。
+    #[test]
+    fn pty_info_with_error_status_round_trips() {
+        let wire = r#"{
+            "id": "pty_dummy_error",
+            "title": "Terminal",
+            "command": "dummy-command",
+            "args": [],
+            "cwd": "/dummy/cwd",
+            "status": "error",
+            "pid": 100,
+            "exit_code": null
+        }"#;
+        let info: PtyInfo = serde_json::from_str(wire).unwrap();
+        assert_eq!(info.status, PtyStatus::Error);
+        let serialized = serde_json::to_string(&info).unwrap();
+        assert!(serialized.contains("\"status\":\"error\""));
     }
 }

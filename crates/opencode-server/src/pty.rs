@@ -6,6 +6,16 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 
+/// PTY の実行状態は共有型 [`opencode_types::PtyStatus`] を単一情報源とする。
+///
+/// 以前はここで `Running` / `Exited` / `Error` のローカル enum を定義していたが、
+/// 共有型側に `Error` が欠けており、wire の `"error"` を共有型を信頼する境界で
+/// 復元すると unknown variant として落ちていた（T-02）。共有型へ `Error` を
+/// 追加した上で再エクスポートし、enum の二重定義を排除する方針を採る。
+/// これにより reader スレッドが publish する `Error` と wire の `"error"` が
+/// 常に往復可能になり、将来のバリアント追加も共有型側の変更だけで済む。
+pub use opencode_types::PtyStatus;
+
 /// Maximum size of the retained output buffer (2 MiB, matching TS).
 const BUFFER_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -17,14 +27,6 @@ pub struct PtySession {
     pub status: PtyStatus,
     pub env: HashMap<String, String>,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum PtyStatus {
-    Running,
-    Exited,
-    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +63,7 @@ struct PtySessionInner {
 /// callers. `PtySession.status` stays a plain serde value field, while the
 /// live value is shared with the blocking reader via `Arc<Mutex<..>>` (M-43).
 fn apply_live_status(session: &mut PtySession, status: &Arc<Mutex<PtyStatus>>) {
-    session.status = status.lock().unwrap().clone();
+    session.status = *status.lock().unwrap();
 }
 
 pub struct PtyManager {
@@ -575,5 +577,15 @@ mod tests {
         *status.lock().unwrap() = PtyStatus::Error;
         apply_live_status(&mut session, &status);
         assert_eq!(session.status, PtyStatus::Error);
+    }
+
+    #[test]
+    fn pty_status_is_the_shared_type_with_error_variant() {
+        // 回帰ガード: server 側 PtyStatus は共有型の再エクスポートであり、
+        // reader の Err 経路が publish する Error が共有型として扱えること。
+        let decoded: PtyStatus = serde_json::from_str("\"error\"").unwrap();
+        assert_eq!(decoded, PtyStatus::Error);
+        let shared: opencode_types::PtyStatus = decoded;
+        assert_eq!(shared, opencode_types::PtyStatus::Error);
     }
 }

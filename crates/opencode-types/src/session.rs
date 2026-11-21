@@ -64,6 +64,13 @@ pub struct SessionSummary {
     /// 変更されたファイル数。
     pub files: u64,
     /// ファイルごとの差分。
+    ///
+    /// `opencode-session` 側の `SessionSummary.diffs` は `Option<Vec<_>>` で
+    /// `None` を直列化時に省略するため、ここでは欠落を許容して空配列へ補う。
+    /// これにより session 側の JSON を直接復元しても "missing field `diffs`"
+    /// にならない（session 側を `Vec` へ変更すると server/routes の
+    /// `.diffs.as_ref()` 呼び出しに波及するため、types 側で吸収する方針）。
+    #[serde(default)]
     pub diffs: Vec<FileDiff>,
 }
 
@@ -321,6 +328,29 @@ mod tests {
             status: "pending".to_string(),
             created_at: 1_700_000_000_000,
         });
+    }
+
+    /// 回帰: session 側が `diffs: None` を省略した JSON も復元できること。
+    #[test]
+    fn session_summary_deserialize_allows_missing_diffs() {
+        let value = json!({ "additions": 3, "deletions": 1, "files": 2 });
+        let summary: SessionSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(summary.additions, 3);
+        assert_eq!(summary.deletions, 1);
+        assert_eq!(summary.files, 2);
+        assert!(summary.diffs.is_empty());
+
+        // 空配列が明示されている場合も同じ結果になる。
+        let with_empty = json!({
+            "additions": 3,
+            "deletions": 1,
+            "files": 2,
+            "diffs": []
+        });
+        assert_eq!(
+            serde_json::from_value::<SessionSummary>(with_empty).unwrap(),
+            summary
+        );
     }
 
     #[test]

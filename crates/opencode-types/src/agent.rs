@@ -14,6 +14,12 @@ pub struct AgentID(pub String);
 /// `null` として扱われ、組み込み色が文字列として往復しなくなる。そのため
 /// 内部の wire enum に `untagged` を適用し、`Serialize` は常に文字列を出力する
 /// 手実装で「タグ無しの文字列表現」を実現する。
+///
+/// 採用した退化対策: wire にタグは残さず、`Custom(known)` を**生成時に組み込み
+/// バリアントへ正規化**する。`custom()` コンストラクタとデシリアライズの両方で
+/// 正規化するため、`Custom("primary")` のような値は生成されず、プレーン文字列
+/// wire を経ても同じ値へ往復する。`Custom` バリアントを直接構築した呼び出し元は
+/// `normalized()` で同じ正規化を適用できる。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentColor {
     /// 主色。
@@ -35,6 +41,30 @@ pub enum AgentColor {
 }
 
 impl AgentColor {
+    /// 任意の色名から色を生成する。
+    ///
+    /// 組み込み色と同名の小文字名が渡された場合は対応する組み込みバリアントへ
+    /// 正規化する（`Custom("primary")` を生成しない）。これにより wire を常に
+    /// プレーン文字列のまま保ちつつ、シリアライズ→デシリアライズの往復が安定する。
+    pub fn custom(name: impl Into<String>) -> Self {
+        Self::from_custom_name(name.into())
+    }
+
+    /// 直接構築された `Custom` も含め、組み込み色名を組み込みバリアントへ正規化する。
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Custom(name) => Self::from_custom_name(name),
+            other => other,
+        }
+    }
+
+    fn from_custom_name(name: String) -> Self {
+        match BuiltinAgentColor::from_name(&name) {
+            Some(builtin) => builtin.into(),
+            None => Self::Custom(name),
+        }
+    }
+
     /// ワイヤ上の文字列表現を返す（任意色は保持している色名そのもの）。
     pub fn as_str(&self) -> &str {
         match self {
@@ -72,6 +102,22 @@ enum BuiltinAgentColor {
     Info,
 }
 
+impl BuiltinAgentColor {
+    /// ワイヤ上の小文字名から組み込み色を引く（正規化判定用）。
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "primary" => Some(Self::Primary),
+            "secondary" => Some(Self::Secondary),
+            "accent" => Some(Self::Accent),
+            "success" => Some(Self::Success),
+            "warning" => Some(Self::Warning),
+            "error" => Some(Self::Error),
+            "info" => Some(Self::Info),
+            _ => None,
+        }
+    }
+}
+
 impl From<BuiltinAgentColor> for AgentColor {
     fn from(value: BuiltinAgentColor) -> Self {
         match value {
@@ -106,8 +152,11 @@ impl From<AgentColorWire> for AgentColor {
     fn from(wire: AgentColorWire) -> Self {
         match wire {
             AgentColorWire::Builtin(builtin) => builtin.into(),
-            AgentColorWire::Custom(name) => Self::Custom(name),
-            AgentColorWire::Legacy(LegacyCustomAgentColor { custom }) => Self::Custom(custom),
+            // 旧オブジェクト形式で "primary" 等が来ても Custom として保持しない。
+            AgentColorWire::Custom(name) => Self::from_custom_name(name),
+            AgentColorWire::Legacy(LegacyCustomAgentColor { custom }) => {
+                Self::from_custom_name(custom)
+            }
         }
     }
 }
@@ -249,5 +298,42 @@ mod tests {
 
         let decoded: AgentColor = serde_json::from_value(json!("#ff0000")).unwrap();
         assert_eq!(decoded, AgentColor::Custom("#ff0000".to_string()));
+    }
+
+    /// 回帰: `Custom("primary")` は生成時に `Primary` へ正規化され、
+    /// プレーン文字列 wire を経ても同じ値へ戻る（Builtin へ退化しない）。
+    #[test]
+    fn agent_color_custom_with_builtin_name_normalizes_to_builtin() {
+        use serde_json::json;
+
+        // 直接構築した値も normalized() で正規化できる。
+        let direct = AgentColor::Custom("primary".to_string());
+        assert_eq!(direct.clone().normalized(), AgentColor::Primary);
+
+        // 生成入口では常に正規化される。
+        assert_eq!(AgentColor::custom("primary"), AgentColor::Primary);
+        assert_eq!(AgentColor::custom("info"), AgentColor::Info);
+        assert_eq!(
+            AgentColor::custom("red"),
+            AgentColor::Custom("red".to_string())
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentColor>(json!("primary")).unwrap(),
+            AgentColor::Primary
+        );
+        // 旧オブジェクト形式の {"custom":"primary"} も Custom として残さない。
+        assert_eq!(
+            serde_json::from_value::<AgentColor>(json!({ "custom": "primary" })).unwrap(),
+            AgentColor::Primary
+        );
+
+        // 正規化済みの値は往復しても変化しない。
+        for color in [
+            AgentColor::custom("primary"),
+            AgentColor::Custom("red".to_string()),
+        ] {
+            let value = serde_json::to_value(&color).unwrap();
+            assert_eq!(serde_json::from_value::<AgentColor>(value).unwrap(), color);
+        }
     }
 }
