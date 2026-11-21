@@ -57,6 +57,9 @@ pub struct PersistedSubsessionState {
     pub conversation: Conversation,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// 復元時に引き継ぐサブエージェント深さ。旧データは `0` として扱う。
+    #[serde(default)]
+    pub subagent_depth: u32,
 }
 
 impl AgentExecutor {
@@ -112,7 +115,7 @@ impl AgentExecutor {
                         agent: state.agent,
                         conversation: state.conversation,
                         disabled_tools: state.disabled_tools.into_iter().collect(),
-                        subagent_depth: 0,
+                        subagent_depth: state.subagent_depth,
                     },
                 )
             })
@@ -141,6 +144,7 @@ impl AgentExecutor {
                         agent: state.agent.clone(),
                         conversation: state.conversation.clone(),
                         disabled_tools: state.disabled_tools.iter().cloned().collect(),
+                        subagent_depth: state.subagent_depth,
                     },
                 )
             })
@@ -910,6 +914,7 @@ mod tests {
                 agent: AgentInfo::explore().with_model("gpt-4.1-mini", "openai"),
                 conversation: conversation.clone(),
                 disabled_tools: vec!["write".to_string(), "edit".to_string()],
+                subagent_depth: 0,
             },
         );
 
@@ -928,6 +933,64 @@ mod tests {
         let mut disabled = state.disabled_tools.clone();
         disabled.sort();
         assert_eq!(disabled, vec!["edit".to_string(), "write".to_string()]);
+    }
+
+    /// 回帰ガード (SUBAGENT-DEPTH-LOST): 深さ 3 のサブセッションが
+    /// 復元 → export → JSON シリアライズをまたいでも 3 のまま保たれること。
+    #[tokio::test]
+    async fn persisted_subsessions_preserve_subagent_depth() {
+        let persisted = HashMap::from([(
+            "task_deep_1".to_string(),
+            PersistedSubsessionState {
+                agent: AgentInfo::explore(),
+                conversation: Conversation::new(),
+                disabled_tools: vec![],
+                subagent_depth: 3,
+            },
+        )]);
+
+        // with_persisted_subsessions が値を復元し、export_subsessions が書き出すこと。
+        let restored = build_executor(AgentInfo::general()).with_persisted_subsessions(persisted);
+        let exported = restored.export_subsessions().await;
+        assert_eq!(
+            exported
+                .get("task_deep_1")
+                .expect("expected persisted subsession")
+                .subagent_depth,
+            3
+        );
+
+        // 実際の永続化経路（JSON）をまたいでも保たれること。
+        let json = serde_json::to_string(&exported).expect("serialize");
+        let from_json: HashMap<String, PersistedSubsessionState> =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            from_json
+                .get("task_deep_1")
+                .expect("expected persisted subsession")
+                .subagent_depth,
+            3
+        );
+    }
+
+    /// 後方互換: 旧データ（subagent_depth フィールド欠落）が 0 にフォールバックすること。
+    #[test]
+    fn persisted_subsession_state_defaults_missing_depth_to_zero() {
+        let persisted = PersistedSubsessionState {
+            agent: AgentInfo::general(),
+            conversation: Conversation::new(),
+            disabled_tools: vec![],
+            subagent_depth: 3,
+        };
+        let mut value = serde_json::to_value(&persisted).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("serialized state must be an object")
+            .remove("subagent_depth");
+
+        let legacy: PersistedSubsessionState =
+            serde_json::from_value(value).expect("legacy data must still deserialize");
+        assert_eq!(legacy.subagent_depth, 0);
     }
 
     #[tokio::test]
