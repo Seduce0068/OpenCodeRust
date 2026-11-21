@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T08:08:35+09:00"
+  at: "2026-11-21T08:59:33+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2810 件（all-features は 2809 件）
+  テスト総数 594 → 2818 件（all-features は 2817 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mcp` / `config` / `tui`: progress hard deadline、transport 直列化、OAuth
+  並行フロー分離、ratatui feature 絞り込み（swarm-coding R1-R6）
 - `provider` / `session` / `plugin`: ストリーム切断即検知、フック task の
   Drop 自動 cleanup と個別 timeout（swarm-coding R1-R6）
 - `tui`: フッタ/sidebar/toast の表示幅計算、centered の境界値（swarm-coding R1-R6）
