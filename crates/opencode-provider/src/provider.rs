@@ -621,6 +621,12 @@ pub(crate) fn default_http_client() -> Result<reqwest::Client, reqwest::Error> {
     build_http_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
 }
 
+/// `type` フォールバックで検出した一時エラーの `response_body` に使う固定サマリ。
+///
+/// 生のレスポンス本文にはトークン値等が含まれる可能性があるため、
+/// 値を一切含まない文字列だけをエラーへ載せる。
+const RETRYABLE_STREAM_ERROR_BODY_SUMMARY: &str = "transient stream error (retryable)";
+
 pub fn parse_stream_error(data: &str) -> Option<ParsedStreamError> {
     let body: serde_json::Value = serde_json::from_str(data).ok()?;
 
@@ -629,7 +635,13 @@ pub fn parse_stream_error(data: &str) -> Option<ParsedStreamError> {
     }
 
     let error = body.get("error")?;
-    let code = error.get("code")?.as_str()?;
+    // `code` を必須とすると Anthropic 等の `{"error":{"type":"overloaded_error"}}`
+    // が丸ごと捨てられ、retryable 判定が失われる。`code` が無い場合のみ
+    // `error.type` をキーとして使う。
+    let code = error
+        .get("code")
+        .and_then(|value| value.as_str())
+        .or_else(|| error.get("type").and_then(|value| value.as_str()))?;
     let response_body = serde_json::to_string(&body).unwrap_or_default();
 
     match code {
@@ -657,6 +669,22 @@ pub fn parse_stream_error(data: &str) -> Option<ParsedStreamError> {
                 message: msg,
                 is_retryable: false,
                 response_body,
+            })
+        }
+        // 過負荷 / レート制限は一時エラー。固定メッセージと値非露出の
+        // サマリを使い、上流の retryable 判定を保持する。
+        "overloaded_error" | "overloaded" | "server_overloaded" | "server_error" => {
+            Some(ParsedStreamError::ApiError {
+                message: "Server is overloaded; the request is retryable.".to_string(),
+                is_retryable: true,
+                response_body: RETRYABLE_STREAM_ERROR_BODY_SUMMARY.to_string(),
+            })
+        }
+        "rate_limit_error" | "rate_limit" | "rate_limit_exceeded" | "too_many_requests" => {
+            Some(ParsedStreamError::ApiError {
+                message: "Rate limit exceeded; the request is retryable.".to_string(),
+                is_retryable: true,
+                response_body: RETRYABLE_STREAM_ERROR_BODY_SUMMARY.to_string(),
             })
         }
         _ => None,
@@ -1165,6 +1193,62 @@ mod tests {
     fn test_parse_stream_error_non_error() {
         let data = r#"{"type":"message","content":"hello"}"#;
         assert!(parse_stream_error(data).is_none());
+    }
+
+    /// ERR2-03: `code` が無い `overloaded_error` を `error.type` から拾い、
+    /// retryable な ApiError として返すこと。トークン値・本文を露出しないこと。
+    #[test]
+    fn test_parse_stream_error_without_code_uses_type_for_overloaded() {
+        let data = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded","token":"SECRET_TOKEN_VALUE"}}"#;
+        let parsed = parse_stream_error(data).expect("error.type must be used as fallback key");
+        match parsed {
+            ParsedStreamError::ApiError {
+                is_retryable,
+                response_body,
+                ..
+            } => {
+                assert!(is_retryable, "overloaded_error must be retryable");
+                assert!(
+                    !response_body.contains("SECRET_TOKEN_VALUE")
+                        && !response_body.contains("Overloaded")
+                        && !response_body.contains("overloaded_error"),
+                    "response body must not expose values: {response_body}"
+                );
+            }
+            other => panic!("expected retryable ApiError, got {other:?}"),
+        }
+    }
+
+    /// ERR2-03: 同じフォールバックが rate_limit 系にも効くこと。
+    #[test]
+    fn test_parse_stream_error_without_code_uses_type_for_rate_limit() {
+        let data = r#"{"type":"error","error":{"type":"rate_limit_error"}}"#;
+        let parsed = parse_stream_error(data).expect("error.type must be used as fallback key");
+        match parsed {
+            ParsedStreamError::ApiError {
+                is_retryable,
+                response_body,
+                ..
+            } => {
+                assert!(is_retryable, "rate_limit_error must be retryable");
+                assert!(!response_body.contains("rate_limit_error"));
+            }
+            other => panic!("expected retryable ApiError, got {other:?}"),
+        }
+    }
+
+    /// `code` が存在する場合は従来どおり `code` を優先し、`type` で上書きしない。
+    #[test]
+    fn test_parse_stream_error_prefers_code_over_type() {
+        let data =
+            r#"{"type":"error","error":{"code":"insufficient_quota","type":"overloaded_error"}}"#;
+        let parsed = parse_stream_error(data).expect("code must take precedence");
+        match parsed {
+            ParsedStreamError::ApiError { is_retryable, .. } => {
+                assert!(!is_retryable, "insufficient_quota must stay non-retryable");
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
     }
 
     #[test]

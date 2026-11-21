@@ -404,9 +404,15 @@ impl McpTransport for HttpTransport {
                         continue;
                     }
                     validate_sse_event_size(data)?;
-                    if let Ok(message) = JsonRpcMessage::parse_json_str(data) {
-                        enqueue_response(&self.response_tx, message)?;
-                    }
+                    // パース失敗を握りつぶすと待機側が timeout までブロックするため
+                    // 固定文言の ProtocolError を返す（SseTransport と同方針、R4）。
+                    // 生データはエラーへ埋め込まない。
+                    let message = JsonRpcMessage::parse_json_str(data).map_err(|_| {
+                        McpClientError::ProtocolError(
+                            "SSE message failed JSON-RPC parsing".to_string(),
+                        )
+                    })?;
+                    enqueue_response(&self.response_tx, message)?;
                 }
             }
         } else {
@@ -534,8 +540,17 @@ impl SseTransport {
                                 // 受信側が閉じられた: これ以上配信先がない。
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                             },
-                            Err(e) => {
-                                tracing::warn!("SSE: failed to parse message: {}", e);
+                            Err(_) => {
+                                // JSON-RPC パース失敗は生ペイロード（トークン値等を
+                                // 含む可能性がある）をログへ出さず、size-limit /
+                                // queue-full と同じ violation + notify 経路で
+                                // 待機側へ ProtocolError を返す。ここでドロップした
+                                // ままだと call_tool が execution_timeout_ms まで
+                                // 無駄に待たされる（ERR2-08）。
+                                *violation.lock().await =
+                                    Some("SSE message failed JSON-RPC parsing".to_string());
+                                notify.notify_one();
+                                break;
                             }
                         }
                     }
@@ -1024,6 +1039,36 @@ mod http_sse_limit_tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("jsonrpc") && !rendered.contains('{'));
 
+        transport.close().await.expect("close");
+        handle.join().expect("mock thread must not panic");
+    }
+
+    /// ERR2-08: SSE の JSON-RPC パース失敗が warn だけでドロップされず、
+    /// 待機中の receive() が timeout ではなく ProtocolError で失敗すること。
+    #[tokio::test]
+    async fn sse_json_rpc_parse_failure_is_surfaced_to_waiting_receiver() {
+        ensure_no_proxy();
+        // 途中で切れた tools/call レスポンス（JSON として不正）。
+        let malformed = r#"data: {"jsonrpc":"2.0","id":7,"result":"PARTIAL_PAYLOAD_MARKER""#;
+        let body = format!("{malformed}\n\n");
+        let (url, handle) = serve_once("text/event-stream", body);
+
+        let transport = SseTransport::new(url, None);
+        transport.connect().await.expect("connect must succeed");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), transport.receive()).await;
+        let error = outcome
+            .expect("receive must not hang on a malformed JSON-RPC event")
+            .expect_err("parse failure must surface as an error");
+        assert!(
+            matches!(&error, McpClientError::ProtocolError(_)),
+            "unexpected error: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("PARTIAL_PAYLOAD_MARKER") && !rendered.contains("jsonrpc"),
+            "error must not echo the malformed payload: {rendered}"
+        );
         transport.close().await.expect("close");
         handle.join().expect("mock thread must not panic");
     }
