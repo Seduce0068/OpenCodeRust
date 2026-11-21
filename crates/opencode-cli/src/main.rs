@@ -1254,6 +1254,50 @@ async fn main() -> anyhow::Result<()> {
 
 const TUI_AUTH_TOKEN_ENV: &str = "OPENCODE_TUI_AUTH_TOKEN";
 
+/// `run_tui` が TUI スレッドへ値を渡すために書き換える `OPENCODE_TUI_*`。
+/// パスワードを運ぶ `TUI_AUTH_TOKEN_ENV` は復元対象に含めない（常に消去するため）。
+const TUI_ENV_KEYS: &[&str] = &[
+    "OPENCODE_TUI_BASE_URL",
+    "OPENCODE_TUI_MODEL",
+    "OPENCODE_TUI_PROMPT",
+    "OPENCODE_TUI_AGENT",
+    "OPENCODE_TUI_SESSION",
+];
+
+/// `run_tui` が書き換える環境変数の元の値を保持し、Drop で復元する RAII ガード。
+///
+/// 既存の `RestoreNoAuth` / `RestoreMcpAuthFile` と同じく、未設定なら `remove_var`、
+/// 設定済みなら元の値へ `set_var` する。パスワードを運ぶ `TUI_AUTH_TOKEN_ENV` は
+/// 元の値に関わらず常に消去し、secret をプロセス env へ残さない。`spawn_blocking`
+/// の Err・早期 return・panic のいずれでも Drop が走るため env が残存しない。
+/// トークン値・パスは保持せず、ログ・エラーにも出さない。
+struct RestoreTuiEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl RestoreTuiEnv {
+    /// 書き換え前に各変数の現在値をスナップショットする。
+    fn snapshot() -> Self {
+        Self(
+            TUI_ENV_KEYS
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        )
+    }
+}
+
+impl Drop for RestoreTuiEnv {
+    fn drop(&mut self) {
+        for (name, original) in &self.0 {
+            match original {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        // パスワードは元の値に関わらず残さない（値そのものは保持しない）。
+        std::env::remove_var(TUI_AUTH_TOKEN_ENV);
+    }
+}
+
 /// attach のパスワードを TUI が読む env へ設定する（未指定時は何もしない）。
 fn set_tui_auth_token_env(password: &Option<String>) {
     if let Some(password) = password {
@@ -1261,6 +1305,7 @@ fn set_tui_auth_token_env(password: &Option<String>) {
     }
 }
 
+#[cfg(test)]
 fn clear_tui_auth_token_env() {
     std::env::remove_var(TUI_AUTH_TOKEN_ENV);
 }
@@ -1331,6 +1376,11 @@ async fn run_tui(
 
     let selected_session =
         resolve_requested_session(&base_url, continue_last, session, fork).await?;
+
+    // env を書き換える前に元の値を退避する。ガードはスコープ末尾まで生きるため、
+    // spawn_blocking の Err / 早期 return / panic のいずれでも Drop で復元される。
+    let _restore_tui_env = RestoreTuiEnv::snapshot();
+
     std::env::set_var("OPENCODE_TUI_BASE_URL", &base_url);
     // attach -p/--password を TUI 側へ secret として渡す。値はログ・エラーへ出さない。
     set_tui_auth_token_env(&password);
@@ -1348,13 +1398,6 @@ async fn run_tui(
     let run_result = tokio::task::spawn_blocking(opencode_tui::run_tui)
         .await
         .map_err(|e| anyhow::anyhow!("TUI task panicked: {}", e))?;
-
-    std::env::remove_var("OPENCODE_TUI_BASE_URL");
-    std::env::remove_var("OPENCODE_TUI_MODEL");
-    std::env::remove_var("OPENCODE_TUI_PROMPT");
-    std::env::remove_var("OPENCODE_TUI_AGENT");
-    std::env::remove_var("OPENCODE_TUI_SESSION");
-    clear_tui_auth_token_env();
 
     drop(mdns_publisher);
     if let Some(handle) = server_handle {
@@ -1391,6 +1434,79 @@ mod password_env_tests {
         set_tui_auth_token_env(&None);
         assert!(std::env::var(TUI_AUTH_TOKEN_ENV).is_err());
         clear_tui_auth_token_env();
+    }
+
+    /// `spawn_blocking(...).await?` が Err になった場合（STATE-08）の回帰テスト。
+    /// `?` による早期 return でも RAII ガードが env を復元することを検証する。
+    #[test]
+    fn tui_env_is_restored_on_early_return() {
+        let _guard = ENV_LOCK.lock().expect("env test lock");
+        // テスト開始時の状態を退避し、テスト終了時に元へ戻す。
+        let _outer = RestoreTuiEnv::snapshot();
+
+        for key in TUI_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        std::env::remove_var(TUI_AUTH_TOKEN_ENV);
+        std::env::set_var("OPENCODE_TUI_BASE_URL", "http://original.invalid");
+        std::env::set_var(TUI_AUTH_TOKEN_ENV, "preexisting-secret");
+
+        // JoinError 相当を ? で早期 return させる（値はログ・エラーへ出さない）。
+        fn early_return() -> anyhow::Result<()> {
+            let _restore = RestoreTuiEnv::snapshot();
+            std::env::set_var("OPENCODE_TUI_BASE_URL", "http://changed.invalid");
+            std::env::set_var("OPENCODE_TUI_MODEL", "changed-model");
+            std::env::set_var(TUI_AUTH_TOKEN_ENV, "injected-secret");
+            anyhow::bail!("simulated TUI task join failure")
+        }
+
+        assert!(early_return().is_err());
+
+        assert_eq!(
+            std::env::var("OPENCODE_TUI_BASE_URL").ok().as_deref(),
+            Some("http://original.invalid"),
+            "base URL must be restored even on early return"
+        );
+        assert!(
+            std::env::var("OPENCODE_TUI_MODEL").is_err(),
+            "previously unset vars must stay unset"
+        );
+        assert!(
+            std::env::var(TUI_AUTH_TOKEN_ENV).is_err(),
+            "auth token must never remain in env"
+        );
+    }
+
+    /// panic で unwind した場合も Drop が走って env が復元されることを検証する。
+    #[test]
+    fn tui_env_is_restored_on_panic() {
+        let _guard = ENV_LOCK.lock().expect("env test lock");
+        let _outer = RestoreTuiEnv::snapshot();
+
+        for key in TUI_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        std::env::remove_var(TUI_AUTH_TOKEN_ENV);
+        std::env::set_var("OPENCODE_TUI_SESSION", "original-session");
+
+        // MutexGuard を捕捉しない（UnwindSafe を保つ）ゼロ捕捉クロージャ。
+        let result = std::panic::catch_unwind(|| {
+            let _restore = RestoreTuiEnv::snapshot();
+            std::env::set_var("OPENCODE_TUI_SESSION", "changed-session");
+            std::env::set_var(TUI_AUTH_TOKEN_ENV, "injected-secret");
+            panic!("simulated panic during TUI run");
+        });
+        assert!(result.is_err());
+
+        assert_eq!(
+            std::env::var("OPENCODE_TUI_SESSION").ok().as_deref(),
+            Some("original-session"),
+            "session must be restored after panic unwind"
+        );
+        assert!(
+            std::env::var(TUI_AUTH_TOKEN_ENV).is_err(),
+            "auth token must never remain in env after panic"
+        );
     }
 }
 
