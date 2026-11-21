@@ -164,14 +164,10 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **AgentColor::Custom が組み込み色と同名で serde 往復時に退化**
-  — `types/agent.rs:37-60` / T-03 / 低
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **messages テーブルの provider_id/cost 列が永続化経路で常に未設定**
   — `storage/repository.rs:566-608` / T-06 / 低
-- [ ] **SessionSummary.diffs の serde 既定値が types/session で非対称**
-  — `types/session.rs:57-68` / T-07 / 低
 - [ ] **GitWatcher イベント待ちが 2 秒固定 timeout**
   — `core/git_watcher.rs:82-95` / TESTREL-04 / 低
 - [ ] **ENV_OVERRIDE_LOCK 範囲外で env を直接書き換え**
@@ -264,8 +260,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **opencode_types::PtyStatus に Error が無く wire "error" が落ちる**
-  — `types/pty.rs:25-33` / T-02 / 中
 - [ ] **update_part が v2 の Part ワイヤ形式を受けられない**
   — `routes.rs:3000-3019` / T-05 / 中（speculation）
 - [ ] **watcher 再帰サブウォッチのアタッチ待ちが固定 sleep 依存**
@@ -308,6 +302,8 @@ status: current
 
 ## 完了
 
+- [x] **[共有型 3 件]** AgentColor 正規化・diffs 既定値・PtyStatus 集約
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[permission 二重エンコード 1 件]** PATCH 後の CorruptData を解消
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定ロード失敗警告 1 件]** 値非依存フォールバック通知

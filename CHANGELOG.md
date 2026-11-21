@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T17:06:24+09:00"
+  at: "2026-11-21T17:23:35+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2902 件（all-features は 2901 件）
+  テスト総数 594 → 2909 件（all-features は 2908 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `types` / `session` / `server`: AgentColor 正規化、diffs 既定値、PtyStatus 集約
+  （swarm-coding R1-R6）
 - `storage`: セッション権限 JSON の二重エンコードを修正（PATCH 後の CorruptData を解消）
   （swarm-coding R1-R6）
 - `cli`: 設定ロード失敗時の値非依存警告（初期化前後どちらも到達可能）
