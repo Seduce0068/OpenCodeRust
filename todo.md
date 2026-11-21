@@ -164,7 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **TUI 入力スレッドが終了時に join されない** — `tui/app.rs:248-274` / SHUTDOWN-08 / 低
 - [ ] **設定検証手段が無く README も不正設定時の挙動を案内しない**
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
@@ -265,10 +264,6 @@ status: current
   — `config/loader.rs:89-95` / CFGVAL-03 / 中
 - [ ] **ネストしたキーの誤記がサイレントに無視される**
   — `config/loader.rs:945-975` / CFGVAL-04 / 中
-- [ ] **Markdown frontmatter パース失敗で全メタデータが黙って失われる**
-  — `config/loader.rs:1193-1209` / CFGVAL-06 / 中
-- [ ] **同一レイヤーの provider/providers 衝突が警告なしで破棄**
-  — `config/schema.rs:1493-1497` / CFGVAL-08 / 中
 - [ ] **不正な入れ子値（oauth/environment/headers）が無警告で捨てられる**
   — `config/schema.rs:1229-1239` / CFGVAL-09 / 中
 - [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
@@ -291,6 +286,8 @@ status: current
 
 ## 完了
 
+- [x] **[provider 警告/frontmatter/TUI join 3 件]** 値非露出の警告とスレッド回収
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin/設定警告 3 件]** kill フォールバックと非推奨キー警告
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[graceful shutdown 4 件]** シグナル・flush・設定警告 replay
@@ -632,6 +629,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（provider 警告/frontmatter の修正時、記録のみ）: frontmatter
+  に不正値が複数ある場合、失敗フィールドが `<unknown>` にフォールバックする
+  （値・本文は出ず、単一不正時は正しく特定できるため必須修正ではない）。
 - 2026-11-21 R4 残存（graceful/警告 replay の修正時、記録のみ）: final flush の
   回帰テストが呼出回数のみで生エラー非露出を実際には検証していない。
   親が TUI の早期 return 時に停止シーケンスが飛ぶ問題と signal feature
