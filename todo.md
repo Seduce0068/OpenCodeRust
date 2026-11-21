@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[serde/後始末 5 件]** old-key alias・round-trip・busy リーク・楽観 msg
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[ページネーション引数露出 1 件]** directory/roots/start を API に追加
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[run_status 復帰 1 件]** ストリーム異常終了で Idle に戻す
@@ -705,6 +707,11 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm176、2 担当・5 件、観点: serde round-trip /
+  エラーパス後始末）: 親が中 2 件を read で事実確認、5 件すべて即座 coding
+  完了。R4 指摘なし。子の finding: untagged enum 構造上 protocol=Some の
+  手作り Remote JSON は File にマッチするが、コード生成の Remote は
+  protocol=None のため実害なし。
 - 2026-11-22 R4 指摘（ページネーション引数の修正時）: send() の生エラーが
   reqwest の URL（directory パス）を表示し得るため固定文言へ変換（親が修正）。
   limit=0 の意味論は設計判断（0=全件か空か）のため未対応。
