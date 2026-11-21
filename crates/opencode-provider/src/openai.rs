@@ -477,28 +477,35 @@ impl OpenAIProvider {
         Self::parse_legacy_sse_data(data, state)
     }
 
+    /// 行バッファから改行が揃った `data: ...` 行だけをパーサへ渡す。
+    ///
+    /// 生バイトを保持したまま行が確定してから UTF-8 へデコードする。
+    /// チャンク単位で `String::from_utf8_lossy` を呼ぶとマルチバイト文字が
+    /// TCP のチャンク境界で分断された際に U+FFFD へ置換され、後続の
+    /// 完全なバイト列と結合されず文字化けする。
+    /// `flush_remainder` はストリーム終端の改行なし行を処理するために使う。
     fn drain_legacy_sse_events(
-        buffer: &mut String,
+        buffer: &mut Vec<u8>,
         state: &mut LegacySseParserState,
         flush_remainder: bool,
     ) -> Vec<StreamEvent> {
         let mut events = Vec::new();
 
-        while let Some(newline_idx) = buffer.find('\n') {
-            let mut line = buffer[..newline_idx].to_string();
+        while let Some(newline_idx) = buffer.iter().position(|&byte| byte == b'\n') {
+            let line = buffer[..newline_idx].to_vec();
             buffer.drain(..=newline_idx);
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            events.extend(Self::parse_legacy_sse_line(&line, state));
+            let decoded = String::from_utf8_lossy(&line);
+            let decoded = decoded.as_ref();
+            let line = decoded.strip_suffix('\r').unwrap_or(decoded);
+            events.extend(Self::parse_legacy_sse_line(line, state));
         }
 
         if flush_remainder && !buffer.is_empty() {
-            let mut tail = std::mem::take(buffer);
-            if tail.ends_with('\r') {
-                tail.pop();
-            }
-            events.extend(Self::parse_legacy_sse_line(&tail, state));
+            let tail = std::mem::take(buffer);
+            let decoded = String::from_utf8_lossy(&tail);
+            let decoded = decoded.as_ref();
+            let line = decoded.strip_suffix('\r').unwrap_or(decoded);
+            events.extend(Self::parse_legacy_sse_line(line, state));
         }
 
         events
@@ -942,7 +949,7 @@ impl OpenAIProvider {
         let stream = stream::try_unfold(
             (
                 response.bytes_stream(),
-                String::new(),
+                Vec::<u8>::new(),
                 LegacySseParserState::default(),
                 VecDeque::<StreamEvent>::new(),
                 false,
@@ -962,7 +969,8 @@ impl OpenAIProvider {
 
                     match chunks.next().await {
                         Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            // 生バイトのままバッファへ積み、行が確定してからデコードする。
+                            buffer.extend_from_slice(bytes.as_ref());
                             pending.extend(Self::drain_legacy_sse_events(
                                 &mut buffer,
                                 &mut parser_state,
@@ -1236,13 +1244,15 @@ mod tests {
     #[test]
     fn drain_legacy_sse_events_handles_partial_and_multiple_lines() {
         let mut state = LegacySseParserState::default();
-        let mut buffer = String::from("data: {\"choices\":[{\"delta\":{\"content\":\"hel");
+        let mut buffer = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel".to_vec();
 
         let events = OpenAIProvider::drain_legacy_sse_events(&mut buffer, &mut state, false);
         assert!(events.is_empty(), "partial line should not be parsed");
 
-        buffer.push_str("lo\"}}]}\n");
-        buffer.push_str("data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n");
+        buffer.extend_from_slice(b"lo\"}}]}\n");
+        buffer.extend_from_slice(
+            b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n",
+        );
         let events = OpenAIProvider::drain_legacy_sse_events(&mut buffer, &mut state, false);
 
         assert_eq!(events.len(), 2);
@@ -1257,6 +1267,153 @@ mod tests {
                 completion_tokens: 2
             }
         ));
+    }
+
+    #[test]
+    fn drain_legacy_sse_events_preserves_multibyte_text_split_mid_character() {
+        let mut state = LegacySseParserState::default();
+        let mut buffer = Vec::new();
+
+        let text = "こんにちは";
+        let prefix = b"data: {\"choices\":[{\"delta\":{\"content\":\"";
+        let text_bytes = text.as_bytes();
+        // "こ" の UTF-8 は E3 81 93。先頭 1 バイト目の直後で分割する。
+        assert_eq!(&text_bytes[..3], &[0xE3u8, 0x81, 0x93]);
+
+        buffer.extend_from_slice(prefix);
+        buffer.extend_from_slice(&text_bytes[..1]);
+        assert!(OpenAIProvider::drain_legacy_sse_events(&mut buffer, &mut state, false).is_empty());
+        assert!(buffer.ends_with(&[0xE3u8]));
+
+        buffer.extend_from_slice(&text_bytes[1..]);
+        buffer.extend_from_slice(b"\"}}]}\n");
+        let events = OpenAIProvider::drain_legacy_sse_events(&mut buffer, &mut state, false);
+        assert!(
+            matches!(events.first(), Some(StreamEvent::TextDelta(delta)) if delta.as_str() == text),
+            "分割されたマルチバイト文字は U+FFFD に置換されず復元される必要がある: {events:?}"
+        );
+        assert!(buffer.is_empty());
+    }
+
+    /// 1 接続だけを処理するループバック HTTP モックを起動する。
+    /// 外部送信は行わず、書き込みの間隔を空けて別 TCP チャンクとして届ける。
+    async fn spawn_openai_sse_mock(
+        writes: Vec<Vec<u8>>,
+    ) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("SKIPPED: loopback TCP bind unavailable: {err}");
+                return None;
+            }
+        };
+        let addr = listener.local_addr().ok()?;
+        let content_length: usize = writes.iter().map(Vec::len).sum();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        );
+
+        let handle = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request_bytes = [0u8; 4096];
+            let _ = socket.read(&mut request_bytes).await;
+            if socket.write_all(headers.as_bytes()).await.is_err() {
+                return;
+            }
+            for (index, payload) in writes.into_iter().enumerate() {
+                if index > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                if socket.write_all(&payload).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+            }
+        });
+
+        Some((format!("http://{addr}"), handle))
+    }
+
+    async fn collect_openai_stream_events(base_url: &str) -> Vec<StreamEvent> {
+        // openai_compatible は legacy ルートを強制するため、修正対象の経路を通る。
+        let provider = OpenAIProvider::openai_compatible(base_url, "test-key");
+        let request = ChatRequest::new("gpt-4o", vec![Message::user("hi")]).with_stream(true);
+        let mut stream = provider
+            .chat_stream(request)
+            .await
+            .expect("chat_stream should succeed");
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("stream event should not be an error"));
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn openai_stream_preserves_multibyte_text_split_across_writes() {
+        let text = "こんにちは";
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\
+             data: [DONE]\n"
+        );
+        // "こ" (E3 81 93) の先頭 1 バイト目の直後で分断する。
+        let split_at = body.find(text).expect("fixture must contain text") + 1;
+        assert!(!body.is_char_boundary(split_at));
+        let (first, second) = body.as_bytes().split_at(split_at);
+
+        let Some((base_url, server)) =
+            spawn_openai_sse_mock(vec![first.to_vec(), second.to_vec()]).await
+        else {
+            return; // ループバック bind が不可な環境ではスキップ
+        };
+        let events = collect_openai_stream_events(&base_url).await;
+        server.await.expect("mock server task should not panic");
+
+        assert!(
+            events.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta(delta) if delta.as_str() == text)
+            ),
+            "マルチバイト文字が U+FFFD に置換されてはならない: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_reassembles_data_line_split_across_writes() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                    data: [DONE]\n";
+        let marker = "\"content\":\"hel";
+        let split_at = body
+            .find(marker)
+            .expect("fixture must contain the split marker")
+            + marker.len();
+        let (first, second) = body.as_bytes().split_at(split_at);
+        assert!(first.ends_with(marker.as_bytes()));
+        assert!(second.starts_with(b"lo\"}}"));
+
+        let Some((base_url, server)) =
+            spawn_openai_sse_mock(vec![first.to_vec(), second.to_vec()]).await
+        else {
+            return; // ループバック bind が不可な環境ではスキップ
+        };
+        let events = collect_openai_stream_events(&base_url).await;
+        server.await.expect("mock server task should not panic");
+
+        assert!(
+            events.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta(delta) if delta.as_str() == "hello")
+            ),
+            "行の途中で分断されたデータ行は結合される必要がある: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
     }
 
     #[test]
