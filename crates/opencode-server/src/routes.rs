@@ -1347,6 +1347,10 @@ async fn delete_message(
 pub struct AddPartRequest {
     #[serde(rename = "type")]
     pub part_type: String,
+    /// R2/API-06: クライアントが再送時に同じ part を識別するための任意 id。
+    /// 未指定（または空）の場合は従来どおり UUID を採番する。
+    #[serde(default)]
+    pub id: Option<String>,
     pub text: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
@@ -1355,7 +1359,48 @@ pub struct AddPartRequest {
     pub is_error: Option<bool>,
 }
 
+/// 従来どおりの part id (`prt_` + UUID v4 simple) を採番する。
+fn new_part_id() -> String {
+    format!("prt_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// クライアント指定の part id をサニタイズする。
+///
+/// - 制御文字（Cc）と書式制御文字（Cf）を除去する
+/// - 最大 128 文字に切り詰める
+/// - 結果が空文字列なら UUID 採番へフォールバックする
+fn sanitize_part_id(raw: &str) -> String {
+    // Cc（is_control）に加え、Cf（書式制御: RLO / ZWSP / BOM 等）も除外する（R4）。
+    // これらは UI 表示やログで視覚的なりすましに使われ得る。
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_control(*c))
+        .take(128)
+        .collect();
+    if cleaned.trim().is_empty() {
+        new_part_id()
+    } else {
+        cleaned
+    }
+}
+
+/// Unicode 一般カテゴリ Cf（書式制御文字）かどうか。
+fn is_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+            | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+    )
+}
+
 fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<opencode_session::MessagePart> {
+    // R2/API-06: 指定 id があればサニタイズして採用し、未指定なら従来の UUID 採番を維持。
+    let id = match req.id.as_deref() {
+        Some(raw) => sanitize_part_id(raw),
+        None => new_part_id(),
+    };
     let part_type = match req.part_type.as_str() {
         "text" => opencode_session::PartType::Text {
             text: req.text.ok_or_else(|| {
@@ -1404,7 +1449,7 @@ fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<opencode_sess
     };
 
     Ok(opencode_session::MessagePart {
-        id: format!("prt_{}", uuid::Uuid::new_v4().simple()),
+        id,
         part_type,
         created_at: chrono::Utc::now(),
         message_id: Some(msg_id.to_string()),
@@ -1425,6 +1470,27 @@ async fn add_message_part(
         .ok_or_else(|| ApiError::NotFound(format!("Message not found: {}", msg_id)))?;
 
     let part = build_message_part(req, &msg_id)?;
+
+    // R2/API-06: 再送などで同一 id の part が既に存在する場合は二重永続化を避け、
+    // `added:false` と既存の part_id を返す。未指定時は毎回新しい UUID が採番されるため
+    // この分岐に入らず、従来の挙動（常に追加・`added:true`）は不変。
+    let duplicate_id = message
+        .parts
+        .iter()
+        .find(|p| p.id == part.id)
+        .map(|p| p.id.clone());
+    if let Some(existing_id) = duplicate_id {
+        drop(sessions);
+        // 初回永続化が失敗していた場合でも、再送時に回復する機会を残す（R4）。
+        persist_sessions_if_enabled(&state).await;
+        return Ok(Json(serde_json::json!({
+            "added": false,
+            "session_id": session_id,
+            "message_id": msg_id,
+            "part_id": existing_id,
+        })));
+    }
+
     let part_id = part.id.clone();
     message.parts.push(part);
     session.touch();
@@ -1437,6 +1503,170 @@ async fn add_message_part(
         "message_id": msg_id,
         "part_id": part_id,
     })))
+}
+
+#[cfg(test)]
+mod add_part_idempotency_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text_part_request(id: Option<&str>, text: &str) -> AddPartRequest {
+        AddPartRequest {
+            part_type: "text".to_string(),
+            id: id.map(|raw| raw.to_string()),
+            text: Some(text.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_input: None,
+            content: None,
+            is_error: None,
+        }
+    }
+
+    async fn state_with_one_message() -> (Arc<ServerState>, String, String) {
+        let state = Arc::new(ServerState::new());
+        let (session_id, msg_id) = {
+            let mut sessions = state.sessions.lock().await;
+            let session_id = sessions.create("default", ".").id;
+            let session = sessions
+                .get_mut(&session_id)
+                .expect("created session should be available for mutation");
+            let msg_id = session.add_user_message("hello").id.clone();
+            (session_id, msg_id)
+        };
+        (state, session_id, msg_id)
+    }
+
+    /// R2/API-06: 同じ id を 2 回送った場合、part は 1 つだけ永続化され、
+    /// 2 回目は `added:false` と既存 part_id を返す。
+    #[tokio::test]
+    async fn explicit_id_retry_adds_only_one_part() {
+        let (state, session_id, msg_id) = state_with_one_message().await;
+
+        let first = add_message_part(
+            State(state.clone()),
+            Path((session_id.clone(), msg_id.clone())),
+            Json(text_part_request(Some("prt_fixed_1"), "retry")),
+        )
+        .await
+        .expect("first add should succeed");
+        assert_eq!(first.0.get("added"), Some(&json!(true)));
+        assert_eq!(first.0.get("part_id"), Some(&json!("prt_fixed_1")));
+
+        let second = add_message_part(
+            State(state.clone()),
+            Path((session_id.clone(), msg_id.clone())),
+            Json(text_part_request(Some("prt_fixed_1"), "retry")),
+        )
+        .await
+        .expect("retry should be handled idempotently");
+        assert_eq!(second.0.get("added"), Some(&json!(false)));
+        assert_eq!(second.0.get("part_id"), Some(&json!("prt_fixed_1")));
+        // レスポンスの他のキーは従来どおり維持される。
+        assert_eq!(
+            second.0.get("session_id").and_then(|v| v.as_str()),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            second.0.get("message_id").and_then(|v| v.as_str()),
+            Some(msg_id.as_str())
+        );
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_id).expect("session should exist");
+        let message = session.get_message(&msg_id).expect("message should exist");
+        let matches: Vec<_> = message
+            .parts
+            .iter()
+            .filter(|part| part.id == "prt_fixed_1")
+            .collect();
+        assert_eq!(matches.len(), 1, "retry must not duplicate the part");
+        assert_eq!(message.parts.len(), 2, "hello + one retry part");
+    }
+
+    /// R2/API-06: id 未指定は従来どおり毎回 UUID を採番し、2 件とも追加される。
+    #[tokio::test]
+    async fn unspecified_id_keeps_uuid_behavior_and_adds_both() {
+        let (state, session_id, msg_id) = state_with_one_message().await;
+
+        let first = add_message_part(
+            State(state.clone()),
+            Path((session_id.clone(), msg_id.clone())),
+            Json(text_part_request(None, "first")),
+        )
+        .await
+        .expect("first add should succeed");
+        let second = add_message_part(
+            State(state.clone()),
+            Path((session_id.clone(), msg_id.clone())),
+            Json(text_part_request(None, "second")),
+        )
+        .await
+        .expect("second add should succeed");
+
+        assert_eq!(first.0.get("added"), Some(&json!(true)));
+        assert_eq!(second.0.get("added"), Some(&json!(true)));
+        let first_id = first
+            .0
+            .get("part_id")
+            .and_then(|v| v.as_str())
+            .expect("part_id")
+            .to_string();
+        let second_id = second
+            .0
+            .get("part_id")
+            .and_then(|v| v.as_str())
+            .expect("part_id")
+            .to_string();
+        assert_ne!(first_id, second_id, "omitted id must get a fresh UUID");
+        for id in [&first_id, &second_id] {
+            let raw = id.strip_prefix("prt_").expect("legacy prt_ prefix");
+            assert!(
+                uuid::Uuid::parse_str(raw).is_ok(),
+                "omitted id must stay prt_UUID: {id}"
+            );
+        }
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_id).expect("session should exist");
+        let message = session.get_message(&msg_id).expect("message should exist");
+        assert_eq!(message.parts.len(), 3, "hello + both parts");
+    }
+
+    /// R2/API-06: 不正な id はサニタイズされるか、UUID へフォールバックする。
+    #[test]
+    fn invalid_explicit_id_is_sanitized_or_falls_back() {
+        assert_eq!(sanitize_part_id("prt_ab\u{1}\ncd"), "prt_abcd");
+        let long = "a".repeat(200);
+        assert_eq!(sanitize_part_id(&long).chars().count(), 128);
+        for raw in ["", "\u{0}\n\t"] {
+            let sanitized = sanitize_part_id(raw);
+            let raw_uuid = sanitized.strip_prefix("prt_").expect("fallback prefix");
+            assert!(
+                uuid::Uuid::parse_str(raw_uuid).is_ok(),
+                "empty id must fall back to prt_UUID"
+            );
+        }
+    }
+
+    #[test]
+    fn build_message_part_honors_explicit_id_and_defaults_to_uuid() {
+        let explicit = build_message_part(text_part_request(Some("prt_client_1"), "x"), "msg_1")
+            .expect("build explicit part");
+        assert_eq!(explicit.id, "prt_client_1");
+        let implicit =
+            build_message_part(text_part_request(None, "x"), "msg_1").expect("build default part");
+        assert!(implicit.id.starts_with("prt_"));
+        assert_ne!(explicit.id, implicit.id);
+    }
+
+    /// 後方互換: `id` を送らない旧クライアントは問題なくデシリアライズできる。
+    #[test]
+    fn omitted_id_field_deserializes_to_none() {
+        let req: AddPartRequest = serde_json::from_value(json!({"type": "text", "text": "hi"}))
+            .expect("legacy request without id should deserialize");
+        assert!(req.id.is_none());
+    }
 }
 
 async fn delete_part(
