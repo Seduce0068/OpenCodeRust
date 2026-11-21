@@ -49,12 +49,8 @@ status: current
     npm lockfile / package.json は存在せず新規設営から。CI は cargo audit のみで
     npm スキャン対象なし（共通ワークフロー委譲のため改修先の調整も必要）。
     chrome-devtools サーバが既存するため devtools は統合/削除の可能性もある（speculative）。
-- [ ] **[H-10]** セッション永続化の並行制御（トランザクション化は対応済み）
-  - 移行と delete+create（`replace_for_session`）は原子化済み。未対応は単一ライタ
     persist キュー、session_repo.update/create とメッセージ置換の同一トランザクション化、
     古い snapshot の遅延 commit による更新喪失（推測のまま）
-- [ ] **[H-11]** キュー冪等性の完全化（終端化・相関 ID は対応済み）
-  - promote 失敗時 failed 化と assistant への queue_id 付与は完了。未対応は
     セッション永続化と promoted 更新の同一トランザクション化（repository.rs 変更要）と、
     下流での queue_id による重複レスポンス排除。完全な二重課金防止は未検証
 - [ ] **[H-13]** TUI イベントルートのブロッキング HTTP と全件再マッピング
@@ -81,8 +77,6 @@ status: current
   - 前提を訂正: util は CLI が実使用（L-04 で配線済み）で「無依存」は stale。
     watcher は core の GitWatcher と config.watcher に機能分散（別 ADR 判断）。
     local-llm は外部 MCP 起動想定（登録有無は未確認）、codemode は ADR-0006 維持。
-- [ ] **[M-04]** エラー型の残課題（source 付きバリアント＋ tool/provider 置換済み）
-  - command の 3 メソッドと、ToolError/ProviderError の source 付きバリアント追加済み。
     2026-11-19 に opencode-tool の 12 ファイル 33 箇所を `execution_with_source` へ、
     opencode-provider の 20 ファイル 62 箇所を `api_error_with_source` /
     `network_error_with_source` へ置換（メッセージ不変・非対象は据え置き、旧パターン残存 0）。
@@ -127,8 +121,6 @@ status: current
     厳密ピン拡充（8/61）は Cargo.lock コミット＋CI locked で再現性担保済みのため
     複数バージョン併存リスクの精査は不要と判断。
   - version/edition/authors/license の workspace 継承は 7 クレートとも完了済み
-- [ ] **[M-16]** 依存方向の逆転（sqlx 未使用 derive は削除済み）
-  - 2026-11-19 調査（swarm-coding R2）: 推奨は **charter/ADR 改訂主軸**。
     逆依存はすべて DAG 内で循環は無く（AGENTS.md のハードルールは充足）、
     session は実質 composition root として provider/tool/mcp/lsp/plugin を直接
     参照するのは設計上説明可能。大規模なトレイト注入反転（90 参照超、
@@ -254,13 +246,9 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **完了ログとエラーが request_id/correlation_id で結合できない**
-  — `server.rs:1828-1851` / OBS-07
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
 - [ ] **MCP OAuth manager が process-global で State 引数が未使用**
   — `routes.rs:3769-3773` / STATE-03
-- [ ] **MODEL_VARIANT_LOOKUP が OnceCell 固定で再 bootstrap 後も古い**
-  — `routes.rs:3300` / STATE-04
 - [ ] **reset_processing が DB 全体の processing を書き換え**
   — `server.rs:672-674` / STATE-06
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
@@ -270,6 +258,8 @@ status: current
 
 ## 完了
 
+- [x] **[完了ログ/variant キャッシュ 2 件]** request_id 明示と無効化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[認証通知/設定反映 3 件]** 起動時固定と README 追随
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[readiness/TUI env 2 件]** 失敗 reason と RAII 復元
@@ -597,6 +587,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 判断（完了ログ/variant の修正時）: 完了ログの path/query が
+  TraceLayer 既定スパンから出る指摘は今回の差分外（既存挙動）のため却下。
+  実行時 request_id のテスト欠如・源码ガード依存は記録のみ。Mutex の await
+  跨ぎは OnceCell generation 分離で修正済み。
 - 2026-11-21 R4 指摘（認証通知/設定反映の修正時）: README の表で環境変数行が
   restart_required に現れる誤解を与える旨を指摘され、親が「PATCH 対象外」
   列へ修正済み。
