@@ -26,7 +26,9 @@ use crate::message_v2::{
 };
 use crate::summary::{summarize_into_session, SummarizeInput};
 use crate::system::SystemPrompt;
-use crate::{MessageRole, PartType, Session, SessionMessage, SessionStateManager, TodoInfo};
+use crate::{
+    MessageRole, PartType, Session, SessionMessage, SessionStateManager, SessionStatus, TodoInfo,
+};
 
 // Permission callback type for tool execution
 pub type PermissionCallback = Option<
@@ -1184,18 +1186,29 @@ impl SessionPrompt {
                     "Context overflow detected, triggering compaction for session {}",
                     session_id
                 );
-                if let Some(summary) = Self::trigger_compaction(session, &filtered_messages) {
-                    tracing::info!("Compaction complete, summary: {}", summary);
+                match Self::trigger_compaction(session, &filtered_messages) {
+                    Some(summary) => {
+                        tracing::info!("Compaction complete, summary: {}", summary);
 
-                    // Notify plugins that compaction occurred (mirrors TS Plugin.trigger).
-                    let _ = opencode_plugin::trigger_collect(
-                        HookContext::new(HookEvent::SessionCompacting)
-                            .with_session(&session_id)
-                            .with_data("auto", serde_json::json!(true))
-                            .with_data("completed", serde_json::json!(true)),
-                    )
-                    .await;
+                        // Notify plugins that compaction occurred (mirrors TS Plugin.trigger).
+                        let _ = opencode_plugin::trigger_collect(
+                            HookContext::new(HookEvent::SessionCompacting)
+                                .with_session(&session_id)
+                                .with_data("auto", serde_json::json!(true))
+                                .with_data("completed", serde_json::json!(true)),
+                        )
+                        .await;
+                    }
+                    None => {
+                        // コンパクションが走らなかった（例: メッセージ不足）場合も、
+                        // 明示開始された Compacting は終端化する（R4）。
+                    }
                 }
+                // Terminalize only the explicit compaction lifecycle started by
+                // start_compaction. Auto-compaction paths only stamp time.compacting
+                // and must keep their existing status/timestamp behavior.
+                // 成功・失敗いずれでも Compacting が残らないようにする（R4）。
+                Self::finish_compaction_if_explicit(session);
             }
 
             tracing::info!("Prompt loop step {} for session {}", step, session_id);
@@ -2755,6 +2768,17 @@ impl SessionPrompt {
         session.touch();
 
         Some(summary)
+    }
+
+    /// Terminalize a successful compaction for sessions explicitly placed in
+    /// `SessionStatus::Compacting` (for example by the `start_compaction` handler).
+    ///
+    /// Auto-compaction paths never change `status`; they only stamp
+    /// `time.compacting`, so they are intentionally left untouched here.
+    fn finish_compaction_if_explicit(session: &mut Session) {
+        if session.status == SessionStatus::Compacting {
+            session.finish_compacting();
+        }
     }
 }
 
@@ -4728,6 +4752,62 @@ mod tests {
 
         let compact = SessionPrompt::should_compact(&[msg], &provider, "tiny-model", None);
         assert!(compact);
+    }
+
+    // ── COMPACT-STATUS-STUCK regression tests ──
+
+    /// A session explicitly put into `Compacting` (as `start_compaction` does)
+    /// must be restored to `Active` with `time.compacting` cleared once the
+    /// in-loop compaction succeeds.
+    #[test]
+    fn successful_compaction_finalizes_explicit_compacting_session() {
+        let mut session = Session::new("proj", ".");
+        let messages: Vec<SessionMessage> = (0..12)
+            .map(|_| SessionMessage::user(session.id.clone(), "context"))
+            .collect();
+
+        session.start_compacting();
+        assert_eq!(session.status, SessionStatus::Compacting);
+        assert!(session.time.compacting.is_some());
+
+        assert!(
+            SessionPrompt::trigger_compaction(&mut session, &messages).is_some(),
+            "trigger_compaction should succeed with at least 10 messages"
+        );
+
+        // The exact terminalization applied by the prompt-loop success branch.
+        SessionPrompt::finish_compaction_if_explicit(&mut session);
+
+        assert_eq!(session.status, SessionStatus::Active);
+        assert!(session.time.compacting.is_none());
+    }
+
+    /// Auto-compaction only stamps `time.compacting`; status and the stamp must
+    /// remain exactly as the existing behavior after the success branch runs.
+    #[test]
+    fn successful_compaction_keeps_auto_compacting_session_unchanged() {
+        let mut session = Session::new("proj", ".");
+        let messages: Vec<SessionMessage> = (0..12)
+            .map(|_| SessionMessage::user(session.id.clone(), "context"))
+            .collect();
+
+        assert_eq!(session.status, SessionStatus::Active);
+        assert!(session.time.compacting.is_none());
+
+        assert!(
+            SessionPrompt::trigger_compaction(&mut session, &messages).is_some(),
+            "trigger_compaction should succeed with at least 10 messages"
+        );
+
+        // trigger_compaction (auto path) sets the stamp but never changes status.
+        let stamped = session.time.compacting;
+        assert_eq!(session.status, SessionStatus::Active);
+        assert!(stamped.is_some());
+
+        SessionPrompt::finish_compaction_if_explicit(&mut session);
+
+        assert_eq!(session.status, SessionStatus::Active);
+        assert_eq!(session.time.compacting, stamped);
     }
 
     // ── PartInput serde round-trip tests ──
