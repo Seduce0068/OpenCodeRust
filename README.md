@@ -36,6 +36,9 @@ tool invocation, MCP/LSP integration, and plugin extensions.
 - C compiler and build tools (`gcc` and `make`; also `pkg-config` when linking
   against a system SQLite instead of the bundled build)
 - Git (recommended)
+- `sqlite3` CLI (external dependency of the `db` command and the
+  backup/restore procedures in `docs/opencode-storage.md`)
+- GitHub CLI (`gh`) (external dependency of the `github` and `pr` commands)
 
 ### 2. Build
 
@@ -149,6 +152,10 @@ Global config default path:
 
 See: `docs/opencode-config.md`
 
+Runtime changes through `PATCH /config` take effect immediately for most keys.
+`logLevel` / `log_level` and environment variables are resolved at startup and
+require a restart (see [Logging](#logging)).
+
 ## Operations
 
 ### Logging
@@ -175,6 +182,19 @@ See: `docs/opencode-config.md`
   path reported at startup) and set `XDG_STATE_HOME` explicitly to redirect
   logs to a known location. Buffered entries are flushed when the process
   exits normally.
+
+`PATCH /config` applies most settings immediately, but some keys are read only
+at startup. A successful PATCH response lists them under `restart_required`:
+
+| Setting | `PATCH /config` | Restart needed |
+| --- | --- | --- |
+| Providers, models, permissions, and other runtime keys | Immediate | No |
+| `server.*` bind keys (port, hostname, cors, mdns) | Not applied | Yes |
+| `logLevel` / `log_level` | Not applied | Yes |
+| Environment variables (for example `RUST_LOG`) | Not applied | Yes |
+
+`log_level` and environment variables are resolved once when the process
+starts; changing them requires a restart rather than a PATCH.
 
 ### Health checks
 
@@ -306,6 +326,7 @@ cargo check -p opencode-tui
 - Tools: `docs/opencode-tool.md`
 - Provider: `docs/opencode-provider.md`
 - Config: `docs/opencode-config.md`
+- Storage and backups: `docs/opencode-storage.md`
 
 ## Notes
 

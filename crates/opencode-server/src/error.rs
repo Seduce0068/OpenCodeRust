@@ -10,7 +10,7 @@ use serde_json::json;
 /// クライアントには汎用メッセージと相関 ID だけを返し、内部詳細はログへ残す。
 /// その際にファイルパス（`/...` / `C:\...` / URL）や認証トークン値がログへ
 /// 流出しないよう、該当する単語を `<redacted>` に置換する。
-fn redact_sensitive_detail(detail: &str) -> String {
+pub(crate) fn redact_sensitive_detail(detail: &str) -> String {
     const REDACTED: &str = "<redacted>";
     let mut words: Vec<&str> = Vec::new();
     let mut redact_next = false;
@@ -43,6 +43,41 @@ fn redact_sensitive_detail(detail: &str) -> String {
     words.join(" ")
 }
 
+/// 相関 ID を払い出し、redact 済みの構造化フィールド付きでサーバエラーを記録する。
+///
+/// `InternalError` / `ProviderError` / セッション永続化失敗で共用する。
+/// 呼び出し側は必ず redact 済みの詳細だけを渡し、生エラー文字列を渡さない。
+/// クライアントには相関 ID だけを返し、内部詳細はログへ残す。
+pub(crate) fn log_error_with_correlation_id(
+    event: &'static str,
+    kind: &'static str,
+    safe_detail: &str,
+) -> String {
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    tracing::error!(
+        correlation_id = %correlation_id,
+        error_kind = %kind,
+        detail = %safe_detail,
+        event = %event,
+        "server error"
+    );
+    correlation_id
+}
+
+/// ProviderError のログ詳細を `provider_id` と `status` だけに絞る。
+///
+/// プロバイダのレスポンス本文・トークン値はこの関数へ渡されないため、
+/// tracing ログへ漏れない。識別子も念のため redact を通す。
+fn provider_log_detail(provider_id: &str, status: Option<u16>) -> String {
+    format!(
+        "provider_id={} status={}",
+        redact_sensitive_detail(provider_id),
+        status
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("Session not found: {0}")]
@@ -54,8 +89,17 @@ pub enum ApiError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
-    #[error("Provider error: {0}")]
-    ProviderError(String),
+    /// プロバイダ層の失敗。
+    ///
+    /// `provider_id` / `status` は tracing ログへ構造化フィールドとして残す。
+    /// `detail`（プロバイダの本文）は redact してクライアント文言に載せるが、
+    /// ログには渡さない（本文・トークン値の漏洩防止）。
+    #[error("Provider error: {detail}")]
+    ProviderError {
+        provider_id: String,
+        status: Option<u16>,
+        detail: String,
+    },
 
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
@@ -75,7 +119,7 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // 4 要素目は「レガシーなトップレベル `message` を残すか」のフラグ、
-        // 5 要素目は InternalError の相関 ID（他バリアントは None）。
+        // 5 要素目は InternalError / ProviderError の相関 ID（他バリアントは None）。
         // 共通スキーマは `{"error":{"message","type"}}` だが、旧 401 レスポンスは
         // `{"error":"unauthorized","message":"..."}` を返していた。互換性のため
         // `Unauthorized` のみトップレベル `message` も併記する。旧 `error` の文字列値
@@ -90,13 +134,25 @@ impl IntoResponse for ApiError {
             ),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg, "not_found", false, None),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg, "bad_request", false, None),
-            ApiError::ProviderError(msg) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Provider error: {}", msg),
-                "provider_error",
-                false,
-                None,
-            ),
+            // 相関 ID を返し、tracing には provider_id と status だけを残す。
+            // プロバイダの本文は redact してボディへ載せるが、ログへは渡さない。
+            ApiError::ProviderError {
+                provider_id,
+                status,
+                detail,
+            } => {
+                let safe_detail = redact_sensitive_detail(&detail);
+                let log_detail = provider_log_detail(&provider_id, status);
+                let correlation_id =
+                    log_error_with_correlation_id("provider error", "provider_error", &log_detail);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Provider error: {safe_detail}"),
+                    "provider_error",
+                    false,
+                    Some(correlation_id),
+                )
+            }
             ApiError::InvalidRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid request: {}", msg),
@@ -107,12 +163,9 @@ impl IntoResponse for ApiError {
             // 内部詳細はボディへ出さず、相関 ID 付きで tracing ログへ残す。
             // ログにもパス / トークン値が出ないよう redact してから記録する。
             ApiError::InternalError(msg) => {
-                let correlation_id = uuid::Uuid::new_v4().to_string();
-                tracing::error!(
-                    correlation_id = %correlation_id,
-                    detail = %redact_sensitive_detail(&msg),
-                    "internal error"
-                );
+                let safe_detail = redact_sensitive_detail(&msg);
+                let correlation_id =
+                    log_error_with_correlation_id("internal error", "internal_error", &safe_detail);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error".to_owned(),
@@ -134,7 +187,14 @@ impl IntoResponse for ApiError {
             ),
         };
 
-        let body = if include_legacy_message {
+        let body = if error_type == "unauthorized" {
+            // 旧 401 契約 `{"error":"unauthorized","message":"..."}` を維持する。
+            // 新スキーマの `error.type` と同等の値をトップレベル `error` にも載せる。
+            json!({
+                "error": error_type,
+                "message": message
+            })
+        } else if include_legacy_message {
             let legacy_message = message.clone();
             json!({
                 "error": {
@@ -223,12 +283,64 @@ mod tests {
     #[tokio::test]
     async fn provider_error_maps_to_502() {
         assert_response(
-            ApiError::ProviderError("down".to_owned()),
+            ApiError::ProviderError {
+                provider_id: "openai".to_owned(),
+                status: Some(502),
+                detail: "down".to_owned(),
+            },
             StatusCode::BAD_GATEWAY,
             "provider_error",
             "Provider error: down",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn provider_error_returns_correlation_id_without_leaking_token() {
+        // 回帰ガード (OBS-02): ProviderError も相関 ID を返し、
+        // プロバイダ本文に含まれるトークン値をボディへ出さない。
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let response = ApiError::ProviderError {
+            provider_id: "openai".to_owned(),
+            status: Some(401),
+            detail: format!("upstream rejected token={secret}"),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "provider_error");
+        let correlation_id = body["error"]["correlation_id"]
+            .as_str()
+            .expect("provider error must return a correlation id");
+        assert!(
+            uuid::Uuid::parse_str(correlation_id).is_ok(),
+            "correlation id must be a UUID: {correlation_id}"
+        );
+        let text = body.to_string();
+        assert!(!text.contains(secret), "token value must not leak: {text}");
+    }
+
+    #[test]
+    fn provider_log_detail_includes_only_provider_id_and_status() {
+        // 回帰ガード (OBS-02): tracing へ渡す詳細は provider_id と status のみで、
+        // レスポンス本文やトークン値は含まれない。
+        let detail = provider_log_detail("openai", Some(429));
+        assert!(detail.contains("provider_id=openai"), "{detail}");
+        assert!(detail.contains("status=429"), "{detail}");
+        assert!(!detail.contains("body"), "{detail}");
+        assert!(!detail.contains("token"), "{detail}");
+
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let redacted = provider_log_detail(secret, Some(500));
+        assert!(!redacted.contains(secret), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+
+        let unspecified = provider_log_detail("openai", None);
+        assert!(unspecified.contains("status=none"), "{unspecified}");
     }
 
     #[tokio::test]
@@ -338,10 +450,9 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["type"], "unauthorized");
         assert_eq!(
-            body["error"]["message"],
-            "Invalid or missing authentication token"
+            body["error"], "unauthorized",
+            "legacy clients read error as the string \"unauthorized\""
         );
         assert_eq!(
             body["message"], "Invalid or missing authentication token",
@@ -359,10 +470,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["type"], "unauthorized");
-        assert_eq!(
-            body["error"]["message"],
-            "Invalid or missing authentication token"
-        );
+        assert_eq!(body["error"], "unauthorized");
+        assert_eq!(body["message"], "Invalid or missing authentication token");
     }
 }

@@ -354,7 +354,14 @@ fn session_to_info(session: &opencode_session::Session) -> SessionInfo {
 
 async fn persist_sessions_if_enabled(state: &Arc<ServerState>) {
     if let Err(err) = state.sync_sessions_to_storage().await {
-        tracing::error!("failed to sync sessions to storage: {}", err);
+        // 生の anyhow::Error を `{}` で出すと DB パスやトークン値がログへ漏れる。
+        // 共通ヘルパで相関 ID を払い出し、redact 済みの構造化フィールドだけを残す。
+        // クライアント伝播は API 契約を壊さないため行わない（方針は report 参照）。
+        let _correlation_id = crate::error::log_error_with_correlation_id(
+            "session sync to storage",
+            "session_sync_failure",
+            &crate::error::redact_sensitive_detail(&err.to_string()),
+        );
     }
 }
 
@@ -1240,7 +1247,11 @@ fn resolve_provider_and_model(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get_provider(&provider_id)
-        .map_err(|e| ApiError::ProviderError(e.to_string()))?;
+        .map_err(|e| ApiError::ProviderError {
+            provider_id: provider_id.clone(),
+            status: e.status_code(),
+            detail: e.to_string(),
+        })?;
     if provider.get_model(&model_id).is_none() {
         return Err(ApiError::BadRequest(format!(
             "Model `{}` not found for provider `{}`",
@@ -3628,10 +3639,14 @@ async fn get_config(State(state): State<Arc<ServerState>>) -> Result<Json<serde_
 
 /// PATCH のうち再起動が必要なキーを列挙する。設定値（特に秘密情報）は含めない。
 fn restart_required_keys(patch: &AppConfig) -> Vec<String> {
-    let Some(server) = patch.server.as_ref() else {
-        return Vec::new();
-    };
     let mut keys = Vec::new();
+    // log_level は起動時に解決され、PATCH 後も再読されないため再起動が必要。
+    if patch.log_level.is_some() {
+        keys.push("log_level".to_string());
+    }
+    let Some(server) = patch.server.as_ref() else {
+        return keys;
+    };
     if server.port.is_some() {
         keys.push("server.port".to_string());
     }
@@ -5653,7 +5668,11 @@ impl From<WorktreeInfoStruct> for WorktreeInfo {
 fn map_worktree_error(err: WorktreeError) -> ApiError {
     match err {
         WorktreeError::NotGitRepo => ApiError::BadRequest("not a git repository".to_string()),
-        WorktreeError::GitError(_) => ApiError::ProviderError("git command failed".to_string()),
+        WorktreeError::GitError(_) => ApiError::ProviderError {
+            provider_id: "worktree".to_string(),
+            status: None,
+            detail: "git command failed".to_string(),
+        },
         WorktreeError::NotFound(_) => ApiError::NotFound("worktree not found".to_string()),
         WorktreeError::IoError(_) => ApiError::InternalError("io error".to_string()),
     }
@@ -8363,6 +8382,31 @@ mod config_patch_runtime_tests {
         );
         // キー名だけを返し、設定値（CORS オリジン等）はレスポンスへ混ぜない。
         assert!(!format!("{keys:?}").contains("example.test"));
+    }
+
+    #[test]
+    fn restart_required_keys_includes_log_level() {
+        // 回帰ガード (OBS-04): log_level は起動時確定のため再起動が必要。
+        let patch = AppConfig {
+            log_level: Some("debug".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(restart_required_keys(&patch), vec!["log_level".to_string()]);
+
+        let patch = AppConfig {
+            log_level: Some("debug".to_string()),
+            server: Some(opencode_config::schema::ServerConfig {
+                port: Some(41234),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            restart_required_keys(&patch),
+            vec!["log_level".to_string(), "server.port".to_string()]
+        );
+        // 設定値（"debug"）はキー一覧へ混ぜない。
+        assert!(!format!("{:?}", restart_required_keys(&patch)).contains("debug"));
     }
 
     #[test]

@@ -129,10 +129,11 @@ sqlite3 /path/to/opencode.db "PRAGMA user_version;"
 ```
 
 `integrity_check` must return `ok`. `user_version` records the applied
-schema level; this codebase writes `SCHEMA_VERSION = 2`
-(`crates/opencode-storage/src/database.rs`). A lower value means the
-storage layer applies migrations at startup. A higher value means the
-backup came from a newer binary and must not be used.
+schema level; this codebase writes `SCHEMA_VERSION = 3`
+(`crates/opencode-storage/src/database.rs`). A backup at version 2 is
+promoted to 3 by the startup migration, so it can be restored and used
+with the current binary. A higher value means the backup came from a
+newer binary and must not be used.
 
 Restart the server afterwards. At storage-backed startup, stale
 `processing` queue rows are reset to `pending`, so interrupted work

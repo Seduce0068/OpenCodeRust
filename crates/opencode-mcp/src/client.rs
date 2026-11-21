@@ -1335,11 +1335,97 @@ mod tests {
         assert_eq!(result.content[0].text.as_deref(), Some("ok"));
     }
 
+    /// Both wire spellings of a progress notification must be recognized by
+    /// `is_progress_notification`: the MCP one and the LSP-style `$/progress`.
+    #[test]
+    fn is_progress_notification_accepts_both_method_spellings() {
+        for method in ["notifications/progress", "$/progress"] {
+            let notif = JsonRpcNotification {
+                jsonrpc: "2.0".to_string(),
+                method: method.to_string(),
+                params: Some(serde_json::json!({ "progress": 1 })),
+            };
+            assert!(
+                McpClient::is_progress_notification(&notif),
+                "must recognize {method} as a progress notification"
+            );
+        }
+
+        let unrelated = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/message".to_string(),
+            params: None,
+        };
+        assert!(!McpClient::is_progress_notification(&unrelated));
+    }
+
+    /// Loopback mock: deliver a progress notification, then a response that
+    /// arrives AFTER the original deadline. Without a deadline extension the
+    /// `timeout_at(initial_deadline)` would fire, so a successful call proves
+    /// the extension actually happened (not just that the response was fast).
+    async fn assert_progress_notification_extends_deadline(method: &str) {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_timeout(100); // initial deadline 100ms / hard deadline 400ms
+
+        let progress = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(serde_json::json!({ "progress": 0.5 })),
+        };
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            result: Some(serde_json::json!({
+                "content": [{ "type": "text", "text": "ok" }]
+            })),
+            error: None,
+        };
+        // 40ms で progress、そこから 80ms 後（= 通算 120ms）で response。
+        // progress が無視されれば 100ms の初期 deadline で Timeout になる。
+        let transport = MockTransport::new(vec![
+            (
+                Duration::from_millis(40),
+                Some(JsonRpcMessage::Notification(progress)),
+            ),
+            (
+                Duration::from_millis(80),
+                Some(JsonRpcMessage::Response(response)),
+            ),
+        ]);
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(transport));
+        }
+
+        let started = tokio::time::Instant::now();
+        let result = client
+            .call_tool("slow-tool", None)
+            .await
+            .expect("response past the initial deadline must succeed when progress extends it");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "response must arrive after the initial 100ms deadline to prove extension"
+        );
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn standard_progress_notification_extends_deadline_via_loopback() {
+        assert_progress_notification_extends_deadline("notifications/progress").await;
+    }
+
+    #[tokio::test]
+    async fn dollar_progress_notification_extends_deadline_via_loopback() {
+        assert_progress_notification_extends_deadline("$/progress").await;
+    }
+
     /// A transport that never answers, only emits progress notifications at a
     /// fixed interval. Models a server keeping a call alive forever by
     /// streaming progress.
     struct InfiniteProgressTransport {
         interval: Duration,
+        method: &'static str,
     }
 
     #[async_trait]
@@ -1359,7 +1445,7 @@ mod tests {
             sleep(self.interval).await;
             Ok(Some(JsonRpcMessage::Notification(JsonRpcNotification {
                 jsonrpc: "2.0".to_string(),
-                method: "notifications/progress".to_string(),
+                method: self.method.to_string(),
                 params: Some(serde_json::json!({ "progress": 1 })),
             })))
         }
@@ -1404,6 +1490,7 @@ mod tests {
             let mut guard = client.transport.lock().await;
             *guard = Some(Arc::new(InfiniteProgressTransport {
                 interval: Duration::from_millis(1),
+                method: "notifications/progress",
             }));
         }
 
@@ -1422,6 +1509,43 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(30),
             "progress should have kept the call alive past the initial deadline"
+        );
+        assert!(
+            elapsed < hard + Duration::from_millis(200),
+            "call must terminate near the hard deadline, not continue indefinitely"
+        );
+    }
+
+    /// `$/progress` も `is_progress_notification` に認識されるため、無限に流れる
+    /// 代替 progress でも初期 deadline を超えてハード deadline まで延長される。
+    /// 認識されなければ初期 20ms で Timeout となり経過時間アサーションが落ちる。
+    #[tokio::test]
+    async fn infinite_dollar_progress_times_out_at_hard_deadline() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_timeout(20);
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(InfiniteProgressTransport {
+                interval: Duration::from_millis(1),
+                method: "$/progress",
+            }));
+        }
+
+        let started = tokio::time::Instant::now();
+        let error = client
+            .call_tool("streaming-tool", None)
+            .await
+            .expect_err("endless $/progress must still time out");
+        assert!(
+            matches!(&error, McpClientError::Timeout),
+            "unexpected: {error}"
+        );
+
+        let hard = Duration::from_millis(20).saturating_mul(PROGRESS_HARD_DEADLINE_MULTIPLIER);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "$/progress must be recognized so the call survives past the initial 20ms deadline"
         );
         assert!(
             elapsed < hard + Duration::from_millis(200),

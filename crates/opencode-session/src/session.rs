@@ -1731,8 +1731,10 @@ mod tests {
 
     /// shutdown() が create()/delete() のプラグインフック task を abort すること。
     ///
-    /// 実フックの代わりに「開始後に無限待機し、drop 時にフラグを立てる」
-    /// 観測用 task を同じ保持先へ積み、abort で future が破棄されることを検証する。
+    /// まず create() が実際に spawn_plugin_hook を呼んでハンドルを 1 件増やすことを
+    /// 観測用 task に依存せず検証し、その後「開始後に無限待機し、drop 時にフラグを
+    /// 立てる」観測用 task を同じ保持先へ積み、abort で future が破棄されることを
+    /// 検証する。
     #[tokio::test]
     async fn test_shutdown_aborts_plugin_hook_tasks() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1749,6 +1751,17 @@ mod tests {
         let started = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
 
+        // 観測用 task を積む前に create() の spawn_plugin_hook 呼び出しを検証する。
+        // 以前は observer を先に積んでいたため、create() が何も spawn しなくても
+        // 「未完了ハンドルが 1 つある」という検査を通過してしまっていた。
+        let hooks_before = manager.plugin_hook_handles.len();
+        manager.create("project-1", "/path/to/project");
+        assert_eq!(
+            manager.plugin_hook_handles.len(),
+            hooks_before + 1,
+            "create() must spawn and retain exactly one plugin hook handle"
+        );
+
         let started_flag = started.clone();
         let dropped_flag = dropped.clone();
         let observer = tokio::spawn(async move {
@@ -1757,16 +1770,6 @@ mod tests {
             std::future::pending::<()>().await;
         });
         manager.plugin_hook_handles.push(observer);
-
-        // create() がフックを spawn し、ハンドルを保持すること。
-        manager.create("project-1", "/path/to/project");
-        assert!(
-            manager
-                .plugin_hook_handles
-                .iter()
-                .any(|handle| !handle.is_finished()),
-            "create() must retain the spawned plugin hook handle"
-        );
 
         // 観測用 task が開始するまで待つ（abort 前に開始していることを保証）。
         tokio::time::timeout(std::time::Duration::from_millis(500), async {
