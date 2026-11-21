@@ -273,23 +273,18 @@ status: current
 - [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
   — `session/todo.rs:441` / API-10
 
-- [ ] **ratatui デフォルト feature で未使用バックエンドと重複バージョンが混入**
-  — `tui/Cargo.toml:25` / DEPS-04
 - [ ] **Markdown 表の列幅が無制限で枠構造が壊れる** — `markdown/renderer.rs:83-119` / RENDER-06
 - [ ] **wrap_spans が幅 2 文字を満杯行へ置き領域より広い行を生成**
   — `session.rs:1230-1256` / RENDER-07
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
-- [ ] **MCP progress が期限を無制限に延長し transport ロックを保持**
-  — `client.rs:487-525` / R1-CONC-07
-- [ ] **MCP OAuth の保留状態・クライアント生成が Check-Then-Act で競合**
-  — `oauth.rs:309-351` / R1-CONC-09
-
 ### 優先度: 中（swarm review+discovery 2026-11-19）
 
 ## 完了
 
+- [x] **[MCP progress/OAuth/ratatui 3 件]** hard deadline・並行フロー・feature
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[stream/フック 3 件]** 切断即検知・Drop cleanup・個別 timeout
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI 表示幅 5 件]** 全角幅計算・centered 境界・toast 省略
@@ -599,6 +594,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（MCP progress/OAuth の修正時、記録のみ）: remove_auth が
+  prepare slot をロック中に削除でき、logout と並行した再 prepare で二重登録
+  され得る（低確率・設計判断）。親が R4 high（transport ID 取り違え）を
+  request_lock 直列化で修正、さらに auth store の read-modify-write 競合を
+  write_lock で解消、server 側テスト 5 箇所をフローキー対応へ更新。
 - 2026-11-21 R4 残存（stream/フックの修正時、記録のみ）: shutdown 回帰テストは
   観測用 task のみで実 trigger の abort は未検証。SSE の [DONE] 後に Inner while を
   抜けても外側 loop は継続し、接続を維持する上流では task が残る（既存挙動）。
