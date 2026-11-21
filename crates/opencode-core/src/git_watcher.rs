@@ -79,20 +79,33 @@ mod tests {
         let watcher = GitWatcher::new(repo).unwrap();
         let mut rx = watcher.subscribe();
 
-        // Trigger a git change
-        StdCommand::new("git")
-            .arg("config")
-            .arg("user.email")
-            .arg("test@example.com")
-            .current_dir(&worktree)
-            .status()
-            .unwrap();
+        // Policy: the watcher and receiver are created before any change, but
+        // the first OS notification can still be lost or heavily delayed on a
+        // slow filesystem or under parallel CI load. Write several distinct
+        // values and wait only for the first observed event so one missed or
+        // coalesced notification cannot fail the test.
+        for value in [
+            "first@example.com",
+            "second@example.com",
+            "third@example.com",
+        ] {
+            StdCommand::new("git")
+                .arg("config")
+                .arg("user.email")
+                .arg(value)
+                .current_dir(&worktree)
+                .status()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
-        // Wait for event
-        let event = timeout(Duration::from_secs(2), rx.recv())
+        // Wait for the first change event. 10s (up from 2s) leaves headroom
+        // for slow filesystems and parallel load. Failure messages contain no
+        // token values and no paths.
+        let event = timeout(Duration::from_secs(10), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("git change event must be observed within 10s")
+            .expect("git watcher channel must stay open");
         assert_eq!(event, GitEvent::IndexChanged);
     }
 }

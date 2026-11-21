@@ -4208,6 +4208,33 @@ theme = "dark"
 mod provider_normalization_tests {
     use super::*;
 
+    // env はプロセスグローバルなため、このモジュールの override テストも
+    // 直列化し、panic 時も元の値へ復元する（値は一切ログへ出さない）。
+    static ENV_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvRestoreGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestoreGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn current_schema_provider() -> ProviderConfig {
         ProviderConfig {
             name: Some("Custom".to_string()),
@@ -4361,11 +4388,15 @@ mod provider_normalization_tests {
 
     #[test]
     fn substitute_env_vars_replaces_pattern() {
-        std::env::set_var("OPENCODE_TEST_ENV_VAR", "resolved-value");
+        // Env vars are process-global: serialize with the other override
+        // tests and restore the original value even if this test panics.
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const VAR: &str = "OPENCODE_TEST_ENV_VAR";
+        let _restore = EnvRestoreGuard::new(VAR);
+        std::env::set_var(VAR, "resolved-value");
         // A placeholder outside a JSON string literal is emitted as a complete
         // JSON string literal (quotes included), not as raw source text.
         let result = substitute_env_vars("prefix:{env:OPENCODE_TEST_ENV_VAR}:suffix", None);
         assert_eq!(result, "prefix:\"resolved-value\":suffix");
-        std::env::remove_var("OPENCODE_TEST_ENV_VAR");
     }
 }
