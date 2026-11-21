@@ -172,6 +172,15 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **CLI auth_status_notice が毎回 env を読み server 固定値と食い違う**
+  — `main.rs:2728-2733` / STATE-09
+- [ ] **migrate_global_config_once が fingerprint 更新と独立**
+  — `main.rs:403-417` / STATE-10
+- [ ] **401/429 rotation が本番未配線で全テストがヘルパ API のみ** — `server.rs:754-757` / TG-01
+- [ ] **rotation の非漏洩がシグネチャ文字列検査のみ** — `server.rs:3891-3911` / TG-02
+- [ ] **shutdown テストの create() フック保持アサーションが常に真**
+  — `session.rs:1754-1759` / TG-03
+- [ ] **`$/progress` の deadline 延長分岐が未テスト** — `client.rs:760-762` / TG-04
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -216,6 +225,28 @@ status: current
     text/image/decisions を実装し、一覧・有効/無効 (`routes.rs:4411-4421`) も実処理へ
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
+
+- [ ] **バックアップ復旧手順の SCHEMA_VERSION が 2 と記載（実装は 3）**
+  — `docs/opencode-storage.md:131-135` / OBS-01 / 高
+- [ ] **ProviderError(502) に相関 ID もログも付かない** — `error.rs:93-99` / OBS-02 / 高
+- [ ] **セッション永続化失敗が 200 のままサイレント化＋生エラーログ** — `routes.rs:355-359` / OBS-03 / 高
+- [ ] **PATCH /config の restart_required に log_level が無い**
+  — `routes.rs:3629-3651` / OBS-04 / 高
+- [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
+  — `plugin/lib.rs:548-563` / STATE-01 / 高
+- [ ] **PLUGIN_LOADER が OnceLock 固定で 2 番目の loader が黙って破棄**
+  — `routes.rs:6060` / STATE-02 / 高
+- [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
+  — `server.rs:869-887` / STATE-05 / 高
+- [ ] **USER_GUIDE の `debug agent` に必須 `<NAME>` が無い**
+  — `USER_GUIDE.md:113-117` / DOGFOOD-01 / 高
+- [ ] **USER_GUIDE が run に存在しない --hostname 等を記載**
+  — `USER_GUIDE.md:128-135` / DOGFOOD-02 / 高
+- [ ] **version 例が生成されない target/release を参照**
+  — `USER_GUIDE.md:16-24` / DOGFOOD-03 / 高
+- [ ] **`models --refresh` が no-op なのに必須手順として提示**
+  — `USER_GUIDE.md:79-82` / DOGFOOD-04 / 高
+- [ ] **MCP 管理コマンドの起動済みサーバ前提が未記載** — `USER_GUIDE.md:94-108` / DOGFOOD-05 / 高
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
@@ -262,6 +293,30 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **環境変数の反映タイミングが未明記（RUST_LOG/NO_AUTH/DATA_DIR 等）**
+  — `README.md:156-177` / OBS-05
+- [ ] **readiness の 200 が migrated を保証する記述と実装が不一致**
+  — `README.md:218-219` / OBS-06
+- [ ] **完了ログとエラーが request_id/correlation_id で結合できない**
+  — `server.rs:1828-1851` / OBS-07
+- [ ] **readiness 失敗ログに原因種別が残らない** — `routes.rs:5771-5783` / OBS-08
+- [ ] **Restore 手順が -wal/-shm 残骸を前提としていない**
+  — `docs/opencode-storage.md:99-113` / OBS-09
+- [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
+- [ ] **MCP OAuth manager が process-global で State 引数が未使用**
+  — `routes.rs:3769-3773` / STATE-03
+- [ ] **MODEL_VARIANT_LOOKUP が OnceCell 固定で再 bootstrap 後も古い**
+  — `routes.rs:3300` / STATE-04
+- [ ] **reset_processing が DB 全体の processing を書き換え**
+  — `server.rs:672-674` / STATE-06
+- [ ] **PluginLoader::shutdown_all が本番から未呼び出し** — `loader.rs:73-83` / STATE-07
+- [ ] **TUI 用 `OPENCODE_TUI_*` env が早期 return 時に cleanup されない**
+  — `main.rs:1255-1266` / STATE-08
+- [ ] **db コマンドが外部 sqlite3 CLI に依存する旨が Requirements に無い**
+  — `USER_GUIDE.md:106` / DOGFOOD-06
+- [ ] **auth login が非永続である旨が事前に説明されない** — `USER_GUIDE.md:84-92` / DOGFOOD-07
+- [ ] **github/pr が gh CLI を要求する旨が Requirements に無い**
+  — `USER_GUIDE.md:113` / DOGFOOD-08
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
@@ -588,6 +643,13 @@ status: current
 
 ## メモ
 
+- 2026-11-21 cross-skill 集約（swarm109、4 担当・32 件、観点: dogfood /
+  テストギャップ / observability / 状態ライフサイクル）: 親が high 6 件
+  （SCHEMA_VERSION 2 vs 3、ProviderError の相関 ID 欠落、永続化失敗の
+  サイレント化、restart_required の log_level 漏れ、PLUGIN_LOADER の
+  OnceLock 固定、USER_GUIDE の debug agent 等）を read で事実確認し、
+  high 12 / 中 15 / 低 6 を追記。前回観点と重複しないよう既知対応を
+  プロンプトに明示した。
 - 2026-11-21 R4 残存（Markdown 表/wrap_spans の修正時、記録のみ）: 列幅算出は
   UnicodeWidthStr（書記素考慮）だが切り詰めは UnicodeWidthChar（文字単位）で、
   ZWJ 絵文字等で基準が一致しない懸念（実害未確認・低優先）。
