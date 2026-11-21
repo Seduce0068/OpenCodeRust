@@ -226,27 +226,12 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **バックアップ復旧手順の SCHEMA_VERSION が 2 と記載（実装は 3）**
-  — `docs/opencode-storage.md:131-135` / OBS-01 / 高
-- [ ] **ProviderError(502) に相関 ID もログも付かない** — `error.rs:93-99` / OBS-02 / 高
-- [ ] **セッション永続化失敗が 200 のままサイレント化＋生エラーログ** — `routes.rs:355-359` / OBS-03 / 高
-- [ ] **PATCH /config の restart_required に log_level が無い**
-  — `routes.rs:3629-3651` / OBS-04 / 高
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **PLUGIN_LOADER が OnceLock 固定で 2 番目の loader が黙って破棄**
   — `routes.rs:6060` / STATE-02 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
   — `server.rs:869-887` / STATE-05 / 高
-- [ ] **USER_GUIDE の `debug agent` に必須 `<NAME>` が無い**
-  — `USER_GUIDE.md:113-117` / DOGFOOD-01 / 高
-- [ ] **USER_GUIDE が run に存在しない --hostname 等を記載**
-  — `USER_GUIDE.md:128-135` / DOGFOOD-02 / 高
-- [ ] **version 例が生成されない target/release を参照**
-  — `USER_GUIDE.md:16-24` / DOGFOOD-03 / 高
-- [ ] **`models --refresh` が no-op なのに必須手順として提示**
-  — `USER_GUIDE.md:79-82` / DOGFOOD-04 / 高
-- [ ] **MCP 管理コマンドの起動済みサーバ前提が未記載** — `USER_GUIDE.md:94-108` / DOGFOOD-05 / 高
 
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
@@ -312,11 +297,6 @@ status: current
 - [ ] **PluginLoader::shutdown_all が本番から未呼び出し** — `loader.rs:73-83` / STATE-07
 - [ ] **TUI 用 `OPENCODE_TUI_*` env が早期 return 時に cleanup されない**
   — `main.rs:1255-1266` / STATE-08
-- [ ] **db コマンドが外部 sqlite3 CLI に依存する旨が Requirements に無い**
-  — `USER_GUIDE.md:106` / DOGFOOD-06
-- [ ] **auth login が非永続である旨が事前に説明されない** — `USER_GUIDE.md:84-92` / DOGFOOD-07
-- [ ] **github/pr が gh CLI を要求する旨が Requirements に無い**
-  — `USER_GUIDE.md:113` / DOGFOOD-08
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
@@ -324,6 +304,8 @@ status: current
 
 ## 完了
 
+- [x] **[observability/dogfood 12 件]** 相関 ID・構造化ログ・手順反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[共有型集約 1 件]** types 単一情報源化を既存実装として確認
   （2026-11-21、親が実コードで事実確認）
 - [x] **[OpenAI UTF-8 境界 1 件]** per-chunk デコードの廃止
@@ -643,6 +625,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（observability/dogfood の修正時、記録のみ）: redact の
+  キー一覧が完全一致のみで client_secret / access_token 等を漏らし得る。
+  rotation は本番 HTTP 経路へ未配線のまま（NOTE 明記）。restart_required の
+  mdnsDomain と README の表が非同期。clap の Models.refresh は残存。
+  親が 401 の旧契約 `error: "unauthorized"` を互換分岐で復元。
 - 2026-11-21 cross-skill 集約（swarm109、4 担当・32 件、観点: dogfood /
   テストギャップ / observability / 状態ライフサイクル）: 親が high 6 件
   （SCHEMA_VERSION 2 vs 3、ProviderError の相関 ID 欠落、永続化失敗の
