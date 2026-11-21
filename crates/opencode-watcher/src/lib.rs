@@ -239,11 +239,16 @@ impl FileWatcher {
             return Ok(());
         }
 
-        if let Some(watcher) = watcher_guard.as_mut() {
-            watcher
+        // Keep the backend result instead of propagating it with `?` right away.
+        // Registry/debounce cleanup and watcher teardown must run even when the
+        // backend fails to detach the path; otherwise is_watching() stays true
+        // and stale debounce keys survive (WATCHER-UNWATCH-PARTIAL).
+        let backend_result: Result<(), WatcherError> = match watcher_guard.as_mut() {
+            Some(watcher) => watcher
                 .unwatch(path)
-                .map_err(|e| WatcherError::WatchError(e.to_string()))?;
-        }
+                .map_err(|e| WatcherError::WatchError(e.to_string())),
+            None => Ok(()),
+        };
 
         self.watched_paths.remove(path);
         // Debounce bookkeeping is keyed by the concrete file paths that fired
@@ -258,7 +263,8 @@ impl FileWatcher {
             info!(path = ?path, "Stopped watching directory");
         }
 
-        Ok(())
+        // The preserved backend error (if any) is returned only after cleanup.
+        backend_result
     }
 
     /// すべての監視を停止し、登録済みパスとデバウンス情報を破棄する。
@@ -704,6 +710,70 @@ mod tests {
         assert!(
             watcher.event_last_seen.is_empty(),
             "stop() must drop every debounce entry"
+        );
+    }
+
+    // Regression: WATCHER-UNWATCH-PARTIAL. A failing backend unwatch() must not
+    // leave the path registered or its debounce keys behind. The backend is
+    // forced to fail by unwatching a registry-only path it never watched
+    // (notify::Error::watch_not_found).
+    #[test]
+    fn test_unwatch_backend_error_still_clears_registry_and_debounce() {
+        let temp_dir = TempDir::new().unwrap();
+        let watcher = FileWatcher::new(WatcherConfig::default()).unwrap();
+        // Lazily create the shared backend with a real watched root.
+        watcher.watch(temp_dir.path()).unwrap();
+
+        // Phantom subtree: registered and debounce-tracked, but never passed to
+        // the backend, so backend unwatch() fails and returns an error.
+        let phantom_root = temp_dir.path().join("never_watched");
+        let debounce_key = phantom_root.join("stale.txt");
+        watcher.watched_paths.insert(phantom_root.clone());
+        watcher
+            .event_last_seen
+            .insert(debounce_key.clone(), Instant::now());
+        assert!(watcher.is_watching(&phantom_root));
+        assert!(watcher.event_last_seen.contains_key(&debounce_key));
+
+        let result = watcher.unwatch(&phantom_root);
+        assert!(
+            matches!(result, Err(WatcherError::WatchError(_))),
+            "backend unwatch must surface its error"
+        );
+
+        // Cleanup must have run despite the error.
+        assert!(
+            !watcher.is_watching(&phantom_root),
+            "path must be unregistered even when backend unwatch fails"
+        );
+        assert!(
+            !watcher.event_last_seen.contains_key(&debounce_key),
+            "debounce keys under the path must be cleared even when unwatch fails"
+        );
+        // The genuinely watched root is left intact.
+        assert!(watcher.is_watching(temp_dir.path()));
+    }
+
+    // Regression: WATCHER-UNWATCH-PARTIAL. When the failing path is the last
+    // registered one, the backend watcher must still be torn down.
+    #[test]
+    fn test_unwatch_backend_error_drops_watcher_when_last_path_removed() {
+        let temp_dir = TempDir::new().unwrap();
+        let watcher = FileWatcher::new(WatcherConfig::default()).unwrap();
+        watcher.watch(temp_dir.path()).unwrap();
+        assert!(watcher.watcher.read().is_some());
+
+        // Leave only a phantom registry entry whose backend unwatch will fail.
+        let phantom = temp_dir.path().join("never_watched");
+        watcher.watched_paths.clear();
+        watcher.watched_paths.insert(phantom.clone());
+
+        let result = watcher.unwatch(&phantom);
+        assert!(matches!(result, Err(WatcherError::WatchError(_))));
+        assert!(watcher.watched_paths.is_empty());
+        assert!(
+            watcher.watcher.read().is_none(),
+            "backend watcher must be dropped when the last registered path is removed"
         );
     }
 }
