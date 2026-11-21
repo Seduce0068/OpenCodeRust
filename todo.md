@@ -257,10 +257,6 @@ status: current
   — `config/schema.rs:195-199` / CFG2-01 / 中
 - [ ] **legacy tools -> permission 変換が HashMap 順序に依存**
   — `config/loader.rs:2199-2221` / CFG2-02 / 中
-- [ ] **legacy mode -> agent 移行が既存の明示 mode を上書き**
-  — `config/loader.rs:2184-2194` / CFG2-03 / 中
-- [ ] **README の設定優先順が実装と逆で主要ソースが欠落**
-  — `README.md:142-158` / CFG2-04 / 中
 - [ ] **wellknown auth の環境変数ブロックリストが限定的**
   — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
 - [ ] **parse_stream_error が code 必須で type ベース retryable を落とす**
@@ -307,6 +303,8 @@ status: current
 
 ## 完了
 
+- [x] **[config 移行/文書 2 件]** 明示 mode 保持と設定源の網羅
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP/Anthropic error 2 件]** フラグ復元と SSE error 昇格
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[LSP/一時ファイル 2 件]** close_document と RAII ガード
@@ -694,6 +692,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（config 移行/文書の修正時、記録のみ）: 回帰テストが
+  apply_post_load_transforms 単体のみで多層マージ経路を通っていない。
+  親が mode 項目自身が mode を持つ場合の上書きと、README の
+  $HOME/.opencode / $OPENCODE_CONFIG_DIR 追記を直接修正。
 - 2026-11-22 R4 残存（MCP/Anthropic error の修正時、記録のみ）: 平文
   StreamEvent::Error は session 側の構造化エンベロープと非互換で、
   エンドツーエンドでは固定メッセージへ置換される（design decision:
