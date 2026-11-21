@@ -251,10 +251,6 @@ status: current
 
 - [ ] **PTY セッションが自然終了しても HashMap に残存**
   — `server/pty.rs:156-189` / RES-01 / 中
-- [ ] **tui_response_queue に pop するコンシューマが無く無限成長**
-  — `routes.rs:5636-5649` / RES-02 / 中
-- [ ] **MCP per-server ログ Vec に上限が無く再接続ごとに増加**
-  — `mcp/client.rs:961-969` / RES-03 / 中
 - [ ] **OAuth 放置フローの一時状態に TTL/回収が無い**
   — `mcp/oauth.rs:441-496` / RES-04 / 中
 - [ ] **DELETE 系が存在しないリソースに 404（冪等性の解釈差）**
@@ -291,6 +287,8 @@ status: current
 
 ## 完了
 
+- [x] **[リソース上限 2 件]** TUI レスポンスキューと MCP ログのリング化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI API 契約 3 件]** compact/revert/fork の不一致を解消
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ビルトイン auth fail-closed 1 件]** load_all の Err 伝播と redact
@@ -666,6 +664,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 判断（リソース上限の修正時）: restart 経路でもログを破棄し、
+  remove が close 失敗時にステータス/ログ更新をスキップする問題を修正。
+  Disconnected ログは意図的に消去（再接続で stale 履歴を残さない方針）。
 - 2026-11-21 cross-skill 集約（swarm140、2 担当・18 件、観点: HTTP API 契約 /
   リソース寿命）: 親が API high 3 件（compact URL / revert レスポンス型 /
   fork 引数 transports）を read で事実確認、高 3 / 中 15 / 低 4 を追記。
