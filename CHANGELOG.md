@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T09:54:55+09:00"
+  at: "2026-11-21T10:09:54+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 2826 件（all-features は 2825 件）
+  テスト総数 594 → 2829 件（all-features は 2828 件）
 
 ### Changed
 
@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `provider`: OpenAI 互換ストリームの UTF-8 境界安全化（swarm-coding R1-R6）
 - `tui`: Markdown 表の端末幅クランプを本番描画経路へ配線、flat 表示の幅遵守
   （swarm-coding R1-R6）
 - `plugin` / `types` / `storage` / `session`: Plugin の async_trait 統一、
