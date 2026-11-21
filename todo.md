@@ -253,7 +253,6 @@ status: current
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
 - [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
   — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
-- [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
 - [ ] **reset_processing が DB 全体の processing を書き換え**
   — `server.rs:672-674` / STATE-06
 - [ ] **[残り]** custom fetch proxy が opencode-provider の process-global
@@ -264,6 +263,8 @@ status: current
 
 ## 完了
 
+- [x] **[client_ip XFF 1 件]** 信頼プロキシ opt-in・fail-closed
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[limit クランプ通知 1 件]** x-limit-clamped と CORS expose
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth TTL 1 件]** 放置フローを回収し期限切れを明示エラー化
@@ -687,6 +688,9 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（client_ip XFF の修正時、記録のみ）: ログ非出力テストが
+  ソース文字列の静的検査に依存（実 tracing subscriber での検証は未実施）。
+  親が複数 XFF ヘッダ行の扱い（get_all の最後の行の最右 hop）を直接修正。
 - 2026-11-22 R4 残存（limit クランプ通知の修正時、記録のみ）: 回帰テストが
   ハンドラ直呼びで、axum が (HeaderMap, Json) を合成する実 HTTP レスポンス
   経由の検証は未実施。親が x-limit-clamped / x-mcp-sync-warning を
