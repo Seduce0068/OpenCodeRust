@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T17:23:35+09:00"
+  at: "2026-11-21T17:40:19+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `config` / `core` / `watcher`: テストの env 直列化・時間依存を解消
+  （swarm-coding R1-R6）
 - `types` / `session` / `server`: AgentColor 正規化、diffs 既定値、PtyStatus 集約
   （swarm-coding R1-R6）
 - `storage`: セッション権限 JSON の二重エンコードを修正（PATCH 後の CorruptData を解消）
