@@ -249,8 +249,6 @@ status: current
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
 - [ ] **add_message_part が毎回 UUID を採番し再送で重複**
   — `routes.rs:1407` / API-06 / 中（speculation）
-- [ ] **provider 一覧のトップレベルキーが /provider と /config/providers で不一致**
-  — `routes.rs:3302` / API-07 / 中
 - [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
   — `tui/api.rs:681-693` / API-08 / 中
 - [ ] **limit 上限クランプが黙って行われ通知手段が無い**
@@ -273,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[provider キー統一 1 件]** /provider に providers エイリアスを追加
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[SessionRow status 1 件]** レガシー行がライフサイクル状態を保持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[strict env 1 件]** opt-in で未定義参照を fail-closed 化
@@ -684,6 +684,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（provider キーの修正時、記録のみ）: all.clone() による
+  ペイロード約 2 倍は後方互換のための受容済みトレードオフ。
+  /config/providers との組み立てロジック重複、回帰テストが純粋関数のみで
+  ハンドラ経由の wire 未検証は今後のリファクタ課題。
 - 2026-11-22 R4 指摘（SessionRow の修正時、記録のみ）: to_row/from_row は
   本番永続化経路で未使用（server/repository の status カラムが既に保持）。
   回帰 3 件はテスト専用パスのガード。親がテスト JSON リテラルの i32
