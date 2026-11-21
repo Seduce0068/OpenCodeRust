@@ -31,7 +31,7 @@ use crate::mcp_oauth::{
 use crate::oauth::{ProviderAuth, ProviderAuthError};
 use crate::pty::{PtySession as PtySessionStruct, PtySubscription};
 use crate::worktree::{self, WorktreeError, WorktreeInfo as WorktreeInfoStruct};
-use crate::{ApiError, Result, ServerState};
+use crate::{ApiError, Result, ServerState, MAX_TUI_RESPONSE_QUEUE};
 use opencode_agent::{AgentInfo as AgentConfigInfo, AgentMode, AgentRegistry, BuiltinAgent};
 use opencode_config::{
     load_config, Config as AppConfig, McpServerConfig as LoadedMcpServerConfig, McpTimeoutConfig,
@@ -5643,6 +5643,11 @@ async fn submit_tui_response(
     Json(body): Json<serde_json::Value>,
 ) -> Json<bool> {
     let mut queue = state.tui_response_queue.lock().await;
+    // RES-02: cap the externally writable inbox. Drop the oldest entry so
+    // repeated POSTs cannot grow the queue without bound.
+    if queue.len() >= MAX_TUI_RESPONSE_QUEUE {
+        queue.pop_front();
+    }
     queue.push_back(body);
     drop(queue);
     state.tui_response_notify.notify_one();
@@ -9295,6 +9300,49 @@ mod config_patch_runtime_tests {
         assert!(
             body.contains("invalidate_model_variant_lookup()"),
             "config re-bootstrap must drop the cached variant lookup: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tui_response_queue_tests {
+    use super::*;
+
+    /// RES-02 regression: the externally writable `/control/response` inbox
+    /// must stay bounded, keeping the newest entries and the `Json<bool>`
+    /// response shape.
+    #[tokio::test]
+    async fn submit_tui_response_bounds_queue_and_drops_oldest() {
+        let state = Arc::new(ServerState::new());
+        let extra = 3usize;
+        let total = MAX_TUI_RESPONSE_QUEUE + extra;
+
+        for index in 0..total {
+            let response = submit_tui_response(
+                State(state.clone()),
+                Json(serde_json::json!({ "n": index })),
+            )
+            .await;
+            assert!(response.0, "external response shape must stay Json<bool>");
+        }
+
+        let queue = state.tui_response_queue.lock().await;
+        assert_eq!(queue.len(), MAX_TUI_RESPONSE_QUEUE);
+        assert_eq!(
+            queue
+                .front()
+                .and_then(|value| value.get("n"))
+                .and_then(|n| n.as_u64()),
+            Some(extra as u64),
+            "oldest entries must be dropped first"
+        );
+        assert_eq!(
+            queue
+                .back()
+                .and_then(|value| value.get("n"))
+                .and_then(|n| n.as_u64()),
+            Some((total - 1) as u64),
+            "newest entry must be retained"
         );
     }
 }
