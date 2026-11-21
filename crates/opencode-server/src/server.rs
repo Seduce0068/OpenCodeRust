@@ -1761,6 +1761,28 @@ fn completion_outcome(status: StatusCode) -> &'static str {
     }
 }
 
+/// 完了ログへ明示的な構造化フィールドとして載せるリクエスト相関情報。
+///
+/// `tracing::Span` には付与済み field を読み出す公開 API が無いため、
+/// `request_span_middleware` から `RequestCompletionLog::on_response` へ
+/// タスクローカル으로引き渡す。スパン文脈（親スパンの field）に依存せず、
+/// 完了ログ行単体で request_id と結合できるようにするのが目的。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestLogContext {
+    request_id: String,
+    session_id: Option<String>,
+}
+
+tokio::task_local! {
+    /// 現在のリクエストの相関情報。ミドルウェア未適用時は未設定。
+    static REQUEST_LOG_CONTEXT: RequestLogContext;
+}
+
+/// 現在のタスクに結び付いた相関情報を取得する（未設定なら `None`）。
+fn current_request_log_context() -> Option<RequestLogContext> {
+    REQUEST_LOG_CONTEXT.try_with(|context| context.clone()).ok()
+}
+
 /// レスポンス完了時に status / latency / outcome をリクエストスパンへ記録する。
 #[derive(Clone, Debug)]
 struct RequestCompletionLog;
@@ -1772,11 +1794,26 @@ impl<B> OnResponse<B> for RequestCompletionLog {
         let status_code = status.as_u16();
         let latency_ms = latency.as_millis() as u64;
 
+        // 完了ログ単体でエラーログ（correlation_id）と結合できるよう、
+        // request_id / session_id を明示的な構造化フィールドとして記録する。
+        // ApiError 側の correlation_id は API 契約変更を避けるため変更しない。
+        // トークン値・クエリ文字列・ボディ・パスはフィールドに含めない。
+        let context = current_request_log_context();
+        let request_id_value = context
+            .as_ref()
+            .map(|context| context.request_id.as_str())
+            .unwrap_or("unknown");
+        let session_id_value = context
+            .as_ref()
+            .and_then(|context| context.session_id.as_deref())
+            .unwrap_or("unknown");
+
         // 5xx を INFO のまま埋もれさせず、ERROR/WARN としてアラートに拾わせる。
-        // トークンやクエリ文字列はフィールドに含めない。
         match completion_log_level(outcome) {
             CompletionLogLevel::Error => tracing::error!(
                 parent: span,
+                request_id = %request_id_value,
+                session_id = %session_id_value,
                 status = status_code,
                 latency_ms = latency_ms,
                 outcome = outcome,
@@ -1784,6 +1821,8 @@ impl<B> OnResponse<B> for RequestCompletionLog {
             ),
             CompletionLogLevel::Warn => tracing::warn!(
                 parent: span,
+                request_id = %request_id_value,
+                session_id = %session_id_value,
                 status = status_code,
                 latency_ms = latency_ms,
                 outcome = outcome,
@@ -1791,6 +1830,8 @@ impl<B> OnResponse<B> for RequestCompletionLog {
             ),
             CompletionLogLevel::Info => tracing::info!(
                 parent: span,
+                request_id = %request_id_value,
+                session_id = %session_id_value,
                 status = status_code,
                 latency_ms = latency_ms,
                 outcome = outcome,
@@ -1856,7 +1897,17 @@ async fn request_span_middleware(request: Request<axum::body::Body>, next: Next)
         span.record("client_ip", tracing::field::display(ip));
     }
 
-    let mut response = next.run(request).instrument(span).await;
+    // 完了ログ（TraceLayer の on_response）へ同じ ID を届ける。tracing には
+    // スパンの field を読み出す API が無く、TraceLayer はこの middleware の
+    // 内側にあるためレスポンス extension からも読めない。タスクローカルなら
+    // レイヤ順を変えずに相関情報を渡せる。値は ID のみで秘密情報は含めない。
+    let context = RequestLogContext {
+        request_id: request_id.clone(),
+        session_id: session_id.clone(),
+    };
+    let mut response = REQUEST_LOG_CONTEXT
+        .scope(context, next.run(request).instrument(span))
+        .await;
     response.headers_mut().insert(
         HeaderName::from_static("x-request-id"),
         request_id_header_value(&request_id),
@@ -3693,6 +3744,128 @@ mod tests {
         assert!(
             !auth_body.contains("supplied_bearer = %"),
             "token value must not be logged"
+        );
+    }
+
+    // ---- OBS-07: 完了ログとエラーを request_id で結合するための回帰テスト ----
+
+    #[tokio::test]
+    async fn request_context_task_local_is_scoped_and_absent_by_default() {
+        assert_eq!(
+            current_request_log_context(),
+            None,
+            "context must not leak outside a request scope"
+        );
+
+        let context = RequestLogContext {
+            request_id: "obs07-correlation".to_owned(),
+            session_id: Some("ses_obs07".to_owned()),
+        };
+        let expected = context.clone();
+        REQUEST_LOG_CONTEXT
+            .scope(context, async {
+                assert_eq!(current_request_log_context(), Some(expected));
+            })
+            .await;
+
+        assert_eq!(
+            current_request_log_context(),
+            None,
+            "context must be cleared after the scope ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_span_middleware_publishes_context_to_inner_handlers() {
+        fn correlation_app() -> axum::Router {
+            axum::Router::new()
+                .route(
+                    "/session/{session_id}/context",
+                    axum::routing::get(|| async {
+                        let context = current_request_log_context()
+                            .expect("middleware must publish the request context");
+                        let RequestLogContext {
+                            request_id,
+                            session_id,
+                        } = context;
+                        format!("{}|{}", request_id, session_id.unwrap_or_default())
+                    }),
+                )
+                .layer(middleware::from_fn(request_span_middleware))
+        }
+
+        let (addr, server) = start_test_server(correlation_app()).await;
+        let request = concat!(
+            "GET /session/ses_obs07/context HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "x-request-id: obs07-correlation\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        let (status, _, body) = http_exchange(addr, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("obs07-correlation"),
+            "request_id must reach the inner handler: {body}"
+        );
+        assert!(
+            body.contains("ses_obs07"),
+            "session_id must reach the inner handler: {body}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn completion_log_carries_request_id_as_explicit_structured_field() {
+        let source = include_str!("server.rs");
+        let body = source_fn_body(source, "impl<B> OnResponse<B> for RequestCompletionLog");
+
+        assert!(
+            body.contains("current_request_log_context()"),
+            "completion log must read the correlated request context"
+        );
+        assert!(
+            body.contains("request_id = %request_id_value"),
+            "completion log must carry request_id as an explicit structured field"
+        );
+        assert!(
+            body.contains("session_id = %session_id_value"),
+            "completion log should carry session_id when available"
+        );
+
+        // 完了ログへ秘密情報・クエリ・ボディ・パスを載せないことを回帰ガードする。
+        for forbidden in ["token =", "query =", "body =", "path ="] {
+            assert!(
+                !body.contains(forbidden),
+                "completion log must not log secrets/query/body/path: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_span_middleware_wires_correlation_context_scope() {
+        let source = include_str!("server.rs");
+        let span_body = source_fn_body(source, "async fn request_span_middleware(");
+
+        assert!(
+            span_body.contains("REQUEST_LOG_CONTEXT"),
+            "middleware must publish the request context"
+        );
+        assert!(
+            span_body.contains(".scope(context, next.run(request).instrument(span))"),
+            "task-local scope must wrap the whole downstream future"
+        );
+        assert!(
+            span_body.contains("request_id: request_id.clone()"),
+            "the echoed request id and the logged request id must be identical"
+        );
+        assert!(
+            span_body.contains("session_id: session_id.clone()"),
+            "session id must be propagated alongside request id"
+        );
+        assert!(
+            span_body.contains("client_ip"),
+            "existing client_ip span field must be preserved"
         );
     }
 
