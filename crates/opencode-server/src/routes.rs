@@ -3839,12 +3839,12 @@ pub struct AuthMethodInfo {
 }
 
 async fn get_provider_auth(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
 ) -> Json<HashMap<String, Vec<AuthMethodInfo>>> {
-    let Some(loader) = get_plugin_loader() else {
+    let Some(loader) = state.plugin_loader() else {
         return Json(HashMap::new());
     };
-    let methods = ProviderAuth::methods(loader).await;
+    let methods = ProviderAuth::methods(&loader).await;
     let result = methods
         .into_iter()
         .map(|(provider, values)| {
@@ -3875,13 +3875,14 @@ pub struct OAuthAuthorizeResponse {
 }
 
 async fn oauth_authorize(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Json(req): Json<OAuthAuthorizeRequest>,
 ) -> Result<Json<OAuthAuthorizeResponse>> {
-    let loader = get_plugin_loader()
+    let loader = state
+        .plugin_loader()
         .ok_or_else(|| ApiError::NotFound("no plugin loader initialized".to_string()))?;
-    let authorization = ProviderAuth::authorize(loader, &id, req.method, None)
+    let authorization = ProviderAuth::authorize(&loader, &id, req.method, None)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -3906,10 +3907,11 @@ async fn oauth_callback(
     Path(id): Path<String>,
     Json(req): Json<OAuthCallbackRequest>,
 ) -> Result<Json<bool>> {
-    let loader = get_plugin_loader()
+    let loader = state
+        .plugin_loader()
         .ok_or_else(|| ApiError::NotFound("no plugin loader initialized".to_string()))?;
     ProviderAuth::new(state.auth_manager.clone())
-        .callback(loader, &id, req.code.as_deref())
+        .callback(&loader, &id, req.code.as_deref())
         .await
         .map_err(|error| match error {
             ProviderAuthError::Auth(error) => ApiError::BadRequest(error.to_string()),
@@ -6494,13 +6496,13 @@ struct AgentInfo {
     description: Option<String>,
 }
 
-async fn list_agents() -> Result<Json<Vec<AgentInfo>>> {
+async fn list_agents(State(state): State<Arc<ServerState>>) -> Result<Json<Vec<AgentInfo>>> {
     let mut config = std::env::current_dir()
         .ok()
         .and_then(|cwd| load_config(&cwd).ok());
 
-    if let (Some(loader), Some(config)) = (get_plugin_loader(), config.as_mut()) {
-        apply_plugin_config_hooks(loader, config).await;
+    if let (Some(loader), Some(config)) = (state.plugin_loader(), config.as_mut()) {
+        apply_plugin_config_hooks(&loader, config).await;
     }
 
     let registry = AgentRegistry::from_optional_config(config.as_ref());
@@ -6627,137 +6629,6 @@ fn parse_auth_info_payload(payload: serde_json::Value) -> Option<AuthInfo> {
 // Plugin auth routes
 // ===========================================================================
 
-static PLUGIN_LOADER: std::sync::OnceLock<Arc<PluginLoader>> = std::sync::OnceLock::new();
-
-/// `OnceLock::set` の戻り値を検査し、2 回目以降の登録失敗だけを警告する。
-///
-/// 失敗の意味は「既に別インスタンスが loader を登録済み」であることだけであり、
-/// loader の識別情報・パス・トークンは一切ログへ出さない（固定文言のみ）。
-/// 戻り値の `true` は登録が拒否され、最初の loader が有効なままであることを示す。
-fn warn_if_plugin_loader_already_registered<T>(result: std::result::Result<(), T>) -> bool {
-    if result.is_err() {
-        tracing::warn!(
-            "plugin loader already registered; keeping the first loader (later instances are ignored)"
-        );
-        true
-    } else {
-        false
-    }
-}
-
-/// Register the global PluginLoader so routes can access auth bridges.
-/// Called once during server startup after plugins are loaded.
-///
-/// # 複数インスタンスでの挙動
-///
-/// `PLUGIN_LOADER` はプロセスグローバルな `OnceLock` で、インスタンス単位には
-/// 分離していない。**最初に登録された loader だけが有効** であり、2 回目以降の
-/// `set_plugin_loader` 呼び出しは失敗して汎用の warn を出すだけである。
-/// per-instance 化は設計判断を伴うため、ここでは変更しない。
-pub fn set_plugin_loader(loader: Arc<PluginLoader>) {
-    warn_if_plugin_loader_already_registered(PLUGIN_LOADER.set(loader));
-}
-
-fn get_plugin_loader() -> Option<&'static Arc<PluginLoader>> {
-    PLUGIN_LOADER.get()
-}
-
-#[cfg(test)]
-mod plugin_loader_registration_tests {
-    use super::*;
-    use std::fmt::Write as _;
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Metadata, Subscriber};
-
-    /// `tracing-subscriber` を依存追加せずに warn 本文を捕捉する最小バッファ。
-    #[derive(Clone, Default)]
-    struct LogBuffer(std::sync::Arc<std::sync::Mutex<String>>);
-
-    impl LogBuffer {
-        fn text(&self) -> String {
-            self.0.lock().expect("log buffer lock").clone()
-        }
-    }
-
-    struct CaptureVisitor(LogBuffer);
-
-    impl Visit for CaptureVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            let mut guard = self.0 .0.lock().expect("log buffer lock");
-            let buffer: &mut String = &mut guard;
-            let _ = write!(buffer, "{}={:?} ", field.name(), value);
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            let mut guard = self.0 .0.lock().expect("log buffer lock");
-            let buffer: &mut String = &mut guard;
-            let _ = write!(buffer, "{}={} ", field.name(), value);
-        }
-    }
-
-    struct CaptureSubscriber {
-        buffer: LogBuffer,
-    }
-
-    impl Subscriber for CaptureSubscriber {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            *metadata.level() <= tracing::Level::WARN
-        }
-
-        fn new_span(&self, _: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            event.record(&mut CaptureVisitor(self.buffer.clone()));
-        }
-
-        fn enter(&self, _: &Id) {}
-
-        fn exit(&self, _: &Id) {}
-    }
-
-    #[test]
-    fn duplicate_plugin_loader_registration_emits_generic_warn() {
-        let buffer = LogBuffer::default();
-        let subscriber = CaptureSubscriber {
-            buffer: buffer.clone(),
-        };
-        // グローバルな OnceLock を汚して既存 plugin routes テストへ影響しないよう、
-        // `PLUGIN_LOADER.set` が 2 回目以降に返す Err と同じ経路だけを注入する。
-        let rejected = tracing::subscriber::with_default(subscriber, || {
-            warn_if_plugin_loader_already_registered(Err(()))
-        });
-        assert!(rejected, "failed registration must be reported");
-
-        let text = buffer.text();
-        assert!(text.contains("already registered"), "{text}");
-        assert!(text.contains("first loader"), "{text}");
-        for forbidden in ["/home", "\\", "sk-", "token", "secret", "password"] {
-            assert!(!text.contains(forbidden), "warn leaked {forbidden}: {text}");
-        }
-    }
-
-    #[test]
-    fn first_plugin_loader_registration_stays_silent() {
-        let buffer = LogBuffer::default();
-        let subscriber = CaptureSubscriber {
-            buffer: buffer.clone(),
-        };
-        let rejected = tracing::subscriber::with_default(subscriber, || {
-            warn_if_plugin_loader_already_registered(Ok::<(), ()>(()))
-        });
-        assert!(!rejected, "first registration must succeed");
-        let text = buffer.text();
-        assert!(text.is_empty(), "{text}");
-    }
-}
-
 fn plugin_auth_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/auth", get(list_plugin_auth))
@@ -6780,8 +6651,8 @@ struct PluginAuthMethodInfo {
     label: String,
 }
 
-async fn list_plugin_auth(_state: State<Arc<ServerState>>) -> Result<Json<Vec<PluginAuthInfo>>> {
-    let Some(loader) = get_plugin_loader() else {
+async fn list_plugin_auth(state: State<Arc<ServerState>>) -> Result<Json<Vec<PluginAuthInfo>>> {
+    let Some(loader) = state.plugin_loader() else {
         return Ok(Json(Vec::new()));
     };
 
@@ -6823,11 +6694,11 @@ struct PluginAuthAuthorizeResponse {
 }
 
 async fn plugin_auth_authorize(
-    _state: State<Arc<ServerState>>,
+    state: State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<PluginAuthAuthorizeRequest>,
 ) -> Result<Json<PluginAuthAuthorizeResponse>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let result = bridge
         .authorize(req.method, req.inputs)
@@ -6857,11 +6728,11 @@ fn plugin_callback_args(req: &PluginAuthCallbackRequest) -> (Option<&str>, Optio
 }
 
 async fn plugin_auth_callback(
-    _state: State<Arc<ServerState>>,
+    state: State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<PluginAuthCallbackRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let (code, flow_id) = plugin_callback_args(&req);
     let result = bridge
@@ -6881,10 +6752,10 @@ struct PluginAuthLoadResponse {
 }
 
 async fn plugin_auth_load(
-    _state: State<Arc<ServerState>>,
+    state: State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<PluginAuthLoadResponse>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let result = bridge
         .load()
@@ -6914,11 +6785,11 @@ struct PluginAuthFetchResponse {
 }
 
 async fn plugin_auth_fetch(
-    _state: State<Arc<ServerState>>,
+    state: State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<PluginAuthFetchRequest>,
 ) -> Result<Json<PluginAuthFetchResponse>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let fetch_req = opencode_plugin::subprocess::PluginFetchRequest {
         url: req.url,
@@ -6940,8 +6811,9 @@ async fn plugin_auth_fetch(
 }
 
 /// Helper: look up the auth bridge for a provider name.
-async fn get_auth_bridge(provider: &str) -> Result<Arc<PluginAuthBridge>> {
-    let loader = get_plugin_loader()
+async fn get_auth_bridge(state: &ServerState, provider: &str) -> Result<Arc<PluginAuthBridge>> {
+    let loader = state
+        .plugin_loader()
         .ok_or_else(|| ApiError::NotFound("no plugin loader initialized".into()))?;
 
     loader
@@ -8629,7 +8501,7 @@ mod health_tests {
     use tracing::{Event, Metadata, Subscriber};
 
     /// `tracing-subscriber` を依存追加せずに warn の構造化フィールドを捕捉する
-    /// 最小バッファ（既存 `plugin_loader_registration_tests` と同じ方式）。
+    /// 最小バッファ。
     #[derive(Clone, Default)]
     struct ReasonLogBuffer(std::sync::Arc<std::sync::Mutex<String>>);
 

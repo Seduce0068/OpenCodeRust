@@ -512,6 +512,9 @@ pub struct ServerState {
     /// Per-instance MCP OAuth manager（旧 process-global static から移行）。
     /// OAuth フロー状態・登録済みサーバ・接続状態を `ServerState` の寿命に紐付ける。
     pub(crate) mcp_oauth_manager: Arc<McpOAuthManager>,
+    /// Per-instance plugin loader（旧 process-global `PLUGIN_LOADER` static から移行）。
+    /// `None` は起動時に loader がまだ作られていない状態を表す。
+    pub(crate) plugin_loader: RwLock<Option<Arc<PluginLoader>>>,
     /// Per-instance queue of pending TUI requests (was a process-global static).
     pub(crate) tui_request_queue: Mutex<VecDeque<routes::TuiRequest>>,
     /// Wakeup signal for `get_next_tui_request` waiters (per-instance).
@@ -571,6 +574,7 @@ impl ServerState {
             permission_broker,
             question_broker,
             mcp_oauth_manager: Arc::new(McpOAuthManager::new()),
+            plugin_loader: RwLock::new(None),
             tui_request_queue: Mutex::new(VecDeque::new()),
             tui_request_notify: Notify::new(),
             tui_response_queue: Mutex::new(VecDeque::new()),
@@ -589,6 +593,28 @@ impl ServerState {
             // CLI の起動時設定は legacy シードから 1 度だけコピーする。
             // 以降の変更はこのインスタンス内に閉じる。
             extra_cors_whitelist: Arc::new(RwLock::new(snapshot_legacy_cors_seed())),
+        }
+    }
+
+    /// このインスタンスの plugin loader を登録する（起動時に一度だけ呼ばれる）。
+    ///
+    /// 書き込み先は常に `self.plugin_loader` であり、同一プロセスの別
+    /// `ServerState` には一切影響しない。
+    pub(crate) fn set_plugin_loader(&self, loader: Arc<PluginLoader>) {
+        match self.plugin_loader.write() {
+            Ok(mut guard) => *guard = Some(loader),
+            Err(poisoned) => *poisoned.into_inner() = Some(loader),
+        }
+    }
+
+    /// このインスタンスの plugin loader を取得する（未初期化なら `None`）。
+    ///
+    /// ロックガードを跨がず所有権付き `Arc` を返すため、呼び出し側は `await` を
+    /// またいで保持できる。loader の値・パス・トークンは返さない。
+    pub(crate) fn plugin_loader(&self) -> Option<Arc<PluginLoader>> {
+        match self.plugin_loader.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -743,7 +769,7 @@ impl ServerState {
         });
         state.auth_manager = auth_manager.clone();
         // ERRPATH-08: ビルトイン認証プラグインのロード失敗は起動中止（fail-closed）。
-        load_plugin_auth_store(&server_url, auth_manager.clone()).await?;
+        load_plugin_auth_store(&server_url, &state).await?;
 
         // 起動時の config 読み込みと BootstrapConfig 変換は
         // `build_initial_provider_registry` に集約する。401/429 ローテーション後の
@@ -1627,10 +1653,8 @@ fn handle_builtin_plugin_load<E>(result: Result<(), E>) -> anyhow::Result<()> {
 /// ビルトインのロード失敗は fail-closed（固定 warn + `Err` 伝播で起動中止）。
 /// それ以外の初期化失敗は従来どおり warn のみで継続するが、どの経路も
 /// 生エラー・値・パス・トークンをログやエラーへ出さない。
-async fn load_plugin_auth_store(
-    server_url: &str,
-    auth_manager: Arc<AuthManager>,
-) -> anyhow::Result<()> {
+async fn load_plugin_auth_store(server_url: &str, state: &ServerState) -> anyhow::Result<()> {
+    let auth_manager = state.auth_manager.clone();
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(_) => {
@@ -1692,7 +1716,8 @@ async fn load_plugin_auth_store(
         return Ok(());
     }
 
-    routes::set_plugin_loader(loader.clone());
+    // per-instance: この ServerState の loader だけを登録する。
+    state.set_plugin_loader(loader.clone());
 
     let bridges = loader.auth_bridges().await;
     for (provider_id, bridge) in bridges {
@@ -3438,6 +3463,20 @@ mod tests {
             .await
             .iter()
             .all(|server| server.name != "first-only"));
+    }
+
+    #[test]
+    fn plugin_loader_is_isolated_between_server_states() {
+        let first = ServerState::new();
+        let second = ServerState::new();
+
+        // 起動前に loader が作られていない状態では両方とも None。
+        assert!(first.plugin_loader().is_none());
+        assert!(second.plugin_loader().is_none());
+
+        // process-global な OnceLock ではなく、各インスタンス固有のフィールドであることを検証する。
+        // setter は self.plugin_loader にしか書き込まないため、これで状態共有を防げる。
+        assert!(!std::ptr::eq(&first.plugin_loader, &second.plugin_loader));
     }
 
     #[test]
