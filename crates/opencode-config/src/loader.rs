@@ -2185,7 +2185,20 @@ fn apply_post_load_transforms(config: &mut Config) {
         tracing::warn!("mode is deprecated; use agent instead (value not logged)");
         let agent_configs = config.agent.get_or_insert_with(AgentConfigs::default);
         for (name, mut mode_agent) in mode_configs.entries {
-            mode_agent.mode = Some(AgentMode::Primary);
+            // A legacy `mode` entry implies Primary, but must not clobber an
+            // explicit `agent.<name>.mode`. Apply the legacy default only when
+            // the same-named agent has no explicit mode of its own.
+            let existing_has_mode = agent_configs
+                .entries
+                .get(&name)
+                .is_some_and(|existing| existing.mode.is_some());
+            if existing_has_mode {
+                // 既存の明示 mode を守るため、legacy 側の mode は渡さない（R4）。
+                // mode 項目自身が mode を持っていても上書きされない。
+                mode_agent.mode = None;
+            } else {
+                mode_agent.mode = Some(AgentMode::Primary);
+            }
             if let Some(existing) = agent_configs.entries.get_mut(&name) {
                 merge_agent_config(existing, mode_agent);
             } else {
@@ -4593,6 +4606,56 @@ theme = "dark"
         for forbidden in ["primary-agent", "legacy-primary", "secret-tool-name"] {
             assert!(!text.contains(forbidden), "config value leaked: {text}");
         }
+    }
+
+    #[test]
+    fn legacy_mode_migration_preserves_explicit_agent_mode() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "mode": {"reviewer": {"model": "legacy-model"}},
+                "agent": {"reviewer": {"mode": "subagent"}}
+            }"#,
+        )
+        .expect("config with an explicit agent mode must parse");
+
+        apply_post_load_transforms(&mut config);
+
+        let agent = config
+            .agent
+            .as_ref()
+            .and_then(|agents| agents.entries.get("reviewer"))
+            .expect("merged reviewer agent must exist");
+        assert!(
+            matches!(agent.mode, Some(AgentMode::Subagent)),
+            "an explicit agent mode must survive legacy mode migration"
+        );
+        assert!(
+            config.mode.is_none(),
+            "the deprecated mode field must be consumed"
+        );
+    }
+
+    #[test]
+    fn legacy_mode_migration_defaults_to_primary_without_explicit_mode() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "mode": {"reviewer": {"model": "legacy-model"}},
+                "agent": {"reviewer": {"model": "explicit-model"}}
+            }"#,
+        )
+        .expect("config without an explicit agent mode must parse");
+
+        apply_post_load_transforms(&mut config);
+
+        let agent = config
+            .agent
+            .as_ref()
+            .and_then(|agents| agents.entries.get("reviewer"))
+            .expect("merged reviewer agent must exist");
+        assert!(
+            matches!(agent.mode, Some(AgentMode::Primary)),
+            "legacy mode must supply Primary when no explicit mode exists"
+        );
     }
 
     #[test]
