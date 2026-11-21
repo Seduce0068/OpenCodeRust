@@ -235,21 +235,6 @@ status: current
 
 ### 優先度: 中（残タスク調査で追加）
 
-- [ ] **[P-03]** 未配線の設定フィールド（MAPPING.md へ明記済み）
-  - 2026-11-19 調査（swarm-coding R2）: 推奨は**現状維持（明記のみ）**。
-    11 フィールドはいずれも serde parse・known_config_keys・DeepMerge に参加し
-    起動失敗やデータ損失は無い。唯一の配線候補は `Config.keybinds`（GET /config
-    が値を返すため API 追加不要、TUI 側マージのみ）だが TUI 直接検証が scope 外
-    で別タスク。他 10 件は意味論未確定／型不一致／既存経路との競合。
-    `Config.enterprise` は loader の managed config（OS 固定ディレクトリ）と
-    無関係、`experimental.mcp_timeout` は実効の `McpConfig::timeout` と別経路。
-    2026-11-19 対応済み: MAPPING.md:168 の loader.rs 参照を 538-548 → 629-637 へ更新。
-  - `Config.keybinds` が TUI の `KeybindRegistry::new()` へ渡されずハードコード固定。
-    `snapshot` / `autoupdate` / `enterprise` / `experimental` と
-    `ExperimentalConfig` の **6 サブフィールド**
-    （現行 schema.rs:1224-1238、旧 todo の「5 件」は古い）も runtime
-    参照 0 件。未対応の旨は MAPPING.md の「設定スキーマの追随状況」に明記済み。
-    未対応は実際の配線（TUI/CLI 側の改修が必要）
 - [ ] **[P-04]** interleaved thinking の runtime 反映（現状維持・定義を再設定）
   - 2026-11-19 調査: 推奨は**現状維持（明記のみ）**。model.interleaved → runtime
     capabilities の変換は bootstrap.rs:965-971 で完了済み。未配線は transform 側だけ
@@ -282,9 +267,6 @@ status: current
   — `README.md:218-219` / OBS-06
 - [ ] **完了ログとエラーが request_id/correlation_id で結合できない**
   — `server.rs:1828-1851` / OBS-07
-- [ ] **readiness 失敗ログに原因種別が残らない** — `routes.rs:5771-5783` / OBS-08
-- [ ] **Restore 手順が -wal/-shm 残骸を前提としていない**
-  — `docs/opencode-storage.md:99-113` / OBS-09
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
 - [ ] **MCP OAuth manager が process-global で State 引数が未使用**
   — `routes.rs:3769-3773` / STATE-03
@@ -292,9 +274,6 @@ status: current
   — `routes.rs:3300` / STATE-04
 - [ ] **reset_processing が DB 全体の processing を書き換え**
   — `server.rs:672-674` / STATE-06
-- [ ] **PluginLoader::shutdown_all が本番から未呼び出し** — `loader.rs:73-83` / STATE-07
-- [ ] **TUI 用 `OPENCODE_TUI_*` env が早期 return 時に cleanup されない**
-  — `main.rs:1255-1266` / STATE-08
 - [ ] **per-instance ServerState の plugin/fetch-proxy は process-global のまま**
   — `server.rs:1037` / 既知残存
 
@@ -302,6 +281,8 @@ status: current
 
 ## 完了
 
+- [x] **[readiness/TUI env 2 件]** 失敗 reason と RAII 復元
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[loader warn/redact 1 件]** 重複登録の可視化とキー正規化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[observability/dogfood 12 件]** 相関 ID・構造化ログ・手順反映
@@ -625,6 +606,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（readiness/TUI env の修正時、記録のみ）: ping reason の
+  分類が sqlx Display のサブストリング依存で、実 sqlite の BUSY/CORRUPT を
+  通す統合テストが無い。RestoreTuiEnv のテストはローカル helper のみで
+  run_tui 実経路のガード配置は未検証。
 - 2026-11-21 R4 残存（loader warn/redact の修正時、記録のみ）: 複数語の機微値
   （"secret: ab cd ef"）は値の終端判定が曖昧なため 1 語目のみマスク。
   camelCase と OAuth 系キーの suffix 正規化は対応済み。誤マスク（token /
