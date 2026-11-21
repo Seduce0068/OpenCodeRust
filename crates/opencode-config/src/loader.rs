@@ -52,7 +52,7 @@ impl ConfigLoader {
             // This inline layer is higher priority than the accumulated map.
             env_lookup.extend(local_env);
         }
-        let content = substitute_env_vars(content, Some(&env_lookup));
+        let content = substitute_env_vars_for_load(content, Some(&env_lookup))?;
         let content = resolve_file_references(&content, Path::new("."))
             .with_context(|| "Failed to resolve file references in inline config")?;
 
@@ -81,7 +81,7 @@ impl ConfigLoader {
             // This file is a higher-priority layer than the accumulated map.
             env_lookup.extend(local_env);
         }
-        let content = substitute_env_vars(&content, Some(&env_lookup));
+        let content = substitute_env_vars_for_load(&content, Some(&env_lookup))?;
 
         // Apply {file:path} substitution
         let base_dir = path.parent().unwrap_or(Path::new("."));
@@ -648,6 +648,42 @@ fn extract_local_env(text: &str) -> Option<HashMap<String, String>> {
 /// by a pathological configuration.
 const MAX_ENV_SUBSTITUTION_PASSES: usize = 16;
 
+/// Fixed error text for opt-in strict mode. It deliberately contains no
+/// variable name, value, file path or config content, so it is safe to surface
+/// to callers and to logs.
+const STRICT_ENV_UNDEFINED_ERROR: &str =
+    "config contains an undefined environment variable reference (strict mode enabled)";
+
+/// Whether opt-in strict env handling is enabled for this process.
+///
+/// Only `1`, `true` and `yes` (case-insensitive) enable it. Unset, malformed or
+/// non-UTF-8 values keep the default warn-and-continue behavior. The value is
+/// never logged, so a secret accidentally placed here cannot leak into logs.
+fn strict_env_mode_enabled() -> bool {
+    match env::var("OPENCODE_CONFIG_STRICT_ENV") {
+        Ok(value) => matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => false,
+    }
+}
+
+/// Loader entry point: reads the opt-in switch once and converts a strict
+/// failure into the fixed, content-free error message above.
+fn substitute_env_vars_for_load(
+    text: &str,
+    config_env: Option<&HashMap<String, String>>,
+) -> Result<String> {
+    substitute_env_vars_inner(text, config_env, strict_env_mode_enabled())
+        .map_err(|_| anyhow::anyhow!("{}", STRICT_ENV_UNDEFINED_ERROR))
+}
+
+/// Non-strict helper kept for the substitution unit tests. Undefined names
+/// still expand to empty and warn by name only, as in the default behavior.
+#[cfg(test)]
+fn substitute_env_vars(text: &str, config_env: Option<&HashMap<String, String>>) -> String {
+    substitute_env_vars_inner(text, config_env, false)
+        .expect("non-strict env substitution cannot fail")
+}
+
 /// Substitute `{env:VAR}` patterns with environment variable values.
 ///
 /// Names are resolved from `config_env` (the merged top-level `env` map) first
@@ -675,10 +711,21 @@ const MAX_ENV_SUBSTITUTION_PASSES: usize = 16;
 ///   of emitting invalid JSON or letting the value alter the object shape.
 ///
 /// Works on the raw JSONC text before parsing so `{file:...}` references can
-/// still be resolved afterwards. No value is written to logs: only variable
-/// names appear in undefined-variable warnings.
-fn substitute_env_vars(text: &str, config_env: Option<&HashMap<String, String>>) -> String {
+/// still be resolved afterwards. In the default mode no value is written to
+/// logs: only variable names appear in undefined-variable warnings. With
+/// `strict` enabled, one undefined reference fails the whole substitution with
+/// a fixed error that contains no names, values or paths.
+///
+/// Core substitution shared by the default (fail-open) and opt-in strict paths.
+/// `strict` is passed in rather than read here so tests can exercise both modes
+/// without mutating process-global environment variables.
+fn substitute_env_vars_inner(
+    text: &str,
+    config_env: Option<&HashMap<String, String>>,
+    strict: bool,
+) -> Result<String> {
     let re = regex::Regex::new(r"\{env:([^}]+)\}").unwrap();
+    let missing_in_strict = std::cell::Cell::new(false);
     let mut resolved_env = config_env.cloned().unwrap_or_default();
 
     // Resolve chained references between config.env values iteratively. Every
@@ -695,12 +742,19 @@ fn substitute_env_vars(text: &str, config_env: Option<&HashMap<String, String>>)
                     match snapshot.get(name).cloned().or_else(|| env::var(name).ok()) {
                         Some(value) => value,
                         None => {
-                            // Undefined names expand to empty without blocking
-                            // startup. Log the name only, never the value.
-                            tracing::warn!(
-                                variable = %name,
-                                "undefined environment variable in config.env expanded to an empty string; startup continues"
-                            );
+                            if strict {
+                                // Strict mode fails the whole load. The caller
+                                // emits a fixed error with no name or value.
+                                missing_in_strict.set(true);
+                            } else {
+                                // Undefined names expand to empty without
+                                // blocking startup. Log the name only, never
+                                // the value.
+                                tracing::warn!(
+                                    variable = %name,
+                                    "undefined environment variable in config.env expanded to an empty string; startup continues"
+                                );
+                            }
                             String::new()
                         }
                     }
@@ -726,7 +780,13 @@ fn substitute_env_vars(text: &str, config_env: Option<&HashMap<String, String>>)
 
     // Substitute the config text with the fully resolved map. Values stay
     // escaped JSON string data and are inserted per the surrounding context.
-    re.replace_all(text, |caps: &regex::Captures| {
+    let result = re.replace_all(text, |caps: &regex::Captures| {
+        // コメント内の例示・メモは置換せず、strict の未定義検出からも除外する（R4）。
+        // {file:...} の解決と挙動を揃える。
+        let match_start = caps.get(0).map_or(0, |m| m.start());
+        if is_inside_comment(text, match_start) {
+            return caps.get(0).map_or(String::new(), |m| m.as_str().to_string());
+        }
         let var_name = &caps[1];
         let value = match resolved_env
             .get(var_name)
@@ -735,26 +795,36 @@ fn substitute_env_vars(text: &str, config_env: Option<&HashMap<String, String>>)
         {
             Some(value) => value,
             None => {
-                // Keep the existing empty-string expansion so startup is not
-                // blocked, but surface the missing variable by name only.
-                // Never log the value (it may be a secret).
-                tracing::warn!(
-                    variable = %var_name,
-                    "undefined environment variable in config expanded to an empty string; startup continues"
-                );
+                if strict {
+                    // Strict mode fails the whole load. The caller emits a
+                    // fixed error with no name, value or path.
+                    missing_in_strict.set(true);
+                } else {
+                    // Keep the existing empty-string expansion so startup is
+                    // not blocked, but surface the missing variable by name
+                    // only. Never log the value (it may be a secret).
+                    tracing::warn!(
+                        variable = %var_name,
+                        "undefined environment variable in config expanded to an empty string; startup continues"
+                    );
+                }
                 String::new()
             }
         };
 
         let body = json_string_body(&value);
-        let match_start = caps.get(0).map_or(0, |m| m.start());
         if inside_json_string_literal(text, match_start) {
             body
         } else {
             format!("\"{body}\"")
         }
     })
-    .to_string()
+    .to_string();
+
+    if strict && missing_in_strict.get() {
+        return Err(anyhow::anyhow!("{}", STRICT_ENV_UNDEFINED_ERROR));
+    }
+    Ok(result)
 }
 
 /// Returns `true` when the byte offset `pos` in `text` is inside a JSON string
@@ -3046,6 +3116,123 @@ mod tests {
         let input = r#"{"api_key": "{env:NONEXISTENT_VAR_12345}"}"#;
         let result = substitute_env_vars(input, None);
         assert_eq!(result, r#"{"api_key": ""}"#);
+    }
+
+    // ERRPATH-01: env vars are process-global, so every test that mutates the
+    // strict switch is serialized and restores the original value on drop.
+    struct StrictEnvRestore(Option<std::ffi::OsString>);
+
+    impl StrictEnvRestore {
+        fn set(value: &str) -> Self {
+            let original = env::var_os("OPENCODE_CONFIG_STRICT_ENV");
+            env::set_var("OPENCODE_CONFIG_STRICT_ENV", value);
+            Self(original)
+        }
+
+        fn unset() -> Self {
+            let original = env::var_os("OPENCODE_CONFIG_STRICT_ENV");
+            env::remove_var("OPENCODE_CONFIG_STRICT_ENV");
+            Self(original)
+        }
+    }
+
+    impl Drop for StrictEnvRestore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => env::set_var("OPENCODE_CONFIG_STRICT_ENV", value),
+                None => env::remove_var("OPENCODE_CONFIG_STRICT_ENV"),
+            }
+        }
+    }
+
+    #[test]
+    fn strict_env_flag_accepts_only_explicit_truthy_values() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = StrictEnvRestore::unset();
+        for value in ["1", "true", "TRUE", "yes", "YeS"] {
+            env::set_var("OPENCODE_CONFIG_STRICT_ENV", value);
+            assert!(strict_env_mode_enabled(), "{value} must enable strict mode");
+        }
+        for value in ["0", "false", "no", "", "enabled", " true "] {
+            env::set_var("OPENCODE_CONFIG_STRICT_ENV", value);
+            assert!(!strict_env_mode_enabled(), "{value} must stay non-strict");
+        }
+    }
+
+    #[test]
+    fn strict_env_mode_rejects_undefined_reference_on_load() {
+        const VAR: &str = "OPENCODE_STRICT_MISSING_AUTH_KEY";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = StrictEnvRestore::set("TRUE");
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let input = format!(r#"{{"model": "{{env:{VAR}}}"}}"#);
+        let error = loader
+            .load_from_str(&input)
+            .expect_err("strict mode must reject an undefined reference");
+        let message = error.to_string();
+        assert_eq!(message, STRICT_ENV_UNDEFINED_ERROR);
+        assert!(!message.contains(VAR), "variable name leaked into error");
+        assert!(
+            !message.contains("model"),
+            "config content leaked into error"
+        );
+        assert!(!message.contains('/'), "path-like data leaked into error");
+    }
+
+    #[test]
+    fn strict_env_mode_rejects_undefined_reference_from_file() {
+        const VAR: &str = "OPENCODE_STRICT_MISSING_FILE_KEY";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = StrictEnvRestore::set("yes");
+        let temp = TestDir::new("opencode_strict_env");
+        let file = temp.path.join("opencode.jsonc");
+        fs::write(&file, format!(r#"{{"model": "{{env:{VAR}}}"}}"#)).unwrap();
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let error = loader
+            .load_from_file(&file)
+            .expect_err("strict mode must reject an undefined file reference");
+        let message = error.to_string();
+        assert_eq!(message, STRICT_ENV_UNDEFINED_ERROR);
+        assert!(!message.contains(VAR), "variable name leaked into error");
+        assert!(
+            !message.contains(&temp.path.to_string_lossy().into_owned()),
+            "config path leaked into error"
+        );
+    }
+
+    #[test]
+    fn strict_env_mode_rejects_undefined_reference_inside_config_env() {
+        let mut config_env = HashMap::new();
+        config_env.insert(
+            "OPENCODE_STRICT_CHAIN_ROOT".to_string(),
+            "{env:OPENCODE_STRICT_MISSING_CHAIN}".to_string(),
+        );
+        let error = substitute_env_vars_inner(
+            r#"{"model": "{env:OPENCODE_STRICT_CHAIN_ROOT}"}"#,
+            Some(&config_env),
+            true,
+        )
+        .expect_err("strict mode must reject an undefined chained reference");
+        assert_eq!(error.to_string(), STRICT_ENV_UNDEFINED_ERROR);
+        assert!(!error.to_string().contains("OPENCODE_STRICT_MISSING_CHAIN"));
+    }
+
+    #[test]
+    fn default_env_mode_keeps_empty_expansion_and_startup_continuation() {
+        const VAR: &str = "OPENCODE_DEFAULT_MISSING_AUTH_KEY";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = StrictEnvRestore::unset();
+        assert!(!strict_env_mode_enabled());
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let input = format!(r#"{{"model": "{{env:{VAR}}}"}}"#);
+        loader
+            .load_from_str(&input)
+            .expect("default mode must warn, expand empty and continue");
+        assert_eq!(loader.config().model.as_deref(), Some(""));
+        assert_eq!(substitute_env_vars(&input, None), r#"{"model": ""}"#);
     }
 
     /// R4: chained `{env:VAR}` references inside `config.env` must be resolved
