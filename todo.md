@@ -166,8 +166,6 @@ status: current
 
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
-- [ ] **設定検証コマンドが無い（README 案内は 2026-11-21 対応済み）**
-  — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
   — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -267,6 +265,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定検証コマンド 1 件]** `config --check` 追加
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[shutdown キュー終端化 1 件]** プロンプト abort と再スケジュール停止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[APP_VERSION_DATE 1 件]** 2026.11.21 へ同期（固定ラベル方針明記）
@@ -634,6 +634,9 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（config --check の修正時、記録のみ）: 回帰テストが
+  clap 解析と中核関数のみで main のディスパッチ分岐を通っていない。
+  親が cwd 取得失敗を「設定不正」と別の固定文へ区別するよう修正。
 - 2026-11-21 R4 判断（shutdown キュー終端化の修正時）: abort が
   PromptTaskCleanup::drop 経由で再 spawn する指摘に対し、親がキュー ID を
   abort 前に drain し shutting_down フラグで Drop / recover の再スケジュール
