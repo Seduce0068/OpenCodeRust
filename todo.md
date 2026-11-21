@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **migrate_global_config_once が fingerprint 更新と独立**
-  — `main.rs:403-417` / STATE-10
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -258,6 +256,8 @@ status: current
 
 ## 完了
 
+- [x] **[移行 fingerprint 1 件]** 起動時一度きりの設計意図を確認・復元
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[完了ログ/variant キャッシュ 2 件]** request_id 明示と無効化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[認証通知/設定反映 3 件]** 起動時固定と README 追随
@@ -587,6 +587,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 判断（移行 fingerprint の修正時）: loader の JSON 存在ガードに
+  より旧 TOML の再移行は設計上行われない。R2 の fingerprint 追跡は無効かつ
+  余分な再ロードを誘発したため R5 で OnceLock へ復元。既存 JSON を上書き
+  する再移行はユーザー設定破壊のため採用しない。再レビューは自動修正 2 回
+  目として省略。
 - 2026-11-21 R4 判断（完了ログ/variant の修正時）: 完了ログの path/query が
   TraceLayer 既定スパンから出る指摘は今回の差分外（既存挙動）のため却下。
   実行時 request_id のテスト欠如・源码ガード依存は記録のみ。Mutex の await
