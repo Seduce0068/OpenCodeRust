@@ -698,9 +698,10 @@ impl PluginSubprocess {
                     PluginSubprocessError::Protocol(format!("bad Content-Length: {e}"))
                 })?;
                 if len > MAX_FRAME_SIZE {
-                    return Err(PluginSubprocessError::Protocol(
-                        "Content-Length exceeds 10 MiB limit".into(),
-                    ));
+                    return Err(PluginSubprocessError::Protocol(format!(
+                        "Content-Length exceeds {} MiB limit",
+                        MAX_FRAME_SIZE / (1024 * 1024)
+                    )));
                 }
                 content_length = Some(len);
             }
@@ -933,6 +934,16 @@ mod tests {
             matches!(&error, PluginSubprocessError::Protocol(_)),
             "unexpected error: {error}"
         );
+    }
+
+    /// フレーム上限はこのファイルの定数が単一情報源。
+    /// `opencode-mcp` 側にも同名定数があるが両クレート間に依存関係はなく、
+    /// 共通モジュールを新設できないため、双方で値を固定して漂移を検出する方針。
+    #[test]
+    fn frame_limit_constants_are_pinned() {
+        assert_eq!(MAX_FRAME_SIZE, 10 * 1024 * 1024);
+        assert_eq!(MAX_HEADER_LINES, 64);
+        assert_eq!(MAX_HEADER_LINE_BYTES, 8192);
     }
 
     // -- Version negotiation regression tests -------------------------------

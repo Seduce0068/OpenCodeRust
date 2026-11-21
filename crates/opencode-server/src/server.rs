@@ -42,7 +42,11 @@ use crate::error::ApiError;
 use crate::pty::PtyManager;
 use crate::routes;
 
-const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
+/// デフォルトのサーバ URL（ループバック）。
+///
+/// CLI のプラグイン認証ブリッジもこの値を共有する。
+/// `OPENCODE_SERVER_URL` が設定されている場合は呼び出し側で上書きされる。
+pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
 
 /// `x-request-id` ヘッダ値の最大長（文字数）。超過分は先頭のみ採用する。
 const MAX_REQUEST_ID_LEN: usize = 128;
@@ -2135,6 +2139,12 @@ pub async fn run_server_with_state(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn default_server_url_is_the_shared_loopback_endpoint() {
+        // server クレートが唯一の定義元。CLI はこの定数を参照する。
+        assert_eq!(DEFAULT_SERVER_URL, "http://127.0.0.1:4096");
+    }
 
     #[test]
     fn convert_config_providers_reads_both_spellings_and_normalizes() {

@@ -181,6 +181,13 @@ mod tests {
         assert!(saved.starts_with("... [truncated]\n"));
     }
 
+    /// 共通既定である 50 KiB が変わらないことを固定する。
+    /// `read` / `bash` はこの定数を直接参照する単一情報源として使う。
+    #[test]
+    fn max_bytes_is_pinned() {
+        assert_eq!(MAX_BYTES, 50 * 1024);
+    }
+
     #[test]
     fn floor_char_boundary_respects_multibyte_boundaries() {
         // 'あ' is 3 bytes; make the raw start index land on its continuation byte.

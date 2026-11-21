@@ -7,7 +7,7 @@ use crate::tool::parse_bool_arg;
 use crate::{with_file_lock, Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[cfg(feature = "lsp")]
-const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
+use crate::MAX_DIAGNOSTICS_PER_FILE;
 
 pub struct EditTool {
     directory: PathBuf,

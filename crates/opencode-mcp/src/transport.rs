@@ -768,6 +768,19 @@ mod stdio_framing_tests {
         );
         let _ = transport.close().await;
     }
+
+    /// フレーム上限はこのファイルの定数が単一情報源。
+    /// `MAX_HTTP_BODY_SIZE` / `MAX_SSE_EVENT_SIZE` もそこから導出される。
+    /// `opencode-plugin` 側にも同名定数があるが両クレート間に依存関係はなく、
+    /// 共通モジュールを新設できないため、双方で値を固定して漂移を検出する方針。
+    #[test]
+    fn frame_limit_constants_are_pinned() {
+        assert_eq!(MAX_FRAME_SIZE, 10 * 1024 * 1024);
+        assert_eq!(MAX_HEADER_LINES, 64);
+        assert_eq!(MAX_HEADER_LINE_BYTES, 8192);
+        assert_eq!(MAX_HTTP_BODY_SIZE, MAX_FRAME_SIZE);
+        assert_eq!(MAX_SSE_EVENT_SIZE, MAX_FRAME_SIZE);
+    }
 }
 
 #[cfg(test)]

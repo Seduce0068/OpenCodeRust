@@ -8,9 +8,10 @@ use crate::{
     with_file_lock, Metadata, PermissionRequest, Tool, ToolContext, ToolError, ToolResult,
 };
 
-pub struct ApplyPatchTool;
 #[cfg(feature = "lsp")]
-const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
+use crate::MAX_DIAGNOSTICS_PER_FILE;
+
+pub struct ApplyPatchTool;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ApplyPatchInput {

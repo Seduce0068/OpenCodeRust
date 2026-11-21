@@ -5,11 +5,11 @@ use std::sync::LazyLock;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout, Duration};
 
+use crate::truncation::MAX_BYTES as MAX_OUTPUT_BYTES;
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 use opencode_plugin::{HookContext, HookEvent};
 
 const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1000;
-const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
 /// Parse an optional non-negative `u64` argument. A missing or `null` value
 /// keeps `default`; a negative number or any other JSON type is rejected
@@ -1734,5 +1734,12 @@ mod tests {
             output.len()
         );
         assert!(reader.is_empty(), "must drain to EOF");
+    }
+
+    /// bash の出力上限は `truncation::MAX_BYTES` を import して使うため
+    /// 単一情報源であり、その値が従来どおり 50 KiB であることを固定する。
+    #[test]
+    fn output_byte_limit_uses_shared_default() {
+        assert_eq!(MAX_OUTPUT_BYTES, 50 * 1024);
     }
 }
