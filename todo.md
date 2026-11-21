@@ -247,7 +247,8 @@ status: current
   — `openai.rs:1026-1083` / ERR2-07 / 中（speculation）
 - [ ] **POST /prompt に冪等キーが無く再送で二重実行**
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
-- [ ] **ページネーション引数の露出と limit=0 の意味論が不一致**
+- [ ] **[残り]** limit=0 の意味論が TUI（未指定扱い）とサーバ（空結果）で不一致
+  （引数の露出は完了）
   — `tui/api.rs:681-693` / API-08 / 中
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
@@ -265,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[ページネーション引数露出 1 件]** directory/roots/start を API に追加
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[run_status 復帰 1 件]** ストリーム異常終了で Idle に戻す
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[compaction 状態終端化 1 件]** Compacting を Active に戻す
@@ -702,6 +705,9 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（ページネーション引数の修正時）: send() の生エラーが
+  reqwest の URL（directory パス）を表示し得るため固定文言へ変換（親が修正）。
+  limit=0 の意味論は設計判断（0=全件か空か）のため未対応。
 - 2026-11-22 R4 残存（run_status の修正時、記録のみ）: Idle 化が 2〜3 経路で
   重複 broadcast される（状態自体は冪等）、tokio runtime 外の Drop では
   Busy が残る（生成経路は常に runtime 内のため通常は発生しない）。親が
