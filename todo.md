@@ -172,8 +172,6 @@ status: current
   — `cli/main.rs:1977-1982` / CFG2-08 / 低
 - [ ] **OPENCODE_CONFIG_CONTENT の {file:...} が cwd 基準で仕様未記載**
   — `config/loader.rs:45-57` / CFG2-09 / 低
-- [ ] **ディレクトリ走査順に依存して同名 command/plugin の勝者が変わる**
-  — `config/loader.rs:1371-1383` / CFG2-10 / 低
 - [ ] **MCP SSE の JSON-RPC パース失敗が warn だけで待機側が timeout**
   — `mcp/transport.rs:524-539` / ERR2-08 / 低（speculation）
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
@@ -261,8 +259,6 @@ status: current
   — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
 - [ ] **parse_stream_error が code 必須で type ベース retryable を落とす**
   — `provider.rs:632` / ERR2-03 / 中
-- [ ] **usage デコード失敗が 0 に丸められ課金統計が狂う**
-  — `openai.rs:854-855` / ERR2-04 / 中
 - [ ] **get_model_id の unwrap_or_default が空 model id を生成**
   — `agent/executor.rs:321-328` / ERR2-05 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -303,6 +299,8 @@ status: current
 
 ## 完了
 
+- [x] **[usage/走査順 2 件]** デコード失敗の可視化と決定的ソート
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[config 移行/文書 2 件]** 明示 mode 保持と設定源の網羅
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP/Anthropic error 2 件]** フラグ復元と SSE error 昇格
@@ -692,6 +690,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（usage/走査順の修正時、記録のみ）: ストリーミング経路の
+  usage デコード失敗は依然無警告（本次は非ストリーミングのみ）。warn ヘルパーと
+  テスト用 Subscriber が openai/responses で重複。親が usage:null の誤警告を
+  直接修正（Value::Object のみデコード対象）。
 - 2026-11-22 R4 残存（config 移行/文書の修正時、記録のみ）: 回帰テストが
   apply_post_load_transforms 単体のみで多層マージ経路を通っていない。
   親が mode 項目自身が mode を持つ場合の上書きと、README の
