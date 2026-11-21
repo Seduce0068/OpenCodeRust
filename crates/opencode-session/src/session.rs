@@ -646,6 +646,7 @@ impl Session {
     pub fn to_row(&self) -> SessionRow {
         SessionRow {
             id: self.id.clone(),
+            status: Some(self.status.clone()),
             slug: self.slug.clone(),
             project_id: self.project_id.clone(),
             directory: self.directory.clone(),
@@ -686,13 +687,19 @@ impl Session {
 
         let share = row.share_url.map(|url| SessionShare { url });
 
-        let status = if row.time_archived.is_some() {
-            SessionStatus::Archived
-        } else if row.time_compacting.is_some() {
-            SessionStatus::Compacting
-        } else {
-            SessionStatus::Active
-        };
+        // 保存済み status を最優先する。旧データ（status が None）は
+        // time_archived / time_compacting からの導出にフォールバックする。
+        // これにより complete() が time_archived を設定しない Completed が
+        // to_row → from_row の往復で Active に化けることを防ぐ。
+        let status = row.status.clone().unwrap_or_else(|| {
+            if row.time_archived.is_some() {
+                SessionStatus::Archived
+            } else if row.time_compacting.is_some() {
+                SessionStatus::Compacting
+            } else {
+                SessionStatus::Active
+            }
+        });
 
         let created_at = DateTime::from_timestamp_millis(row.time_created).unwrap_or_else(Utc::now);
         let updated_at = DateTime::from_timestamp_millis(row.time_updated).unwrap_or_else(Utc::now);
@@ -729,6 +736,12 @@ impl Session {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRow {
     pub id: String,
+    /// セッションのライフサイクル状態。
+    ///
+    /// `None` は status が保存されていない旧データを示す。`from_row` は
+    /// この場合のみ `time_archived` / `time_compacting` から状態を導出する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SessionStatus>,
     pub slug: String,
     pub project_id: String,
     pub directory: String,
@@ -1259,6 +1272,101 @@ mod tests {
         }
     }
 
+    /// 回帰: `complete()` 後のセッションを `to_row` → `from_row` で往復させても
+    /// Completed が Active に化けないこと。
+    #[test]
+    fn test_completed_session_survives_row_round_trip() {
+        let mut session = Session::new("project-1", "/path/to/project");
+        session.complete();
+        assert_eq!(session.status, SessionStatus::Completed);
+
+        let row = session.to_row();
+        assert_eq!(row.status, Some(SessionStatus::Completed));
+
+        let restored = Session::from_row(row);
+        assert_eq!(
+            restored.status,
+            SessionStatus::Completed,
+            "status must be restored from the row instead of derived from timestamps"
+        );
+    }
+
+    /// 旧データ（status なし）は従来どおり time_archived / time_compacting
+    /// から状態を導出し、保存済み status はタイムスタンプより優先される。
+    #[test]
+    fn test_from_row_status_precedence_and_legacy_fallback() {
+        let mut row = SessionRow {
+            id: "ses_legacy".into(),
+            status: None,
+            slug: "legacy".into(),
+            project_id: "project-1".into(),
+            directory: "/path".into(),
+            parent_id: None,
+            title: "Legacy".into(),
+            version: "1.0.0".into(),
+            time_created: 1_700_000_000_000i64,
+            time_updated: 1_700_000_000_001i64,
+            time_compacting: None,
+            time_archived: None,
+            share_url: None,
+            summary_additions: None,
+            summary_deletions: None,
+            summary_files: None,
+            revert: None,
+            permission: None,
+        };
+
+        // タイムスタンプなし → Active
+        assert_eq!(Session::from_row(row.clone()).status, SessionStatus::Active);
+
+        // time_archived あり → Archived（旧データのフォールバック）
+        row.time_archived = Some(1_700_000_000_002);
+        assert_eq!(
+            Session::from_row(row.clone()).status,
+            SessionStatus::Archived
+        );
+
+        // time_compacting あり → Compacting
+        row.time_archived = None;
+        row.time_compacting = Some(1_700_000_000_003);
+        assert_eq!(
+            Session::from_row(row.clone()).status,
+            SessionStatus::Compacting
+        );
+
+        // 保存済み status はタイムスタンプより優先される。
+        row.status = Some(SessionStatus::Completed);
+        assert_eq!(Session::from_row(row).status, SessionStatus::Completed);
+    }
+
+    /// status キーが無い旧 JSON 行も `#[serde(default)]` でデコードできること。
+    #[test]
+    fn test_session_row_deserialize_without_status() {
+        let row: SessionRow = serde_json::from_value(serde_json::json!({
+            "id": "ses_old",
+            "slug": "old",
+            "project_id": "project-1",
+            "directory": "/path",
+            "parent_id": null,
+            "title": "Old",
+            "version": "1.0.0",
+            "time_created": 1_700_000_000_000i64,
+            "time_updated": 1_700_000_000_001i64,
+            "time_compacting": null,
+            "time_archived": 1_700_000_000_002i64,
+            "share_url": null,
+            "summary_additions": null,
+            "summary_deletions": null,
+            "summary_files": null,
+            "revert": null,
+            "permission": null
+        }))
+        .expect("legacy row without status must deserialize");
+
+        assert_eq!(row.status, None);
+        assert_eq!(Session::from_row(row).status, SessionStatus::Archived);
+    }
+
     #[test]
     fn test_child_session() {
         let parent = Session::new("project-1", "/path/to/project");
@@ -1620,14 +1728,15 @@ mod tests {
     fn test_from_row_normalizes_missing_diffs_to_empty_vec() {
         let row = SessionRow {
             id: "ses_row".into(),
+            status: None,
             slug: "row".into(),
             project_id: "project-1".into(),
             directory: "/path".into(),
             parent_id: None,
             title: "Row".into(),
             version: "1.0.0".into(),
-            time_created: 1_700_000_000_000,
-            time_updated: 1_700_000_000_001,
+            time_created: 1_700_000_000_000i64,
+            time_updated: 1_700_000_000_001i64,
             time_compacting: None,
             time_archived: None,
             share_url: None,
