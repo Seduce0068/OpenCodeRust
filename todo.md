@@ -164,6 +164,18 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **AgentColor::Custom が組み込み色と同名で serde 往復時に退化**
+  — `types/agent.rs:37-60` / T-03 / 低
+- [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
+  — `session/session.rs:668-692` / T-04 / 低（speculation）
+- [ ] **messages テーブルの provider_id/cost 列が永続化経路で常に未設定**
+  — `storage/repository.rs:566-608` / T-06 / 低
+- [ ] **SessionSummary.diffs の serde 既定値が types/session で非対称**
+  — `types/session.rs:57-68` / T-07 / 低
+- [ ] **GitWatcher イベント待ちが 2 秒固定 timeout**
+  — `core/git_watcher.rs:82-95` / TESTREL-04 / 低
+- [ ] **ENV_OVERRIDE_LOCK 範囲外で env を直接書き換え**
+  — `config/loader.rs:4362-4369` / TESTREL-06 / 低
 - [ ] **設定検証手段が無く README も不正設定時の挙動を案内しない**
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
@@ -217,6 +229,8 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
+- [ ] **SessionRepository::update が permission JSON を二重エンコード**
+  — `storage/repository.rs:357-386` / T-01 / 高（事実確認済み、PATCH から到達）
 - [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
   — `plugin/lib.rs:548-563` / STATE-01 / 高
 - [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
@@ -252,6 +266,18 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **opencode_types::PtyStatus に Error が無く wire "error" が落ちる**
+  — `types/pty.rs:25-33` / T-02 / 中
+- [ ] **update_part が v2 の Part ワイヤ形式を受けられない**
+  — `routes.rs:3000-3019` / T-05 / 中（speculation）
+- [ ] **watcher 再帰サブウォッチのアタッチ待ちが固定 sleep 依存**
+  — `watcher/lib.rs:596-605` / TESTREL-01 / 中
+- [ ] **watcher unwatch 後の負の検証が 300ms 固定**
+  — `watcher/lib.rs:569-576` / TESTREL-02 / 中
+- [ ] **plugin チャンク overflow テストが 150ms timeout + 50ms sleep 依存**
+  — `plugin/client.rs:872-894` / TESTREL-03 / 中
+- [ ] **bash プロセツリキル検証が 600ms 固定 sleep 依存**
+  — `tool/bash.rs:1200-1209` / TESTREL-05 / 中
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
@@ -629,6 +655,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 cross-skill 集約（swarm125、2 担当・13 件、観点: 型境界/所有権 /
+  テスト信頼性）: 親が T-01 の二重エンコードを read で事実確認（create は
+  `Json<T>`、update は `Json<String>` で保存され decode が CorruptData）。
+  高 1 / 中 7 / 低 6 を追記。既知の known flaky と同一原因は除外。
 - 2026-11-21 R4 残存（設定ロード失敗警告の修正時、記録のみ）: 初期化前バッファ
   経路は本番では到達不能（全呼び出しが TRACING_READY 後）でテスト専用。
   直接 emit と replay でログ field 構成が異なる点、同一 cwd 重複を排除しない
