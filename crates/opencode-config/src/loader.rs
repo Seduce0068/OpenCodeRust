@@ -1780,9 +1780,13 @@ fn yaml_scalar_to_json(value: &str) -> serde_json::Value {
             return serde_json::Value::Number(num);
         }
     }
-    // Strip surrounding quotes
-    if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
+    // Strip surrounding quotes. A lone quote character (`"` or `'`) has length 1;
+    // slicing it as `1..len - 1` yields the invalid range `1..0` and panics.
+    // Requiring at least two bytes keeps the slice valid, and such malformed
+    // input is simply returned unchanged as a string.
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
     {
         return serde_json::Value::String(value[1..value.len() - 1].to_string());
     }
@@ -4015,6 +4019,31 @@ mod tests {
         let json = serde_yaml_frontmatter_to_json(yaml);
         assert_eq!(json["name"], "quoted value");
         assert_eq!(json["description"], "single quoted");
+    }
+
+    #[test]
+    fn test_yaml_frontmatter_lone_quote_value_does_not_panic() {
+        // 回帰: `key: "` のように値が引用符 1 文字だけだと、長さ 1 に対して
+        // `value[1..value.len() - 1]` = `1..0` を計算して panic していた。
+        // 本番の frontmatter 経路と同じ serde_yaml_frontmatter_to_json で確認する。
+        let json = serde_yaml_frontmatter_to_json("description: \"");
+        assert_eq!(json["description"], "\"");
+        let json = serde_yaml_frontmatter_to_json("description: '");
+        assert_eq!(json["description"], "'");
+
+        // スカラー変換でも入力がそのまま返り、通常の引用符は従来どおり剥がれる。
+        assert_eq!(
+            yaml_scalar_to_json("\""),
+            serde_json::Value::String("\"".to_string())
+        );
+        assert_eq!(
+            yaml_scalar_to_json("'"),
+            serde_json::Value::String("'".to_string())
+        );
+        assert_eq!(
+            yaml_scalar_to_json("\"ok\""),
+            serde_json::Value::String("ok".to_string())
+        );
     }
 
     #[test]

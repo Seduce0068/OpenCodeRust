@@ -156,7 +156,9 @@ pub fn parse_iso(text: &str) -> f64 {
         }
     };
 
-    let days = days_from_civil(year, month, day);
+    let Some(days) = days_from_civil(year, month, day) else {
+        return f64::NAN;
+    };
     let local_ms = days as f64 * MS_PER_DAY
         + hours as f64 * 3_600_000.0
         + minutes as f64 * 60_000.0
@@ -325,7 +327,10 @@ pub fn from_components(values: &[f64]) -> f64 {
         .unwrap_or(i64::MAX / 2);
     let normalized_year = total_months.div_euclid(12);
     let normalized_month = total_months.rem_euclid(12) as u32 + 1;
-    let days = days_from_civil(normalized_year, normalized_month, 1)
+    let Some(days) = days_from_civil(normalized_year, normalized_month, 1) else {
+        return f64::NAN;
+    };
+    let days = days
         .checked_add(day)
         .and_then(|value| value.checked_sub(1))
         .unwrap_or(i64::MAX / 2);
@@ -352,14 +357,26 @@ fn to_integer(value: f64) -> i64 {
     value.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
+/// Days since the Unix epoch for a civil date, or `None` when the arithmetic
+/// would overflow `i64` (an out-of-range year).
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let year = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = if year >= 0 {
+        year
+    } else {
+        year.checked_sub(399)?
+    } / 400;
     let year_of_era = year - era * 400;
     let month_prime = if month > 2 { month - 3 } else { month + 9 } as i64;
     let day_of_year = (153 * month_prime + 2) / 5 + day as i64 - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
 }
 
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -445,6 +462,16 @@ mod tests {
         assert_eq!(from_components(&[2024.0, 12.0, 1.0]), 1_735_689_600_000.0);
         assert!(from_components(&[f64::NAN, 0.0]).is_nan());
         assert!(from_components(&[2024.0, f64::NAN]).is_nan());
+    }
+
+    #[test]
+    fn extreme_yields_nan_without_overflow() {
+        // `era * 146_097` in days_from_civil overflows i64 for these years and
+        // must produce NaN instead of panicking in debug builds.
+        assert!(from_components(&[i64::MAX as f64, 0.0, 1.0]).is_nan());
+        assert!(from_components(&[i64::MIN as f64, 0.0, 1.0]).is_nan());
+        assert!(from_components(&[1.0e18, 0.0, 1.0]).is_nan());
+        assert!(parse_iso("9223372036854775807-01-01").is_nan());
     }
 
     #[test]

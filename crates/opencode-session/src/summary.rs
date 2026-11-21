@@ -51,7 +51,9 @@ const MESSAGE_SUMMARY_DIFFS_KEY: &str = "summary_diffs";
 /// them in double quotes and using octal or C-style escape sequences.
 /// This function reverses that encoding.
 pub fn unquote_git_path(input: &str) -> String {
-    if !input.starts_with('"') || !input.ends_with('"') {
+    // A single `"` both starts and ends with `"`, so slicing `1..len - 1`
+    // would produce the invalid range `1..0` and panic. Require two bytes.
+    if input.len() < 2 || !input.starts_with('"') || !input.ends_with('"') {
         return input.to_string();
     }
 
@@ -822,6 +824,13 @@ mod tests {
     fn test_unquote_git_path_empty_and_quotes_only() {
         assert_eq!(unquote_git_path(""), "");
         assert_eq!(unquote_git_path("\"\""), "");
+    }
+
+    #[test]
+    fn test_unquote_git_path_single_quote_no_panic() {
+        // A lone `"` both starts and ends with a quote; the body slice
+        // `1..len - 1` would be `1..0` and panic without the length guard.
+        assert_eq!(unquote_git_path("\""), "\"");
     }
 
     #[test]

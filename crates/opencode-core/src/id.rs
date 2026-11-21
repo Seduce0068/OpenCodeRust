@@ -78,7 +78,13 @@ pub fn create(prefix: Prefix, _descending: bool, timestamp: Option<u64>) -> Stri
     });
 
     let counter_val = next_counter(current_timestamp);
-    let now = current_timestamp * 0x1000 + u64::from(counter_val);
+    // A caller-supplied timestamp near `u64::MAX` would overflow the unchecked
+    // multiplication/addition. Clamp to the boundary value instead of panicking;
+    // the public signature and normal-timestamp output stay unchanged.
+    let now = current_timestamp
+        .checked_mul(0x1000)
+        .and_then(|value| value.checked_add(u64::from(counter_val)))
+        .unwrap_or(u64::MAX);
     let time_bytes = now.to_be_bytes();
     let hex_time = hex::encode(time_bytes);
     let random_part = random_base62(LENGTH - 12);
@@ -154,6 +160,17 @@ mod tests {
             .collect();
         for id in ids {
             assert_eq!(timestamp(&id), baseline_ts);
+        }
+    }
+
+    #[test]
+    fn test_create_id_timestamp_overflow_does_not_panic() {
+        // Values whose `timestamp * 0x1000` exceeds u64 must be clamped rather
+        // than overflowing in debug builds.
+        for ts in [u64::MAX, u64::MAX - 1, (u64::MAX / 0x1000) + 1] {
+            let id = create(Prefix::Message, false, Some(ts));
+            assert_eq!(id.len(), 34);
+            assert!(timestamp(&id).is_some());
         }
     }
 }

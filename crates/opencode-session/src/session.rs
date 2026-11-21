@@ -397,7 +397,9 @@ impl Session {
                 let base = &self.title[..pos];
                 let num_part = &self.title[pos + 8..self.title.len() - 1];
                 if let Ok(num) = num_part.parse::<u32>() {
-                    return format!("{} (fork #{})", base, num + 1);
+                    // `u32::MAX` cannot be incremented; fall back to #1.
+                    let next = num.checked_add(1).unwrap_or(1);
+                    return format!("{} (fork #{})", base, next);
                 }
             }
         }
@@ -1550,6 +1552,17 @@ mod tests {
         };
         let title2 = temp.get_forked_title();
         assert!(title2.ends_with("(fork #2)"));
+    }
+
+    #[test]
+    fn test_fork_title_u32_max_wraps_to_one() {
+        let session = Session::new("project-1", "/path/to/project");
+        let maxed = Session {
+            title: format!("plan (fork #{})", u32::MAX),
+            ..session.clone()
+        };
+        // `num + 1` overflows for u32::MAX; the fallback must be #1.
+        assert_eq!(maxed.get_forked_title(), "plan (fork #1)");
     }
 
     #[test]

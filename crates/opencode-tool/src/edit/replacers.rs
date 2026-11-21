@@ -670,6 +670,10 @@ pub fn trim_diff(diff: &str) -> String {
         return diff.to_string();
     }
 
+    // Measure indentation as a byte offset, not a character count. A character
+    // count used as `&content[min_indent..]` below panics for multibyte leading
+    // whitespace (e.g. U+3000 IDEOGRAPHIC SPACE is 3 bytes): the count points
+    // into the middle of the UTF-8 sequence instead of a char boundary.
     let min_indent = content_lines
         .iter()
         .filter_map(|line| {
@@ -677,8 +681,12 @@ pub fn trim_diff(diff: &str) -> String {
             if content.trim().is_empty() {
                 return None;
             }
-            let indent_len = content.chars().take_while(|c| c.is_whitespace()).count();
-            Some(indent_len)
+            let indent_bytes = content
+                .char_indices()
+                .find(|(_, c)| !c.is_whitespace())
+                .map(|(idx, _)| idx)
+                .unwrap_or(content.len());
+            Some(indent_bytes)
         })
         .min()
         .unwrap_or(0);
@@ -697,7 +705,11 @@ pub fn trim_diff(diff: &str) -> String {
                 let prefix = &line[0..1];
                 let content = &line[1..];
                 if content.len() >= min_indent {
-                    format!("{}{}", prefix, &content[min_indent..])
+                    // `min_indent` is the smallest byte indent across lines; a
+                    // line with wider multibyte whitespace may not have a char
+                    // boundary exactly there, so snap down to the nearest one.
+                    let cut = content.floor_char_boundary(min_indent);
+                    format!("{}{}", prefix, &content[cut..])
                 } else {
                     line.to_string()
                 }
@@ -817,5 +829,22 @@ mod tests {
         let replacer = LineTrimmedReplacer;
         let found: Vec<String> = replacer.find("same", "same\nb\nc").collect();
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn trim_diff_handles_multibyte_common_indent() {
+        // 回帰: 全角空白 U+3000 (3 bytes) の共通インデントを文字数で数え、
+        // その値をバイト位置としてスライスしていたため UTF-8 継続バイトで panic していた。
+        let diff = "--- a.txt\n+++ b.txt\n@@ -1,2 +1,2 @@\n+\u{3000}first\n+\u{3000}second";
+        let trimmed = trim_diff(diff);
+        assert!(trimmed.contains("+first"));
+        assert!(trimmed.contains("+second"));
+        assert!(!trimmed.contains('\u{3000}'));
+
+        // 幅の異なる空白が混在しても、インデントは文字境界に丸められ panic しない。
+        let mixed = "+\u{3000}wide\n+  narrow";
+        let trimmed_mixed = trim_diff(mixed);
+        assert!(trimmed_mixed.contains('w'));
+        assert!(trimmed_mixed.contains('n'));
     }
 }
