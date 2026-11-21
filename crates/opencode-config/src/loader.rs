@@ -369,8 +369,8 @@ fn get_global_config_path() -> PathBuf {
 /// Explicitly migrate the legacy global TOML config into `opencode.json`.
 ///
 /// This is the mutating counterpart of the file readers such as
-/// `ConfigLoader::load_from_file`: on success it writes `opencode.json`,
-/// creates `config.bak` and removes the original `config` file. Keeping this
+/// `ConfigLoader::load_from_file`: on success it creates `config.bak`, writes
+/// `opencode.json` and removes the original `config` file. Keeping this
 /// behavior in a dedicated public API makes the destructive side effects
 /// visible to callers instead of hiding them inside `load_global`.
 ///
@@ -409,9 +409,13 @@ fn migrate_global_config_if_absent(config_dir: &Path, config: &mut Config) -> Op
 /// Migrate legacy global TOML config (`~/.config/opencode/config`) into
 /// `opencode.json` and merge it into the currently loaded config.
 ///
-/// The original file is copied to `config.bak` before being removed so the
-/// migration can be rolled back. If the backup cannot be created, the original
-/// is left in place and a warning is logged.
+/// The original file is copied to `config.bak` before any JSON is written; it
+/// is removed only after both the backup and `opencode.json` exist. If the
+/// backup cannot be created the migration aborts without writing JSON, leaving
+/// the legacy TOML as the single source of truth. The in-memory config is
+/// committed once the backup and `opencode.json` both exist; a failure to
+/// remove the legacy TOML is warned about but does not abort the migration
+/// (the JSON remains the active source).
 fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<PathBuf> {
     let legacy_path = config_dir.join("config");
     if !legacy_path.exists() {
@@ -480,7 +484,12 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
     if migrated.schema.is_none() {
         migrated.schema = Some("https://opencode.ai/config.json".to_string());
     }
-    config.merge(migrated);
+
+    // Build the value to persist on a clone so `config` stays untouched until
+    // every filesystem step has succeeded. A failed migration is therefore a
+    // true no-op for the caller, matching the `None` return value.
+    let mut migrated_config = config.clone();
+    migrated_config.merge(migrated);
 
     let json_path = config_dir.join("opencode.json");
     if let Some(parent) = json_path.parent() {
@@ -494,7 +503,7 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
         }
     }
 
-    let serialized = match serde_json::to_string_pretty(config) {
+    let serialized = match serde_json::to_string_pretty(&migrated_config) {
         Ok(json) => json,
         Err(error) => {
             tracing::warn!(
@@ -506,35 +515,36 @@ fn migrate_legacy_toml_config(config_dir: &Path, config: &mut Config) -> Option<
         }
     };
 
+    // Back up the original before writing any JSON. If the backup fails, return
+    // without creating `opencode.json` so the legacy file stays the single
+    // source of truth and no unrecoverable half-migrated state is left behind.
+    let backup_path = config_dir.join("config.bak");
+    if let Err(error) = fs::copy(&legacy_path, &backup_path) {
+        // Deliberately no config paths in this warning: directory names may be
+        // sensitive. Only the I/O error category is reported.
+        tracing::warn!(
+            %error,
+            "failed to back up legacy TOML config; migration aborted before writing JSON"
+        );
+        return None;
+    }
+
     if let Err(error) = write_config_file(&json_path, serialized.as_bytes()) {
         tracing::warn!(%error, "failed to write migrated JSON config");
         return None;
     }
 
-    // Keep a backup so the migration can be rolled back. The original is only
-    // removed after the backup has been created successfully; if backing up
-    // fails, the legacy file stays in place.
-    let backup_path = config_dir.join("config.bak");
-    match fs::copy(&legacy_path, &backup_path) {
-        Ok(_) => {
-            if let Err(error) = fs::remove_file(&legacy_path) {
-                tracing::warn!(
-                    path = %legacy_path.display(),
-                    backup = %backup_path.display(),
-                    %error,
-                    "failed to remove legacy TOML config after migration; backup was preserved"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                path = %legacy_path.display(),
-                backup = %backup_path.display(),
-                %error,
-                "failed to back up legacy TOML config; leaving original in place"
-            );
-        }
+    if let Err(error) = fs::remove_file(&legacy_path) {
+        tracing::warn!(
+            path = %legacy_path.display(),
+            backup = %backup_path.display(),
+            %error,
+            "failed to remove legacy TOML config after migration; backup was preserved"
+        );
     }
+
+    // Commit the in-memory change only after every on-disk step succeeded.
+    *config = migrated_config;
 
     tracing::info!(
         legacy = %legacy_path.display(),
@@ -3389,17 +3399,70 @@ theme = "dark"
         fs::create_dir_all(&config_dir).unwrap();
         // Force fs::copy to fail by making the backup destination a directory.
         fs::create_dir(config_dir.join("config.bak")).unwrap();
-        let original = "model = \"claude\"\n";
+        let original = "provider = \"anthropic\"\nmodel = \"claude\"\n";
         fs::write(config_dir.join("config"), original).unwrap();
 
         let mut config = Config::default();
-        assert!(migrate_legacy_toml_config(&config_dir, &mut config).is_some());
+        // A failed backup must abort before any JSON is written.
+        assert!(migrate_legacy_toml_config(&config_dir, &mut config).is_none());
 
         assert_eq!(
             fs::read_to_string(config_dir.join("config")).unwrap(),
             original
         );
-        assert!(config_dir.join("opencode.json").exists());
+        assert!(!config_dir.join("opencode.json").exists());
+        assert!(
+            config.model.is_none(),
+            "in-memory config must stay untouched on a failed migration"
+        );
+    }
+
+    #[test]
+    fn legacy_toml_migration_backup_failure_leaves_no_partial_state() {
+        // Regression for ERRPATH-07: a backup failure used to be downgraded to
+        // a warning while the new JSON was still written and reported as a
+        // successful migration, leaving JSON + TOML with no backup at all.
+        let temp = TestDir::new("opencode_legacy_toml_backup_rollback");
+        let config_dir = temp.path.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let original = "provider = \"anthropic\"\nmodel = \"claude\"\ntheme = \"dark\"\n";
+        fs::write(config_dir.join("config"), original).unwrap();
+        // Make fs::copy fail by occupying the backup destination with a dir.
+        fs::create_dir(config_dir.join("config.bak")).unwrap();
+
+        let mut config = Config::default();
+        assert!(migrate_legacy_toml_config(&config_dir, &mut config).is_none());
+
+        assert_eq!(
+            fs::read_to_string(config_dir.join("config")).unwrap(),
+            original,
+            "legacy TOML must remain the only config source"
+        );
+        assert!(
+            !config_dir.join("opencode.json").exists(),
+            "no JSON may be created when its backup could not be made"
+        );
+        assert!(config.model.is_none());
+        assert!(config.theme.is_none());
+
+        // The normal path is unchanged: with a writable backup destination the
+        // migration still produces JSON, a backup, and removes the source.
+        let ok_dir = temp.path.join("opencode_ok");
+        fs::create_dir_all(&ok_dir).unwrap();
+        fs::write(ok_dir.join("config"), original).unwrap();
+
+        let mut ok_config = Config::default();
+        assert!(migrate_legacy_toml_config(&ok_dir, &mut ok_config).is_some());
+
+        assert!(ok_dir.join("opencode.json").exists());
+        assert_eq!(
+            fs::read_to_string(ok_dir.join("config.bak")).unwrap(),
+            original
+        );
+        assert!(!ok_dir.join("config").exists());
+        assert_eq!(ok_config.model.as_deref(), Some("anthropic/claude"));
+        assert_eq!(ok_config.theme.as_deref(), Some("dark"));
     }
 
     #[test]

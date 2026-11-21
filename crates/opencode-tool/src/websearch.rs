@@ -1,10 +1,20 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::{Tool, ToolContext, ToolError, ToolResult};
 
 const API_BASE_URL: &str = "https://mcp.exa.ai";
+/// reqwest `Client` 全体のタイムアウト（接続からボディ読了までを含む上限）。
+const WEBSEARCH_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 個別の WebSearch リクエストに適用するタイムアウト。
+///
+/// `WEBSEARCH_CLIENT_TIMEOUT`（30 秒）より 5 秒短くし、Client 全体の上限に
+/// 依存せず個別リクエスト側を先に発火させる。これにより `e.is_timeout()` を
+/// 判定して "Search request timed out" を返す経路が確実に通り、将来 Client 側の
+/// 設定や再試行が追加されてもタイムアウト原因を判別できる。
+const WEBSEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 const DEFAULT_NUM_RESULTS: usize = 8;
 /// Exa が受け付ける `numResults` の範囲。CodeSearch の `.clamp()` と同じ方針で
 /// 境界値へ丸め、不正値をエラーやログに出さない。
@@ -23,7 +33,7 @@ impl WebSearchTool {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(WEBSEARCH_CLIENT_TIMEOUT)
                 .build()
                 .unwrap(),
         }
@@ -260,7 +270,7 @@ impl Tool for WebSearchTool {
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
             .json(&search_request)
-            .timeout(std::time::Duration::from_secs(25))
+            .timeout(WEBSEARCH_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| {
@@ -331,6 +341,18 @@ mod tests {
     #[test]
     fn default_num_results_is_eight() {
         assert_eq!(default_num_results(), 8);
+    }
+
+    /// 回帰テスト（R2）: 個別リクエスト timeout を 25 秒に固定し、
+    /// Client 全体の 30 秒より短い関係（5 秒の余裕）を維持すること。
+    #[test]
+    fn websearch_request_timeout_is_shorter_than_client_timeout() {
+        assert_eq!(WEBSEARCH_CLIENT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(WEBSEARCH_REQUEST_TIMEOUT, Duration::from_secs(25));
+        assert!(
+            WEBSEARCH_REQUEST_TIMEOUT < WEBSEARCH_CLIENT_TIMEOUT,
+            "per-request timeout must fire before the client-level timeout"
+        );
     }
 
     #[test]

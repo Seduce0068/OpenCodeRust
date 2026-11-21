@@ -39,6 +39,9 @@ pub const PLUGIN_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// 既知のキー名・トークン接頭辞・スキーム付き URL の userinfo だけを対象とし、
 /// ホストやパスなど障害追跡に必要な情報は残す。
 pub fn redact_sensitive_text(input: &str) -> String {
+    // ログ・エラー側のマスクは山括弧形式 `<redacted>` に固定する。
+    // UI 表示側（opencode-tui）は `[redacted]` を用いる。共有定数を新設しない
+    // スコープのため、テストで値を固定して形式の漂移を検出する。
     const REDACTED: &str = "<redacted>";
     const SECRET_KEYS: &[&str] = &[
         "x-goog-api-key",
@@ -838,5 +841,14 @@ mod tests {
             !redacted.contains("ghp_1234567890"),
             "token leaked: {redacted}"
         );
+    }
+
+    /// 回帰テスト（R2）: ログ側のマスクは山括弧形式 `<redacted>` に固定する。
+    /// UI 表示側の `[redacted]` に漂移しないことを検出する。
+    #[test]
+    fn redact_sensitive_text_uses_log_angle_bracket_marker() {
+        let masked = redact_sensitive_text("token=abc123");
+        assert_eq!(masked, "token=<redacted>");
+        assert!(!masked.contains("[redacted]"));
     }
 }
