@@ -219,11 +219,6 @@ status: current
 
 ### 優先度: 高（swarm review+discovery 2026-11-20）
 
-- [ ] **GLOBAL_PLUGIN_SYSTEM が最初の PluginSystem を固定**
-  — `plugin/lib.rs:548-563` / STATE-01 / 高
-- [ ] **sync_sessions_to_storage がスナップショット外の永続セッションを削除**
-  — `server.rs:869-887` / STATE-05 / 高
-
 ### 優先度: 高（swarm review+discovery 2026-11-19）
 
 ### 優先度: 中（残タスク調査で追加）
@@ -282,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[高優先: plugin/session 2 件]** init 競合の可視化と sync 削除スコープ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[入れ子キー/不正値警告 2 件]** ユーザー定義名のマスクと warn
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定エラー/スキーマ明記 2 件]** 値非露出と情報源の明確化
@@ -639,6 +636,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（plugin/session の修正時、記録のみ）: 明示削除が
+  ストレージ失敗時も deleted:true を返し部分残存を放置し得る（API 契約変更を
+  伴うため記録のみ）。init_global_replace は本番未使用で先勝ちが仕様。
+  親が世代採番をロック取得後へ移動し、Installed 分岐のログも guard drop 後へ修正。
 - 2026-11-21 R4 残存（入れ子キー警告の修正時、記録のみ）: mcp 直下の未知
   キーを完全除外するため `mcp.srvrs` のような誤記が server id として扱われ
   下位警告に誤記名が残る。provider スキーマの known 集合（baseURL/apiKey）が
