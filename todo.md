@@ -166,8 +166,6 @@ status: current
 
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
-- [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
-  — `provider/auth.rs:231-261` / ERRPATH-09 / 低（設計判断）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -265,6 +263,8 @@ status: current
 
 ## 完了
 
+- [x] **[rotate_key 永続化 1 件]** persist-before-commit とロールバック
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定検証コマンド 1 件]** `config --check` 追加
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[shutdown キュー終端化 1 件]** プロンプト abort と再スケジュール停止
