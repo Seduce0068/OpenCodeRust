@@ -246,8 +246,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **サブセッション復元で subagent 深さカウンタが 0 にリセット**
-  — `agent/executor.rs:102-121` / SUBAGENT-DEPTH-LOST / 中
 - [ ] **ストリームタスク異常終了で run_status が Busy のまま残る**
   — `routes.rs:1901-1911` / STREAM-RUN-STATUS-ON-PANIC / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -274,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[subagent 深さ復元 1 件]** 永続化ラウンドトリップで深さを保持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[optimistic メッセージ残存 1 件]** Home 経路の失敗時 cleanup
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[境界 panic 6 件]** 1文字引用符・全角空白・オーバーフロー・巨大年
@@ -703,6 +703,9 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（subagent 深さ復元の修正時、記録のみ）: 復元後の
+  MAX_SUBAGENT_DEPTH ガード実効化の自動テストが欠落（コード追跡では
+  ctx.extra と disabled_tools の両方で効くと評価）。
 - 2026-11-22 cross-skill 集約（swarm168、2 担当・12 件、観点: 境界値 panic /
   状態不整合）: 親が high 1 件（compaction 状態固定）を read で事実確認。
   境界 panic 6 件は即座に coding 完了、state 不整合 5 件を高 1/中 3/低 2 で
