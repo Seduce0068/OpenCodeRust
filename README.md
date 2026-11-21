@@ -159,6 +159,9 @@ require a restart, as do the environment variables listed in
 
 ### Invalid or problematic configuration
 
+Run `opencoderust config --check` to validate the current configuration. It
+prints `Configuration is valid` on success and exits non-zero on errors.
+
 Most configuration problems produce a warning and startup continues instead
 of failing. Review each warning as follows.
 
