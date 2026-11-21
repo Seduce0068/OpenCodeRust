@@ -246,8 +246,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **シェル実行失敗で optimistic メッセージが残存（Home 経路）**
-  — `tui/app.rs:2776-2781` / TUI-SHELL-OPTIMISTIC-LEAK / 中
 - [ ] **サブセッション復元で subagent 深さカウンタが 0 にリセット**
   — `agent/executor.rs:102-121` / SUBAGENT-DEPTH-LOST / 中
 - [ ] **ストリームタスク異常終了で run_status が Busy のまま残る**
@@ -276,6 +274,8 @@ status: current
 
 ## 完了
 
+- [x] **[optimistic メッセージ残存 1 件]** Home 経路の失敗時 cleanup
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[境界 panic 6 件]** 1文字引用符・全角空白・オーバーフロー・巨大年
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[client_ip XFF 1 件]** 信頼プロキシ opt-in・fail-closed
