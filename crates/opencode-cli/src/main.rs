@@ -2014,11 +2014,16 @@ fn parse_model_and_provider(model: Option<String>) -> (Option<String>, Option<St
     }
 }
 
+/// 真偽値 env をパースする純粋関数（`OPENCODE_AUTO_SHARE` などで使用）。
+///
+/// `parse_env_flag` / `parse_no_auth` と同じ fail-closed 意味論に統一:
+/// `1` / `true` / `yes`（大小文字無視・前後空白除去）のみ真とし、
+/// `on` を含むそれ以外の値はすべて偽とする。
 fn parse_bool_env(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    let normalized = value.trim();
+    normalized == "1"
+        || normalized.eq_ignore_ascii_case("true")
+        || normalized.eq_ignore_ascii_case("yes")
 }
 
 fn infer_language_id(path: &Path) -> &'static str {
@@ -7288,6 +7293,34 @@ mod tests {
             format_stats_total_cost(Some(f64::INFINITY)),
             "Cost unavailable"
         );
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_only_explicit_true_values() {
+        // parse_env_flag / parse_no_auth と同じ fail-closed 意味論:
+        // 1 / true / yes（大小文字無視・前後空白除去）のみ真。
+        let truthy: [&str; 8] = [
+            "1", "true", "yes", "TRUE", "YES", "True", " true ", "\tyes\n",
+        ];
+        for value in truthy {
+            assert!(
+                parse_bool_env(value),
+                "explicit true value must be accepted: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_rejects_on_and_all_other_values() {
+        // "on" は従来 parse_bool_env のみ真とみなしていたが、
+        // fail-closed 統一により偽へ変更されたことを保証する。
+        let falsy: [&str; 8] = ["on", "ON", " On ", "0", "false", "no", "", "garbage"];
+        for value in falsy {
+            assert!(
+                !parse_bool_env(value),
+                "non-explicit value must be rejected: {value:?}"
+            );
+        }
     }
 
     #[test]
