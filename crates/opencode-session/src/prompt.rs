@@ -968,7 +968,12 @@ impl SessionPrompt {
             None => return Err(anyhow::anyhow!("Session {} is busy", input.session_id)),
         };
 
-        self.create_user_message(&input, session).await?;
+        // `start` が登録した実行トークンは、メッセージ生成が失敗した場合も
+        // 解放しなければ後続 prompt が永久に "Session busy" で拒否される。
+        if let Err(err) = self.create_user_message(&input, session).await {
+            self.finish_run(&input.session_id).await;
+            return Err(err);
+        }
         session.touch();
         Self::emit_session_update(update_hook.as_ref(), session);
 
@@ -4180,6 +4185,93 @@ mod tests {
             .map(SessionMessage::get_text)
             .unwrap_or_default();
         assert_eq!(final_text, "Hello");
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_releases_running_state_and_allows_followup_prompt() {
+        let prompt = SessionPrompt::default();
+        let mut session = Session::new("proj", ".");
+        let provider = Arc::new(ScriptedStreamProvider {
+            model: ModelInfo {
+                id: "test-model".to_string(),
+                name: "Test Model".to_string(),
+                provider: "mock".to_string(),
+                context_window: 8192,
+                max_output_tokens: 1024,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            },
+            events: vec![
+                StreamEvent::Start,
+                StreamEvent::TextDelta("ok".to_string()),
+                StreamEvent::FinishStep {
+                    finish_reason: Some("stop".to_string()),
+                    usage: StreamUsage::default(),
+                    provider_metadata: None,
+                },
+                StreamEvent::Done,
+            ],
+        });
+
+        let empty_input = PromptInput {
+            session_id: session.id.clone(),
+            message_id: None,
+            model: Some(ModelRef {
+                provider_id: "mock".to_string(),
+                model_id: "test-model".to_string(),
+            }),
+            agent: None,
+            no_reply: false,
+            system: None,
+            variant: None,
+            parts: Vec::new(),
+            tools: None,
+        };
+        let mut valid_input = empty_input.clone();
+        valid_input.parts = vec![PartInput::Text {
+            text: "Say hello".to_string(),
+        }];
+
+        let err = prompt
+            .prompt_with_update_hook(
+                empty_input,
+                &mut session,
+                provider.clone(),
+                None,
+                Vec::new(),
+                AgentParams::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("empty prompt must fail validation");
+        assert!(
+            err.to_string().contains("No content in prompt"),
+            "the original validation error must be preserved"
+        );
+        assert!(
+            !prompt.is_running(&session.id).await,
+            "failed create_user_message must release the execution token"
+        );
+
+        prompt
+            .prompt_with_update_hook(
+                valid_input,
+                &mut session,
+                provider,
+                None,
+                Vec::new(),
+                AgentParams::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("follow-up prompt must succeed after the token is released");
+        assert!(!prompt.is_running(&session.id).await);
     }
 
     #[tokio::test]

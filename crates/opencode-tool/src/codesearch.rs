@@ -10,7 +10,7 @@ const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 #[serde(rename_all = "camelCase")]
 pub struct CodeSearchParams {
     pub query: String,
-    #[serde(default = "default_tokens")]
+    #[serde(default = "default_tokens", alias = "tokens_num")]
     pub tokens_num: u32,
 }
 
@@ -226,6 +226,20 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(params.tokens_num, 1000);
+    }
+
+    #[test]
+    fn params_accept_legacy_tokens_num_key_and_normalize() {
+        let params: CodeSearchParams = serde_json::from_value(serde_json::json!({
+            "query": "react hooks",
+            "tokens_num": 1000
+        }))
+        .unwrap();
+        assert_eq!(params.tokens_num, 1000);
+
+        let serialized = serde_json::to_value(&params).unwrap();
+        assert_eq!(serialized["tokensNum"], 1000);
+        assert!(serialized.get("tokens_num").is_none());
     }
 
     #[test]

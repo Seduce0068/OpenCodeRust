@@ -12,7 +12,7 @@ pub struct SkillTool;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SkillInput {
-    #[serde(rename = "skill_name")]
+    #[serde(rename = "skill_name", alias = "skillName", alias = "name")]
     skill_name: String,
     #[serde(default)]
     arguments: Option<serde_json::Value>,
@@ -511,6 +511,22 @@ custom content
         let tool = SkillTool;
         assert_eq!(tool.id(), "skill");
         assert_eq!(tool.parameters()["type"], "object");
+    }
+
+    #[test]
+    fn skill_input_accepts_legacy_keys_and_normalizes() {
+        for legacy in [
+            serde_json::json!({ "skillName": "reviewer" }),
+            serde_json::json!({ "name": "reviewer" }),
+        ] {
+            let input: SkillInput = serde_json::from_value(legacy).unwrap();
+            assert_eq!(input.skill_name, "reviewer");
+
+            let serialized = serde_json::to_value(&input).unwrap();
+            assert_eq!(serialized["skill_name"], "reviewer");
+            assert!(serialized.get("skillName").is_none());
+            assert!(serialized.get("name").is_none());
+        }
     }
 
     /// スキル走査ルート内の symlink が外部の SKILL.md や外部ディレクトリを

@@ -44,10 +44,14 @@ pub struct FileReference {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Reference {
+    /// ローカルファイルによる参照。
+    ///
+    /// `FileReference.protocol` は必須の `String` であるため、先にマッチさせる。
+    /// これにより File をシリアライズした JSON が Remote に化けるのを防ぐ。
+    /// `protocol` が無い／`null` の JSON は File にマッチせず Remote へフォールバックする。
+    File(FileReference),
     /// リモートリポジトリへの参照。
     Remote(RemoteReference),
-    /// ローカルファイルによる参照。
-    File(FileReference),
 }
 
 fn normalize_input(input: &str) -> String {
@@ -246,5 +250,113 @@ mod tests {
     fn parse_rejects_empty_and_unsafe() {
         assert!(parse("").is_none());
         assert!(parse("-bad").is_none());
+    }
+
+    // serde_json を dev-dependency に追加せずに JSON 相当のマップを組み立て、
+    // untagged enum のバリアント選択を検証するための最小限の値表現。
+    enum TestValue {
+        Str(String),
+        Null,
+        Seq(Vec<TestValue>),
+    }
+
+    struct TestValueDeserializer(TestValue);
+
+    impl<'de> serde::de::IntoDeserializer<'de, serde::de::value::Error> for TestValue {
+        type Deserializer = TestValueDeserializer;
+
+        fn into_deserializer(self) -> Self::Deserializer {
+            TestValueDeserializer(self)
+        }
+    }
+
+    impl<'de> serde::Deserializer<'de> for TestValueDeserializer {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            match self.0 {
+                TestValue::Str(value) => visitor.visit_string(value),
+                TestValue::Null => visitor.visit_unit(),
+                TestValue::Seq(items) => {
+                    visitor.visit_seq(serde::de::value::SeqDeserializer::new(items.into_iter()))
+                }
+            }
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+            map struct enum identifier ignored_any
+        }
+    }
+
+    fn deserialize_reference(fields: Vec<(&'static str, TestValue)>) -> Reference {
+        let map = fields
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<Vec<_>>();
+        let de =
+            serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(map.into_iter());
+        Reference::deserialize(de).expect("reference JSON must deserialize")
+    }
+
+    fn base_fields() -> Vec<(&'static str, TestValue)> {
+        vec![
+            ("host", TestValue::Str("github.com".to_string())),
+            ("path", TestValue::Str("anomalyco/opencode".to_string())),
+            (
+                "segments",
+                TestValue::Seq(vec![
+                    TestValue::Str("anomalyco".to_string()),
+                    TestValue::Str("opencode".to_string()),
+                ]),
+            ),
+            ("owner", TestValue::Str("anomalyco".to_string())),
+            ("repo", TestValue::Str("opencode".to_string())),
+            (
+                "remote",
+                TestValue::Str("https://github.com/anomalyco/opencode".to_string()),
+            ),
+            ("label", TestValue::Str("anomalyco/opencode".to_string())),
+        ]
+    }
+
+    #[test]
+    fn file_shaped_json_round_trips_as_file() {
+        let mut fields = base_fields();
+        fields.push(("protocol", TestValue::Str("file".to_string())));
+
+        match deserialize_reference(fields) {
+            Reference::File(file) => {
+                assert_eq!(file.protocol, "file");
+                assert_eq!(file.base.host, "github.com");
+                assert_eq!(file.base.path, "anomalyco/opencode");
+                assert_eq!(file.base.owner.as_deref(), Some("anomalyco"));
+            }
+            Reference::Remote(_) => {
+                panic!("File-shaped JSON must stay File after a serialization round-trip")
+            }
+        }
+    }
+
+    #[test]
+    fn remote_shaped_json_still_deserializes_as_remote() {
+        let mut fields = base_fields();
+        fields.push(("protocol", TestValue::Null));
+
+        match deserialize_reference(fields) {
+            Reference::Remote(remote) => {
+                assert_eq!(remote.protocol, None);
+                assert_eq!(remote.base.host, "github.com");
+                assert_eq!(remote.base.path, "anomalyco/opencode");
+                assert_eq!(remote.base.repo, "opencode");
+            }
+            Reference::File(_) => {
+                panic!("Remote-shaped JSON must still deserialize as Remote")
+            }
+        }
     }
 }

@@ -2782,7 +2782,11 @@ impl App {
                 }
 
                 self.set_session_status(&session.id, SessionStatus::Idle);
-                let _ = self.sync_session_from_server(&session.id);
+                // 同期に失敗すると楽観メッセージがサーバー応答へ置換されず残るため、
+                // execute_shell 失敗経路と同じく明示的に削除する。
+                if self.sync_session_from_server(&session.id).is_err() {
+                    self.remove_optimistic_message(&session.id, &opt_id);
+                }
             }
             Route::Session { session_id } => {
                 let opt_id = self.append_optimistic_user_message(
@@ -2802,7 +2806,11 @@ impl App {
                     return Ok(());
                 }
                 self.set_session_status(&session_id, SessionStatus::Idle);
-                let _ = self.sync_session_from_server(&session_id);
+                // 同期に失敗すると楽観メッセージがサーバー応答へ置換されず残るため、
+                // execute_shell 失敗経路と同じく明示的に削除する。
+                if self.sync_session_from_server(&session_id).is_err() {
+                    self.remove_optimistic_message(&session_id, &opt_id);
+                }
             }
             _ => {}
         }
@@ -5316,6 +5324,132 @@ mod tests {
         assert!(
             shell_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "the stub /shell endpoint must actually be reached (500 path)"
+        );
+    }
+
+    /// `create_session` と `/shell` は成功させるが、その後の同期
+    /// (`GET /session/{id}`) を失敗させるローカル HTTP スタブ。
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_shell_ok_sync_fail_api() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        let shell_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub_hits = Arc::clone(&shell_hits);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let (status, body) = if first_line.contains("POST /session ") {
+                    (
+                        "200 OK",
+                        r#"{"id":"ses_stub_1","slug":"s","project_id":"p","directory":"","parent_id":null,"title":"t","version":"1","time":{"created":0,"updated":0,"compacting":null,"archived":null},"revert":null}"#,
+                    )
+                } else if first_line.contains("/shell") {
+                    stub_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ("200 OK", r#"{}"#)
+                } else {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"type":"error","message":"sync failed"}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), shell_hits)
+    }
+
+    #[test]
+    fn home_shell_sync_failure_removes_optimistic_message() {
+        let (base_url, shell_hits) = spawn_shell_ok_sync_fail_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        context.navigate(Route::Home);
+
+        let mut app = headless_app(context.clone());
+        app.submit_shell_command("echo probe".to_string())
+            .expect("submit_shell_command must not fail hard");
+
+        let session_ctx = context.session.read();
+        let messages = session_ctx
+            .messages
+            .get("ses_stub_1")
+            .expect("promoted session messages");
+        assert!(
+            messages.iter().all(|m| !m.id.starts_with("local_user_")),
+            "optimistic user message must be removed when session sync fails"
+        );
+        assert!(
+            messages.iter().all(|m| m.content != "$ echo probe"),
+            "optimistic shell line must not remain after session sync failure"
+        );
+        assert!(
+            shell_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the stub /shell endpoint must actually be reached (success path)"
+        );
+    }
+
+    #[test]
+    fn session_shell_sync_failure_removes_optimistic_message() {
+        let (base_url, shell_hits) = spawn_shell_ok_sync_fail_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let session_id = context
+            .session
+            .write()
+            .create_session(Some("shell sync".to_string()));
+        context.navigate(Route::Session {
+            session_id: session_id.clone(),
+        });
+
+        let mut app = headless_app(context.clone());
+        app.submit_shell_command("echo probe".to_string())
+            .expect("submit_shell_command must not fail hard");
+
+        let session_ctx = context.session.read();
+        let messages = session_ctx
+            .messages
+            .get(&session_id)
+            .expect("existing session messages");
+        assert!(
+            messages.iter().all(|m| !m.id.starts_with("local_user_")),
+            "optimistic user message must be removed when session sync fails"
+        );
+        assert!(
+            messages.iter().all(|m| m.content != "$ echo probe"),
+            "optimistic shell line must not remain after session sync failure"
+        );
+        assert!(
+            shell_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the stub /shell endpoint must actually be reached (success path)"
         );
     }
 }
