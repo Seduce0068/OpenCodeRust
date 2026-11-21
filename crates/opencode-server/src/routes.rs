@@ -589,6 +589,14 @@ async fn delete_session(
     terminalize_queue_for_deleted_session(&state, &id).await;
     state.session_run_status.write().await.remove(&id);
     state.prompt_locks.write().await.remove(&id);
+    // sync は「追加・更新のみ」へ変更したため、削除は明示 API で反映する。
+    // 生エラー（id / パスを含み得る）は出さず、固定文言の構造化 warn のみ。
+    if let Err(_error) = state.delete_session_from_storage(&id).await {
+        tracing::warn!(
+            event = "session_storage_delete_failed",
+            "failed to delete session from storage after explicit deletion"
+        );
+    }
     persist_sessions_if_enabled(&state).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }

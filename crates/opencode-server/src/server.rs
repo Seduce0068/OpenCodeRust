@@ -870,6 +870,12 @@ impl ServerState {
         Ok(())
     }
 
+    /// 自インスタンスのスナップショットを永続ストレージへ「追加・更新のみ」反映する。
+    ///
+    /// STATE-05: 以前はスナップショットに無い永続セッションを stale と判定して
+    /// 物理削除していたが、複数 `ServerState` が同一 DB を指す構成では他
+    /// インスタンスが未ロードのセッションまで消していた。sync は削除を行わず、
+    /// 物理削除は明示的な `delete_session_from_storage` に委譲する。
     pub async fn sync_sessions_to_storage(&self) -> anyhow::Result<()> {
         let (Some(session_repo), Some(message_repo)) = (&self.session_repo, &self.message_repo)
         else {
@@ -880,16 +886,6 @@ impl ServerState {
             let manager = self.sessions.lock().await;
             manager.list().into_iter().cloned().collect()
         };
-
-        let snapshot_ids: HashSet<String> = snapshot.iter().map(|s| s.id.clone()).collect();
-        let persisted = session_repo.list(None, 100_000).await?;
-
-        for stale in persisted {
-            if !snapshot_ids.contains(&stale.id.0) {
-                message_repo.delete_for_session(&stale.id.0).await?;
-                session_repo.delete(&stale.id.0).await?;
-            }
-        }
 
         for session in snapshot {
             // serde_json 往復では usage / metadata / synthetic / ignored が落ち、
@@ -915,6 +911,52 @@ impl ServerState {
             message_repo
                 .replace_for_session(&stored_session.id.0, &messages)
                 .await?;
+        }
+
+        Ok(())
+    }
+
+    /// 明示的なセッション削除に伴う永続ストレージの物理削除。
+    ///
+    /// `sync_sessions_to_storage` は追加・更新のみを担当し、スナップショット外の
+    /// 行を削除しない（STATE-05）。`routes::delete_session` が
+    /// `SessionManager::delete` でセッション（子セッションを含む）を取り除いた
+    /// 直後に本メソッドを呼ぶことで、DB 上の行とメッセージも削除する。
+    ///
+    /// セッション id・パス・トークン値はログにもエラー本文にも含めない。
+    /// リポジトリが未設定の場合は何もせず成功扱いとする。
+    pub async fn delete_session_from_storage(&self, session_id: &str) -> anyhow::Result<()> {
+        let (Some(session_repo), Some(message_repo)) = (&self.session_repo, &self.message_repo)
+        else {
+            return Ok(());
+        };
+
+        // `SessionManager::delete` は子セッションを再帰的に削除するため、
+        // 永続ストレージ側も同じサブツリーを削除する。visited で循環を防ぐ。
+        let mut pending = vec![session_id.to_string()];
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            for child in session_repo
+                .list_children(&current)
+                .await
+                .map_err(|_| anyhow::anyhow!("failed to list stored child sessions"))?
+            {
+                let child_id = child.id.0;
+                if !visited.contains(&child_id) {
+                    pending.push(child_id);
+                }
+            }
+            message_repo
+                .delete_for_session(&current)
+                .await
+                .map_err(|_| anyhow::anyhow!("failed to delete stored session messages"))?;
+            session_repo
+                .delete(&current)
+                .await
+                .map_err(|_| anyhow::anyhow!("failed to delete stored session"))?;
         }
 
         Ok(())
@@ -1504,6 +1546,10 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
             return;
         }
     };
+    // STATE-01: グローバル PluginSystem は先勝ちセマンティクスを明示的に選択する。
+    // 同一プロセスで 2 番目の ServerState を作ると衝突は WARN へ昇格し、
+    // 有効な世代がログと戻り値から観測できる（値・パス・トークンは出さない）。
+    // 後勝ちへ切り替える意図がある場合は init_global_replace を使う。
     init_global(loader.hook_system());
 
     let directory = cwd.to_string_lossy().to_string();
@@ -2688,50 +2734,137 @@ mod tests {
         );
     }
 
+    /// STATE-05 回帰: sync は自スナップショット外の永続セッションを削除しない。
     #[tokio::test]
-    async fn sync_removes_deleted_sessions_from_storage() {
+    async fn sync_keeps_persistent_sessions_outside_snapshot() {
         let db = Database::in_memory()
             .await
             .expect("in-memory db should initialize");
         let pool = db.pool().clone();
         let session_repo = SessionRepository::new(pool.clone());
 
-        let state = state_with_repos(
+        let owner = state_with_repos(
             SessionRepository::new(pool.clone()),
-            MessageRepository::new(pool),
+            MessageRepository::new(pool.clone()),
         );
         let session_id = {
-            let mut manager = state.sessions.lock().await;
+            let mut manager = owner.sessions.lock().await;
             manager.create("default", ".").id
+        };
+
+        owner
+            .sync_sessions_to_storage()
+            .await
+            .expect("initial snapshot should sync");
+        assert!(session_repo
+            .get(&session_id)
+            .await
+            .expect("get should succeed")
+            .is_some());
+
+        // 同じ DB を指すが当該セッションを一切ロードしていない別インスタンス。
+        let other = state_with_repos(
+            SessionRepository::new(pool.clone()),
+            MessageRepository::new(pool.clone()),
+        );
+        other
+            .sync_sessions_to_storage()
+            .await
+            .expect("empty snapshot sync should succeed");
+        assert!(
+            session_repo
+                .get(&session_id)
+                .await
+                .expect("get should succeed")
+                .is_some(),
+            "他インスタンスの未ロードセッションを sync が削除してはならない"
+        );
+
+        // 自インスタンスで manager から削除しても、sync は削除しない。
+        {
+            let mut manager = owner.sessions.lock().await;
+            manager.delete(&session_id);
+        }
+        owner
+            .sync_sessions_to_storage()
+            .await
+            .expect("sync after in-memory delete should succeed");
+        assert!(session_repo
+            .get(&session_id)
+            .await
+            .expect("get should succeed")
+            .is_some());
+    }
+
+    /// STATE-05 回帰: 明示的な delete API は DB からもセッションを削除する。
+    #[tokio::test]
+    async fn explicit_delete_removes_persisted_session_tree() {
+        let db = Database::in_memory()
+            .await
+            .expect("in-memory db should initialize");
+        let pool = db.pool().clone();
+        let session_repo = SessionRepository::new(pool.clone());
+        let message_repo = MessageRepository::new(pool.clone());
+        let state = state_with_repos(
+            SessionRepository::new(pool.clone()),
+            MessageRepository::new(pool.clone()),
+        );
+
+        let (parent_id, child_id) = {
+            let mut manager = state.sessions.lock().await;
+            let parent_id = manager.create("default", ".").id;
+            let child_id = manager
+                .create_child(&parent_id)
+                .expect("child session should be created")
+                .id;
+            (parent_id, child_id)
         };
 
         state
             .sync_sessions_to_storage()
             .await
-            .expect("initial snapshot should sync");
-        assert_eq!(
-            session_repo
-                .list(None, 10)
-                .await
-                .expect("list should succeed")
-                .len(),
-            1
-        );
+            .expect("snapshot should sync");
+        assert!(session_repo
+            .get(&parent_id)
+            .await
+            .expect("get works")
+            .is_some());
+        assert!(session_repo
+            .get(&child_id)
+            .await
+            .expect("get works")
+            .is_some());
 
+        // 実 API と同じ順序: manager から削除してから明示的な永続削除を行う。
         {
             let mut manager = state.sessions.lock().await;
-            manager.delete(&session_id);
+            manager.delete(&parent_id);
         }
-
         state
-            .sync_sessions_to_storage()
+            .delete_session_from_storage(&parent_id)
             .await
-            .expect("delete sync should succeed");
+            .expect("explicit storage delete should succeed");
+
         assert!(session_repo
-            .get(&session_id)
+            .get(&parent_id)
             .await
-            .expect("get should succeed")
+            .expect("get works")
             .is_none());
+        assert!(session_repo
+            .get(&child_id)
+            .await
+            .expect("get works")
+            .is_none());
+        assert!(message_repo
+            .list_for_session(&parent_id)
+            .await
+            .expect("list works")
+            .is_empty());
+        assert!(message_repo
+            .list_for_session(&child_id)
+            .await
+            .expect("list works")
+            .is_empty());
     }
 
     fn question_defs() -> Vec<opencode_tool::QuestionDef> {
