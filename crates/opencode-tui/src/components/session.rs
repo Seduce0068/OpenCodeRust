@@ -594,6 +594,7 @@ impl SessionView {
                         &theme,
                         show_timestamps,
                         msg.agent.as_deref(),
+                        content_width,
                     );
                     append_message_lines(
                         &mut lines,
@@ -643,6 +644,7 @@ impl SessionView {
                             &msg.content,
                             &theme,
                             assistant_marker,
+                            content_width,
                         );
                         if semantic_hl {
                             text_lines =
@@ -678,6 +680,7 @@ impl SessionView {
                                         text,
                                         &theme,
                                         assistant_marker,
+                                        content_width,
                                     );
                                     if semantic_hl {
                                         text_lines = super::semantic_highlight::highlight_lines(
@@ -717,6 +720,7 @@ impl SessionView {
                                             &theme,
                                             collapsed,
                                             THINKING_PREVIEW_LINES,
+                                            content_width,
                                         );
                                         if !rendered.lines.is_empty() {
                                             let painted = paint_block_lines(
@@ -1230,6 +1234,9 @@ fn tint_sidebar_overlay(background: Color, accent: Color) -> Color {
     }
 }
 
+/// タブ幅。「タブ等の制御文字は既知幅へ展開する」要件に従い 4 セルで固定する。
+const TAB_WIDTH: usize = 4;
+
 fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
     if width == 0 {
         return vec![spans];
@@ -1240,28 +1247,55 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
 
     for span in spans {
         let style = span.style;
-        for ch in span.content.chars() {
-            if ch == '\n' {
+        for raw_ch in span.content.chars() {
+            if raw_ch == '\n' {
                 out.push(Vec::new());
                 current_width = 0;
                 continue;
             }
 
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if current_width + ch_width > width && !out.last().is_some_and(|line| line.is_empty()) {
-                out.push(Vec::new());
-                current_width = 0;
+            if raw_ch == '\t' {
+                // タブは 4 文字の空白として扱い、1 文字ずつ折り返し判定へ通す。
+                for _ in 0..TAB_WIDTH {
+                    current_width = push_wrapped_char(&mut out, current_width, ' ', width, style);
+                }
+                continue;
             }
 
-            push_merged_span(out.last_mut().expect("line exists"), ch, style);
-            current_width += ch_width;
+            // 幅が定義されない制御文字は 1 セルの空白へ展開し、過小/過大見積もりを防ぐ。
+            let ch = if UnicodeWidthChar::width(raw_ch).is_none() {
+                ' '
+            } else {
+                raw_ch
+            };
+            current_width = push_wrapped_char(&mut out, current_width, ch, width, style);
         }
     }
 
-    if out.is_empty() {
-        out.push(Vec::new());
-    }
     out
+}
+
+/// 1 文字を現在行へ追加する。現在行に収まらなければ新しい行へ送る。
+///
+/// 旧実装は「現在行が空なら改行しない」ため、幅 2 の文字を幅 1 の領域へ置くと
+/// 行幅が領域をはみ出していた。新実装では現在行に内容があれば必ず改行し、
+/// `width` 自体が文字幅未満の場合だけ「1 文字 1 行」を許容する。
+fn push_wrapped_char(
+    out: &mut Vec<Vec<Span<'static>>>,
+    current_width: usize,
+    ch: char,
+    width: usize,
+    style: Style,
+) -> usize {
+    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1);
+    // 幅 0 の結合文字は改行のトリガーにしない (直前の基底文字と同じ行に残す)。
+    if ch_width > 0 && current_width > 0 && current_width.saturating_add(ch_width) > width {
+        out.push(Vec::new());
+        push_merged_span(out.last_mut().expect("line exists"), ch, style);
+        return ch_width;
+    }
+    push_merged_span(out.last_mut().expect("line exists"), ch, style);
+    current_width.saturating_add(ch_width)
 }
 
 fn push_merged_span(line: &mut Vec<Span<'static>>, ch: char, style: Style) {
@@ -1527,6 +1561,41 @@ mod tests {
     fn wrap_spans_zero_width_is_unchanged() {
         let wrapped = wrap_spans(vec![Span::raw("abc")], 0);
         assert_eq!(joined(&wrapped), vec!["abc"]);
+    }
+
+    #[test]
+    fn wrap_spans_wide_char_gets_own_line_when_width_is_one() {
+        // 幅 1 の領域に全角 (表示幅 2) を置いても 1 文字 1 行になり、
+        // 空行を延々と作り続けたり同一行へ押し込めたりしないことを固定する。
+        let wrapped = wrap_spans(vec![Span::raw("あい")], 1);
+        assert_eq!(joined(&wrapped), vec!["あ", "い"]);
+        for line in &wrapped {
+            assert_eq!(line.len(), 1);
+            assert_eq!(UnicodeWidthStr::width(line[0].content.as_ref()), 2);
+        }
+    }
+
+    #[test]
+    fn wrap_spans_never_exceeds_width_with_cjk() {
+        let wrapped = wrap_spans(vec![Span::raw("ab漢字cd")], 4);
+        assert_eq!(joined(&wrapped), vec!["ab漢", "字cd"]);
+        for line in &wrapped {
+            let width: usize = line
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            assert!(width <= 4, "line width {width} must not exceed 4");
+        }
+    }
+
+    #[test]
+    fn wrap_spans_expands_tabs_to_known_width() {
+        let wrapped = wrap_spans(vec![Span::raw("a\tb")], 10);
+        assert_eq!(joined(&wrapped), vec!["a    b"]);
+
+        // 展開後の空白も折り返し対象なので、幅 2 なら 2 文字ずつの行に収まる。
+        let wrapped = wrap_spans(vec![Span::raw("\t")], 2);
+        assert_eq!(joined(&wrapped), vec!["  ", "  "]);
     }
 
     #[test]
