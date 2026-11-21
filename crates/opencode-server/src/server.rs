@@ -774,8 +774,8 @@ impl ServerState {
         let providers = convert_config_providers_for_bootstrap(config);
         bootstrap_config_from_raw(
             providers,
-            config.disabled_providers.clone(),
-            config.enabled_providers.clone(),
+            config.disabled_providers.as_slice().to_vec(),
+            config.enabled_providers.as_slice().to_vec(),
             config.model.clone(),
             config.small_model.clone(),
         )

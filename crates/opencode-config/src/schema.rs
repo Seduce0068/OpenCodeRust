@@ -192,11 +192,22 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autoupdate: Option<AutoUpdateMode>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_providers: Vec<String>,
+    // These two lists use replacement (not union) semantics on merge, but they
+    // still need a presence bit: an omitted key must leave the accumulated
+    // value intact, while an explicit empty array is a real value that clears
+    // lower-precedence layers. `ExplicitStringList` keeps both cases distinct
+    // and stays serde-compatible with the original `Vec<String>` JSON shape.
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub disabled_providers: ExplicitStringList,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub enabled_providers: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub enabled_providers: ExplicitStringList,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -2017,6 +2028,20 @@ fn merge_explicit_string_list(target: &mut ExplicitStringList, source: ExplicitS
     target.explicitly_set = true;
 }
 
+/// Merge a config layer's string list using replacement semantics.
+///
+/// Unlike [`merge_explicit_string_list`], the provider lists are defined by the
+/// upstream schema as a replacement rather than a union: a higher-precedence
+/// non-empty array replaces the accumulated value wholesale (see the existing
+/// `provider_lists_follow_replace_semantics_instead_of_union` test). Presence
+/// tracking is still required so that an omitted key leaves the accumulated
+/// value untouched while an explicit empty array clears it.
+fn merge_explicit_string_list_replace(target: &mut ExplicitStringList, source: ExplicitStringList) {
+    if source.is_explicit() {
+        *target = source;
+    }
+}
+
 impl DeepMerge for KeybindsConfig {
     fn deep_merge(&mut self, other: Self) {
         merge_option_replace(&mut self.leader, other.leader);
@@ -2527,12 +2552,8 @@ impl Config {
         merge_explicit_string_list(&mut self.plugin, other.plugin);
         merge_explicit_string_list(&mut self.instructions, other.instructions);
 
-        if !other.disabled_providers.is_empty() {
-            self.disabled_providers = other.disabled_providers;
-        }
-        if !other.enabled_providers.is_empty() {
-            self.enabled_providers = other.enabled_providers;
-        }
+        merge_explicit_string_list_replace(&mut self.disabled_providers, other.disabled_providers);
+        merge_explicit_string_list_replace(&mut self.enabled_providers, other.enabled_providers);
     }
 }
 
@@ -2779,13 +2800,13 @@ mod tests {
     #[test]
     fn provider_lists_follow_replace_semantics_instead_of_union() {
         let mut base = Config {
-            disabled_providers: vec!["anthropic".to_string()],
-            enabled_providers: vec!["openai".to_string()],
+            disabled_providers: vec!["anthropic".to_string()].into(),
+            enabled_providers: vec!["openai".to_string()].into(),
             ..Default::default()
         };
 
         let overlay = Config {
-            disabled_providers: vec!["google".to_string()],
+            disabled_providers: vec!["google".to_string()].into(),
             ..Default::default()
         };
 
@@ -2793,6 +2814,70 @@ mod tests {
 
         assert_eq!(base.disabled_providers, vec!["google".to_string()]);
         assert_eq!(base.enabled_providers, vec!["openai".to_string()]);
+    }
+
+    #[test]
+    fn explicit_empty_provider_lists_clear_accumulated_values() {
+        let mut base = Config {
+            disabled_providers: vec!["anthropic".to_string()].into(),
+            enabled_providers: vec!["openai".to_string()].into(),
+            ..Default::default()
+        };
+
+        let clear: Config =
+            serde_json::from_str(r#"{"disabled_providers": [], "enabled_providers": []}"#).unwrap();
+        assert!(clear.disabled_providers.is_explicit());
+        assert!(clear.enabled_providers.is_explicit());
+
+        base.merge(clear);
+
+        assert!(
+            base.disabled_providers.is_empty(),
+            "disabled_providers: [] must clear lower-precedence values"
+        );
+        assert!(
+            base.enabled_providers.is_empty(),
+            "enabled_providers: [] must clear lower-precedence values"
+        );
+    }
+
+    #[test]
+    fn omitted_provider_lists_keep_accumulated_values() {
+        let mut base = Config {
+            disabled_providers: vec!["anthropic".to_string()].into(),
+            enabled_providers: vec!["openai".to_string()].into(),
+            ..Default::default()
+        };
+
+        let theme_only: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        assert!(!theme_only.disabled_providers.is_explicit());
+        assert!(!theme_only.enabled_providers.is_explicit());
+
+        base.merge(theme_only);
+
+        assert_eq!(base.disabled_providers, vec!["anthropic".to_string()]);
+        assert_eq!(base.enabled_providers, vec!["openai".to_string()]);
+    }
+
+    #[test]
+    fn provider_lists_accept_json_arrays_and_preserve_explicit_empty() {
+        let parsed: Config = serde_json::from_str(
+            r#"{"disabled_providers": ["anthropic", "google"], "enabled_providers": []}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.disabled_providers,
+            vec!["anthropic".to_string(), "google".to_string()]
+        );
+        assert!(parsed.enabled_providers.is_explicit());
+        assert!(parsed.enabled_providers.is_empty());
+
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            json.get("disabled_providers"),
+            Some(&serde_json::json!(["anthropic", "google"]))
+        );
+        assert_eq!(json.get("enabled_providers"), Some(&serde_json::json!([])));
     }
 
     #[test]

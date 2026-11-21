@@ -2999,8 +2999,8 @@ async fn setup_providers(config: &opencode_config::Config) -> anyhow::Result<Pro
     let bootstrap_providers = convert_config_providers(config);
     let bootstrap_config = bootstrap_config_from_raw(
         bootstrap_providers,
-        config.disabled_providers.clone(),
-        config.enabled_providers.clone(),
+        config.disabled_providers.as_slice().to_vec(),
+        config.enabled_providers.as_slice().to_vec(),
         config.model.clone(),
         config.small_model.clone(),
     );
