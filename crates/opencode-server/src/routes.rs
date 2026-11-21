@@ -2991,7 +2991,7 @@ async fn update_session(
 async fn get_message(
     State(state): State<Arc<ServerState>>,
     Path((session_id, msg_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Json<MessageInfo>> {
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&session_id)
@@ -3000,16 +3000,12 @@ async fn get_message(
         .get_message(&msg_id)
         .ok_or_else(|| ApiError::NotFound(format!("Message not found: {}", msg_id)))?;
 
-    let info = serde_json::json!({
-        "id": message.id,
-        "sessionID": session_id,
-        "role": message_role_name(&message.role),
-        "createdAt": message.created_at.timestamp_millis(),
-    });
-    Ok(Json(serde_json::json!({
-        "info": info,
-        "parts": message.parts.clone(),
-    })))
+    // list_messages と同じ message_to_info()/part_to_info() を経由させ、
+    // wire スキーマ（snake_case キー + 正規化済み parts）を統一する。
+    // 旧来の手組み `{"info": {"sessionID", "createdAt", ...}, "parts": raw}` は
+    // TUI の MessageInfo（sessionID/createdAt に alias なし）で受け取れなかった。
+    // ログやエラーにトークン値・パスを出力する処理は追加しない。
+    Ok(Json(message_to_info(&session_id, message)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7914,6 +7910,92 @@ mod message_info_wire_format_tests {
         // synthetic は skip_serializing_if、ignored は Some のまま出力される。
         assert!(first.get("synthetic").is_none());
         assert_eq!(first.get("ignored"), Some(&json!(true)));
+    }
+}
+
+#[cfg(test)]
+mod get_message_wire_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 1 件の user メッセージ（text part を 1 つ持つ）を持つセッションを用意する。
+    async fn state_with_one_message() -> (Arc<ServerState>, String, String) {
+        let state = Arc::new(ServerState::new());
+        let (session_id, msg_id) = {
+            let mut sessions = state.sessions.lock().await;
+            let session_id = sessions.create("default", ".").id;
+            let session = sessions
+                .get_mut(&session_id)
+                .expect("created session should be available for mutation");
+            let msg_id = session.add_user_message("hello").id.clone();
+            (session_id, msg_id)
+        };
+        (state, session_id, msg_id)
+    }
+
+    /// R2/API-09: 単一取得と一覧取得で wire スキーマが同一であることを検証する回帰テスト。
+    #[tokio::test]
+    async fn get_message_matches_list_messages_wire_schema() {
+        let (state, session_id, msg_id) = state_with_one_message().await;
+
+        let single = get_message(
+            State(state.clone()),
+            Path((session_id.clone(), msg_id.clone())),
+        )
+        .await
+        .expect("get_message should succeed for an existing message");
+
+        let list = list_messages(
+            State(state.clone()),
+            Path(session_id.clone()),
+            Query(ListMessagesQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list_messages should succeed for an existing session");
+
+        let single_value = serde_json::to_value(single.0).expect("MessageInfo should serialize");
+        let list_value = serde_json::to_value(list.0).expect("Vec<MessageInfo> should serialize");
+        let list = list_value
+            .as_array()
+            .expect("list_messages payload should be an array");
+
+        // get_message のペイロードは list_messages の要素と完全に同一構造。
+        assert_eq!(list.len(), 1);
+        assert_eq!(&single_value, &list[0]);
+
+        // snake_case キーであり、旧 camelCase / 旧外包 {"info", "parts"} が残らない。
+        assert_eq!(single_value.get("id"), Some(&json!(msg_id)));
+        assert_eq!(single_value.get("session_id"), Some(&json!(session_id)));
+        assert_eq!(single_value.get("role"), Some(&json!("user")));
+        assert!(single_value.get("sessionID").is_none());
+        assert!(single_value.get("createdAt").is_none());
+        assert!(single_value.get("info").is_none());
+
+        // parts は PartInfo に正規化され、type/text 等の snake_case キーで出力される。
+        let parts = single_value
+            .get("parts")
+            .and_then(|parts| parts.as_array())
+            .expect("parts should be an array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].get("type"), Some(&json!("text")));
+        assert_eq!(parts[0].get("text"), Some(&json!("hello")));
+        assert!(parts[0].get("part_type").is_none());
+        assert!(parts[0].get("partType").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_message_not_found_keeps_existing_error_contract() {
+        // 存在しない ID は 404 NotFound（既存契約を維持）。
+        // トークン値やパスをログ・エラーへ出力する処理はハンドラに追加していない。
+        let (state, session_id, _msg_id) = state_with_one_message().await;
+        let error = get_message(State(state), Path((session_id, "msg_missing".to_string())))
+            .await
+            .expect_err("unknown message id must be rejected");
+        assert!(matches!(&error, ApiError::NotFound(_)));
+        assert_eq!(error.into_response().status(), StatusCode::NOT_FOUND);
     }
 }
 

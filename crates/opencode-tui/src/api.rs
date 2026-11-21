@@ -1733,10 +1733,9 @@ mod tests {
         // `MessageInfo` を serde 既定の snake_case キーで直列化した配列を返す。
         // 具体的には `session_id` / `created_at` / `completed_at` と、トークンの
         // `cache_read` / `cache_write` 等がそのまま wire キーになる。
-        // なお同一 routes.rs の `get_message` が返す
-        // `{"info": {"sessionID", "createdAt", ...}, "parts": [...]}` は手組みの
-        // 別契約で、この `MessageInfo` のデシリアライズ対象外（`createdAt` の
-        // alias も持たない）。
+        // 同一 routes.rs の `get_message` も `message_to_info` 経由で同じ
+        // snake_case `MessageInfo` を返す（旧 `{"info","parts"}` 外包形状は廃止済み）。
+        // そのため単一取得・一覧取得のどちらもこの型でデシリアライズできる。
         let messages: Vec<MessageInfo> = serde_json::from_value(json!([
             {
                 "id": "msg-list-1",
