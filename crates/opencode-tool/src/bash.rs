@@ -1198,21 +1198,38 @@ mod tests {
         .expect("descendant heartbeat must start");
 
         kill_process_tree(pid).await;
-        let bytes_before = tokio::fs::read_to_string(&heartbeat)
-            .await
-            .unwrap_or_default()
-            .len();
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let bytes_after = tokio::fs::read_to_string(&heartbeat)
-            .await
-            .unwrap_or_default()
-            .len();
+
+        // 固定 sleep に依存せず、心拍ファイルのサイズが変化しなくなるまで
+        // （＝子孫が書込を止めたまで）期限付きで継続観測する。サイズが動いた
+        // ら安定化タイマーをリセットするため、kill 直後の in-flight な書込は
+        // 許容しつつ、書込が続く場合は deadline で確実に失敗させられる。
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut last = tokio::fs::metadata(&heartbeat)
+                .await
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let mut stable_since = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let current = tokio::fs::metadata(&heartbeat)
+                    .await
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                if current != last {
+                    last = current;
+                    stable_since = tokio::time::Instant::now();
+                } else if stable_since.elapsed() >= Duration::from_millis(500) {
+                    break current;
+                }
+            }
+        })
+        .await;
 
         let _ = child.kill().await;
         let _ = child.wait().await;
 
-        assert_eq!(
-            bytes_after, bytes_before,
+        assert!(
+            settled.is_ok(),
             "descendant survived the process-group kill and kept writing"
         );
     }

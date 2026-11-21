@@ -26,6 +26,8 @@ const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
 const MAX_HEADER_LINES: usize = 64;
 /// 1 ヘッダ行の最大長（改行を除く）。値はエラー本文に含めない。
 const MAX_HEADER_LINE_BYTES: usize = 8192;
+/// auth.fetch.stream のチャンクキュー容量（本番と回帰テストで共有）。
+const STREAM_CHUNK_BUFFER: usize = 128;
 /// ストリーム全体の上限は RPC タイムアウトのこの倍数（最大 30 分）。
 const STREAM_TOTAL_TIMEOUT_FACTOR: u32 = 30;
 const STREAM_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -404,7 +406,7 @@ impl PluginSubprocess {
             .await?;
 
         let (start_tx, start_rx) = oneshot::channel::<StreamStart>();
-        let (chunk_tx, chunk_rx) = mpsc::channel(128);
+        let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHUNK_BUFFER);
         let stdout = Arc::clone(&self.stdout);
         let idle_timeout = self.timeout;
         let total_timeout = self
@@ -877,20 +879,37 @@ mod tests {
             .expect("start frame should arrive");
         let mut chunks = stream.chunks;
 
-        // Let the reader hit the 128-item buffer limit before draining.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut saw_overflow = false;
-        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), chunks.recv()).await
-        {
-            match item {
-                Ok(_) => {}
-                Err(PluginSubprocessError::Protocol(message)) if message.contains("overflow") => {
-                    saw_overflow = true;
-                    break;
-                }
-                Err(err) => panic!("unexpected stream error: {err}"),
+        // Synchronize on the channel itself instead of a fixed sleep: the
+        // bounded buffer holds 128 items, so `len() >= 128` is an explicit
+        // signal that the reader has already pushed 128 chunks and is at the
+        // overflow point. Draining only after that keeps the terminal error
+        // deliverable within its grace window regardless of scheduling delay.
+        let drain = async {
+            while chunks.len() < STREAM_CHUNK_BUFFER {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        }
+            let mut saw_overflow = false;
+            while let Some(item) = chunks.recv().await {
+                match item {
+                    Ok(_) => {}
+                    Err(PluginSubprocessError::Protocol(message))
+                        if message.contains("overflow") =>
+                    {
+                        saw_overflow = true;
+                        break;
+                    }
+                    // Do not format the error text: protocol messages originate
+                    // from the plugin and may carry sensitive values.
+                    Err(_) => panic!("unexpected stream error before overflow"),
+                }
+            }
+            saw_overflow
+        };
+        // One deadline covers the whole sync + drain phase, so a slow CI worker
+        // can no longer trip a per-receive timeout midway through 128+ chunks.
+        let saw_overflow = tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("chunk overflow must be observed before the deadline");
         assert!(saw_overflow, "chunk overflow must terminate with an error");
 
         let acquired = tokio::time::timeout(Duration::from_secs(1), sub.rpc_lock.lock()).await;
