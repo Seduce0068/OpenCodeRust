@@ -3518,11 +3518,8 @@ mod tests {
         let (status, _, body) = http_exchange(addr, request).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let parsed = parse_json_body(&body);
-        assert_eq!(parsed["error"]["type"], "unauthorized");
-        assert_eq!(
-            parsed["error"]["message"],
-            "Invalid or missing authentication token"
-        );
+        assert_eq!(parsed["error"], "unauthorized");
+        assert_eq!(parsed["message"], "Invalid or missing authentication token");
         assert_eq!(
             parsed["message"], "Invalid or missing authentication token",
             "legacy top-level message must remain for existing clients"
@@ -3888,26 +3885,65 @@ mod tests {
         );
     }
 
+    /// NOTE: 本番の HTTP 401/429 自動ローテーションはまだ配線されていない。
+    /// `rotate_provider_key` は API としてのみ提供され、routes.rs / opencode-provider
+    /// 側の自動発火配線は今回の scope 外（上記の NOTE を維持）。
+    ///
+    /// ソース文字列のシグネチャ検査をやめ、純粋関数 `rotation_reason_for_status`
+    /// の実際の返り値を観測して次を固定する:
+    ///  (a) 401/429 のみで発火すること
+    ///  (b) 返る理由がキー値・応答本文を保持し得ない診断ラベルであること
     #[test]
-    fn rotation_helper_accepts_no_key_or_response_body() {
-        // 秘密情報がヘルパへ入らないことをシグネチャ面でも固定する。
-        let source = include_str!("server.rs");
-        let start = source
-            .find("pub async fn rotate_provider_key(")
-            .expect("helper must exist");
-        let end = source[start..]
-            .find(") -> Option<ProviderRegistry>")
-            .expect("helper signature");
-        let signature = &source[start..start + end];
-        assert!(signature.contains("provider_id: &str"));
-        assert!(signature.contains("status: StatusCode"));
-        assert!(
-            !signature.contains("body"),
-            "response body must not be passed in"
+    fn rotation_reason_fires_only_on_401_429_and_carries_no_key_value() {
+        // 401 / 429 はそれぞれ対応する理由を返す。
+        assert_eq!(
+            ServerState::rotation_reason_for_status(StatusCode::UNAUTHORIZED),
+            Some(RotationReason::Unauthorized)
         );
+        assert_eq!(
+            ServerState::rotation_reason_for_status(StatusCode::TOO_MANY_REQUESTS),
+            Some(RotationReason::RateLimited)
+        );
+
+        // 境界を含む 401/429 以外は一切発火しない。
+        for status in [
+            StatusCode::CONTINUE,
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                ServerState::rotation_reason_for_status(status),
+                None,
+                "non 401/429 status must not trigger rotation: {status}"
+            );
+        }
+
+        // 返る理由はフィールドを持たない診断用 enum のみ。Debug 表現が固定ラベル
+        // であり、ダミーのキー値やトークン/シークレット文言を含まないことを確認する。
+        let dummy_key = "test-primary-key";
+        for (status, expected_label) in [
+            (StatusCode::UNAUTHORIZED, "Unauthorized"),
+            (StatusCode::TOO_MANY_REQUESTS, "RateLimited"),
+        ] {
+            let reason = ServerState::rotation_reason_for_status(status)
+                .expect("401/429 must produce a reason");
+            let rendered = format!("{reason:?}");
+            assert_eq!(rendered, expected_label);
+            let lowered = rendered.to_ascii_lowercase();
+            assert!(!rendered.contains(dummy_key));
+            assert!(!lowered.contains("key"));
+            assert!(!lowered.contains("token"));
+            assert!(!lowered.contains("secret"));
+        }
         assert!(
-            !signature.contains("key:"),
-            "key value must not be passed in"
+            std::mem::size_of::<RotationReason>() <= 8,
+            "RotationReason must remain a fieldless diagnostics label, not a key container"
         );
     }
 

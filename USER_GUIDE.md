@@ -61,7 +61,7 @@ Run these from the **OpenCodeRust repo root**; use
 `./target/debug/opencoderust` or `cargo run -p opencode-cli --`.
 
 To check the version, use the `version` subcommand:
-`./target/release/opencoderust version` prints `OpenCode 0.1.0`.
+`./target/debug/opencoderust version` prints `OpenCode 0.1.0`.
 There is no `--version` flag.
 
 ### 2.1 Session management
@@ -77,9 +77,12 @@ There is no `--version` flag.
 
 ```bash
 ./target/debug/opencoderust models
-./target/debug/opencoderust models --refresh --verbose
 ./target/debug/opencoderust config
+./target/debug/opencoderust debug config
 ```
+
+Model availability depends on API key environment variables. Use
+`auth list` to see which provider variables are set.
 
 ### 2.3 Auth management
 
@@ -90,8 +93,14 @@ There is no `--version` flag.
 ```
 
 Note: For `auth login` / `auth logout` options, use the `--help` output.
+`auth login` sets the credential for the current process only; it is not
+persistent. To persist it, export the provider's API key environment
+variable in your shell profile (for example `export ANTHROPIC_API_KEY=...`).
 
 ### 2.4 MCP management
+
+MCP commands are HTTP clients: a `serve` process must already be running.
+The default address is `http://127.0.0.1:3000`.
 
 ```bash
 ./target/debug/opencoderust mcp list
@@ -113,10 +122,10 @@ If the local server is not at the default address:
 ./target/debug/opencoderust debug paths
 ./target/debug/opencoderust debug config
 ./target/debug/opencoderust debug skill
-./target/debug/opencoderust debug agent
+./target/debug/opencoderust debug agent <NAME>
 ```
 
-## 3. TUI and Run common options
+## 3. TUI and run options
 
 Show full options:
 
@@ -125,7 +134,7 @@ Show full options:
 ./target/debug/opencoderust run --help
 ```
 
-Frequently used (both TUI and run):
+### 3.1 TUI options
 
 - `-m, --model <MODEL>` – Set model
 - `-c, --continue` – Continue latest session
@@ -134,8 +143,16 @@ Frequently used (both TUI and run):
 - `--agent <AGENT>` – Set agent (default: `build`)
 - `--port <PORT>` / `--hostname <HOSTNAME>` – Server address
 
-Additional common options for `run`:
+### 3.2 Run options
 
+- `-m, --model <MODEL>` – Set model
+- `--agent <AGENT>` – Set agent (default: `build`)
+- `--attach <URL>` – Attach to a running server
+- `--port <PORT>` – Server port (`run` has no `--hostname`)
+- `-c, --continue` – Continue latest session; requires `--attach <URL>`
+- `-s, --session <SESSION>` – Continue specific session; requires
+  `--attach <URL>`
+- `--fork` – Fork session; requires `--attach <URL>`
 - `--format default|json`
 - `-f, --file <FILE>`
 - `--thinking`
@@ -192,10 +209,13 @@ Do not commit real API keys; use env vars or a local config that’s in `.gitign
 
 ```bash
 ./target/debug/opencoderust auth list
-./target/debug/opencoderust models --refresh
+./target/debug/opencoderust debug config
+./target/debug/opencoderust models
 ```
 
-You should see `anthropic` and Claude models in the list.
+`auth list` reports whether the API key environment variable (for example
+`ANTHROPIC_API_KEY`) is set. `debug config` shows the final merged config.
+You should see `anthropic` and Claude models in the `models` list.
 
 ### 5.3 Run a coding session
 
@@ -258,9 +278,12 @@ Use `./target/debug/opencoderust models` to see the full list for your setup.
 
 ### 7.2 Model not available
 
-1. `./target/debug/opencoderust auth list`
-2. `./target/debug/opencoderust models --refresh`
-3. `./target/debug/opencoderust config` to check that provider config is applied
+1. `./target/debug/opencoderust auth list` – confirm the provider's API key
+   environment variable is set.
+2. `./target/debug/opencoderust debug config` – inspect the merged config
+   and confirm the provider is applied.
+3. `./target/debug/opencoderust models` – list models for the current
+   environment.
 
 ### 7.3 Config issues
 
@@ -268,6 +291,8 @@ Use `./target/debug/opencoderust models` to see the full list for your setup.
 2. `./target/debug/opencoderust debug config` – see final merged config
 
 ### 7.4 MCP connection problems
+
+A running `serve` process is required; these commands call its HTTP API.
 
 1. `./target/debug/opencoderust mcp list`
 2. `./target/debug/opencoderust mcp debug <NAME>`
