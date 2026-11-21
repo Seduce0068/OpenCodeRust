@@ -247,8 +247,6 @@ status: current
 
 - [ ] **wellknown auth の環境変数ブロックリストが限定的**
   — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
-- [ ] **get_model_id の unwrap_or_default が空 model id を生成**
-  — `agent/executor.rs:321-328` / ERR2-05 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -287,6 +285,8 @@ status: current
 
 ## 完了
 
+- [x] **[空モデル ID 1 件]** type 付きエラー化と明示指定も検査
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider リスト 1 件]** 明示的空配列によるクリア
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[error retryable/SSE 2 件]** type フォールバックと失敗伝播
@@ -686,6 +686,11 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（空モデル ID の修正時、記録のみ）: 回帰テストが
+  get_model_id 単体で、? 伝播の統合経路（execute/streaming）は未検証。
+
+  StreamEvent::Error の生文字列が CLI stderr へ出る既存経路も本次差分外。
+  親が明示指定の空 model_id も InvalidResponse にする medium を修正。
 - 2026-11-22 R4 残存（provider リストの修正時、記録のみ）: ExplicitStringList の
   DerefMut が presence bit を迂回し得るが、現状の呼び出し箇所（as_slice().to_vec()
   / into() / merge）では発生していない。公開 API 契約としての明記は今後の課題。
