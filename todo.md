@@ -247,8 +247,6 @@ status: current
   — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
-- [ ] **ビルトイン auth プラグインのロード失敗を warn のみで起動継続**
-  — `server.rs:1512-1521` / ERRPATH-08 / 中（設計判断）
 - [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
   — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
 - [ ] **client_ip が X-Forwarded-For を尊重しない** — `server.rs:1803-1812` / OBS-10
@@ -263,6 +261,8 @@ status: current
 
 ## 完了
 
+- [x] **[ビルトイン auth fail-closed 1 件]** load_all の Err 伝播と redact
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[rotate_key 永続化 1 件]** persist-before-commit とロールバック
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定検証コマンド 1 件]** `config --check` 追加
@@ -634,6 +634,11 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（ビルトイン auth fail-closed の修正時、記録のみ）:
+  fail-closed の実起動経路（new_with_storage_for_url）を通る統合テストが無く、
+  ヘルパーのみの検証。CLI 経路は warn + 継続のまま（担当外・server と不一致）。
+  PluginLoader::new() 失敗も warn + 継続。init_global が失敗ローダーを先に
+  登録する点は前回の世代管理で可視化済み。親が clippy write_with_newline を修正。
 - 2026-11-21 R4 残存（config --check の修正時、記録のみ）: 回帰テストが
   clap 解析と中核関数のみで main のディスパッチ分岐を通っていない。
   親が cwd 取得失敗を「設定不正」と別の固定文へ区別するよう修正。
