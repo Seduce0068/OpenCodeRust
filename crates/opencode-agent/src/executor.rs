@@ -165,7 +165,7 @@ impl AgentExecutor {
             steps += 1;
 
             let provider = self.get_provider()?;
-            let model_id = self.get_model_id(&provider);
+            let model_id = self.get_model_id(&provider)?;
 
             // Plugin hook: chat.system.transform — let plugins modify system prompt per step
             opencode_plugin::trigger(
@@ -241,7 +241,7 @@ impl AgentExecutor {
             steps += 1;
 
             let provider = self.get_provider()?;
-            let model_id = self.get_model_id(&provider);
+            let model_id = self.get_model_id(&provider)?;
             let request = ChatRequest::new(model_id, self.conversation.to_provider_messages());
 
             let stream = provider
@@ -293,7 +293,7 @@ impl AgentExecutor {
         self.conversation.add_user_message(user_message);
 
         let provider = self.get_provider()?;
-        let model_id = self.get_model_id(&provider);
+        let model_id = self.get_model_id(&provider)?;
         let request = ChatRequest::new(model_id, self.conversation.to_provider_messages());
 
         let stream = provider
@@ -318,13 +318,26 @@ impl AgentExecutor {
         }
     }
 
-    fn get_model_id(&self, provider: &Arc<dyn Provider>) -> String {
+    /// モデル ID を解決する。
+    ///
+    /// モデルが明示指定されていない場合にプロバイダのモデル一覧が空だと、
+    /// 空文字を `ChatRequest` へ渡して原因不明のプロバイダエラーに化けるため、
+    /// 固定文言の `InvalidResponse` として早期に失敗させる。エラー文言には
+    /// モデル一覧・プロバイダ ID・トークン値を含めない。
+    fn get_model_id(&self, provider: &Arc<dyn Provider>) -> Result<String, AgentError> {
         if let Some(ref model_ref) = self.agent.model {
-            model_ref.model_id.clone()
-        } else {
-            let models = provider.models();
-            models.first().map(|m| m.id.clone()).unwrap_or_default()
+            // 明示指定でも空 ID は同じ失敗モードへ落ちないよう検査する（R4）。
+            return if model_ref.model_id.trim().is_empty() {
+                Err(AgentError::InvalidResponse)
+            } else {
+                Ok(model_ref.model_id.clone())
+            };
         }
+        provider
+            .models()
+            .first()
+            .map(|m| m.id.clone())
+            .ok_or(AgentError::InvalidResponse)
     }
 
     /// 引数 JSON のパース失敗を表す `ToolError` を生成する。
@@ -605,7 +618,7 @@ impl AgentExecutor {
         }
 
         let provider = self.get_provider().ok()?;
-        let model_id = self.get_model_id(&provider);
+        let model_id = self.get_model_id(&provider).ok()?;
         if model_id.is_empty() {
             return None;
         }
@@ -722,6 +735,7 @@ fn permission_target_from_args(tool_name: &str, args: &serde_json::Value) -> Str
 mod tests {
     use super::*;
     use opencode_permission::{PermissionAction, PermissionRule};
+    use opencode_provider::{ChatResponse, ModelInfo, StreamResult};
 
     fn build_executor(agent: AgentInfo) -> AgentExecutor {
         AgentExecutor::new(
@@ -729,6 +743,158 @@ mod tests {
             Arc::new(ProviderRegistry::new()),
             Arc::new(ToolRegistry::new()),
         )
+    }
+
+    /// `models()` を制御できるだけの最小 Provider スタブ。
+    /// `chat` / `chat_stream` はテストでは呼ばれず、固定文言のエラーを返す。
+    /// トークン値やファイルパスを一切保持しない。
+    struct StubProvider {
+        models: Vec<ModelInfo>,
+    }
+
+    // トレイトは `#[async_trait]` で宣言されているが、本クレートは
+    // `async-trait` を直接依存に持たないため、展開後のシグネチャを直接実装する。
+    #[allow(clippy::type_complexity)]
+    impl Provider for StubProvider {
+        fn id(&self) -> &str {
+            "stub"
+        }
+
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            self.models.clone()
+        }
+
+        fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+            self.models.iter().find(|model| model.id == id)
+        }
+
+        fn chat<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ChatResponse, ProviderError>>
+                    + std::marker::Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                Err(ProviderError::ApiError(
+                    "stub provider does not implement chat".to_string(),
+                ))
+            })
+        }
+
+        fn chat_stream<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<StreamResult, ProviderError>>
+                    + std::marker::Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                let stream: std::pin::Pin<
+                    Box<dyn futures::Stream<Item = Result<StreamEvent, ProviderError>> + Send>,
+                > = Box::pin(futures::stream::empty());
+                Ok(stream)
+            })
+        }
+    }
+
+    fn stub_provider(models: Vec<ModelInfo>) -> Arc<dyn Provider> {
+        Arc::new(StubProvider { models })
+    }
+
+    fn stub_model(id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            name: "stub model".to_string(),
+            provider: "stub".to_string(),
+            context_window: 1,
+            max_output_tokens: 1,
+            supports_vision: false,
+            supports_tools: false,
+            cost_per_million_input: 0.0,
+            cost_per_million_output: 0.0,
+        }
+    }
+
+    /// 回帰ガード: モデル未指定かつモデル一覧が空なら、空文字を
+    /// `ChatRequest` へ渡さず `InvalidResponse` で即座に失敗すること。
+    #[test]
+    fn get_model_id_errors_when_model_list_is_empty() {
+        let executor = build_executor(AgentInfo::general());
+        let provider = stub_provider(Vec::new());
+
+        let error = executor
+            .get_model_id(&provider)
+            .expect_err("empty model list must produce an explicit error");
+        assert!(matches!(error, AgentError::InvalidResponse));
+
+        // 固定文言のみ。モデル一覧・プロバイダ ID・トークン値は漏えいしない。
+        assert_eq!(error.to_string(), "Invalid response");
+    }
+
+    /// モデルが明示指定されていれば、モデル一覧が空でも従来どおり
+    /// 指定された ID が使われること。
+    #[test]
+    fn get_model_id_keeps_explicitly_configured_model() {
+        let executor = build_executor(AgentInfo::general().with_model("chosen-model", "stub"));
+        let provider = stub_provider(Vec::new());
+
+        assert_eq!(
+            executor
+                .get_model_id(&provider)
+                .expect("explicit model must resolve"),
+            "chosen-model"
+        );
+    }
+
+    /// 既存契約の維持: モデル一覧が空なら `current_model_string` は
+    /// `Result` を `Option` に変換して `None` を返すこと。
+    #[test]
+    fn current_model_string_returns_none_for_empty_model_list() {
+        let mut registry = ProviderRegistry::new();
+        registry.register_arc(stub_provider(Vec::new()));
+        let executor = AgentExecutor::new(
+            AgentInfo::general(),
+            Arc::new(registry),
+            Arc::new(ToolRegistry::new()),
+        );
+
+        assert_eq!(executor.current_model_string(), None);
+    }
+
+    /// モデル一覧が空でなければ先頭モデル ID が従来どおり使われること。
+    #[test]
+    fn current_model_string_uses_first_model_when_unspecified() {
+        let mut registry = ProviderRegistry::new();
+        registry.register_arc(stub_provider(vec![stub_model("first-model")]));
+        let executor = AgentExecutor::new(
+            AgentInfo::general(),
+            Arc::new(registry),
+            Arc::new(ToolRegistry::new()),
+        );
+
+        assert_eq!(
+            executor.current_model_string().as_deref(),
+            Some("stub:first-model")
+        );
     }
 
     #[tokio::test]
