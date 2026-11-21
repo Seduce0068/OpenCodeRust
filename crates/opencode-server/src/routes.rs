@@ -2037,6 +2037,13 @@ struct PromptTaskCleanup {
 impl Drop for PromptTaskCleanup {
     fn drop(&mut self) {
         self.state.clear_prompt_task(&self.session_id, self.task_id);
+        // graceful shutdown 中は再スケジュールしない（二重実行防止）。
+        if self.state.shutting_down.load(Ordering::Acquire) {
+            if let Some(queue_id) = &self.queue_id {
+                self.state.clear_prompt_queue_id(&self.session_id, queue_id);
+            }
+            return;
+        }
         let Some(queue_id) = self.queue_id.clone() else {
             return;
         };
