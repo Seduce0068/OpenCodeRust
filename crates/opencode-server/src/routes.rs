@@ -6073,14 +6073,133 @@ fn parse_auth_info_payload(payload: serde_json::Value) -> Option<AuthInfo> {
 
 static PLUGIN_LOADER: std::sync::OnceLock<Arc<PluginLoader>> = std::sync::OnceLock::new();
 
+/// `OnceLock::set` の戻り値を検査し、2 回目以降の登録失敗だけを警告する。
+///
+/// 失敗の意味は「既に別インスタンスが loader を登録済み」であることだけであり、
+/// loader の識別情報・パス・トークンは一切ログへ出さない（固定文言のみ）。
+/// 戻り値の `true` は登録が拒否され、最初の loader が有効なままであることを示す。
+fn warn_if_plugin_loader_already_registered<T>(result: std::result::Result<(), T>) -> bool {
+    if result.is_err() {
+        tracing::warn!(
+            "plugin loader already registered; keeping the first loader (later instances are ignored)"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Register the global PluginLoader so routes can access auth bridges.
 /// Called once during server startup after plugins are loaded.
+///
+/// # 複数インスタンスでの挙動
+///
+/// `PLUGIN_LOADER` はプロセスグローバルな `OnceLock` で、インスタンス単位には
+/// 分離していない。**最初に登録された loader だけが有効** であり、2 回目以降の
+/// `set_plugin_loader` 呼び出しは失敗して汎用の warn を出すだけである。
+/// per-instance 化は設計判断を伴うため、ここでは変更しない。
 pub fn set_plugin_loader(loader: Arc<PluginLoader>) {
-    let _ = PLUGIN_LOADER.set(loader);
+    warn_if_plugin_loader_already_registered(PLUGIN_LOADER.set(loader));
 }
 
 fn get_plugin_loader() -> Option<&'static Arc<PluginLoader>> {
     PLUGIN_LOADER.get()
+}
+
+#[cfg(test)]
+mod plugin_loader_registration_tests {
+    use super::*;
+    use std::fmt::Write as _;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// `tracing-subscriber` を依存追加せずに warn 本文を捕捉する最小バッファ。
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("log buffer lock").clone()
+        }
+    }
+
+    struct CaptureVisitor(LogBuffer);
+
+    impl Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("log buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct CaptureSubscriber {
+        buffer: LogBuffer,
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut CaptureVisitor(self.buffer.clone()));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn duplicate_plugin_loader_registration_emits_generic_warn() {
+        let buffer = LogBuffer::default();
+        let subscriber = CaptureSubscriber {
+            buffer: buffer.clone(),
+        };
+        // グローバルな OnceLock を汚して既存 plugin routes テストへ影響しないよう、
+        // `PLUGIN_LOADER.set` が 2 回目以降に返す Err と同じ経路だけを注入する。
+        let rejected = tracing::subscriber::with_default(subscriber, || {
+            warn_if_plugin_loader_already_registered(Err(()))
+        });
+        assert!(rejected, "failed registration must be reported");
+
+        let text = buffer.text();
+        assert!(text.contains("already registered"), "{text}");
+        assert!(text.contains("first loader"), "{text}");
+        for forbidden in ["/home", "\\", "sk-", "token", "secret", "password"] {
+            assert!(!text.contains(forbidden), "warn leaked {forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn first_plugin_loader_registration_stays_silent() {
+        let buffer = LogBuffer::default();
+        let subscriber = CaptureSubscriber {
+            buffer: buffer.clone(),
+        };
+        let rejected = tracing::subscriber::with_default(subscriber, || {
+            warn_if_plugin_loader_already_registered(Ok::<(), ()>(()))
+        });
+        assert!(!rejected, "first registration must succeed");
+        let text = buffer.text();
+        assert!(text.is_empty(), "{text}");
+    }
 }
 
 fn plugin_auth_routes() -> Router<Arc<ServerState>> {
