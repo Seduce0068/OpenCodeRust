@@ -106,13 +106,14 @@ fn is_safe_env_key(key: &str) -> bool {
 ///
 /// Shared by both the fetch and the cache-hit paths so a rotated token is
 /// always re-injected, even while the config cache is still valid. Only the
-/// key and URL are ever logged — the token value is never written to logs.
+/// key name is ever logged — the URL and token value are never written to logs.
 ///
 /// Returns `true` when the token was injected, `false` when the key was
 /// rejected as unsafe.
-fn inject_auth_token(url: &str, auth: &WellKnownAuth) -> bool {
+fn inject_auth_token(_url: &str, auth: &WellKnownAuth) -> bool {
     if !is_safe_env_key(&auth.key) {
-        tracing::warn!(url = %url, key = %auth.key, "refusing unsafe env key from auth.json");
+        // URL は内部エンドポイントを含み得るためログへ出さない（R4）。
+        tracing::warn!(key = %auth.key, "refusing unsafe env key from auth.json");
         return false;
     }
     std::env::set_var(&auth.key, &auth.token);
@@ -169,8 +170,9 @@ async fn load_wellknown_from_entries(entries: &HashMap<String, WellKnownAuth>) -
                 tracing::debug!(url = %url, "loaded remote config from well-known");
                 merged.merge(config);
             }
-            Err(e) => {
-                tracing::warn!(url = %endpoint, error = %e, "failed to fetch wellknown config, skipping");
+            Err(_) => {
+                // URL と生エラー（レスポンス本文を含む）はログへ出さない（R4）。
+                tracing::warn!("failed to fetch wellknown config, skipping");
             }
         }
     }
@@ -182,19 +184,30 @@ async fn fetch_wellknown_config(client: &reqwest::Client, endpoint: &str) -> Res
     let resp = client.get(endpoint).send().await?;
 
     if !resp.status().is_success() {
-        anyhow::bail!("HTTP {} from {}", resp.status(), endpoint);
+        // エンドポイント URL は内部情報を露し得るためエラーへ埋め込まない（R4）。
+        anyhow::bail!("well-known config fetch returned an unsuccessful status");
     }
 
     let body = resp.bytes().await?;
     if body.len() as u64 > MAX_WELLKNOWN_JSON_BYTES {
         anyhow::bail!("well-known response exceeds size limit");
     }
-    let wk: WellKnownResponse = serde_json::from_slice(&body)?;
+    // serde の生エラーはレスポンス値を含むため、固定文言へ変換する（R4）。
+    let wk: WellKnownResponse = serde_json::from_slice(&body)
+        .map_err(|_| anyhow::anyhow!("well-known config has an invalid envelope"))?;
     let config_value = wk
         .config
         .unwrap_or(serde_json::Value::Object(Default::default()));
-    let config: Config = serde_json::from_value(config_value)?;
+    let config: Config = config_from_wellknown_value(config_value)?;
     Ok(config)
+}
+
+/// Deserialize a remote `.well-known/opencode` `config` object through the same
+/// validation pipeline as local config files. Unknown keys are warned (key
+/// names only) and type errors report a sanitized field path; values, tokens
+/// and URLs never appear in warnings or errors.
+fn config_from_wellknown_value(config_value: serde_json::Value) -> Result<Config> {
+    crate::loader::validate_config_value(config_value)
 }
 
 fn get_cached(url: &str) -> Option<Config> {
@@ -253,6 +266,57 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+    use std::sync::Arc;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// Minimal `tracing` capture; `tracing-subscriber` is not a dev-dependency.
+    #[derive(Clone, Default)]
+    struct WarningBuffer(Arc<Mutex<String>>);
+
+    impl WarningBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("warning buffer lock").clone()
+        }
+    }
+
+    struct WarningVisitor(WarningBuffer);
+
+    impl Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct WarningSubscriber {
+        buffer: WarningBuffer,
+    }
+
+    impl Subscriber for WarningSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut WarningVisitor(self.buffer.clone()));
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
 
     #[test]
     fn wellknown_byte_limit_is_eight_mib() {
@@ -315,8 +379,46 @@ mod tests {
         let json = r#"{"config": {"model": "claude-3-opus"}}"#;
         let wk: WellKnownResponse = serde_json::from_str(json).unwrap();
         let config_val = wk.config.unwrap();
-        let config: Config = serde_json::from_value(config_val).unwrap();
+        let config: Config = config_from_wellknown_value(config_val).unwrap();
         assert_eq!(config.model.as_deref(), Some("claude-3-opus"));
+    }
+
+    /// 回帰 (CFG2-05): wellknown の config もローカル設定と同じ検証パイプラインを
+    /// 通り、未知キーはキー名のみで警告され、値（トークン風文字列）は出ない。
+    #[test]
+    fn wellknown_unknown_keys_warn_without_values() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "model": "claude-3-opus",
+                "secretive_typo": "TOKEN_SENTINEL_NEVER_LOG",
+                "server": {"port": 4096, "prots": "URL_SENTINEL_NEVER_LOG"}
+            }"#,
+        )
+        .unwrap();
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            let _config =
+                config_from_wellknown_value(value).expect("unknown keys must not block startup");
+        });
+
+        let text = buffer.text();
+        for expected in ["secretive_typo", "server.prots"] {
+            assert!(
+                text.contains(expected),
+                "missing unknown-key warning: {text}"
+            );
+        }
+        for forbidden in ["TOKEN_SENTINEL_NEVER_LOG", "URL_SENTINEL_NEVER_LOG"] {
+            assert!(
+                !text.contains(forbidden),
+                "value leaked into warning: {text}"
+            );
+        }
     }
 
     #[test]

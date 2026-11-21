@@ -971,6 +971,22 @@ fn parse_jsonc(content: &str) -> Result<Config> {
         Err(_parse_error) => return Err(anyhow::anyhow!("Failed to parse JSONC")),
     };
 
+    validate_config_value(parsed)
+}
+
+/// Shared validation pipeline for an already-parsed config JSON value.
+///
+/// Both local config parsing ([`parse_jsonc`]) and the remote
+/// `.well-known/opencode` loader call this helper, so unknown keys, nested
+/// typos and type errors are handled identically for every config source.
+/// Previously the wellknown path deserialized its `config` value directly with
+/// `serde_json::from_value`, bypassing the unknown-key/nested-key warnings and
+/// the sanitized error path.
+///
+/// Only key names and key paths are emitted in warnings; values, tokens and
+/// URLs are never included in warnings or errors. Unknown keys are reported but
+/// never rejected, preserving the documented "never block startup" policy.
+pub(crate) fn validate_config_value(parsed: serde_json::Value) -> Result<Config> {
     // Warn about (but never reject) unknown keys. Only key names / key paths
     // are logged -- never a value, which may hold secrets. Ignoring unknown
     // keys keeps the documented "never block startup" compatibility policy.
@@ -1124,6 +1140,9 @@ fn unknown_config_keys(value: &serde_json::Value) -> Vec<String> {
     let mut unknown: Vec<String> = object
         .keys()
         .filter(|key| !known.contains(key.as_str()))
+        // リモート設定由来のキー名もあり得るため、入れ子警告と同じ安全基準で
+        // サニタイズしてからログへ渡す（R4）。
+        .filter(|key| is_safe_field_segment(key))
         .cloned()
         .collect();
     unknown.sort();
@@ -2191,6 +2210,43 @@ fn apply_env_overrides(config: &mut Config) {
     }
 }
 
+/// Resolve legacy `tools` entries into permission actions.
+///
+/// Several legacy names (`write`, `edit`, `patch`, `multiedit`) collapse onto
+/// the single `"edit"` permission key. Iterating the input `HashMap` has no
+/// defined order, so a plain "last insert wins" made `{"write": true,
+/// "edit": false}` resolve differently between runs. Resolution is now
+/// deterministic and fail-safe: **Deny wins**. If any alias for a key disables
+/// the tool, the merged action is `Deny` regardless of the visitation order.
+/// The enable flag is never logged, only used to choose the action.
+fn resolve_legacy_tools_actions(
+    tools: impl IntoIterator<Item = (String, bool)>,
+) -> HashMap<String, PermissionAction> {
+    let mut resolved: HashMap<String, PermissionAction> = HashMap::new();
+    for (tool, enabled) in tools {
+        let action = if enabled {
+            PermissionAction::Allow
+        } else {
+            PermissionAction::Deny
+        };
+        // write, edit, patch, multiedit all map to "edit" permission
+        let key = if tool == "write" || tool == "edit" || tool == "patch" || tool == "multiedit" {
+            "edit".to_string()
+        } else {
+            tool
+        };
+        resolved
+            .entry(key)
+            .and_modify(|current| {
+                if action == PermissionAction::Deny {
+                    *current = PermissionAction::Deny;
+                }
+            })
+            .or_insert(action);
+    }
+    resolved
+}
+
 /// Apply post-load transforms: legacy migrations, plugin dedup, provider normalization.
 fn apply_post_load_transforms(config: &mut Config) {
     // Migrate deprecated `mode` field to `agent` field. The warning names only
@@ -2226,18 +2282,10 @@ fn apply_post_load_transforms(config: &mut Config) {
     if let Some(tools) = config.tools.take() {
         tracing::warn!("tools is deprecated; use permission instead (value not logged)");
         let mut perms = HashMap::new();
-        for (tool, enabled) in tools {
-            let action = if enabled {
-                PermissionAction::Allow
-            } else {
-                PermissionAction::Deny
-            };
-            // write, edit, patch, multiedit all map to "edit" permission
-            if tool == "write" || tool == "edit" || tool == "patch" || tool == "multiedit" {
-                perms.insert("edit".to_string(), PermissionRule::Action(action));
-            } else {
-                perms.insert(tool, PermissionRule::Action(action));
-            }
+        // Resolve aliased tool names with a fixed Deny-wins rule so the result
+        // cannot depend on HashMap iteration order.
+        for (key, action) in resolve_legacy_tools_actions(tools) {
+            perms.insert(key, PermissionRule::Action(action));
         }
         // Legacy tools have lower priority than explicit permission config
         if let Some(existing) = &config.permission {
@@ -4620,6 +4668,61 @@ theme = "dark"
         for forbidden in ["primary-agent", "legacy-primary", "secret-tool-name"] {
             assert!(!text.contains(forbidden), "config value leaked: {text}");
         }
+    }
+
+    /// 回帰 (CFG2-02): write/edit/patch/multiedit は同じ "edit" キーに畳み込まれる。
+    /// 入力順を変えても解決結果は変わらず、いずれかの別名が false なら Deny が勝つ。
+    #[test]
+    fn legacy_tools_edit_aliases_resolve_deterministically() {
+        let orders: [Vec<(&str, bool)>; 4] = [
+            vec![("write", true), ("edit", false)],
+            vec![("edit", false), ("write", true)],
+            vec![("patch", true), ("write", false), ("multiedit", true)],
+            vec![("multiedit", true), ("write", false), ("patch", true)],
+        ];
+        for order in orders {
+            let entries = order
+                .into_iter()
+                .map(|(name, enabled)| (name.to_string(), enabled));
+            let resolved = resolve_legacy_tools_actions(entries);
+            assert!(
+                matches!(resolved.get("edit"), Some(PermissionAction::Deny)),
+                "Deny must win regardless of input order: {resolved:?}"
+            );
+        }
+
+        // 別名でないツールは独自キーと値を保つ（マッピング回帰の確認）。
+        let resolved = resolve_legacy_tools_actions(vec![
+            ("bash".to_string(), true),
+            ("read".to_string(), false),
+        ]);
+        assert!(matches!(
+            resolved.get("bash"),
+            Some(PermissionAction::Allow)
+        ));
+        assert!(matches!(resolved.get("read"), Some(PermissionAction::Deny)));
+    }
+
+    /// 回帰 (CFG2-02): 実際の変換パスでも競合する別名が Deny に解決すること。
+    #[test]
+    fn legacy_tools_conflicting_edit_aliases_end_to_end_is_deny() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"tools": {"write": true, "edit": false}}"#)
+                .expect("legacy tools config must parse");
+        apply_post_load_transforms(&mut config);
+
+        assert!(
+            config.tools.is_none(),
+            "legacy tools field must be consumed"
+        );
+        let rules = config.permission.expect("permission set").rules();
+        assert!(
+            matches!(
+                rules.get("edit"),
+                Some(PermissionRule::Action(PermissionAction::Deny))
+            ),
+            "conflicting edit aliases must resolve to Deny: {rules:?}"
+        );
     }
 
     #[test]
