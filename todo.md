@@ -166,8 +166,6 @@ status: current
 
 - [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
   — `session/session.rs:668-692` / T-04 / 低（speculation）
-- [ ] **messages テーブルの provider_id/cost 列が永続化経路で常に未設定**
-  — `storage/repository.rs:566-608` / T-06 / 低
 - [ ] **設定検証手段が無く README も不正設定時の挙動を案内しない**
   — `cli/main.rs:445-674` / CFGVAL-10 / 低（設計判断）
 - [ ] **rotate_key がローテーション結果をディスクへ永続化しない**
@@ -264,8 +262,6 @@ status: current
   — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
 - [ ] **シグナル終了で tracing WorkerGuard のフラッシュが飛ぶ**
   — `main.rs:1032-1034` / SHUTDOWN-09 / 中（speculation）
-- [ ] **1 フィールドの型不正が設定全体破棄となり次アクションを示さない**
-  — `config/loader.rs:89-95` / CFGVAL-03 / 中
 - [ ] **ネストしたキーの誤記がサイレントに無視される**
   — `config/loader.rs:945-975` / CFGVAL-04 / 中
 - [ ] **不正な入れ子値（oauth/environment/headers）が無警告で捨てられる**
@@ -290,6 +286,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定エラー/スキーマ明記 2 件]** 値非露出と情報源の明確化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[テスト信頼性 2 件]** overflow 同期と心拍の継続観測
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[テスト信頼性 4 件]** env 直列化・時間依存の解消
@@ -643,6 +641,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（設定エラーの修正時、記録のみ）: キー除去プローブが
+  ユーザー定義キー（agent 名等）を field path として出し得る点、キー数に
+  比例する探索コストの点は未対応（設計判断・未測定）。親が read / file-reference
+  エラーのフルパス露出を固定文言化して解消。
 - 2026-11-21 R4 残存（overflow/心拍テストの修正時、記録のみ）: plugin の
   1ms ポーリングと 100ms グレースが極端なスケジューラ遅延で競合し得る。
   bash の心拍停止は子孫終了の代理指標で、metadata 失敗が 0 と丸められる。
