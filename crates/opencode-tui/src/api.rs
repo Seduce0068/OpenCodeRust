@@ -251,19 +251,19 @@ pub struct ShareResponse {
     pub url: String,
 }
 
+/// `POST /session/{id}/fork` のリクエストボディ。
+///
+/// サーバの `ForkSessionRequest { message_id: Option<String> }` と同一形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactResponse {
-    pub success: bool,
+struct ForkSessionRequest {
+    /// `None` の場合はキーを省略し、空ボディではなく `{}` を送信する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevertRequest {
     pub message_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RevertResponse {
-    pub success: bool,
 }
 
 /// `DELETE /session/{id}` の応答。キー欠落・型不一致はデシリアライズ失敗とする（M-52）。
@@ -1097,8 +1097,12 @@ impl ApiClient {
         Ok(result.unshared)
     }
 
-    pub fn compact_session(&self, session_id: &str) -> anyhow::Result<CompactResponse> {
-        let url = format!("{}/session/{}/compact", self.base_url, session_id);
+    /// `POST /session/{id}/compaction` を呼び、更新後の `SessionInfo` を返す。
+    ///
+    /// サーバは `/compact` ではなく `/compaction` を登録しており、戻り値も
+    /// `{"success": bool}` ではなく `Json<SessionInfo>` である（routes.rs）。
+    pub fn compact_session(&self, session_id: &str) -> anyhow::Result<SessionInfo> {
+        let url = format!("{}/session/{}/compaction", self.base_url, session_id);
         let response = self.client.post(&url).send()?;
         if !response.status().is_success() {
             let status = response.status();
@@ -1109,14 +1113,18 @@ impl ApiClient {
                 error_detail(status, &text)
             );
         }
-        Ok(response.json::<CompactResponse>()?)
+        Ok(response.json::<SessionInfo>()?)
     }
 
+    /// `POST /session/{id}/revert` を呼び、更新後の `SessionInfo` を返す。
+    ///
+    /// サーバの `session_revert` は `Json<SessionInfo>` を返すため、
+    /// `{"success": bool}` を期待する旧契約では `missing field success` で失敗していた。
     pub fn revert_session(
         &self,
         session_id: &str,
         message_id: &str,
-    ) -> anyhow::Result<RevertResponse> {
+    ) -> anyhow::Result<SessionInfo> {
         let url = format!("{}/session/{}/revert", self.base_url, session_id);
         let request = RevertRequest {
             message_id: message_id.to_string(),
@@ -1131,25 +1139,23 @@ impl ApiClient {
                 error_detail(status, &text)
             );
         }
-        Ok(response.json::<RevertResponse>()?)
+        Ok(response.json::<SessionInfo>()?)
     }
 
+    /// `POST /session/{id}/fork` に JSON ボディを送り、新しい `SessionInfo` を返す。
+    ///
+    /// サーバはクエリではなく `Json<ForkSessionRequest>` を要求するため、
+    /// `message_id` が `None` のときも空ボディではなく `{}` を送信する。
     pub fn fork_session(
         &self,
         session_id: &str,
         message_id: Option<&str>,
     ) -> anyhow::Result<SessionInfo> {
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(msg_id) = message_id {
-            params.push(("message_id", msg_id.to_string()));
-        }
         let url = format!("{}/session/{}/fork", self.base_url, session_id);
-        let request = if params.is_empty() {
-            self.client.post(&url)
-        } else {
-            self.client.post(&url).query(&params)
+        let request = ForkSessionRequest {
+            message_id: message_id.map(|msg_id| msg_id.to_string()),
         };
-        let response = request.send()?;
+        let response = self.client.post(&url).json(&request).send()?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
@@ -2275,5 +2281,254 @@ mod tests {
                 .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
             "invalid token must not produce an Authorization header: {request}"
         );
+    }
+
+    // --- R2: compact / revert / fork の API 契約回帰テスト（loopback のみ） ---
+
+    /// サーバ `session_to_info` が返す SessionInfo の wire 形状。
+    const SERVER_SESSION_JSON: &str = r#"{
+        "id":"ses-1",
+        "slug":"dummy-slug",
+        "project_id":"proj-1",
+        "directory":"/tmp/dummy",
+        "parent_id":null,
+        "title":"dummy title",
+        "version":"v1",
+        "time":{"created":1000,"updated":2000},
+        "revert":{"message_id":"msg-1"}
+    }"#;
+
+    #[test]
+    fn compact_and_revert_response_shape_is_session_info_not_success_flag() {
+        let session: SessionInfo = serde_json::from_str(SERVER_SESSION_JSON)
+            .expect("server-shaped SessionInfo must deserialize");
+        assert_eq!(session.id, "ses-1");
+        assert_eq!(
+            session.revert.as_ref().map(|r| r.message_id.as_str()),
+            Some("msg-1")
+        );
+
+        // 旧契約の `{"success": true}` は SessionInfo として解析失敗すること。
+        assert!(
+            serde_json::from_value::<SessionInfo>(json!({ "success": true })).is_err(),
+            "legacy success-flag payload must not be treated as SessionInfo"
+        );
+    }
+
+    #[test]
+    fn fork_session_request_serializes_to_server_shape() {
+        let with_id = ForkSessionRequest {
+            message_id: Some("msg-1".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&with_id).expect("fork request should serialize"),
+            json!({ "message_id": "msg-1" })
+        );
+
+        let without_id = ForkSessionRequest { message_id: None };
+        assert_eq!(
+            serde_json::to_value(&without_id).expect("empty fork request should serialize"),
+            json!({})
+        );
+
+        // サーバ側も Option<String> なので `{}` と明示 null の両方を受け付ける。
+        // TUI 側はキーを丸ごと省くため、空ボディにはならない。
+        let from_empty: ForkSessionRequest =
+            serde_json::from_value(json!({})).expect("server accepts `{}`");
+        assert!(from_empty.message_id.is_none());
+        let from_null: ForkSessionRequest = serde_json::from_value(json!({ "message_id": null }))
+            .expect("server accepts explicit null");
+        assert!(from_null.message_id.is_none());
+    }
+
+    // --- loopback モック: メソッド・パス・ボディを記録し、サーバ形式 JSON を返す ---
+
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        request_line: String,
+        body: String,
+    }
+
+    struct RecordingMock {
+        base_url: String,
+        seen: Arc<Mutex<Vec<RecordedRequest>>>,
+        thread: thread::JoinHandle<()>,
+    }
+
+    impl RecordingMock {
+        fn spawn(response_body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+            let addr = listener.local_addr().expect("loopback addr must succeed");
+            let base_url = format!("http://{addr}");
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let seen_for_thread = Arc::clone(&seen);
+            let thread = thread::spawn(move || {
+                listener
+                    .set_nonblocking(true)
+                    .expect("mock listener must be nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                panic!("mock timed out waiting for a connection");
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => panic!("mock accept failed: {err}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("mock stream read timeout");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (header_end, content_len) = loop {
+                    let read = stream.read(&mut chunk).expect("mock must read request");
+                    assert!(read > 0, "unexpected EOF while reading request");
+                    buf.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = String::from_utf8_lossy(&buf[..end]);
+                        let mut len = 0usize;
+                        for line in headers.lines() {
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                len = value.trim().parse().expect("valid content length");
+                            }
+                        }
+                        break (end, len);
+                    }
+                };
+                while buf.len() < header_end + content_len {
+                    let read = stream.read(&mut chunk).expect("mock must read body");
+                    assert!(read > 0, "unexpected EOF while reading body");
+                    buf.extend_from_slice(&chunk[..read]);
+                }
+                let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                let request_line = headers.lines().next().unwrap_or("").to_string();
+                let body = String::from_utf8_lossy(&buf[header_end..header_end + content_len])
+                    .into_owned();
+                seen_for_thread
+                    .lock()
+                    .expect("mock seen lock")
+                    .push(RecordedRequest { request_line, body });
+
+                let response_headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response_headers.as_bytes())
+                    .expect("mock must write headers");
+                stream
+                    .write_all(response_body.as_bytes())
+                    .expect("mock must write body");
+            });
+            Self {
+                base_url,
+                seen,
+                thread,
+            }
+        }
+
+        fn request(self) -> RecordedRequest {
+            self.thread.join().expect("mock thread must not panic");
+            let seen = self.seen.lock().expect("mock seen lock");
+            assert_eq!(seen.len(), 1, "exactly one request must be received");
+            seen[0].clone()
+        }
+    }
+
+    #[test]
+    fn compact_session_posts_to_compaction_and_reads_session_info() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn(SERVER_SESSION_JSON);
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let session = client
+            .compact_session("ses-1")
+            .expect("compact response must deserialize into SessionInfo");
+        assert_eq!(session.id, "ses-1");
+        assert_eq!(session.title, "dummy title");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("POST /session/ses-1/compaction "),
+            "compact must POST to /compaction: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn revert_session_posts_message_id_and_reads_session_info() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn(SERVER_SESSION_JSON);
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let session = client
+            .revert_session("ses-1", "msg-1")
+            .expect("revert response must deserialize into SessionInfo");
+        assert_eq!(session.id, "ses-1");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("POST /session/ses-1/revert "),
+            "revert must POST to /revert: {}",
+            request.request_line
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&request.body).expect("revert body must be JSON");
+        assert_eq!(body["message_id"], json!("msg-1"));
+    }
+
+    #[test]
+    fn fork_session_sends_json_body_and_reads_session_info() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn(SERVER_SESSION_JSON);
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let session = client
+            .fork_session("ses-1", Some("msg-9"))
+            .expect("fork response must deserialize into SessionInfo");
+        assert_eq!(session.id, "ses-1");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("POST /session/ses-1/fork "),
+            "fork must POST to /fork: {}",
+            request.request_line
+        );
+        assert!(
+            !request.request_line.contains("message_id="),
+            "message_id must be a JSON body, not a query param: {}",
+            request.request_line
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&request.body).expect("fork body must be JSON");
+        assert_eq!(body["message_id"], json!("msg-9"));
+    }
+
+    #[test]
+    fn fork_session_without_message_id_sends_empty_json_object() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn(SERVER_SESSION_JSON);
+        let client = ApiClient::new(mock.base_url.clone());
+
+        client
+            .fork_session("ses-1", None)
+            .expect("fork without message_id must still succeed");
+
+        let request = mock.request();
+        let body: serde_json::Value =
+            serde_json::from_str(&request.body).expect("fork body must be JSON");
+        assert_eq!(body, json!({}), "empty body must not be sent");
     }
 }
