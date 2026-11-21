@@ -9086,7 +9086,7 @@ mod config_patch_runtime_tests {
         );
 
         let patch = AppConfig {
-            disabled_providers: vec!["openai".to_string()],
+            disabled_providers: vec!["openai".to_string()].into(),
             ..Default::default()
         };
         state.config.write().await.merge(patch);
