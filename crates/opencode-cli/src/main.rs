@@ -107,12 +107,37 @@ fn resolve_server_runtime_config(
 }
 
 /// 現在の cwd の `config.server.*` を読み、CLI 明示指定とマージして返す。
-/// 設定読み込み失敗は警告せず既定値へフォールバックする（秘密情報を出さない）。
+/// 設定読み込み失敗時は値非依存の警告を出し、既定値へフォールバックする。
 fn server_runtime_from_cli(overrides: ServerCliOverrides) -> ServerRuntimeConfig {
-    let configured = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| config_for(&cwd).ok())
-        .and_then(|config| config.server);
+    let cwd = std::env::current_dir().ok();
+    server_runtime_for_cwd(overrides, cwd.as_deref())
+}
+
+/// `cwd` を明示してサーバ設定を解決する（本番・テストで同じ経路を通す）。
+///
+/// CFGVAL-02: `config_for` が Err を返した場合はエラー本文・パス・設定値を
+/// 一切使わず、値非依存の固定警告のみを出す（`warn_server_config_fallback`）。
+/// 既定値フォールバック自体は `resolve_server_runtime_config` が担うため、
+/// 既存の server_runtime の挙動・テストは変わらない。
+fn server_runtime_for_cwd(
+    overrides: ServerCliOverrides,
+    cwd: Option<&Path>,
+) -> ServerRuntimeConfig {
+    let configured = match cwd {
+        Some(cwd) => match config_for(cwd) {
+            Ok(config) => config.server,
+            Err(_) => {
+                // エラー本文にはパス／トークン値が含まれ得るため参照しない。
+                warn_server_config_fallback(Some(cwd));
+                None
+            }
+        },
+        None => {
+            // cwd を取得できない場合も設定を読めないため同じ警告を出す。
+            warn_server_config_fallback(None);
+            None
+        }
+    };
     resolve_server_runtime_config(overrides, configured.as_ref())
 }
 
@@ -167,6 +192,19 @@ static CONFIG_CACHE: OnceLock<RwLock<HashMap<PathBuf, CachedConfig>>> = OnceLock
 /// `init_tracing` が完了したかどうか。true の間は WARN を直接 tracing へ流し、
 /// スコープ付き捕捉を行わない（二重発行を防ぐ）。
 static TRACING_READY: AtomicBool = AtomicBool::new(false);
+
+/// CFGVAL-02: サーバ設定のロード失敗時に出す警告の固定本文。
+///
+/// 「ロード失敗」というエラー種別と「既定値を使用」を明示するが、エラー本文・
+/// パス・設定値・トークンは一切含まない。`config_for` の `anyhow::Error` は
+/// `with_context` によりパスを保持し得るため、ここでは参照すらしない。
+const SERVER_CONFIG_FALLBACK_WARNING: &str =
+    "failed to load config for server settings; using defaults";
+
+/// CFGVAL-02: tracing 初期化前にサーバ設定ロード失敗を検出した場合に、
+/// 値非依存の警告文を cwd 単位で保留する。`replay_config_diagnostics` が
+/// 初期化後に 1 回だけ再発火し、バッファをクリアする。
+static PENDING_SERVER_WARNINGS: OnceLock<RwLock<HashMap<PathBuf, Vec<String>>>> = OnceLock::new();
 
 /// 捕捉した診断行を書き込むスコープ付きライタ。
 #[derive(Clone)]
@@ -469,25 +507,74 @@ fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
     Ok(config)
 }
 
-/// 起動初期（tracing 未初期化）に捕捉してキャッシュへ保存した診断を、
+/// 起動初期（tracing 未初期化）に捕捉・保留した診断を、
 /// tracing 初期化後に 1 回だけ再発火する。
 ///
 /// 保存されているのは値非依存の整形行のみで、トークン値・パスは含まれない。
 /// 再発火後にバッファをクリアするため、二重表示や次回以降の再発火は起きない。
+/// CFGVAL-02 のサーバ設定ロード失敗警告も、初期化前に保留されていればここで
+/// 同じく再発火する（初期化後に解決された場合は直接 warn 済みでバッファは空）。
 pub(crate) fn replay_config_diagnostics(cwd: &Path) {
-    let Some(cache) = CONFIG_CACHE.get() else {
-        return;
-    };
-    let diagnostics = {
-        let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_mut(cwd)
-            .map(|(_, _, pending)| std::mem::take(pending))
-            .unwrap_or_default()
-    };
+    let diagnostics = CONFIG_CACHE
+        .get()
+        .and_then(|cache| {
+            let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get_mut(cwd)
+                .map(|(_, _, pending)| std::mem::take(pending))
+        })
+        .unwrap_or_default();
     for message in diagnostics {
         // 保存済み本文をそのまま message フィールドとして流す（値は含まない）。
         tracing::warn!("{message}");
+    }
+
+    // CFGVAL-02: tracing 初期化前に保留したサーバ設定ロード失敗警告を
+    // cwd 単位で取り出して 1 回だけ再発火する（固定本文のみ）。
+    let server_warnings = PENDING_SERVER_WARNINGS
+        .get()
+        .and_then(|map| map.write().unwrap_or_else(|e| e.into_inner()).remove(cwd))
+        .unwrap_or_default();
+    for message in server_warnings {
+        tracing::warn!("{message}");
+    }
+}
+
+/// サーバ設定ロード失敗の警告本文を tracing へ直接流す。
+///
+/// 値非依存の固定本文と `event` フィールドのみ。エラー本文・パス・設定値は
+/// 渡さないため、初期化済み subscriber のどこへ出力されても漏れない。
+fn emit_server_config_fallback_warning() {
+    tracing::warn!(
+        event = "server_config_load_failed",
+        "{}",
+        SERVER_CONFIG_FALLBACK_WARNING
+    );
+}
+
+/// サーバ設定ロード失敗を警告する。
+///
+/// 方針（CFGVAL-02 / 受け入れ条件 2）：
+/// - tracing 初期化後（`TRACING_READY == true`）: `server_runtime_for_cwd` は
+///   `main` の `init_tracing` 後にのみ呼ばれるため、直接 `tracing::warn!` が
+///   確実に届く（replay 不要・二重発行なし）。
+/// - tracing 初期化前: 警告を cwd 単位で保留し、`replay_config_diagnostics`
+///   が初期化後に 1 回だけ再発火する。これにより初回ロードが初期化前でも
+///   警告が失われない。`cwd` が None のときは空パスをキーにする（防御経路）。
+///
+/// いずれの経路でも渡すのは `SERVER_CONFIG_FALLBACK_WARNING` 固定文だけであり、
+/// エラー本文・パス・トークン値・設定値は一切含まれない。
+fn warn_server_config_fallback(cwd: Option<&Path>) {
+    if TRACING_READY.load(Ordering::Relaxed) {
+        emit_server_config_fallback_warning();
+    } else {
+        PENDING_SERVER_WARNINGS
+            .get_or_init(|| RwLock::new(HashMap::new()))
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(cwd.unwrap_or_else(|| Path::new("")).to_path_buf())
+            .or_default()
+            .push(SERVER_CONFIG_FALLBACK_WARNING.to_string());
     }
 }
 
@@ -501,6 +588,20 @@ fn cached_config_diagnostics(cwd: &Path) -> Vec<String> {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(cwd)
                 .map(|(_, _, diagnostics)| diagnostics.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// CFGVAL-02 テスト用: cwd 単位で保留中のサーバ設定ロード失敗警告を読む。
+#[cfg(test)]
+fn pending_server_warnings(cwd: &Path) -> Vec<String> {
+    PENDING_SERVER_WARNINGS
+        .get()
+        .and_then(|map| {
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(cwd)
+                .cloned()
         })
         .unwrap_or_default()
 }
@@ -8095,6 +8196,124 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CFGVAL-02 回帰テスト: 設定ロード失敗時に値非依存の警告が出ること、
+    /// 既定値へフォールバックすること、エラー本文・パス・設定値が漏れないこと。
+    #[test]
+    fn config_load_failure_warns_without_values_and_uses_defaults() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+
+        let dir = temp_config_project("cfgval02-fallback");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        // 壊れた JSON で config_for を確実に Err にする。エラー本文にはパスが
+        // 入り得るが、警告には一切含めないことを後の assert で固定する。
+        fs::write(
+            dir.join("opencode.json"),
+            r#"INVALID_CONFIG 41234 0.0.0.0 sk-CFGVAL-SECRET-BROKEN"#,
+        )
+        .expect("write broken config");
+        invalidate_config_cache(&dir);
+
+        // 本番と同じ server_runtime_for_cwd 経路を通す。
+        let (runtime, captured_during_load) = capture_config_diagnostics(|| {
+            server_runtime_for_cwd(ServerCliOverrides::default(), Some(&dir))
+        });
+
+        // 既存 server_runtime の既定値フォールバックが壊れていないこと。
+        assert_eq!(runtime.port, 0);
+        assert_eq!(runtime.hostname, "127.0.0.1");
+        assert!(!runtime.mdns);
+        assert_eq!(runtime.mdns_domain, "opencode.local");
+        assert!(runtime.cors.is_empty());
+
+        // ロード中に既定の tracing へ直接漏れていないこと（初期化前は保留）。
+        assert!(
+            !captured_during_load
+                .iter()
+                .any(|line| line.contains(SERVER_CONFIG_FALLBACK_WARNING)),
+            "fallback warning must be buffered, not emitted pre-init: {captured_during_load:?}"
+        );
+
+        // 値非依存の警告が cwd 単位で 1 件だけ保留されていること。
+        assert_eq!(
+            pending_server_warnings(&dir),
+            vec![SERVER_CONFIG_FALLBACK_WARNING.to_string()]
+        );
+
+        // 初期化後の replay で 1 回だけ届き、バッファがクリアされること。
+        let (_, replayed) = capture_config_diagnostics(|| replay_config_diagnostics(&dir));
+        assert_eq!(replayed, vec![SERVER_CONFIG_FALLBACK_WARNING.to_string()]);
+        assert!(pending_server_warnings(&dir).is_empty());
+        let (_, replayed_twice) = capture_config_diagnostics(|| replay_config_diagnostics(&dir));
+        assert!(
+            replayed_twice.is_empty(),
+            "fallback warning must not be replayed twice: {replayed_twice:?}"
+        );
+
+        // パス・トークン値・設定値が警告に一切漏れないこと。
+        for leaked in [
+            dir.to_string_lossy().as_ref(),
+            "sk-CFGVAL-SECRET-BROKEN",
+            "41234",
+            "0.0.0.0",
+        ] {
+            assert!(
+                !replayed.iter().any(|line| line.contains(leaked)),
+                "fallback warning leaked {leaked:?}: {replayed:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CFGVAL-02 回帰テスト: 設定ロード成功時は警告を出さず、設定値が使われること。
+    #[test]
+    fn config_load_success_does_not_emit_fallback_warning() {
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_xdg = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+
+        let dir = temp_config_project("cfgval02-ok");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        fs::write(
+            dir.join("opencode.json"),
+            r#"{"server":{"port":41234,"hostname":"0.0.0.0","mdns":true}}"#,
+        )
+        .expect("write valid config");
+        invalidate_config_cache(&dir);
+
+        let (runtime, captured) = capture_config_diagnostics(|| {
+            server_runtime_for_cwd(ServerCliOverrides::default(), Some(&dir))
+        });
+        assert_eq!(runtime.port, 41234);
+        assert_eq!(runtime.hostname, "0.0.0.0");
+        assert!(runtime.mdns);
+        assert!(pending_server_warnings(&dir).is_empty());
+        assert!(
+            !captured
+                .iter()
+                .any(|line| line.contains(SERVER_CONFIG_FALLBACK_WARNING)),
+            "successful load must not warn about defaults: {captured:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CFGVAL-02 回帰テスト: 警告本文が値非依存であることを静的に固定する。
+    #[test]
+    fn server_config_fallback_warning_is_value_independent() {
+        let message = SERVER_CONFIG_FALLBACK_WARNING;
+        assert!(message.contains("failed to load config"), "{message}");
+        assert!(message.contains("using defaults"), "{message}");
+        assert!(!message.contains('/'), "path must not appear: {message}");
+        assert!(!message.contains("sk-"), "token must not appear: {message}");
+        assert!(!message.contains("{}"), "no value placeholder: {message}");
     }
 
     #[test]
