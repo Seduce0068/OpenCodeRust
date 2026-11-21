@@ -1,6 +1,7 @@
 use crate::schema::{
-    known_config_keys, AgentConfig, AgentConfigs, AgentMode, CommandConfig, McpConfig,
-    McpTimeoutConfig, PermissionAction, PermissionConfig, PermissionRule, ProviderConfig,
+    known_config_keys, nested_root_child, nested_schema, AgentConfig, AgentConfigs, AgentMode,
+    CommandConfig, McpConfig, McpTimeoutConfig, NestedValueSchema, PermissionAction,
+    PermissionConfig, PermissionRule, ProviderConfig,
 };
 use crate::Config;
 use anyhow::{Context, Result};
@@ -970,13 +971,22 @@ fn parse_jsonc(content: &str) -> Result<Config> {
         Err(_parse_error) => return Err(anyhow::anyhow!("Failed to parse JSONC")),
     };
 
-    // Warn about (but never reject) unknown top-level keys. Only the key name
-    // is logged -- never its value, which may hold secrets. Ignoring unknown
+    // Warn about (but never reject) unknown keys. Only key names / key paths
+    // are logged -- never a value, which may hold secrets. Ignoring unknown
     // keys keeps the documented "never block startup" compatibility policy.
     for key in unknown_config_keys(&parsed) {
         tracing::warn!(
             key = %key,
             "unknown configuration key ignored; startup continues"
+        );
+    }
+    // Nested typos (e.g. `server.prots`) used to be dropped silently. The
+    // walker inspects key names only, skips user-defined name levels and has a
+    // fixed depth bound; it never logs the values behind those keys.
+    for key_path in unknown_nested_config_keys(&parsed) {
+        tracing::warn!(
+            key_path = %key_path,
+            "unknown nested configuration key ignored; startup continues"
         );
     }
 
@@ -1097,14 +1107,15 @@ fn is_safe_field_path(path: &str) -> bool {
         && path.len() <= 64
         && path
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '*'))
 }
 
 /// Returns the names of top-level keys in a parsed config that `Config` does
 /// not recognize. Values are deliberately discarded: callers log only the
-/// key names. Only top-level keys are inspected because the M-08 findings
+/// key names. Only top-level keys are inspected here so the M-08 findings
 /// (`security.strictPermissionChecks`, `storage.gcBufferMb`,
-/// `references.gemini`) are all unknown top-level sections.
+/// `references.gemini`) stay a single top-level warning; nested sections are
+/// handled by [`unknown_nested_config_keys`].
 fn unknown_config_keys(value: &serde_json::Value) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();
@@ -1117,6 +1128,140 @@ fn unknown_config_keys(value: &serde_json::Value) -> Vec<String> {
         .collect();
     unknown.sort();
     unknown
+}
+
+/// 入れ子キーの誤記を検出するときの深さ上限。トップレベル直下を 1 と数え、
+/// ユーザー定義名（エージェント名・provider id・MCP server id）の階層は
+/// カウントしない。これにより `provider.<id>.<key>` や
+/// `mcp.servers.<id>.<key>` も上限内で検査できる。
+const MAX_NESTED_KEY_DEPTH: usize = 3;
+
+/// 既知の入れ子キーに対して、誤記と思われるキーパスだけを返す。
+///
+/// 値の型や内容は一切見ない（値依存の判定をしないため）。返る文字列は安全な
+/// 識別子と `.` だけで構成され、呼び出し側はこれをそのまま警告へ渡す。
+/// ユーザー定義キー自体は警告の対象外で、パス区切りとして使う場合も
+/// [`is_safe_field_segment`] を通ったものだけを使用する。
+fn unknown_nested_config_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown = Vec::new();
+    for (key, child) in object {
+        let Some(schema) = nested_root_child(key) else {
+            // このセクションの入れ子キー集合は未定義。誤検知を避けるため対象外。
+            continue;
+        };
+        if !is_safe_field_segment(key) {
+            continue;
+        }
+        collect_unknown_nested_keys(child, schema, 1, key, &mut unknown);
+    }
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+/// `value` を `schema` に従って辿り、未知のキー名を `path` 配下のキーパスとして集める。
+fn collect_unknown_nested_keys(
+    value: &serde_json::Value,
+    schema: NestedValueSchema,
+    depth: usize,
+    path: &str,
+    out: &mut Vec<String>,
+) {
+    if depth > MAX_NESTED_KEY_DEPTH {
+        return;
+    }
+
+    match schema {
+        NestedValueSchema::Opaque | NestedValueSchema::UserMapOpaque => {}
+        NestedValueSchema::UserMapStruct(name) => {
+            let Some(object) = value.as_object() else {
+                return;
+            };
+            for (user_key, child) in object {
+                // ユーザー定義名（provider id / agent 名 / MCP server id）は
+                // 誤記判定せず、警告パスへも出さず固定プレースホルダ `*` に置換する。
+                if !is_safe_field_segment(user_key) {
+                    continue;
+                }
+                let child_path = format!("{path}.*");
+                if !is_safe_field_path(&child_path) {
+                    continue;
+                }
+                collect_unknown_nested_keys(
+                    child,
+                    NestedValueSchema::Struct(name),
+                    depth,
+                    &child_path,
+                    out,
+                );
+            }
+        }
+        NestedValueSchema::ListOfStruct(name) => {
+            let Some(items) = value.as_array() else {
+                return;
+            };
+            for (index, item) in items.iter().enumerate() {
+                let child_path = format!("{path}.entry{index}");
+                if !is_safe_field_path(&child_path) {
+                    continue;
+                }
+                collect_unknown_nested_keys(
+                    item,
+                    NestedValueSchema::Struct(name),
+                    depth,
+                    &child_path,
+                    out,
+                );
+            }
+        }
+        NestedValueSchema::Struct(name) => {
+            let Some(object) = value.as_object() else {
+                return;
+            };
+            let Some(spec) = nested_schema(name) else {
+                return;
+            };
+            for (key, child) in object {
+                let declared = spec
+                    .children
+                    .iter()
+                    .find(|(candidate, _)| *candidate == key.as_str())
+                    .map(|(_, child_schema)| *child_schema);
+                let is_known = spec.known.contains(&key.as_str());
+
+                // 値は見ず、キー名だけを既知集合と照合する。
+                if !is_known && declared.is_none() && spec.unknown_child.is_none() {
+                    if !is_safe_field_segment(key) {
+                        continue;
+                    }
+                    let key_path = format!("{path}.{key}");
+                    if is_safe_field_path(&key_path) {
+                        out.push(key_path);
+                    }
+                }
+
+                let child_schema = declared
+                    .or(if is_known {
+                        Some(NestedValueSchema::Opaque)
+                    } else {
+                        spec.unknown_child
+                    })
+                    .unwrap_or(NestedValueSchema::Opaque);
+                if matches!(child_schema, NestedValueSchema::Opaque) || !is_safe_field_segment(key)
+                {
+                    continue;
+                }
+                let child_path = format!("{path}.{key}");
+                if !is_safe_field_path(&child_path) {
+                    continue;
+                }
+                collect_unknown_nested_keys(child, child_schema, depth + 1, &child_path, out);
+            }
+        }
+    }
 }
 
 fn normalize_existing_path(path: &Path) -> PathBuf {
@@ -1951,11 +2096,40 @@ fn parse_env_flag(value: &str) -> bool {
     )
 }
 
+/// 有効な非真値（`false` / `0` / `no` / 空）かどうか。これらは警告しない。
+fn is_valid_false_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "no" | ""
+    )
+}
+
 /// Reads a boolean-like environment variable with fail-closed semantics.
 ///
-/// Unset, non-UTF-8, or non-truthy values all yield `false`.
+/// Unset, non-UTF-8, or non-truthy values all yield `false`. A set but invalid
+/// value is warned about by variable name only; the value itself is never
+/// logged (it may be a token accidentally pasted into the variable).
 fn env_flag_enabled(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| parse_env_flag(&value))
+    match env::var(name) {
+        Ok(value) if parse_env_flag(&value) => true,
+        // 明示的な false / 0 / no / 空は有効値なので警告しない。
+        Ok(value) if is_valid_false_env_flag(&value) => false,
+        Ok(_) => {
+            tracing::warn!(
+                env_var = %name,
+                "ignoring invalid OPENCODE_DISABLE_* value; flag stays disabled"
+            );
+            false
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                env_var = %name,
+                "ignoring non-UTF-8 OPENCODE_DISABLE_* value; flag stays disabled"
+            );
+            false
+        }
+        Err(env::VarError::NotPresent) => false,
+    }
 }
 
 /// Applies the `OPENCODE_PERMISSION` environment override.
@@ -2426,6 +2600,78 @@ mod tests {
         )
         .unwrap();
         assert!(unknown_config_keys(&value).is_empty());
+    }
+
+    /// 回帰: `server.prots` のような入れ子誤記は従来サイレントに捨てられていた。
+    /// キーパスだけが警告され、値（トークン風の文字列）は一切出ないこと。
+    #[test]
+    fn nested_unknown_keys_warn_by_path_without_values() {
+        let content = r#"{
+            "server": {"port": 4096, "prots": 4096},
+            "provider": {"my-provider-id": {"name": "ok", "api_ky": "TOKEN_SENTINEL_NEVER_LOG"}},
+            "agent": {"reviewer": {"model": "x", "promt": "PROMPT_SENTINEL_NEVER_LOG"}},
+            "mcp": {"servers": {"local": {"command": ["x"], "environmnt": {"SECRET": "VALUE_SENTINEL_NEVER_LOG"}}}}
+        }"#;
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            let _config = parse_jsonc(content).expect("unknown nested keys must not block startup");
+        });
+
+        let text = buffer.text();
+        for expected in [
+            "server.prots",
+            "provider.*.api_ky",
+            "agent.*.promt",
+            "mcp.servers.*.environmnt",
+        ] {
+            assert!(text.contains(expected), "missing nested warning: {text}");
+        }
+        for forbidden in [
+            "my-provider-id",
+            "reviewer",
+            "local",
+            "TOKEN_SENTINEL_NEVER_LOG",
+            "PROMPT_SENTINEL_NEVER_LOG",
+            "VALUE_SENTINEL_NEVER_LOG",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "user name or value leaked: {text}"
+            );
+        }
+    }
+
+    /// 正しいキーとユーザー定義名（agent 名・provider id・mcp server id）は
+    /// 誤記として警告されない。深さ上限も明示的に確認する。
+    #[test]
+    fn nested_unknown_keys_ignore_valid_keys_user_names_and_overflow() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "server": {"port": 4096, "hostname": "localhost"},
+                "provider": {"my-provider-id": {"name": "ok", "api_key": "not-logged"}},
+                "agent": {"reviewer": {"model": "x", "mode": "primary"}},
+                "mcp": {"servers": {"local": {"command": ["x"], "enabled": true}}}
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            unknown_nested_config_keys(&value).is_empty(),
+            "valid keys and user-defined names must not warn"
+        );
+
+        let mut out = Vec::new();
+        collect_unknown_nested_keys(
+            &serde_json::json!({"prots": 4096}),
+            NestedValueSchema::Struct("server"),
+            MAX_NESTED_KEY_DEPTH + 1,
+            "server",
+            &mut out,
+        );
+        assert!(out.is_empty(), "depth-limit subtree must not be inspected");
     }
 
     #[test]
@@ -3270,6 +3516,29 @@ mod tests {
                 "{value:?} must leave the flag disabled"
             );
         }
+    }
+
+    /// 不正な `OPENCODE_DISABLE_*` の値は変数名だけを警告し、値は出さない。
+    #[test]
+    fn invalid_disable_env_flag_warns_with_variable_name_only() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const AUTO: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
+        std::env::set_var(AUTO, "SENTINEL_VALUE_NEVER_LOG");
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let enabled = tracing::subscriber::with_default(subscriber, || env_flag_enabled(AUTO));
+        std::env::remove_var(AUTO);
+
+        assert!(!enabled, "invalid env value must not enable the flag");
+        let text = buffer.text();
+        assert!(text.contains(AUTO), "variable name must be logged: {text}");
+        assert!(
+            !text.contains("SENTINEL_VALUE_NEVER_LOG"),
+            "env value leaked: {text}"
+        );
     }
 
     #[test]

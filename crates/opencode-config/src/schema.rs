@@ -331,6 +331,358 @@ pub(crate) fn known_config_keys() -> &'static [&'static str] {
     ]
 }
 
+/// 入れ子キー検査における、ある階層の値の扱い方。
+///
+/// 警告はキー名（と必要ならその親までのキーパス）だけで行い、値は一切見ない。
+/// `UserMapStruct` / `UserMapOpaque` はエージェント名・プロバイダ id・MCP
+/// server id などのユーザー定義キーの階層を表し、そのキー自体は誤記判定から
+/// 除外する。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NestedValueSchema {
+    /// 既知キー集合を持つ固定オブジェクト。
+    Struct(&'static str),
+    /// キーはユーザー定義名。キーは警告せず、値を固定スキーマとして検査する。
+    UserMapStruct(&'static str),
+    /// キーはユーザー定義名。値も検査しない（ツール名など）。
+    UserMapOpaque,
+    /// 配列要素を固定スキーマとして検査する。
+    ListOfStruct(&'static str),
+    /// これ以上降りない。
+    Opaque,
+}
+
+/// 固定スキーマの既知キー集合と、既知キーから子スキーマへの対応。
+pub(crate) struct NestedKeySchema {
+    pub(crate) known: &'static [&'static str],
+    pub(crate) children: &'static [(&'static str, NestedValueSchema)],
+    /// 既知キーに一致しないキーの値の扱い。`None` の場合のみ誤記として警告する。
+    pub(crate) unknown_child: Option<NestedValueSchema>,
+}
+
+/// 主要な入れ子型の既知キー集合。`known_config_keys` と同じく値は保持しない。
+///
+/// `mcp` の `unknown_child` は、旧スキーマでは server id が `mcp` 直下に置かれた
+/// ため、未知キーを「ユーザー定義の server id」として扱い警告しない。誤記と
+/// server id を値非依存で見分けることはできないので、この階層は意図的に除外する。
+static NESTED_SCHEMAS: &[(&str, NestedKeySchema)] = &[
+    (
+        "server",
+        NestedKeySchema {
+            known: &[
+                "port",
+                "hostname",
+                "mdns",
+                "mdnsDomain",
+                "mdns_domain",
+                "cors",
+            ],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "agent",
+        NestedKeySchema {
+            known: &[
+                "name",
+                "model",
+                "variant",
+                "temperature",
+                "top_p",
+                "prompt",
+                "disable",
+                "description",
+                "mode",
+                "hidden",
+                "options",
+                "color",
+                "steps",
+                "max_steps",
+                "maxSteps",
+                "max_tokens",
+                "permission",
+                "tools",
+            ],
+            children: &[("permission", NestedValueSchema::UserMapOpaque)],
+            unknown_child: None,
+        },
+    ),
+    (
+        "provider",
+        NestedKeySchema {
+            known: &[
+                "name",
+                "api_key",
+                "apiKey",
+                "base_url",
+                "baseURL",
+                "models",
+                "options",
+                "npm",
+                "package",
+                "settings",
+                "headers",
+                "compatibility",
+                "whitelist",
+                "blacklist",
+            ],
+            children: &[("models", NestedValueSchema::UserMapStruct("model"))],
+            unknown_child: None,
+        },
+    ),
+    (
+        "model",
+        NestedKeySchema {
+            known: &[
+                "name",
+                "model",
+                "modelID",
+                "api_key",
+                "base_url",
+                "variants",
+                "limit",
+                "capabilities",
+            ],
+            children: &[
+                ("limit", NestedValueSchema::Struct("model_limit")),
+                (
+                    "capabilities",
+                    NestedValueSchema::Struct("model_capabilities"),
+                ),
+            ],
+            unknown_child: None,
+        },
+    ),
+    (
+        "model_limit",
+        NestedKeySchema {
+            known: &["context", "output"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "model_capabilities",
+        NestedKeySchema {
+            known: &["tools", "reasoning", "attachment", "input", "output"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "mcp",
+        NestedKeySchema {
+            known: &["servers", "timeout"],
+            children: &[
+                ("servers", NestedValueSchema::UserMapStruct("mcp_server")),
+                ("timeout", NestedValueSchema::Struct("mcp_timeout")),
+            ],
+            // 旧スキーマの server id はユーザー定義キーなので誤記判定の対象外。
+            unknown_child: Some(NestedValueSchema::UserMapStruct("mcp_server")),
+        },
+    ),
+    (
+        "mcp_server",
+        NestedKeySchema {
+            known: &[
+                "type",
+                "command",
+                "args",
+                "environment",
+                "env",
+                "url",
+                "enabled",
+                "disabled",
+                "headers",
+                "oauth",
+                "cwd",
+                "timeout",
+                "protocol",
+                "client_id",
+                "authorization_url",
+            ],
+            children: &[
+                ("oauth", NestedValueSchema::Struct("oauth")),
+                ("timeout", NestedValueSchema::Struct("mcp_timeout")),
+            ],
+            unknown_child: None,
+        },
+    ),
+    (
+        "mcp_timeout",
+        NestedKeySchema {
+            known: &["startup", "catalog", "execution"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "oauth",
+        NestedKeySchema {
+            known: &[
+                "clientId",
+                "client_id",
+                "clientSecret",
+                "client_secret",
+                "scope",
+                "callbackPort",
+                "callback_port",
+                "redirectUri",
+                "redirect_uri",
+                "authServerMetadataUrl",
+                "auth_server_metadata_url",
+            ],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "permission_entry",
+        NestedKeySchema {
+            known: &["action", "resource", "effect"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "command",
+        NestedKeySchema {
+            known: &[
+                "name",
+                "description",
+                "template",
+                "model",
+                "agent",
+                "subtask",
+            ],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "formatter",
+        NestedKeySchema {
+            known: &["disabled", "command", "environment", "extensions"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "lsp",
+        NestedKeySchema {
+            known: &["command", "extensions", "disabled", "env", "initialization"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "tui",
+        NestedKeySchema {
+            known: &[
+                "mode",
+                "sidebar",
+                "scroll_speed",
+                "scroll_acceleration",
+                "diff_style",
+            ],
+            children: &[(
+                "scroll_acceleration",
+                NestedValueSchema::Struct("tui_scroll"),
+            )],
+            unknown_child: None,
+        },
+    ),
+    (
+        "tui_scroll",
+        NestedKeySchema {
+            known: &["enabled"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "compaction",
+        NestedKeySchema {
+            known: &["auto", "prune", "reserved"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "experimental",
+        NestedKeySchema {
+            known: &[
+                "disable_paste_summary",
+                "batch_tool",
+                "openTelemetry",
+                "open_telemetry",
+                "primary_tools",
+                "continue_loop_on_deny",
+                "mcp_timeout",
+            ],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "enterprise",
+        NestedKeySchema {
+            known: &["url", "managed_config_dir"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "skills",
+        NestedKeySchema {
+            known: &["paths", "urls"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+    (
+        "watcher",
+        NestedKeySchema {
+            known: &["ignore"],
+            children: &[],
+            unknown_child: None,
+        },
+    ),
+];
+
+/// 固定スキーマ名から既知キー集合を引く。
+pub(crate) fn nested_schema(name: &str) -> Option<&'static NestedKeySchema> {
+    NESTED_SCHEMAS
+        .iter()
+        .find(|(schema_name, _)| *schema_name == name)
+        .map(|(_, schema)| schema)
+}
+
+/// トップレベルキーから入れ子スキーマを引く。
+///
+/// `keybinds` などは未定義のままにしてある。古い別名が多く、値非依存の誤記
+/// 判定で誤検知するリスクが高いため、主要セクションだけを対象にする。
+pub(crate) fn nested_root_child(key: &str) -> Option<NestedValueSchema> {
+    Some(match key {
+        "server" => NestedValueSchema::Struct("server"),
+        "agent" | "agents" | "mode" => NestedValueSchema::UserMapStruct("agent"),
+        "provider" | "providers" => NestedValueSchema::UserMapStruct("provider"),
+        "mcp" => NestedValueSchema::Struct("mcp"),
+        "permission" => NestedValueSchema::UserMapOpaque,
+        "permissions" => NestedValueSchema::ListOfStruct("permission_entry"),
+        "command" => NestedValueSchema::UserMapStruct("command"),
+        "formatter" => NestedValueSchema::UserMapStruct("formatter"),
+        "lsp" => NestedValueSchema::UserMapStruct("lsp"),
+        "tui" => NestedValueSchema::Struct("tui"),
+        "compaction" => NestedValueSchema::Struct("compaction"),
+        "experimental" => NestedValueSchema::Struct("experimental"),
+        "enterprise" => NestedValueSchema::Struct("enterprise"),
+        "skills" => NestedValueSchema::Struct("skills"),
+        "watcher" => NestedValueSchema::Struct("watcher"),
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShareMode {
@@ -1193,8 +1545,8 @@ impl McpServerV2 {
             command,
             environment: self
                 .environment
-                .map(string_map)
-                .or_else(|| self.env.map(string_map)),
+                .map(|values| string_map(values, "environment"))
+                .or_else(|| self.env.map(|values| string_map(values, "env"))),
             cwd: self.cwd,
             url: self.url,
             enabled: self
@@ -1202,7 +1554,7 @@ impl McpServerV2 {
                 .or_else(|| self.disabled.map(|disabled| !disabled)),
             timeout: self.timeout,
             protocol: self.protocol,
-            headers: self.headers.map(string_map),
+            headers: self.headers.map(|values| string_map(values, "headers")),
             oauth: self.oauth.and_then(oauth_config_from_value),
             args: self.args,
             env: None,
@@ -1219,10 +1571,40 @@ impl DeepMerge for McpConfig {
     }
 }
 
-fn string_map(values: HashMap<String, serde_json::Value>) -> HashMap<String, String> {
+/// ログに出してよい名前だけを返す。改行や記号を含む名前は固定文字列に置換し、
+/// 値そのものや不正な文字列が警告へ混入しないようにする。
+fn loggable_key(key: &str) -> &str {
+    if !key.is_empty()
+        && key.len() <= 64
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        key
+    } else {
+        "<redacted>"
+    }
+}
+
+/// 捨てた値の警告はフィールド名と変数名だけを出す。値は一切渡さない。
+fn warn_dropped_map_value(field: &str, key: &str) {
+    tracing::warn!(
+        field = %field,
+        key = %loggable_key(key),
+        "ignoring non-string config value (value not logged)"
+    );
+}
+
+fn string_map(values: HashMap<String, serde_json::Value>, field: &str) -> HashMap<String, String> {
     values
         .into_iter()
-        .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+        .filter_map(|(key, value)| match value.as_str() {
+            Some(value) => Some((key, value.to_string())),
+            None => {
+                warn_dropped_map_value(field, &key);
+                None
+            }
+        })
         .collect()
 }
 
@@ -1231,10 +1613,25 @@ fn oauth_config_from_value(value: serde_json::Value) -> Option<McpOAuthConfig> {
         serde_json::Value::Bool(false) => Some(McpOAuthConfig::Disabled(false)),
         // `true` means "auto-detect", which is the default (no explicit config).
         serde_json::Value::Bool(true) => None,
-        serde_json::Value::Object(_) => serde_json::from_value(value)
-            .ok()
-            .map(McpOAuthConfig::Config),
-        _ => None,
+        serde_json::Value::Object(_) => match serde_json::from_value(value) {
+            Ok(config) => Some(McpOAuthConfig::Config(config)),
+            // serde のエラー文言は値を含む可能性があるので破棄し、フィールド名だけを出す。
+            Err(_) => {
+                tracing::warn!(
+                    field = "oauth",
+                    "ignoring invalid oauth config object (value not logged)"
+                );
+                None
+            }
+        },
+        // スカラー・配列・null などの不正値はフィールド名だけを警告する。
+        _ => {
+            tracing::warn!(
+                field = "oauth",
+                "ignoring invalid oauth config value (value not logged)"
+            );
+            None
+        }
     }
 }
 
@@ -2864,9 +3261,88 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("a".to_owned(), serde_json::json!("x"));
         values.insert("b".to_owned(), serde_json::json!(42));
-        let map = string_map(values);
+        let map = string_map(values, "headers");
         assert_eq!(map.get("a").map(String::as_str), Some("x"));
         assert!(!map.contains_key("b"));
+    }
+
+    /// 不正な environment / headers / oauth の値は捨てるときにキー名／変数名だけを
+    /// 警告し、値（トークン風の文字列）は一切出さない。
+    #[test]
+    fn invalid_mcp_nested_values_warn_with_names_only() {
+        let content = r#"{
+            "mcp": {"servers": {"remote": {
+                "url": "https://example.invalid",
+                "environment": {"BAD_ENV": {"token": "ENV_SENTINEL_NEVER_LOG"}},
+                "headers": {"BAD_HEADER": 42},
+                "oauth": {"clientId": {"token": "OAUTH_SENTINEL_NEVER_LOG"}}
+            }}}
+        }"#;
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let config = tracing::subscriber::with_default(subscriber, || {
+            serde_json::from_str::<Config>(content)
+        })
+        .expect("invalid nested values must still parse");
+
+        let text = buffer.text();
+        for expected in [
+            "field=environment",
+            "key=BAD_ENV",
+            "field=headers",
+            "key=BAD_HEADER",
+            "field=oauth",
+        ] {
+            assert!(text.contains(expected), "missing warning: {text}");
+        }
+        for forbidden in ["ENV_SENTINEL_NEVER_LOG", "OAUTH_SENTINEL_NEVER_LOG"] {
+            assert!(!text.contains(forbidden), "config value leaked: {text}");
+        }
+
+        let server = config
+            .mcp
+            .expect("mcp")
+            .servers
+            .expect("servers")
+            .remove("remote")
+            .expect("server");
+        match server {
+            McpServerConfig::Full(server) => {
+                assert!(server.environment.expect("environment").is_empty());
+                assert!(server.headers.expect("headers").is_empty());
+                assert!(server.oauth.is_none());
+            }
+            McpServerConfig::Enabled { .. } => panic!("full server config expected"),
+        }
+    }
+
+    /// oauth にスカラーを入れた場合もフィールド名だけを警告する。
+    #[test]
+    fn invalid_oauth_scalar_warns_with_field_name_only() {
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let parsed = tracing::subscriber::with_default(subscriber, || {
+            oauth_config_from_value(serde_json::json!("OAUTH_SCALAR_SENTINEL_NEVER_LOG"))
+        });
+        assert!(parsed.is_none(), "invalid scalar must be rejected");
+
+        let text = buffer.text();
+        assert!(text.contains("field=oauth"), "{text}");
+        assert!(
+            !text.contains("OAUTH_SCALAR_SENTINEL_NEVER_LOG"),
+            "value leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn loggable_key_redacts_unsafe_names() {
+        assert_eq!(loggable_key("HTTP_HEADER"), "HTTP_HEADER");
+        assert_eq!(loggable_key("line\nSECRET=DO-NOT-LOG-ME"), "<redacted>");
     }
 
     #[test]
