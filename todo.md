@@ -178,8 +178,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **Plugin::register_hooks が手動 `Pin<Box>` で非同期パターンが 3 様式**
-  — `plugin/lib.rs:255` / API-09
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -270,9 +268,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **Todo 型が types/storage/session の 3 層で同名再定義**
-  — `session/todo.rs:441` / API-10
-
 - [ ] **Markdown 表の列幅が無制限で枠構造が壊れる** — `markdown/renderer.rs:83-119` / RENDER-06
 - [ ] **wrap_spans が幅 2 文字を満杯行へ置き領域より広い行を生成**
   — `session.rs:1230-1256` / RENDER-07
@@ -283,6 +278,8 @@ status: current
 
 ## 完了
 
+- [x] **[Plugin/Todo 型 2 件]** async_trait 統一・単一情報源化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP progress/OAuth/ratatui 3 件]** hard deadline・並行フロー・feature
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[stream/フック 3 件]** 切断即検知・Drop cleanup・個別 timeout
@@ -594,6 +591,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 R4 残存（Plugin/Todo 型の修正時、記録のみ）: types 側の
+  TodoInfo/TodoItem は実利用がなく session の TodoInfo は未集約。TodoStatus/
+  Priority の serde 正式表現が snake_case へ変化（Deserialize alias は旧形式も
+  受ける、Serialize 側の旧形式互換は無し）。いずれも実害なし。
 - 2026-11-21 R4 残存（MCP progress/OAuth の修正時、記録のみ）: remove_auth が
   prepare slot をロック中に削除でき、logout と並行した再 prepare で二重登録
   され得る（低確率・設計判断）。親が R4 high（transport ID 取り違え）を
