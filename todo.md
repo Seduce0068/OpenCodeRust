@@ -118,8 +118,9 @@ status: current
     ログアウト時に manager を削除、read guard を跨ぐ await を解消。
     discovery.rs に loopback HTTP モック（新規依存なし・false green 回避）で
     7 件の実 HTTP テストを追加。テスト +11 件。
-  - 未対応: RFC8707 resource の永続化、`try_unfold` を通す実 HTTP モックハーネス、
-    `openai.rs:954` 等の per-chunk from_utf8_lossy 残存。
+  - 2026-11-21 対応済み: openai.rs の per-chunk from_utf8_lossy を廃止し、
+    生バイトを改行まで保持してからデコード（UTF-8 境界安全）。
+  - 未対応: RFC8707 resource の永続化、`try_unfold` を通す実 HTTP モックハーネス。
     SSE transport は RemoteMcpConfig に選択肢が無く server connect から未到達
     （add_sse 側の注入自体は実装済み）。
   - 残存（R4 記録）: ループバック bind 失敗時の graceful skip は false green、
@@ -275,6 +276,8 @@ status: current
 
 ## 完了
 
+- [x] **[OpenAI UTF-8 境界 1 件]** per-chunk デコードの廃止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[Markdown 表/wrap_spans 2 件]** 幅クランプの本番配線と wide char 境界
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[Plugin/Todo 型 2 件]** async_trait 統一・単一情報源化
