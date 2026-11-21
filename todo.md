@@ -251,8 +251,6 @@ status: current
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **サーバ abort 時にキュー項目が終端化されず二重実行リスク**
   — `server.rs:517-522` / SHUTDOWN-07 / 中（speculation）
-- [ ] **シグナル終了で tracing WorkerGuard のフラッシュが飛ぶ**
-  — `main.rs:1032-1034` / SHUTDOWN-09 / 中（speculation）
 - [ ] **{env:VAR} 未定義時に空展開で起動継続（認証 fail-open）**
   — `config/loader.rs:654-705` / ERRPATH-01 / 中（設計判断）
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
@@ -273,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[シグナル終了時フラッシュ 1 件]** graceful shutdown で既にカバー
+  （2026-11-21、親が実コードで事実確認）
 - [x] **[MCP 同期失敗警告 1 件]** ヘッダ伝播とワイヤ互換維持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[高優先: plugin/session 2 件]** init 競合の可視化と sync 削除スコープ
@@ -634,6 +634,10 @@ status: current
 
 ## メモ
 
+- 2026-11-21 事実確認（WorkerGuard フラッシュ）: server.rs の
+  wait_for_os_shutdown が Ctrl-C / SIGTERM を捕捉し graceful shutdown 後に
+  main が正常リターンするため `_log_guard` の Drop が走る。SHUTDOWN-09 は
+  graceful shutdown 実装（c1bc2d0）で既に解消済み。
 - 2026-11-21 誤検知却下（T-05 update_part）: GET /message が返す parts は
   `Vec<MessagePart>`（`SessionMessage.parts`）で、update_part が `MessagePart`
   を要求するのは GET と対称で正しい。`message_v2::Part` は別経路の型で、
