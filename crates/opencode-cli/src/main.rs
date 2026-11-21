@@ -301,6 +301,9 @@ fn config_fingerprint(cwd: &Path) -> ConfigFingerprint {
         global_dirs.push(PathBuf::from(appdata).join("opencode"));
     }
     for dir in global_dirs {
+        // レガシー TOML (`config`) は fingerprint に含めない。移行は起動時の
+        // 一度きりで、JSON 存在ガード下では再移行が no-op になるため、
+        // 旧 TOML の復活・更新を再ロード検知に使っても意味がない。
         for name in ["opencode.jsonc", "opencode.json"] {
             stamp_config_file(dir.join(name), &mut seen, &mut files);
         }
@@ -384,6 +387,8 @@ fn config_for(cwd: &Path) -> anyhow::Result<opencode_config::Config> {
     }
 
     // 古いエントリを明示的に破棄してから再ロードする。
+    // レガシー TOML の移行は起動時に一度だけ行い、再ロード時には呼ばない。
+    // JSON 存在ガード下では再移行が no-op で、余分な再ロードを誘発するだけだから。
     invalidate_config_cache(cwd);
 
     let config = load_config(cwd)?;
@@ -400,20 +405,33 @@ fn load_config_for_display(cwd: &Path) -> anyhow::Result<opencode_config::Config
     load_config(cwd)
 }
 
-/// One-time, startup-only migration of the legacy global TOML config.
+/// レガシー global TOML 移行が起動時に一度だけ実行されたことを示す番人。
 ///
-/// `load_config` / `load_global` are read-only, so this mutating step must run
-/// before the first `config_for` read to make the migrated JSON visible in the
-/// same process. `OnceLock` makes the "at most once" guarantee explicit even if
-/// this helper is reached more than once.
+/// 破壊的な移行（`opencode.json` の書き出しと旧 TOML の削除）はプロセス起動時に
+/// 一度きり。`opencode-config` 側の `migrate_global_config_if_absent` が JSON の
+/// 存在時に no-op を返すため、旧 TOML が復活・更新されても既存 JSON は上書き
+/// されない。再移行を試みることはなく、余分な設定再ロードも誘発しない。
+static MIGRATION_DONE: OnceLock<()> = OnceLock::new();
+
+/// レガシー global TOML を JSON へ移行する実処理。
+///
+/// 移行は `opencode-config` 側の JSON 存在ガードにより、既存の `opencode.json` /
+/// `opencode.jsonc` を上書き・削除しない。旧 TOML が復活しても既存 JSON は保護される。
+/// エラー詳細にはパスやトークン値が含まれ得るため出力しない。
+fn migrate_global_config_inner() {
+    if migrate_global_config().is_err() {
+        // エラー詳細にはパスが含まれ得るため出力しない（パス・トークン非露出）。
+        // tracing は起動前に未初期化のため stderr を使う。
+        eprintln!("Warning: failed to migrate legacy global config (details suppressed)");
+    }
+}
+
+/// 起動時にレガシー global TOML の移行を一度だけ実行する。
+///
+/// 以降の設定再ロード（`config_for`）では呼ばない。JSON 存在ガード下で再移行は
+/// no-op であり、余分な再ロードを誘発するだけだからである。
 fn migrate_global_config_once() {
-    static MIGRATION_DONE: OnceLock<()> = OnceLock::new();
-    MIGRATION_DONE.get_or_init(|| {
-        if let Err(error) = migrate_global_config() {
-            // tracing is not initialized yet at startup; use stderr.
-            eprintln!("Warning: failed to migrate legacy global config: {error}");
-        }
-    });
+    MIGRATION_DONE.get_or_init(migrate_global_config_inner);
 }
 
 #[derive(Parser)]
@@ -7050,8 +7068,8 @@ mod tests {
         let _restore = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
         std::env::set_var("XDG_CONFIG_HOME", &temp);
 
-        // 起動時の一度だけのマイグレーション（config ローダは読み取り専用）。
-        migrate_global_config_once();
+        // 起動時の一度きりの移行処理（config ローダは読み取り専用）。
+        migrate_global_config_inner();
 
         assert!(config_dir.join("opencode.json").exists());
         assert!(!config_dir.join("config").exists());
@@ -7062,19 +7080,105 @@ mod tests {
         assert_eq!(migrated["model"], "anthropic/claude-3-5-sonnet");
         assert_eq!(migrated["theme"], "dark");
 
-        // 2 回目は no-op。レガシー状態を再現しても再マイグレーションしない。
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn legacy_toml_update_does_not_overwrite_existing_json() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "opencoderust_global_remigrate_{}_{}",
+            std::process::id(),
+            MIGRATION_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let config_dir = temp.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config"),
-            "provider = \"openai\"\nmodel = \"gpt\"\n",
+            "provider = \"anthropic\"\nmodel = \"claude-first\"\n",
         )
         .unwrap();
-        let _ = fs::remove_file(config_dir.join("opencode.json"));
-        migrate_global_config_once();
-        assert!(
-            !config_dir.join("opencode.json").exists(),
-            "startup migration must run at most once per process"
+        let _restore = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        std::env::set_var("XDG_CONFIG_HOME", &temp);
+
+        migrate_global_config_inner();
+        let first: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(first["model"], "anthropic/claude-first");
+
+        // JSON が存在する状態で旧 TOML が復活・更新されても、JSON 存在ガードにより
+        // 既存 JSON は上書きされない（ユーザー設定の破壊を防ぐ）。
+        fs::write(
+            config_dir.join("config"),
+            "provider = \"openai\"\nmodel = \"gpt-updated\"\n",
+        )
+        .unwrap();
+        migrate_global_config_inner();
+        let second: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            second["model"], "anthropic/claude-first",
+            "existing JSON must never be overwritten by a revived/updated legacy TOML"
         );
-        assert!(config_dir.join("config").exists());
+        assert!(
+            config_dir.join("config").exists(),
+            "legacy TOML is left untouched when the migration is skipped"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn migrate_global_config_once_runs_only_once() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = MIGRATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "opencoderust_global_once_{}_{}",
+            std::process::id(),
+            MIGRATION_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let config_dir = temp.join("opencode");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config"),
+            "provider = \"anthropic\"\nmodel = \"once-first\"\n",
+        )
+        .unwrap();
+        let _restore = RestoreXdgConfigHome(std::env::var_os("XDG_CONFIG_HOME"));
+        std::env::set_var("XDG_CONFIG_HOME", &temp);
+
+        migrate_global_config_once();
+        assert!(MIGRATION_DONE.get().is_some());
+        let first: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(first["model"], "anthropic/once-first");
+
+        // 旧 TOML が復活しても once 番人が効き、JSON は上書きされない。
+        fs::write(
+            config_dir.join("config"),
+            "provider = \"openai\"\nmodel = \"once-second\"\n",
+        )
+        .unwrap();
+        migrate_global_config_once();
+        let second: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            second["model"], "anthropic/once-first",
+            "migration must run only once per process"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }
