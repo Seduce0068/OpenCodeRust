@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **レガシー SessionRow::from_row が Completed を Active に復元**
-  — `session/session.rs:668-692` / T-04 / 低（speculation）
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -275,6 +273,8 @@ status: current
 
 ## 完了
 
+- [x] **[SessionRow status 1 件]** レガシー行がライフサイクル状態を保持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[strict env 1 件]** opt-in で未定義参照を fail-closed 化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[DELETE 冪等性 1 件]** 404 を既削除として扱う
@@ -684,6 +684,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（SessionRow の修正時、記録のみ）: to_row/from_row は
+  本番永続化経路で未使用（server/repository の status カラムが既に保持）。
+  回帰 3 件はテスト専用パスのガード。親がテスト JSON リテラルの i32
+  オーバーフロー（i64 サフィックス）を直接修正。
 - 2026-11-22 R4 残存（strict env の修正時、記録のみ）: 既定警告は変数名を出す
   （値・パスなし、従来挙動）。連鎖 strict テストは inner 直呼びで実ロード経路
   未検証。16 段超の連鎖で未展開参照が残る場合の fail-closed は不完全（極めて稀）。
