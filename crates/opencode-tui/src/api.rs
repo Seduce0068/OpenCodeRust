@@ -674,14 +674,39 @@ impl ApiClient {
         Ok(session)
     }
 
+    /// セッション一覧を取得する（追加フィルタなし、従来どおり）。
     pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionInfo>> {
         self.list_sessions_filtered(None, None)
     }
 
+    /// `search` / `limit` で絞り込む後方互換ラッパー。
+    ///
+    /// `directory` / `roots` / `start` は `None` を渡し、従来のクエリ形状を維持する。
     pub fn list_sessions_filtered(
         &self,
         search: Option<&str>,
         limit: Option<usize>,
+    ) -> anyhow::Result<Vec<SessionInfo>> {
+        self.list_sessions_with_filter(search, limit, None, None, None)
+    }
+
+    /// セッション一覧を pagination / 絞り込み引数付きで取得する。
+    ///
+    /// 各引数は `Some` のときだけクエリパラメータへ追加される（サーバの
+    /// `ListSessionsQuery` と同じ形状）。
+    ///
+    /// - `search`: trim 後に空でない場合のみ送信（従来どおり）。
+    /// - `limit`: `> 0` の場合のみ送信（従来どおり `0` は送らない）。
+    /// - `directory`: パス。`Some` のときだけ送信し、ログ・エラーには出さない。
+    /// - `roots`: `Some(flag)` のとき `"true"` / `"false"` として送信。
+    /// - `start`: `Some` のときだけ送信。
+    pub fn list_sessions_with_filter(
+        &self,
+        search: Option<&str>,
+        limit: Option<usize>,
+        directory: Option<&str>,
+        roots: Option<bool>,
+        start: Option<i64>,
     ) -> anyhow::Result<Vec<SessionInfo>> {
         let url = format!("{}/session", self.base_url);
         let mut params: Vec<(&str, String)> = Vec::new();
@@ -691,13 +716,26 @@ impl ApiClient {
         if let Some(limit) = limit.filter(|l| *l > 0) {
             params.push(("limit", limit.to_string()));
         }
+        if let Some(directory) = directory {
+            params.push(("directory", directory.to_string()));
+        }
+        if let Some(roots) = roots {
+            params.push(("roots", roots.to_string()));
+        }
+        if let Some(start) = start {
+            params.push(("start", start.to_string()));
+        }
 
         let request = if params.is_empty() {
             self.client.get(&url)
         } else {
             self.client.get(&url).query(&params)
         };
-        let response = request.send()?;
+        // reqwest の生エラーは完全な URL（directory パスのクエリを含む）を
+        // 表示し得るため、固定文言へ変換して伝播させない（R4）。
+        let response = request
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send list sessions request"))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -2618,5 +2656,191 @@ mod tests {
             "delete must DELETE /session/{{id}}: {}",
             request.request_line
         );
+    }
+
+    // --- R2 (API-08): セッション一覧の pagination 引数露出の回帰テスト（loopback のみ） ---
+
+    /// テスト専用の percent-decode（`+` は空白として扱う）。
+    fn percent_decode(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' if i + 2 < bytes.len() => {
+                    let hi = (bytes[i + 1] as char).to_digit(16);
+                    let lo = (bytes[i + 2] as char).to_digit(16);
+                    if let (Some(hi), Some(lo)) = (hi, lo) {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    } else {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// リクエスト行からクエリを取り出し、デコード済みの (key, value) 組を返す。
+    fn request_query(request_line: &str) -> Vec<(String, String)> {
+        let target = request_line.split_whitespace().nth(1).unwrap_or("");
+        let Some((_, query)) = target.split_once('?') else {
+            return Vec::new();
+        };
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (percent_decode(key), percent_decode(value))
+            })
+            .collect()
+    }
+
+    fn has_param(query: &[(String, String)], key: &str, value: &str) -> bool {
+        query.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    fn has_key(query: &[(String, String)], key: &str) -> bool {
+        query.iter().any(|(k, _)| k == key)
+    }
+
+    #[test]
+    fn list_sessions_with_filter_sends_all_query_params() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn("[]");
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let sessions = client
+            .list_sessions_with_filter(
+                Some("keyword"),
+                Some(30),
+                Some("/home/user/my dir"),
+                Some(true),
+                Some(42),
+            )
+            .expect("mock must return an empty session list");
+        assert!(sessions.is_empty());
+
+        let request = mock.request();
+        assert!(
+            request.request_line.starts_with("GET /session?"),
+            "list must GET /session with query: {}",
+            request.request_line
+        );
+        let query = request_query(&request.request_line);
+        assert!(has_param(&query, "search", "keyword"), "{query:?}");
+        assert!(has_param(&query, "limit", "30"), "{query:?}");
+        assert!(
+            has_param(&query, "directory", "/home/user/my dir"),
+            "{query:?}"
+        );
+        assert!(has_param(&query, "roots", "true"), "{query:?}");
+        assert!(has_param(&query, "start", "42"), "{query:?}");
+    }
+
+    #[test]
+    fn list_sessions_with_filter_serializes_false_and_omits_unset_params() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn("[]");
+        let client = ApiClient::new(mock.base_url.clone());
+
+        client
+            .list_sessions_with_filter(None, Some(0), None, Some(false), None)
+            .expect("mock must return an empty session list");
+
+        let query = request_query(&mock.request().request_line);
+        assert!(has_param(&query, "roots", "false"), "{query:?}");
+        assert!(
+            !has_key(&query, "limit"),
+            "limit=0 must stay omitted: {query:?}"
+        );
+        for key in ["search", "directory", "start"] {
+            assert!(!has_key(&query, key), "{key} must stay omitted: {query:?}");
+        }
+
+        // 全引数 None のときはクエリを付けない（list_sessions と同一の wire format）。
+        let mock_none = RecordingMock::spawn("[]");
+        let client_none = ApiClient::new(mock_none.base_url.clone());
+        client_none
+            .list_sessions_with_filter(None, None, None, None, None)
+            .expect("mock must return an empty session list");
+        let line = mock_none.request().request_line;
+        assert!(
+            line.starts_with("GET /session "),
+            "no query params must be appended: {line}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_filtered_keeps_legacy_query_shape() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn("[]");
+        let client = ApiClient::new(mock.base_url.clone());
+
+        client
+            .list_sessions_filtered(Some("  spaced  "), Some(7))
+            .expect("mock must return an empty session list");
+
+        let query = request_query(&mock.request().request_line);
+        assert!(has_param(&query, "search", "spaced"), "{query:?}");
+        assert!(has_param(&query, "limit", "7"), "{query:?}");
+        for key in ["directory", "roots", "start"] {
+            assert!(
+                !has_key(&query, key),
+                "legacy wrapper must not send {key}: {query:?}"
+            );
+        }
+
+        // list_sessions() は従来どおり無クエリ。
+        let mock_plain = RecordingMock::spawn("[]");
+        let client_plain = ApiClient::new(mock_plain.base_url.clone());
+        client_plain
+            .list_sessions()
+            .expect("mock must return an empty session list");
+        let line = mock_plain.request().request_line;
+        assert!(
+            line.starts_with("GET /session "),
+            "list_sessions must not append a query: {line}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_with_filter_does_not_leak_directory_into_errors() {
+        ensure_no_proxy();
+        let secret_dir = "/home/secret/project";
+        let mock = RecordingMock::spawn_with_status(
+            "500 Internal Server Error",
+            r#"{"error":{"type":"internal_error","message":"boom"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let err = client
+            .list_sessions_with_filter(None, None, Some(secret_dir), None, None)
+            .expect_err("500 must remain an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("500 Internal Server Error"),
+            "message: {message}"
+        );
+        assert!(
+            !message.contains(secret_dir),
+            "directory path must not leak into error: {message}"
+        );
+        assert!(
+            !message.contains("directory="),
+            "query must not leak into error: {message}"
+        );
+        let _ = mock.request();
     }
 }
