@@ -80,19 +80,89 @@ fn read_wellknown_entries() -> HashMap<String, WellKnownAuth> {
 
 /// Returns true when an auth.json key is safe to expose as a process
 /// environment variable. Blocks names that would alter program loading or
-/// lookup behaviour for every later subprocess.
+/// lookup behaviour for every later subprocess (CFG2-06).
+///
+/// The blocklist is intentionally a plain exact-match list: only the exact
+/// variable name is dangerous. Names such as `LD_AUDIT_TOKEN` are legitimate
+/// token keys and must remain allowed. The uppercase/underscore format
+/// validation below is unchanged.
 fn is_safe_env_key(key: &str) -> bool {
     const BLOCKED: &[&str] = &[
+        // Base execution / lookup environment (pre-existing).
         "PATH",
         "HOME",
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
         "SHELL",
         "USER",
         "PWD",
         "IFS",
+        // glibc dynamic loader: library resolution and injection surface.
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_DEBUG_OUTPUT",
+        "LD_PROFILE",
+        "LD_PROFILE_OUTPUT",
+        "LD_ORIGIN_PATH",
+        "LD_BIND_NOW",
+        "LD_BIND_NOT",
+        "LD_DYNAMIC_WEAK",
+        "LD_HWCAP_MASK",
+        "LD_ASSUME_KERNEL",
+        "LD_VERBOSE",
+        "LD_WARN",
+        "LD_POINTER_GUARD",
+        // glibc tunables, iconv/locale module lookup — can rewrite loader
+        // behaviour or load attacker-controlled modules.
+        "GLIBC_TUNABLES",
+        "GCONV_PATH",
+        "LOCPATH",
+        // dyld (macOS) library/framework resolution.
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FALLBACK_FRAMEWORK_PATH",
+        "DYLD_IMAGE_SUFFIX",
+        "DYLD_ROOT_PATH",
+        "DYLD_SHARED_REGION",
+        "DYLD_FORCE_FLAT_NAMESPACE",
+        // Language runtimes: flags/paths that change interpreter or compiler
+        // execution for every later subprocess.
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "NODE_EXTRA_CA_CERTS",
+        "RUSTFLAGS",
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTDOC",
+        "RUSTUP_TOOLCHAIN",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONMALLOC",
+        "PYTHONBREAKPOINT",
+        "PERL5LIB",
+        "PERL5OPT",
+        "RUBYOPT",
+        "RUBYLIB",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "_JAVA_OPTIONS",
+        "CLASSPATH",
+        "LUA_PATH",
+        "LUA_CPATH",
+        // OpenSSL config / module paths and TLS trust stores — redirecting
+        // these changes credential validation for downstream processes.
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+        "OPENSSL_ENGINES",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        // Shell startup files executed by non-interactive shells.
+        "BASH_ENV",
+        "ENV",
     ];
     let valid = !key.is_empty()
         && key
@@ -529,6 +599,105 @@ mod tests {
         assert!(!is_safe_env_key("lowerCase"));
         assert!(!is_safe_env_key("1BAD"));
         assert!(!is_safe_env_key("BAD-KEY"));
+    }
+
+    /// 回帰 (CFG2-06): 子プロセスのローダー／実行挙動を変える代表的な変数は
+    /// すべて拒否される。既存の 10 名に加え、glibc/dyld ローダー、言語ランタイム、
+    /// OpenSSL／TLS トラスト、シェル起動ファイルを網羅する。
+    #[test]
+    fn safe_env_keys_reject_loader_and_runtime_hijack_names() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let hijack_names = [
+            // 受け入れ条件で明示された代表変数。
+            "GLIBC_TUNABLES",
+            "NODE_OPTIONS",
+            "RUSTFLAGS",
+            "RUSTC_WRAPPER",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "OPENSSL_CONF",
+            "LD_AUDIT",
+            "LD_DEBUG",
+            // 追加したその他のローダー／実行挙動変更変数。
+            "LD_DEBUG_OUTPUT",
+            "LD_PROFILE",
+            "LD_PROFILE_OUTPUT",
+            "LD_ORIGIN_PATH",
+            "LD_BIND_NOW",
+            "LD_BIND_NOT",
+            "LD_DYNAMIC_WEAK",
+            "LD_HWCAP_MASK",
+            "LD_ASSUME_KERNEL",
+            "LD_VERBOSE",
+            "LD_WARN",
+            "LD_POINTER_GUARD",
+            "GCONV_PATH",
+            "LOCPATH",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_FALLBACK_FRAMEWORK_PATH",
+            "DYLD_IMAGE_SUFFIX",
+            "DYLD_ROOT_PATH",
+            "DYLD_SHARED_REGION",
+            "DYLD_FORCE_FLAT_NAMESPACE",
+            "NODE_PATH",
+            "NODE_EXTRA_CA_CERTS",
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTUP_TOOLCHAIN",
+            "PYTHONSTARTUP",
+            "PYTHONINSPECT",
+            "PYTHONMALLOC",
+            "PYTHONBREAKPOINT",
+            "PERL5LIB",
+            "PERL5OPT",
+            "RUBYOPT",
+            "RUBYLIB",
+            "JAVA_TOOL_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "_JAVA_OPTIONS",
+            "CLASSPATH",
+            "LUA_PATH",
+            "LUA_CPATH",
+            "OPENSSL_MODULES",
+            "OPENSSL_ENGINES",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "BASH_ENV",
+            "ENV",
+        ];
+        for key in hijack_names {
+            assert!(
+                !is_safe_env_key(key),
+                "{key} must be rejected as an unsafe env key"
+            );
+        }
+    }
+
+    /// 回帰 (CFG2-06): ブラックリストは完全一致であり、通常のトークン環境変数名は
+    /// 従来どおり許可される。ブロック名を部分一致で拒否する回帰も防ぐ。
+    #[test]
+    fn safe_env_keys_still_accept_normal_token_names() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let token_names = [
+            "OPENAI_API_KEY",
+            "GH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "MY_TOKEN_1",
+            "OPENCODE_WK_ROTATION_TEST",
+            // ブロック名と前方一致／後方一致するが完全一致ではない正当な名。
+            "LD_AUDIT_TOKEN",
+            "NODE_OPTIONS_TOKEN",
+            "RUSTFLAGS_EXTRA",
+            "MY_SSL_CERT_FILE",
+        ];
+        for key in token_names {
+            assert!(
+                is_safe_env_key(key),
+                "{key} must remain an allowed token key"
+            );
+        }
     }
 
     // std Mutex はプロセスグローバルな env の直列化にのみ使用し、await 中は
