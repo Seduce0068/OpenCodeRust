@@ -3308,8 +3308,23 @@ pub struct ModelInfo {
     pub variants: Vec<String>,
 }
 
-static MODEL_VARIANT_LOOKUP: OnceCell<HashMap<String, HashMap<String, Vec<String>>>> =
-    OnceCell::const_new();
+type ModelVariantLookup = HashMap<String, HashMap<String, Vec<String>>>;
+
+// 外側の Mutex は「現在の generation を表す OnceCell の差し替え」だけを守り、
+// 決して await を跨いで保持しない（patch 経路の invalidate を 2 秒待たせない）。
+//
+// generation ごとに別の `Arc<OnceCell<_>>` を使う理由:
+//   * `OnceCell::get_or_init` が初期化を 1 回だけ実行し、並行 init でも load は 1 回。
+//   * invalidate は cell を差し替えるだけなので、古い load が完了しても
+//     切り離された旧 cell に書き込まれるだけで、新しいキャッシュを上書きしない。
+// 値は models.json 由来の provider_id / model_id / variant 名のみで、
+// トークン値やパスは含めず、ログやエラーにも出さない。
+type VariantLookupCell = Arc<OnceCell<Arc<ModelVariantLookup>>>;
+
+static MODEL_VARIANT_LOOKUP: Mutex<Option<VariantLookupCell>> = Mutex::const_new(None);
+
+#[cfg(test)]
+static VARIANT_LOOKUP_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn load_models_dev_data() -> ModelsData {
     let cache_path = dirs::cache_dir()
@@ -3386,13 +3401,52 @@ fn max_tokens_for_variant(default_max_tokens: u64, variant: Option<&str>) -> u64
     }
 }
 
-async fn get_model_variant_lookup() -> &'static HashMap<String, HashMap<String, Vec<String>>> {
-    MODEL_VARIANT_LOOKUP
-        .get_or_init(|| async {
-            let data = load_models_dev_data().await;
-            build_model_variant_lookup(data)
+async fn get_model_variant_lookup() -> Arc<ModelVariantLookup> {
+    get_model_variant_lookup_with(load_models_dev_data).await
+}
+
+/// `loader` を差し替え可能な取得本体。実処理はロックを一切跨がない。
+///
+/// 1. キャッシュ命中確認は Mutex を短時間だけ取り、ガードを落としてから返す。
+/// 2. 未命中時は cell を 1 つだけ選び、`OnceCell::get_or_init` 内で
+///    `loader().await` を実行する。他スレッドが初期化中ならその完了を待ち、
+///    既に格納されていればその値を返す（load は 1 回だけ）。
+/// 3. invalidate が途中で走ると cell 自体が差し替わるため、古い load の結果は
+///    切り離された旧 cell に留まり、新しいキャッシュへ復活しない。
+async fn get_model_variant_lookup_with<F, Fut>(loader: F) -> Arc<ModelVariantLookup>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ModelsData>,
+{
+    // このブロック内では await しない。ガードはここで必ずドロップされる。
+    let cell = {
+        let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if let Some(lookup) = cached.get() {
+                return Arc::clone(lookup);
+            }
+            Arc::clone(cached)
+        } else {
+            let created = Arc::new(OnceCell::new());
+            *guard = Some(Arc::clone(&created));
+            created
+        }
+    };
+
+    let lookup = cell
+        .get_or_init(move || async move {
+            let data = loader().await;
+            Arc::new(build_model_variant_lookup(data))
         })
-        .await
+        .await;
+    Arc::clone(lookup)
+}
+
+/// models.json 由来の variant lookup キャッシュを破棄する。
+/// 破棄するのは派生データのみで、トークン値・パスをログやエラーへ出さない。
+async fn invalidate_model_variant_lookup() {
+    let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+    let _ = guard.take();
 }
 
 fn variants_for_model(
@@ -3418,7 +3472,7 @@ async fn list_providers(State(state): State<Arc<ServerState>>) -> Json<ProviderL
     for m in models {
         let provider_id = m.provider.clone();
         let model_id = m.id.clone();
-        let variants = variants_for_model(variant_lookup, &provider_id, &model_id);
+        let variants = variants_for_model(&variant_lookup, &provider_id, &model_id);
         provider_map
             .entry(provider_id.clone())
             .or_default()
@@ -3670,6 +3724,9 @@ fn restart_required_keys(patch: &AppConfig) -> Vec<String> {
 async fn rebuild_provider_registry_after_patch(state: &Arc<ServerState>) {
     let registry = state.build_provider_registry_from_auth().await;
     state.replace_provider_registry(registry);
+    // /providers が起動時の variants を返し続けないよう、models.json 由来の
+    // キャッシュも破棄して次回リクエストで再計算させる（STATE-04）。
+    invalidate_model_variant_lookup().await;
 }
 
 async fn patch_config(
@@ -3730,7 +3787,7 @@ async fn get_config_providers(
     for m in models {
         let provider_id = m.provider.clone();
         let model_id = m.id.clone();
-        let variants = variants_for_model(variant_lookup, &provider_id, &model_id);
+        let variants = variants_for_model(&variant_lookup, &provider_id, &model_id);
         provider_map
             .entry(provider_id.clone())
             .or_default()
@@ -8820,5 +8877,180 @@ mod config_patch_runtime_tests {
                 .expect("patched model must resolve after PATCH");
         assert_eq!(provider_id, "openai");
         assert_eq!(model_id, "patched-model");
+    }
+
+    fn models_data_with_provider(provider_id: &str) -> ModelsData {
+        // テスト専用のダミー値。トークン値やパスは含めず、ログ・エラーへも出さない。
+        let info = opencode_provider::ModelsProviderInfo {
+            api: None,
+            name: provider_id.to_string(),
+            env: Vec::new(),
+            id: provider_id.to_string(),
+            npm: None,
+            models: HashMap::new(),
+        };
+        HashMap::from([(provider_id.to_string(), info)])
+    }
+
+    async fn fresh_models_data() -> ModelsData {
+        models_data_with_provider("fresh-provider")
+    }
+
+    #[tokio::test]
+    async fn invalidate_model_variant_lookup_forces_recomputation() {
+        let _serial = VARIANT_LOOKUP_TEST_LOCK.lock().await;
+        let sentinel_provider = "state04-sentinel-provider";
+        let seeded: ModelVariantLookup =
+            HashMap::from([(sentinel_provider.to_string(), HashMap::new())]);
+        let previous = {
+            let seeded_cell: VariantLookupCell = Arc::new(OnceCell::new());
+            let _ = seeded_cell.set(Arc::new(seeded));
+            let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+            let previous = guard.replace(seeded_cell);
+            // シードと検証を同じロック区内で行い、並列テストによる割り込みを避ける。
+            assert!(
+                guard
+                    .as_ref()
+                    .and_then(|cell| cell.get())
+                    .is_some_and(|lookup| lookup.contains_key(sentinel_provider)),
+                "precondition: seeded lookup must be cached"
+            );
+            previous
+        };
+
+        invalidate_model_variant_lookup().await;
+
+        let recomputed = get_model_variant_lookup().await;
+        // 並列実行される他テストへキャッシュを残さないよう、直前の状態を復元する。
+        *MODEL_VARIANT_LOOKUP.lock().await = previous;
+        assert!(
+            !recomputed.contains_key(sentinel_provider),
+            "cached lookup must be recomputed after invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookup_initialization_loads_data_only_once() {
+        let _serial = VARIANT_LOOKUP_TEST_LOCK.lock().await;
+        {
+            let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+            let _ = guard.take();
+        }
+
+        let load_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&load_count);
+        let loader = move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                models_data_with_provider("concurrent-provider")
+            }
+        };
+
+        let (a, b, c, d) = tokio::join!(
+            get_model_variant_lookup_with(&loader),
+            get_model_variant_lookup_with(&loader),
+            get_model_variant_lookup_with(&loader),
+            get_model_variant_lookup_with(&loader),
+        );
+
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            1,
+            "parallel cold init must load data only once"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &c) && Arc::ptr_eq(&a, &d),
+            "all concurrent callers must share the single initialized lookup"
+        );
+        assert!(a.contains_key("concurrent-provider"));
+
+        {
+            let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+            let _ = guard.take();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_during_load_prevents_stale_lookup_from_reviving() {
+        let _serial = VARIANT_LOOKUP_TEST_LOCK.lock().await;
+        {
+            let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+            let _ = guard.take();
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let resume_rx = Arc::new(std::sync::Mutex::new(Some(resume_rx)));
+        let started_for_loader = Arc::clone(&started);
+        let stale_loader = move || {
+            let started = Arc::clone(&started_for_loader);
+            let resume_rx = Arc::clone(&resume_rx);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                let receiver = {
+                    let mut guard = resume_rx.lock().expect("resume receiver lock");
+                    guard.take().expect("resume receiver used once")
+                };
+                let _ = receiver.await;
+                models_data_with_provider("stale-provider")
+            }
+        };
+
+        // 同じタスク上で「古い load」と「invalidate → 再計算」を交互に進める。
+        let control = async {
+            // 古い load が開始するまで待つ（開始しなければ 2 秒で失敗）。
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stale loader must start");
+
+            // load が完了する前に invalidate → 再計算。
+            invalidate_model_variant_lookup().await;
+            let fresh = get_model_variant_lookup_with(fresh_models_data).await;
+            assert!(
+                fresh.contains_key("fresh-provider"),
+                "recomputation after invalidate must use fresh data"
+            );
+
+            // ここで初めて古い load を完了させる。
+            let _ = resume_tx.send(());
+            fresh
+        };
+
+        let (stale, fresh) = tokio::join!(get_model_variant_lookup_with(stale_loader), control);
+        assert!(stale.contains_key("stale-provider"));
+
+        // 古い load が遅れて完了しても、キャッシュは再計算後の値のまま。
+        let final_lookup = get_model_variant_lookup_with(fresh_models_data).await;
+        assert!(
+            Arc::ptr_eq(&fresh, &final_lookup) && final_lookup.contains_key("fresh-provider"),
+            "stale in-flight load must not overwrite the invalidated-then-recomputed lookup"
+        );
+        assert!(!final_lookup.contains_key("stale-provider"));
+
+        {
+            let mut guard = MODEL_VARIANT_LOOKUP.lock().await;
+            let _ = guard.take();
+        }
+    }
+
+    #[test]
+    fn rebuild_provider_registry_after_patch_invalidates_model_variant_lookup() {
+        let source = include_str!("routes.rs");
+        let start = source
+            .find("async fn rebuild_provider_registry_after_patch(")
+            .expect("rebuild function must exist");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("rebuild function closing brace");
+        let body = &rest[..end];
+        assert!(
+            body.contains("invalidate_model_variant_lookup()"),
+            "config re-bootstrap must drop the cached variant lookup: {body}"
+        );
     }
 }
