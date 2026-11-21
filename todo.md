@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **リモート wellknown 設定が parse_jsonc 検証をバイパス**
-  — `config/wellknown.rs:181-198` / CFG2-05 / 低
 - [ ] **tui --project 時に元 cwd の logLevel で tracing 初期化**
   — `cli/main.rs:1260-1272` / CFG2-07 / 低
 - [ ] **真値パーサーが箇所ごとに異なる（OPENCODE_AUTO_SHARE 未記載）**
@@ -253,8 +251,6 @@ status: current
 
 - [ ] **disabled/enabled_providers が上位の空配列でクリアできない**
   — `config/schema.rs:195-199` / CFG2-01 / 中
-- [ ] **legacy tools -> permission 変換が HashMap 順序に依存**
-  — `config/loader.rs:2199-2221` / CFG2-02 / 中
 - [ ] **wellknown auth の環境変数ブロックリストが限定的**
   — `config/wellknown.rs:81-103` / CFG2-06 / 中（speculation）
 - [ ] **parse_stream_error が code 必須で type ベース retryable を落とす**
@@ -299,6 +295,8 @@ status: current
 
 ## 完了
 
+- [x] **[wellknown/tools 2 件]** 検証共有と Deny 優先の決定的変換
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[usage/走査順 2 件]** デコード失敗の可視化と決定的ソート
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[config 移行/文書 2 件]** 明示 mode 保持と設定源の網羅
@@ -690,6 +688,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（wellknown/tools の修正時、記録のみ）: wellknown の型不正
+  に対する回帰テストが未追加（未知キーのみ検証）。親がトップレベル未知キーの
+  サニタイズ、fetch 失敗の URL/生エラー除去、inject_auth_token の URL 除外を
+  直接修正。
 - 2026-11-22 R4 残存（usage/走査順の修正時、記録のみ）: ストリーミング経路の
   usage デコード失敗は依然無警告（本次は非ストリーミングのみ）。warn ヘルパーと
   テスト用 Subscriber が openai/responses で重複。親が usage:null の誤警告を
