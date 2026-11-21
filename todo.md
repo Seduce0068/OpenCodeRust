@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **tui --project 時に元 cwd の logLevel で tracing 初期化**
-  — `cli/main.rs:1260-1272` / CFG2-07 / 低
 - [ ] **真値パーサーが箇所ごとに異なる（OPENCODE_AUTO_SHARE 未記載）**
   — `cli/main.rs:1977-1982` / CFG2-08 / 低
 - [ ] **OPENCODE_CONFIG_CONTENT の {file:...} が cwd 基準で仕様未記載**
@@ -295,6 +293,8 @@ status: current
 
 ## 完了
 
+- [x] **[--project logLevel 1 件]** 起動時設定読み込み先の是正
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown/tools 2 件]** 検証共有と Deny 優先の決定的変換
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[usage/走査順 2 件]** デコード失敗の可視化と決定的ソート
@@ -688,6 +688,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（--project logLevel の修正時、記録のみ）: 回帰テストが
+  startup_log_level の再計算のみで main の init_tracing への配線を検証していない。
+  Commands::Attach { dir } にも同種の問題があるが担当外のため未対応。親が
+  相対パス/symlink を canonicalize してキャッシュキーを統一する medium を修正。
 - 2026-11-22 R4 残存（wellknown/tools の修正時、記録のみ）: wellknown の型不正
   に対する回帰テストが未追加（未知キーのみ検証）。親がトップレベル未知キーの
   サニタイズ、fetch 失敗の URL/生エラー除去、inject_auth_token の URL 除外を
