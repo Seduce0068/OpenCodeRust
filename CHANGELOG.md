@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-21T19:25:43+09:00"
+  at: "2026-11-21T19:31:02+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `docs`: 不正設定時の挙動と次のアクションを README に明記
+  （swarm-coding R1-R6）
 - `server` / `tui`: MCP 同期失敗をヘッダで伝え、ボディの既存ワイヤ形状を維持
   （swarm-coding R1-R6）
 - `plugin` / `server`: plugin init の競合可視化と世代採番、session sync の

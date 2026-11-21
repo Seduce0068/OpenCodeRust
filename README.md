@@ -157,6 +157,29 @@ Runtime changes through `PATCH /config` take effect immediately for most keys.
 require a restart, as do the environment variables listed in
 [Logging](#logging).
 
+### Invalid or problematic configuration
+
+Most configuration problems produce a warning and startup continues instead
+of failing. Review each warning as follows.
+
+- Unknown keys (top level or nested): a warning is logged and startup
+  continues. User-defined names are masked with an asterisk. Check the
+  warned key path and remove or rename the misspelled key.
+- Wrong value types: only the field path is warned, never the value. Check
+  that field's type in the config reference and correct the value.
+- Undefined `{env:VAR}` placeholders: expanded to an empty string with a
+  warning (this is not fail-closed). Confirm the variable is set in the
+  environment, or replace the placeholder with a literal value.
+- Deprecated keys `mode`, `tools`, `autoshare`: accepted with a migration
+  warning. Move to the current equivalent key and drop the old one.
+- Explicit `OPENCODE_CONFIG` path missing: a warning names the file only.
+  Create the file or point the variable at an existing config file.
+- MCP disk sync failure: an `x-mcp-sync-warning` header and a fixed warning
+  are emitted. Check disk space and write permissions for the MCP state
+  directory, then retry.
+- `logLevel` / `log_level`, `server.*` bind keys, and environment variables:
+  read only at startup. Restart the process after changing them.
+
 ## Operations
 
 ### Logging
