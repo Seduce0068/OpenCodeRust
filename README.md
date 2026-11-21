@@ -162,6 +162,10 @@ The project layer also reads `$HOME/.opencode/opencode.json{,c}` and
 modes from markdown/JS files. Environment overrides are applied before the
 managed config so that managed stays the highest-priority source.
 
+Relative file references (`{file:...}`) in the inline source
+(`OPENCODE_CONFIG_CONTENT`) resolve against the process current working
+directory, not the parent directory of the `OPENCODE_CONFIG` file.
+
 See: `docs/opencode-config.md`
 
 Runtime changes through `PATCH /config` take effect immediately for most keys.
