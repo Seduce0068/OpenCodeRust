@@ -153,8 +153,9 @@ Global config default path:
 See: `docs/opencode-config.md`
 
 Runtime changes through `PATCH /config` take effect immediately for most keys.
-`logLevel` / `log_level` and environment variables are resolved at startup and
-require a restart (see [Logging](#logging)).
+`logLevel` / `log_level` and `server.*` bind keys are read only at startup and
+require a restart, as do the environment variables listed in
+[Logging](#logging).
 
 ## Operations
 
@@ -191,10 +192,20 @@ at startup. A successful PATCH response lists them under `restart_required`:
 | Providers, models, permissions, and other runtime keys | Immediate | No |
 | `server.*` bind keys (port, hostname, cors, mdns) | Not applied | Yes |
 | `logLevel` / `log_level` | Not applied | Yes |
-| Environment variables (for example `RUST_LOG`) | Not applied | Yes |
+| Environment variables (see note) | Not a PATCH key | N/A |
 
-`log_level` and environment variables are resolved once when the process
-starts; changing them requires a restart rather than a PATCH.
+Environment variables are not configuration keys, so they never appear in
+`restart_required`. The following are resolved once when the process starts;
+changing them while it runs has no effect and requires a restart:
+
+- `RUST_LOG` – log level filter (resolution order: config `log_level`, then
+  `RUST_LOG`, then `info`)
+- `OPENCODE_LOG_RETENTION` – number of log generations to keep
+- `OPENCODE_NO_AUTH` – whether authentication is disabled
+- `OPENCODE_DATA_DIR` – base directory for the database and other local data
+
+`logLevel` / `log_level` and `server.*` bind keys are likewise read only at
+startup, as shown in the table above.
 
 ### Health checks
 
@@ -233,13 +244,15 @@ traffic or dependency gate.
 #### Readiness
 
 `GET /health/ready` (alias: `GET /global/ready`) probes the database with a
-real `SELECT` through the configured repository. It returns:
+lightweight `SELECT 1` through the configured repository. It returns:
 
-- `200` with `status: "ok"` when the database is reachable, migrated and
-  usable.
+- `200` with `status: "ok"` when the database is reachable and usable.
 - `503` with `status: "error"` and `healthy: false` when the repository is not
   initialized, the connection is closed, the database is locked or the stored
   data is corrupt.
+
+Database migrations are applied at startup. The probe only checks connectivity
+and basic usability with `SELECT 1`; it does not verify migration status.
 
 ```bash
 curl -fsS -o /dev/null -w '%{http_code}\n' \
