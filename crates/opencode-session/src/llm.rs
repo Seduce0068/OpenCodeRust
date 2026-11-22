@@ -1338,7 +1338,12 @@ impl LlmProcessor {
                     forward_stream_events(stream, tx, abort).await;
                 }
                 Err(e) => {
-                    tracing::error!("Failed to start stream: {}", e);
+                    // 生エラー（message にレスポンス本文/トークンを含み得る）は
+                    // ログへ出さず、status_code のみ記録する（R4）。
+                    tracing::error!(
+                        status_code = ?e.status_code(),
+                        "Failed to start stream"
+                    );
                     // 文字列化せず構造化情報を保持したまま StreamEvent へ渡す。
                     let _ = tx.send(StreamEvent::Error(encode_stream_error(&e))).await;
                 }
@@ -1384,14 +1389,14 @@ async fn forward_stream_events<S, E>(
                 break;
             }
             _ = tx.closed() => {
-                tracing::warn!("Stream receiver dropped");
+                tracing::info!("Stream receiver dropped");
                 break;
             }
             event_result = stream.next() => {
                 match event_result {
                     Some(Ok(event)) => {
                         if tx.send(event).await.is_err() {
-                            tracing::warn!("Stream receiver dropped");
+                            tracing::info!("Stream receiver dropped");
                             break;
                         }
                     }

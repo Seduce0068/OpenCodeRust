@@ -557,8 +557,10 @@ impl SseTransport {
                     Ok(Event::Open) => {
                         tracing::debug!("SSE connection opened");
                     }
-                    Err(e) => {
-                        tracing::error!("SSE error: {}", e);
+                    Err(_) => {
+                        // エラー本文（URL クエリのトークンや生ペイロードを含む可能性が
+                        // ある）は一切ログへ出さない（R4）。
+                        tracing::error!("SSE stream error");
                         // エラー本文（トークン等を含む可能性がある）は残さず、
                         // 理由だけ記録して待機中の receive() を必ず起こす。
                         *violation.lock().await = Some("SSE stream error".to_string());
