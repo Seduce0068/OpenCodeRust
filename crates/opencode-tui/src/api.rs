@@ -619,6 +619,17 @@ impl ApiClient {
     /// `token` が `None` の場合は `new` と同一（ヘッダを付与しない）。
     /// トークン値はログ・エラー・デバッグ出力へ一切含めない。
     pub fn with_auth_token(base_url: String, token: Option<&str>) -> Self {
+        // app.rs の SSE URL 生成や cli/main.rs と同じく、末尾の `/` を除いてから保持する。
+        // 末尾付き URL をそのまま使うと `format!("{}/session", base_url)` が `//session` になる。
+        // 空文字列になった場合はルート `/` を維持し、末尾なし URL はそのまま不変。
+        let base_url = {
+            let trimmed = base_url.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
             // SSE 側（app.rs の spawn_server_event_listener）と同一方針:
@@ -2327,6 +2338,52 @@ mod tests {
                 .lines()
                 .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
             "invalid token must not produce an Authorization header: {request}"
+        );
+    }
+
+    // --- R2: base_url 末尾スラッシュ正規化の回帰テスト（loopback のみ） ---
+
+    #[test]
+    fn with_auth_token_trims_trailing_slash_from_base_url() {
+        let client = ApiClient::with_auth_token("http://127.0.0.1:8080/api/".to_string(), None);
+        assert_eq!(client.base_url, "http://127.0.0.1:8080/api");
+    }
+
+    #[test]
+    fn with_auth_token_keeps_url_without_trailing_slash_unchanged() {
+        let client = ApiClient::with_auth_token("http://127.0.0.1:8080/api".to_string(), None);
+        assert_eq!(client.base_url, "http://127.0.0.1:8080/api");
+    }
+
+    #[test]
+    fn with_auth_token_keeps_root_slash_when_all_slashes_trimmed() {
+        let client = ApiClient::with_auth_token("///".to_string(), None);
+        assert_eq!(client.base_url, "/");
+    }
+
+    #[test]
+    fn trailing_slash_base_url_does_not_double_api_path() {
+        ensure_no_proxy();
+        let mock = HeaderMock::spawn();
+        let client = ApiClient::with_auth_token(format!("{}/", mock.base_url.clone()), None);
+
+        let agents = client
+            .list_agents()
+            .expect("mock must return an empty agent list");
+        assert!(agents.is_empty());
+
+        let request = mock.request();
+        let request_line = request
+            .lines()
+            .next()
+            .expect("request must have a request line");
+        assert!(
+            request_line.starts_with("GET /agent "),
+            "trailing slash must not produce a doubled path: {request_line}"
+        );
+        assert!(
+            !request_line.contains("//agent"),
+            "API path must not contain a double slash: {request_line}"
         );
     }
 

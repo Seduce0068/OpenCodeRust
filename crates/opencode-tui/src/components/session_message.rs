@@ -72,7 +72,13 @@ pub fn render_user_message(
     }
 
     if show_timestamps {
-        let ts = msg.created_at.format("%H:%M").to_string();
+        // wire/DB の UTC 値はそのままに、表示時だけローカルタイムゾーンへ変換する。
+        // session_list / prompt_stash と同じ方針（最大で offset 分のズレを解消）。
+        let ts = msg
+            .created_at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
         if !lines.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled(border_char, border_style),
@@ -138,5 +144,50 @@ mod tests {
         let second = user_border_color_for_agent(Some("build"), &theme);
         assert_eq!(first, second);
         assert!(theme.agent_colors.contains(&first));
+    }
+
+    #[test]
+    fn user_message_timestamp_uses_local_timezone() {
+        use crate::context::{MessageRole, TokenUsage};
+        use chrono::{TimeZone, Utc};
+
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid UTC datetime");
+        let msg = Message {
+            id: "m1".to_string(),
+            role: MessageRole::User,
+            content: "hi".to_string(),
+            created_at,
+            agent: None,
+            model: None,
+            mode: None,
+            finish: None,
+            error: None,
+            completed_at: None,
+            cost: 0.0,
+            tokens: TokenUsage::default(),
+            parts: Vec::new(),
+        };
+
+        let lines = render_user_message(&msg, &Theme::default(), true, None, 80);
+        let rendered = lines
+            .last()
+            .and_then(|line| line.spans.iter().find(|span| span.content.contains(':')))
+            .map(|span| span.content.to_string())
+            .expect("timestamp span must be rendered");
+
+        let expected = created_at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(rendered, expected, "timestamp must use local timezone");
+
+        // オフセットが 0 のホストでは UTC と一致するため、差分がある場合のみ検証する。
+        let raw_utc = created_at.format("%H:%M").to_string();
+        if expected != raw_utc {
+            assert_ne!(rendered, raw_utc, "timestamp must not be raw UTC");
+        }
     }
 }

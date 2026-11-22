@@ -43,6 +43,15 @@ use crate::ui::{Clipboard, Selection};
 const TICK_RATE_MS: u64 = 16;
 const MAX_EVENTS_PER_FRAME: usize = 256;
 
+/// メッセージ時刻をローカルタイムゾーンの `HH:MM:SS` で表示する。
+/// wire/DB 上の値は UTC のまま保持し、描画時のみ変換する。
+fn format_message_timestamp(created_at: &chrono::DateTime<Utc>) -> String {
+    created_at
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
 /// 無修飾 `q` で終了してよいか。未送信入力がある、またはプロンプトが
 /// テキスト入力を捕捉している場合は `q` を文字として扱う。
 fn should_exit_on_unmodified_q(prompt_has_input: bool, prompt_captures_text: bool) -> bool {
@@ -2393,7 +2402,7 @@ impl App {
                             message_id: m.id.clone(),
                             role: role.to_string(),
                             preview,
-                            timestamp: m.created_at.format("%H:%M:%S").to_string(),
+                            timestamp: format_message_timestamp(&m.created_at),
                         }
                     })
                     .collect::<Vec<_>>()
@@ -2431,7 +2440,7 @@ impl App {
                             message_id: m.id.clone(),
                             role: role.to_string(),
                             preview,
-                            timestamp: m.created_at.format("%H:%M:%S").to_string(),
+                            timestamp: format_message_timestamp(&m.created_at),
                         }
                     })
                     .collect::<Vec<_>>()
@@ -4694,6 +4703,28 @@ mod tests {
     use super::*;
     use std::io::Read as _;
     use std::net::TcpListener;
+
+    #[test]
+    fn message_timestamp_uses_local_timezone() {
+        use chrono::TimeZone;
+
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid UTC datetime");
+        let rendered = format_message_timestamp(&created_at);
+        let expected = created_at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string();
+        assert_eq!(rendered, expected, "timestamp must use local timezone");
+
+        // オフセットが 0 のホストでは UTC と一致するため、差分がある場合のみ検証する。
+        let raw_utc = created_at.format("%H:%M:%S").to_string();
+        if expected != raw_utc {
+            assert_ne!(rendered, raw_utc, "timestamp must not be raw UTC");
+        }
+    }
 
     #[test]
     fn optimistic_ids_include_unique_uuid_suffix() {

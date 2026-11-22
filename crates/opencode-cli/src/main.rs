@@ -1967,7 +1967,14 @@ async fn wait_for_server_ready(
     timeout: Duration,
     server_handle: Option<&mut tokio::task::JoinHandle<anyhow::Result<()>>>,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    // ローカルサーバへの起動待ちは env proxy を経由しない。HTTP_PROXY が到達不能
+    // でも loopback の /health へ直接届く必要がある（webfetch の pinned_client と
+    // 同じ no_proxy 方針）。connect_timeout は TCP 接続確立が遅い場合の防御で、
+    // accept 後にレスポンスを送らないケースは下流の tokio::time::timeout が切る。
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .build()?;
     let start = tokio::time::Instant::now();
     // `/health` は server 側で認証 middleware の対象外（liveness）。
     // 起動待ちでは Bearer を送らず、200 が返るまで待つ。
@@ -1987,16 +1994,20 @@ async fn wait_for_server_ready(
             }
         }
 
-        if start.elapsed() > timeout {
+        // 全体 timeout の残りを各 probe に渡す。残りが 0 以下なら即座に失敗させ、
+        // 1 回の probe が無応答でも無期限にハングしないようにする。
+        let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
+        if remaining.is_zero() {
             anyhow::bail!(
                 "Timed out waiting for local server to start at {}",
                 base_url
             );
         }
-        if let Ok(resp) = client.get(&health).send().await {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+
+        match tokio::time::timeout(remaining, client.get(&health).send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() => return Ok(()),
+            // 接続拒否・無応答・タイムアウトはいずれも再試行対象。
+            _ => {}
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -8147,6 +8158,61 @@ mod tests {
         assert_eq!(stats_cost_note(Some(1.25)), None);
     }
 
+    /// proxy 環境変数を書き換えるテストと loopback へ reqwest を使うテストが
+    /// 並列実行で干渉しないよう直列化するためのロック。
+    static NETWORK_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// テスト中だけ到達不能な proxy を設定し、Drop で環境変数を復元するガード。
+    /// NO_PROXY も空にすることで、env 側のバイパスではなくクライアント自身の
+    /// `no_proxy()` 設定を検証できるようにする。
+    struct ProxyEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProxyEnvGuard {
+        fn set_unreachable() -> Self {
+            const PROXY_KEYS: [&str; 6] = [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ];
+            const ENV_KEYS: [&str; 8] = [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let saved = ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            for key in PROXY_KEYS {
+                std::env::set_var(key, "http://127.0.0.1:1");
+            }
+            std::env::set_var("NO_PROXY", "");
+            std::env::set_var("no_proxy", "");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ProxyEnvGuard {
+        fn drop(&mut self) {
+            for (key, original) in &self.saved {
+                match original {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn wait_for_server_ready_probes_health_without_a_bearer_token() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8191,8 +8257,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_server_ready_times_out_when_probe_never_responds() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+
+        // accept するが一切レスポンスを送らない stub。HTTP probe が無期限ハング
+        // せず、指定 timeout 程度で Err を返すことを検証する。
+        let stub = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept health probe");
+            let mut buf = [0u8; 1024];
+            // リクエストを読んで接続を維持するだけ（レスポンスは決して書かない）。
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let timeout = Duration::from_millis(600);
+        let started = tokio::time::Instant::now();
+        let result = wait_for_server_ready(&base_url, timeout, None).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "non-responsive probe must time out");
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "probe must wait near the configured timeout: elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "probe must not hang indefinitely: elapsed {elapsed:?}"
+        );
+        stub.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_for_server_ready_ignores_env_proxy_for_loopback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 環境変数を書き換えるため、loopback へ reqwest を使う他テストと直列化する。
+        let _guard = NETWORK_ENV_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+
+        // proxy 設定に関係なく /health probe が直接 loopback に届くことの確認。
+        let probe = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept health probe");
+            let mut buf = [0u8; 2048];
+            let read = socket.read(&mut buf).await.expect("read probe request");
+            let request = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            assert!(
+                request.starts_with("get /health http/1.1"),
+                "startup probe must GET /health directly: {request}"
+            );
+
+            let body = r#"{"status":"ok","version":"test","healthy":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write health response");
+        });
+
+        // 到達不能な HTTP proxy + 空の NO_PROXY でも ready 判定できるのは
+        // クライアントの no_proxy() 設定によるもの。
+        let _proxy = ProxyEnvGuard::set_unreachable();
+        wait_for_server_ready(&base_url, Duration::from_secs(3), None)
+            .await
+            .expect("loopback health probe must bypass env proxy");
+        probe.await.expect("probe server task");
+    }
+
+    #[tokio::test]
     async fn tui_fork_posts_to_server_and_uses_forked_session() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 上記テストが proxy 環境変数を書き換えるため直列化する。
+        let _guard = NETWORK_ENV_LOCK.lock().await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
