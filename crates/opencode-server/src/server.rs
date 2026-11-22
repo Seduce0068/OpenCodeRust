@@ -1060,13 +1060,17 @@ impl ServerState {
     /// セッション id・パス・トークン値はログにもエラー本文にも含めない。
     /// リポジトリが未設定の場合は何もせず成功扱いとする。
     pub async fn delete_session_from_storage(&self, session_id: &str) -> anyhow::Result<()> {
-        let (Some(session_repo), Some(message_repo)) = (&self.session_repo, &self.message_repo)
-        else {
+        let Some(session_repo) = &self.session_repo else {
             return Ok(());
         };
 
         // `SessionManager::delete` は子セッションを再帰的に削除するため、
         // 永続ストレージ側も同じサブツリーを削除する。visited で循環を防ぐ。
+        //
+        // messages.session_id は ON DELETE CASCADE のため、セッション削除 1 文で
+        // メッセージも同じトランザクション内で削除される。明示的なメッセージ削除は
+        // 別 auto-commit となり、セッション削除失敗時にメッセージだけ失われるため
+        // 意図的に呼ばない（TX-01）。
         let mut pending = vec![session_id.to_string()];
         let mut visited: HashSet<String> = HashSet::new();
         while let Some(current) = pending.pop() {
@@ -1083,10 +1087,6 @@ impl ServerState {
                     pending.push(child_id);
                 }
             }
-            message_repo
-                .delete_for_session(&current)
-                .await
-                .map_err(|_| anyhow::anyhow!("failed to delete stored session messages"))?;
             session_repo
                 .delete(&current)
                 .await

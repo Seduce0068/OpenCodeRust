@@ -6607,11 +6607,13 @@ struct WriteLogRequest {
 }
 
 /// Sanitize an untrusted log field: strip control characters (newlines in
-/// particular) and cap its length to avoid log-forging and oversized entries.
+/// particular) and Unicode format controls (Cf: RLO / ZWSP / BOM etc., same
+/// rule as `sanitize_part_id`) and cap its length to avoid log-forging and
+/// oversized entries.
 fn sanitize_log_field(value: &str, max_chars: usize) -> String {
     value
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_format_control(*c))
         .take(max_chars)
         .collect()
 }
@@ -7634,6 +7636,19 @@ mod mapping_tests {
         assert_eq!(sanitize_log_field("a\r\nb\tc", 100), "abc");
         assert_eq!(sanitize_log_field("abcdef", 3), "abc");
         assert_eq!(sanitize_log_field("", 10), "");
+    }
+
+    /// ENC-03: Cf は `is_control()` に該当しないため、既存の
+    /// `is_format_control` で明示的に除外する（sanitize_part_id と同基準）。
+    #[test]
+    fn sanitize_log_field_strips_unicode_format_controls() {
+        assert_eq!(
+            sanitize_log_field("a\u{202E}b\u{200B}c\u{FEFF}d", 100),
+            "abcd"
+        );
+        assert_eq!(sanitize_log_field("\u{FEFF}", 100), "");
+        // フィルタ後に Cc 除去と max_chars 制限が従来どおり適用されること。
+        assert_eq!(sanitize_log_field("a\n\u{202E}bcdef", 3), "abc");
     }
 
     #[test]
