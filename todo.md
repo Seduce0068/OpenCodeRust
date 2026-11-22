@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **McpClient::close が in-flight receive() とデッドロック**
-  — `mcp/client.rs:892` / SIG-01 / 中（high）
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[McpClient close 1 件]** in-flight receive とデッドロックしない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[BashTool 完了判定 1 件]** 背景子の EOF 待ちでハングしない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP stderr 1 件]** stdio 子の stderr を null 化してブロック防止
@@ -773,6 +773,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（McpClient close の修正時）: 親が notify_waiters() を
+  notify_one()（permit 保存で notified 登録前の競合を解消）へ、progress 側の
+  timeout 分岐で shutdown 再確認・hard_deadline チェックを shutdown の後ろへ
+  直接修正。sticky フラグにより close 後再利用は TransportError だが、
+  restart は新規クライアント生成のため実害なし。
 - 2026-11-23 R4 残存（BashTool 完了判定、3 回目の修正で停止）: 後段の
   残り時間 wait / グレース drain の間は abort トークンをポールしないため、
   その間に取り消されると Cancelled にならない可能性（low）。親の初期診断
