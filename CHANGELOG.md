@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T03:50:00+09:00"
+  at: "2026-11-23T04:13:44+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3197 件（all-features は 3196 件）
+  テスト総数 594 → 3200 件（all-features は 3199 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `codemode`: Math.random の乱数状態を CAS 更新（並行呼び出しで同一 UUID を防ぐ）
+  （swarm-coding R1-R6）
 - `config`: PATCH の read-modify-write を直列化（並行更新でパッチが消えない）
   （swarm-coding R1-R6）
 - `codemode`: URLSearchParams の WHATWG urlencoded 規則（'+' ↔ 空白）を実装

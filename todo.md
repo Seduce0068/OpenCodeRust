@@ -239,6 +239,10 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **SseTransport::connect が旧 sse_task を abort せずリーク**
+  — `mcp/transport.rs:586` / LIFE-01 / 中（本番未到達）
+- [ ] **SseTransport::close が violation/queue をリセットしない**
+  — `mcp/transport.rs:684` / LIFE-02 / 中（本番未到達）
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -266,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[乱数並行安全性 1 件]** Math.random を CAS 更新へ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[config 並行更新 1 件]** PATCH の read-modify-write を直列化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[URLSearchParams 1 件]** WHATWG urlencoded 規則（'+' ↔ 空白）
@@ -761,6 +767,13 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm218、2 担当・4 件、観点: リソース寿命 /
+  並行アクセス）: 親が CONC-01 を read で事実確認し即座 coding（AtomicU64 の
+  load/store を try_update CAS へ）。親が deprecated fetch_update→try_update、
+  clippy hex grouping、子の手計算ミス期待値、R4 指摘（決定的 CAS テスト・
+  expect 化）を直接修正。MCP transport/client の再接続時クリーンアップ 3 件は
+  現行本番経路で未到達（毎回新規インスタンス）だが公開 API 不整合として
+  triage。乱数は 1 スレッド出力列不変・並行同一 UUID 防止を検証。
 - 2026-11-23 R4 指摘（config ロックの修正時）: 親が並行回帰テストの
   ベストエフォート性（Barrier は read 直前の同時解放に過ぎずロック無しでも
   両キーが残り得る）をコメントに明記。read-modify-write 全体の包絡、
