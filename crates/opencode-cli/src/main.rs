@@ -44,6 +44,85 @@ use opencode_tool::{create_default_registry, ToolContext};
 use opencode_types::{MessagePart, Session, SessionMessage};
 use tracing_subscriber::layer::SubscriberExt;
 
+/// ホストとポートを `host:port` 形式へ整形する（IPv6 対応・後方互換）。
+///
+/// ':' を含むホスト（IPv6）は角括弧で囲んで `[host]:port` を返す。
+/// 既に `[]` で囲まれている場合はそのまま使い、二重括号を避ける。
+/// IPv4 / ホスト名（':' を含まない）は従来どおり `host:port` を返す。
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// `http://host:port` 形式の URL を生成する（IPv6 は角括弧で囲む）。
+fn format_http_url(host: &str, port: u16) -> String {
+    format!("http://{}", format_host_port(host, port))
+}
+
+#[cfg(test)]
+mod host_port_format_tests {
+    use super::*;
+
+    /// NET-01 回帰: 圧縮形式 IPv6 が `SocketAddr` としてパースでき、URL が正しく括られること。
+    #[test]
+    fn ipv6_hostname_is_bracketed_for_socket_addr_and_url() {
+        let socket = format_host_port("::1", 3000);
+        assert_eq!(socket, "[::1]:3000");
+        assert!(
+            socket.parse::<SocketAddr>().is_ok(),
+            "bracketed IPv6 must parse as SocketAddr"
+        );
+        assert_eq!(format_http_url("::1", 3000), "http://[::1]:3000");
+    }
+
+    /// 後方互換: IPv4 / ホスト名の出力は不変（角括弧を付けない）。
+    #[test]
+    fn ipv4_and_hostname_output_is_unchanged() {
+        assert_eq!(format_host_port("127.0.0.1", 3000), "127.0.0.1:3000");
+        assert_eq!(format_host_port("0.0.0.0", 3000), "0.0.0.0:3000");
+        assert_eq!(format_host_port("localhost", 3000), "localhost:3000");
+        assert_eq!(format_http_url("127.0.0.1", 3000), "http://127.0.0.1:3000");
+        assert_eq!(format_http_url("localhost", 3000), "http://localhost:3000");
+    }
+
+    /// 既に `[]` で囲まれた IPv6 が二重括号にならないこと。
+    #[test]
+    fn already_bracketed_ipv6_is_not_double_wrapped() {
+        assert_eq!(format_host_port("[::1]", 3000), "[::1]:3000");
+        assert_eq!(format_http_url("[::1]", 3000), "http://[::1]:3000");
+    }
+
+    /// 完全形式 IPv6（'::' を含まない）も ':' を含むため角括弧されること。
+    #[test]
+    fn full_form_ipv6_is_bracketed() {
+        let full = "2001:db8:0:0:0:0:0:1";
+        let socket = format_host_port(full, 3000);
+        assert_eq!(socket, format!("[{}]:3000", full));
+        assert!(
+            socket.parse::<SocketAddr>().is_ok(),
+            "bracketed full-form IPv6 must parse as SocketAddr"
+        );
+        assert_eq!(
+            format_http_url(full, 3000),
+            "http://[2001:db8:0:0:0:0:0:1]:3000"
+        );
+    }
+
+    /// unspecified アドレスは接続用 loopback へ正規化される（R4）。
+    #[test]
+    fn unspecified_bind_hosts_normalize_to_loopback() {
+        assert_eq!(client_host_for_bind("0.0.0.0", "127.0.0.1"), "127.0.0.1");
+        assert_eq!(client_host_for_bind("::", "127.0.0.1"), "127.0.0.1");
+        assert_eq!(client_host_for_bind("[::]", "localhost"), "localhost");
+        assert_eq!(client_host_for_bind("::1", "localhost"), "::1");
+        assert!(is_loopback_host("[::1]"));
+        assert!(!is_loopback_host("2001:db8::1"));
+    }
+}
+
 /// CLI で明示指定されたサーバ起動オプションのみを保持する。
 /// 未指定（`None` / 空ベクタ）は `config.server.*` を採用する。
 #[derive(Debug, Default)]
@@ -1684,18 +1763,14 @@ async fn run_tui(
         } else {
             runtime.hostname.clone()
         };
-        let client_host = if bind_host == "0.0.0.0" {
-            "127.0.0.1".to_string()
-        } else {
-            bind_host.clone()
-        };
+        let client_host = client_host_for_bind(&bind_host, "127.0.0.1");
         let bind_port = if runtime.port == 0 {
             3000
         } else {
             runtime.port
         };
-        let addr: SocketAddr = format!("{}:{}", bind_host, bind_port).parse()?;
-        let server_url = format!("http://{}:{}", client_host, bind_port);
+        let addr: SocketAddr = format_host_port(&bind_host, bind_port).parse()?;
+        let server_url = format_http_url(&client_host, bind_port);
         // TUI のローカルサーバは run_server_command を通らず
         // run_server_with_shutdown を直接 spawn するため、
         // CLI と同じ fail-closed 判定の認証状態通知をここで 1 回出す。
@@ -3325,7 +3400,7 @@ async fn run_http_server(mode: &str, runtime: ServerRuntimeConfig) -> anyhow::Re
     opencode_server::set_cors_whitelist(runtime.cors);
     let _mdns_publisher =
         start_mdns_publisher_if_needed(runtime.mdns, &bind_host, bind_port, &runtime.mdns_domain);
-    let addr: SocketAddr = format!("{}:{}", bind_host, bind_port).parse()?;
+    let addr: SocketAddr = format_host_port(&bind_host, bind_port).parse()?;
     println!("Starting OpenCode {} server on {}", mode, addr);
     opencode_server::run_server(addr).await?;
     Ok(())
@@ -3378,12 +3453,8 @@ async fn run_web_command(overrides: ServerCliOverrides) -> anyhow::Result<()> {
     } else {
         runtime.port
     };
-    let display_host = if runtime.hostname == "0.0.0.0" {
-        "localhost".to_string()
-    } else {
-        runtime.hostname.clone()
-    };
-    let url = format!("http://{}:{}", display_host, bind_port);
+    let display_host = client_host_for_bind(&runtime.hostname, "localhost");
+    let url = format_http_url(&display_host, bind_port);
     println!("Web interface: {}", url);
     try_open_browser(&url);
     run_http_server("web", runtime).await
@@ -3413,7 +3484,21 @@ async fn run_acp_command(overrides: ServerCliOverrides, cwd: PathBuf) -> anyhow:
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    // [::1] のような角括弧付き表記も loopback として扱う（R4）。
+    let normalized = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    matches!(normalized, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// bind 用 unspecified アドレスを、接続用の loopback host へ正規化する（R4）。
+fn client_host_for_bind(bind_host: &str, loopback: &str) -> String {
+    if bind_host == "0.0.0.0" || bind_host == "::" || bind_host == "[::]" {
+        loopback.to_string()
+    } else {
+        bind_host.to_string()
+    }
 }
 
 fn service_name_from_mdns_domain(domain: &str, port: u16) -> String {
