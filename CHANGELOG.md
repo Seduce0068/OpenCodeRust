@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T07:57:33+09:00"
+  at: "2026-11-23T08:11:32+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3232 件（all-features は 3231 件）
+  テスト総数 594 → 3235 件（all-features は 3234 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `config`: 明示的空配列で watcher.ignore をクリアできるように修正
+  （swarm-coding R1-R6）
 - `provider`: Anthropic tool_use の id/name 欠落で空 ID イベントを出さない
   （swarm-coding R1-R6）
 - `tui`: セッション status 取得失敗時に既存の busy 表示を維持

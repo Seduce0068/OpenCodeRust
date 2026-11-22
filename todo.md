@@ -67,6 +67,9 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **空配列クリアが他 4 フィールドで未対応**
+  — skills.paths/urls, provider.whitelist/blacklist, primary_tools /
+  watcher.ignore と同パターンで ExplicitStringList 化
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -239,8 +242,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **空配列によるクリアが watcher.ignore 等で無視される**
-  — `config/schema.rs:967` / CFGCONV-R1-01 / 中
 - [ ] **grep ディレクトリ検索の一部ファイル失敗が握りつぶされる**
   — `grep/search.rs:74` / ERRPROP-02 / 中
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
@@ -270,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[空配列クリア 1 件]** watcher.ignore を ExplicitStringList 化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[Anthropic tool_use 1 件]** 空 ID イベントを出さない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[session status 1 件]** 取得失敗時に busy 表示を維持
@@ -787,6 +790,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（watcher.ignore の修正時）: 同種の残り 4 フィールド
+  （skills.paths/urls、provider.whitelist/blacklist、primary_tools）は今回
+  スコープ外として中優先 TODO へ明示。なお config の watcher.ignore は
+  opencode-watcher の ignore_patterns へ配線されておらず、R4 も「今回の
+  回帰ではない」と指摘（既知の watch.ignore 未配線として既に記録済み）。
+  親がテストの move エラー（base.watcher の二重 expect）を直接修正。
 - 2026-11-23 R4 残存（Anthropic tool_use の修正時）: 同一 index に旧ブロック
   が残ると後続 partial_json が誤った id へ属性付けされる可能性（R4 も
   confidence low）、マルチブロック混在の回帰テスト不足。親が空白のみ
