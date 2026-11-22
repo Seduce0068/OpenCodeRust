@@ -1,6 +1,6 @@
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -199,6 +199,16 @@ pub struct McpClient {
     oauth_manager: RwLock<Option<Arc<McpOAuthManager>>>,
     /// Set to true when a `notifications/tools/list_changed` is received.
     tools_changed: std::sync::atomic::AtomicBool,
+    /// Signaled by `close()` before it tears down the transport. Every in-flight
+    /// `receive()` wait selects on this notification so shutdown can wake it
+    /// instead of deadlocking on transport-internal locks (SIG-01).
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    /// Sticky shutdown flag. `close()` stores this flag first and wakes the
+    /// in-flight waiter with `notify_one()`, which stores a permit for a
+    /// `notified()` created later. Every request checkpoint also reads the
+    /// flag, so a waiter created after the wake-up still aborts.
+    /// the in-flight call (R4). Idempotent across repeated `close()` calls.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl McpClient {
@@ -218,6 +228,8 @@ impl McpClient {
             status: RwLock::new(McpStatus::Disabled),
             oauth_manager: RwLock::new(None),
             tools_changed: std::sync::atomic::AtomicBool::new(false),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -512,6 +524,25 @@ impl McpClient {
         self.request_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Whether `close()` has been called. The flag is sticky and SeqCst, so it
+    /// also covers wake-ups that `Notify::notify_waiters()` could not deliver
+    /// because no `notified()` future was registered yet.
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Canonical error for a request aborted by shutdown. `close()` stores the
+    /// flag before notifying, so a wake-up from `shutdown_notify` must observe
+    /// `is_shutdown() == true`; the assertion documents that contract. No
+    /// token value, request id, or path is included in the message.
+    fn shutdown_error(&self) -> McpClientError {
+        debug_assert!(
+            self.is_shutdown(),
+            "shutdown notification received without the shutdown flag"
+        );
+        McpClientError::TransportError("Connection closed".to_string())
+    }
+
     /// Send a JSON-RPC notification (no `id`, no response expected).
     async fn send_notification(
         &self,
@@ -542,6 +573,14 @@ impl McpClient {
         // steal responses carrying another request's id.
         let _request_guard = self.request_lock.lock().await;
 
+        // close() may have run before this caller registered any notified()
+        // future. The sticky flag closes that gap without trusting the wake-up.
+        if self.is_shutdown() {
+            return Err(McpClientError::TransportError(
+                "Connection closed".to_string(),
+            ));
+        }
+
         let id = self.next_id().await;
         let request = JsonRpcRequest::new(id, method);
         let request = if let Some(p) = params {
@@ -560,13 +599,60 @@ impl McpClient {
                 .cloned()
                 .ok_or(McpClientError::NotInitialized)?
         };
-        transport.send(&request).await?;
+        // Own the notifier locally so every select! below never borrows `self`
+        // and never holds a Mutex guard across an await. `close()` signals it
+        // before tearing down the transport, waking a waiter that would
+        // otherwise hang behind transport-internal locks.
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        // Race send() itself against shutdown: a transport that hangs inside
+        // send() (e.g. an unanswered HTTP POST) must be released by close()
+        // instead of waiting until some outer timeout. The flag checks before
+        // and after this select! cover the window where close() fires before
+        // notified() is registered.
+        if self.is_shutdown() {
+            return Err(McpClientError::TransportError(
+                "Connection closed".to_string(),
+            ));
+        }
+        tokio::select! {
+            result = transport.send(&request) => result?,
+            _ = shutdown_notify.notified() => {
+                return Err(self.shutdown_error());
+            }
+        }
+        if self.is_shutdown() {
+            return Err(McpClientError::TransportError(
+                "Connection closed".to_string(),
+            ));
+        }
 
         let response = loop {
-            match transport.receive().await? {
+            // Re-check on every iteration: close() may have fired during
+            // handle_notification() or immediately after a `continue`, i.e.
+            // while no notified() future was registered to receive it.
+            if self.is_shutdown() {
+                return Err(McpClientError::TransportError(
+                    "Connection closed".to_string(),
+                ));
+            }
+            let message = tokio::select! {
+                result = transport.receive() => result?,
+                _ = shutdown_notify.notified() => {
+                    return Err(self.shutdown_error());
+                }
+            };
+            match message {
                 Some(JsonRpcMessage::Response(resp)) if resp.id == id => break resp,
                 Some(JsonRpcMessage::Notification(notif)) => {
                     self.handle_notification(notif).await;
+                    // handle_notification() awaits internal locks; close() can
+                    // fire there with no notified() future registered.
+                    if self.is_shutdown() {
+                        return Err(McpClientError::TransportError(
+                            "Connection closed".to_string(),
+                        ));
+                    }
                     continue;
                 }
                 Some(_) => continue,
@@ -595,6 +681,14 @@ impl McpClient {
         // same `transport.receive()` and consume each other's id-tagged reply.
         let _request_guard = self.request_lock.lock().await;
 
+        // Sticky flag closes the gap where close() ran before any notified()
+        // future was registered for this request.
+        if self.is_shutdown() {
+            return Err(McpClientError::TransportError(
+                "Connection closed".to_string(),
+            ));
+        }
+
         let id = self.next_id().await;
         let request = JsonRpcRequest::new(id, method);
         let request = if let Some(p) = params {
@@ -614,6 +708,10 @@ impl McpClient {
                 .ok_or(McpClientError::NotInitialized)?
         };
 
+        // Own the notifier locally so the select! in the receive loop never
+        // borrows `self` and never holds a Mutex guard across the wait.
+        let shutdown_notify = self.shutdown_notify.clone();
+
         // The deadline is fixed BEFORE send: reqwest has no default request
         // timeout, so an HTTP/SSE POST that accepts the connection but never
         // answers must not hang forever. `call_start` also bounds the receive
@@ -629,25 +727,63 @@ impl McpClient {
 
         // Cover send() itself with the same absolute bound. Progress cannot
         // extend the send phase, but using hard_deadline keeps a single,
-        // explicit upper bound for the whole request exchange.
-        tokio::time::timeout_at(hard_deadline, transport.send(&request))
-            .await
-            .map_err(|_| McpClientError::Timeout)??;
+        // explicit upper bound for the whole request exchange. The shutdown
+        // branch is essential: without it a hung POST could wait for the full
+        // hard deadline (~48h at the documented defaults) after close().
+        if self.is_shutdown() {
+            return Err(McpClientError::TransportError(
+                "Connection closed".to_string(),
+            ));
+        }
+        tokio::select! {
+            timed = tokio::time::timeout_at(hard_deadline, transport.send(&request)) => {
+                timed.map_err(|_| McpClientError::Timeout)??;
+            }
+            _ = shutdown_notify.notified() => {
+                return Err(self.shutdown_error());
+            }
+        }
+        if self.is_shutdown() {
+            return Err(McpClientError::TransportError(
+                "Connection closed".to_string(),
+            ));
+        }
 
         let response = loop {
             // `timeout_at` alone can be starved: if the transport keeps yielding
             // messages without ever going pending, its inner future wins every
             // poll and the timeout is never observed. Check the absolute bound
             // explicitly on every iteration so a progress flood always ends.
+            // shutdown を deadline より先に確認する（biased で timeout 分岐が
+            // 先に評価されても、close() 由来なら Connection closed を返す、R4）。
+            if self.is_shutdown() {
+                return Err(self.shutdown_error());
+            }
             if tokio::time::Instant::now() >= hard_deadline {
                 return Err(McpClientError::Timeout);
             }
             let effective_deadline = deadline.min(hard_deadline);
-            let message =
-                match tokio::time::timeout_at(effective_deadline, transport.receive()).await {
-                    Ok(result) => result?,
-                    Err(_) => return Err(McpClientError::Timeout),
-                };
+            // `biased` restores the old `timeout_at` priority: the timeout
+            // branch is evaluated first, so an elapsed effective deadline
+            // always yields Timeout even if receive() is also ready. Default
+            // random selection could otherwise let a late response win.
+            let message = tokio::select! {
+                biased;
+                timed = tokio::time::timeout_at(effective_deadline, transport.receive()) => {
+                    match timed {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            if self.is_shutdown() {
+                                return Err(self.shutdown_error());
+                            }
+                            return Err(McpClientError::Timeout);
+                        }
+                    }
+                }
+                _ = shutdown_notify.notified() => {
+                    return Err(self.shutdown_error());
+                }
+            };
 
             match message {
                 Some(JsonRpcMessage::Response(resp)) if resp.id == id => break resp,
@@ -664,6 +800,13 @@ impl McpClient {
                         }
                     }
                     self.handle_notification(notif).await;
+                    // handle_notification() awaits locks; re-check immediately
+                    // so a close() during it is not lost to the next select!.
+                    if self.is_shutdown() {
+                        return Err(McpClientError::TransportError(
+                            "Connection closed".to_string(),
+                        ));
+                    }
                     continue;
                 }
                 Some(_) => continue,
@@ -890,6 +1033,19 @@ impl McpClient {
     }
 
     pub async fn close(&self) -> Result<(), McpClientError> {
+        // Set the sticky flag FIRST, then notify_one() (which stores a permit
+        // even if no waiter is registered yet). SeqCst + idempotent store makes
+        // repeated close() calls safe.
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        // Wake every in-flight `receive()` waiter BEFORE taking the transport.
+        // StdioTransport::receive() holds the stdout guard while it waits for a
+        // reply; StdioTransport::close() needs stdout -> stdin -> process, so a
+        // pending receive() would otherwise block close() forever (SIG-01).
+        // Woken waiters return TransportError("Connection closed") from the
+        // select! in send_request / send_request_with_progress_timeout.
+        self.shutdown_notify.notify_one();
+
         // Take the transport out and drop the Mutex guard before awaiting
         // close(), so in-flight requests waiting on receive() are not blocked
         // by (or blocking) the shutdown path.
@@ -1653,6 +1809,323 @@ mod tests {
         // このテストの目的は receive() 待ち中に Mutex が取得できたことなので、
         // call の最終エラー種別は問わない（panic していなければよい）。
         assert!(joined.is_ok(), "call task must not panic");
+    }
+
+    /// Models StdioTransport's lock ordering (SIG-01): `receive()` holds the
+    /// stdout guard while waiting for a reply that never arrives, while
+    /// `close()` must acquire that same guard before it can finish. Without
+    /// the shutdown notification, close() blocks forever on stdout.
+    struct DeadlockProneTransport {
+        stdout: Arc<Mutex<()>>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl McpTransport for DeadlockProneTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            let _stdout_guard = self.stdout.lock().await;
+            self.entered.store(true, Ordering::SeqCst);
+            // Never answer: stay pending while holding the stdout guard.
+            std::future::pending().await
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            // StdioTransport::close() acquires stdout before stdin/process.
+            let _stdout_guard = self.stdout.lock().await;
+            Ok(())
+        }
+    }
+
+    /// Regression (SIG-01), progress-timeout path: an in-flight call() parked
+    /// in receive() must be woken by close(), and close() must complete instead
+    /// of deadlocking on the stdout guard held by that receive().
+    #[tokio::test]
+    async fn close_unblocks_in_flight_call_without_deadlock() {
+        let client = Arc::new(
+            McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+                .with_timeout(5_000),
+        );
+        let stdout = Arc::new(Mutex::new(()));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(DeadlockProneTransport {
+                stdout: stdout.clone(),
+                entered: entered.clone(),
+            }));
+        }
+
+        let call_client = client.clone();
+        let call = tokio::spawn(async move { call_client.call_tool("hung", None).await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "receive() was never entered"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        // Without the notification, close() would block on stdout forever and
+        // this timeout would fire.
+        let close_client = client.clone();
+        let close_result =
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                async move { close_client.close().await },
+            )
+            .await
+            .expect("close() must not deadlock against an in-flight receive()");
+        assert!(close_result.is_ok(), "close() must succeed");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("in-flight call must finish after close()")
+            .expect("call task must not panic")
+            .expect_err("in-flight call must fail after shutdown");
+        assert!(
+            matches!(&error, McpClientError::TransportError(msg) if msg == "Connection closed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Regression (SIG-01), plain send_request path: `initialize()` parked in
+    /// receive() must be woken by close() with the same TransportError.
+    #[tokio::test]
+    async fn close_unblocks_in_flight_initialize_without_deadlock() {
+        let client = Arc::new(
+            McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+                .with_timeout(5_000),
+        );
+        let stdout = Arc::new(Mutex::new(()));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(DeadlockProneTransport {
+                stdout: stdout.clone(),
+                entered: entered.clone(),
+            }));
+        }
+
+        let init_client = client.clone();
+        let init = tokio::spawn(async move { init_client.initialize().await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "receive() was never entered"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        let close_client = client.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            async move { close_client.close().await },
+        )
+        .await
+        .expect("close() must not deadlock against an in-flight initialize()")
+        .expect("close() must succeed");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), init)
+            .await
+            .expect("in-flight initialize() must finish after close()")
+            .expect("init task must not panic")
+            .expect_err("in-flight initialize() must fail after shutdown");
+        assert!(
+            matches!(&error, McpClientError::TransportError(msg) if msg == "Connection closed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Transport whose `send()` signals entry and then stays pending: models an
+    /// HTTP POST that is accepted but never answered.
+    struct SignalingHangingSendTransport {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl McpTransport for SignalingHangingSendTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            self.entered.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            Ok(None)
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    /// Regression (R4): close() during send() must abort the in-flight call.
+    /// Without the send-side shutdown select!, `notify_waiters()` cannot wake
+    /// a future that never registered `notified()`, so a hung POST would wait
+    /// for the hard deadline (up to ~48h at the documented defaults).
+    #[tokio::test]
+    async fn close_during_hanging_send_aborts_in_flight_call() {
+        let client = Arc::new(
+            McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+                .with_timeout(60_000),
+        );
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(SignalingHangingSendTransport {
+                entered: entered.clone(),
+            }));
+        }
+
+        let call_client = client.clone();
+        let call = tokio::spawn(async move { call_client.call_tool("hung", None).await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "send() was never entered"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        let close_client = client.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            async move { close_client.close().await },
+        )
+        .await
+        .expect("close() must not hang while send() is pending")
+        .expect("close() must succeed");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("in-flight call must finish right after close()")
+            .expect("call task must not panic")
+            .expect_err("call must fail after shutdown");
+        assert!(
+            matches!(&error, McpClientError::TransportError(msg) if msg == "Connection closed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Regression (R4): close() before a request registers any `notified()`
+    /// future must still be observed. `notify_waiters()` stores no permit, so a
+    /// later `notified()` would miss the wake-up entirely; only the sticky flag
+    /// can abort such a call.
+    #[tokio::test]
+    async fn close_before_request_registers_notified_aborts_call() {
+        let client = Arc::new(
+            McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+                .with_timeout(60_000),
+        );
+        // receive() would otherwise hang forever; the flag must short-circuit
+        // before the transport is even touched.
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(HangingTransport));
+        }
+
+        client.close().await.expect("close() must succeed");
+        assert!(client.is_shutdown(), "shutdown flag must be sticky");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), client.call_tool("hung", None))
+            .await
+            .expect("call must not hang after close()")
+            .expect_err("call must fail when already shut down");
+        assert!(
+            matches!(&error, McpClientError::TransportError(msg) if msg == "Connection closed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A response that only becomes available after the effective deadline.
+    struct LateResponseTransport {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl McpTransport for LateResponseTransport {
+        async fn send(&self, _request: &JsonRpcRequest) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn send_notification(
+            &self,
+            _notification: &JsonRpcNotification,
+        ) -> Result<(), McpClientError> {
+            Ok(())
+        }
+
+        async fn receive(&self) -> Result<Option<JsonRpcMessage>, McpClientError> {
+            sleep(self.delay).await;
+            Ok(Some(JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: 1,
+                result: Some(serde_json::json!({
+                    "content": [{ "type": "text", "text": "late" }]
+                })),
+                error: None,
+            })))
+        }
+
+        async fn close(&self) -> Result<(), McpClientError> {
+            Ok(())
+        }
+    }
+
+    /// Regression (R4): default random branch selection could let a response
+    /// arriving after `effective_deadline` win over the timeout. `biased;`
+    /// restores the old `timeout_at` priority, so Timeout is deterministic.
+    #[tokio::test]
+    async fn progress_timeout_wins_over_late_response() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()))
+            .with_timeout(40); // effective deadline 40ms, hard deadline 160ms
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(LateResponseTransport {
+                delay: Duration::from_millis(120),
+            }));
+        }
+
+        let error = client
+            .call_tool("slow", None)
+            .await
+            .expect_err("response after the effective deadline must not succeed");
+        assert!(
+            matches!(error, McpClientError::Timeout),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The shutdown flag is idempotent: repeated close() calls must remain safe.
+    #[tokio::test]
+    async fn repeated_close_is_safe() {
+        let client = McpClient::new("test-server".to_string(), Arc::new(McpToolRegistry::new()));
+        client.close().await.expect("first close must succeed");
+        client.close().await.expect("second close must succeed");
+        assert!(client.is_shutdown());
     }
 
     #[tokio::test]
