@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T05:03:51+09:00"
+  at: "2026-11-23T05:17:41+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mcp`: stdio 子プロセスの stderr を破棄し大量出力でのブロックを防止
+  （swarm-coding R1-R6）
 - `tui`: クリップボードコマンドの stdin 書込失敗時も子を reap（zombie 防止）
   （swarm-coding R1-R6）
 - `mcp`: SSE 再接続時に旧リスナ・古い violation/Notify を破棄

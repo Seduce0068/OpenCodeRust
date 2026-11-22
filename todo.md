@@ -241,8 +241,6 @@ status: current
 
 - [ ] **McpClient::close が in-flight receive() とデッドロック**
   — `mcp/client.rs:892` / SIG-01 / 中（high）
-- [ ] **StdioTransport が stderr を未ドレインで子がブロック**
-  — `mcp/transport.rs:127` / SIG-02 / 中
 - [ ] **BashTool がパイプ EOF を待ち背景子で Timeout**
   — `tool/bash.rs:402` / SIG-03 / 中
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
@@ -272,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP stderr 1 件]** stdio 子の stderr を null 化してブロック防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[clipboard zombie 1 件]** 書込失敗時も子を reap
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP SSE 再接続 2 件]** 旧リスナ abort と violation/Notify リセット
@@ -773,6 +773,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（MCP stderr の修正時）: 子は inherit() を選んだが、
+  親が null() へ変更。子側トークン値・パスの親ログ流出と大量 stderr による
+  ログフラッドを防ぐため（plugin 側は inherit のまま）。回帰テストのダミー
+  を 1 MiB へ増やし pipe-max-size 引き上げ環境でも検出感度を維持。
 - 2026-11-23 却下（FILEIO-01、apply_patch 末尾改行）: 子が元ファイルの
   末尾改行を復元する修正を実装したが、既存テスト 5 件が「末尾改行は付かない」
   と明記して仕様化しており（OpenCode 互換）、discovery の「バグ」判定は
