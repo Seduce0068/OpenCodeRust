@@ -239,6 +239,22 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **権限ダイアログのクリック座標がボタン行と一致しない**
+  — `tui/components/permission.rs:310-325` / TUIEV-03 / 中
+- [ ] **5 秒ごとの背景更新でセッション一覧の選択が先頭へ戻る**
+  — `tui/dialogs/session_list.rs:207-225` / TUIEV-04 / 中
+- [ ] **Ctrl+Shift+C が input_copy を奪いプロンプトをコピーできない**
+  — `tui/app/app.rs:557-564` / TUIEV-05 / 中
+- [ ] **`attach` の空 URL が既定ローカルサーバへ黙って接続する**
+  — `cli/main.rs:791` / CLIARG-01 / 中
+- [ ] **`mcp add --url` と `--command` の併用が競合検知されない**
+  — `cli/main.rs:1238` / CLIARG-02 / 中
+- [ ] **存在しない `--agent` が既定 build へ黙ってフォールバック**
+  — `cli/main.rs:2795` / CLIARG-05 / 中
+- [ ] **`session delete` が空 ID を許し 0 件削除を成功表示**
+  — `cli/main.rs:4651` / CLIARG-06 / 中
+- [ ] **`upgrade <TARGET>` の空文字が暗黙最新版として扱われる**
+  — `cli/main.rs:4265` / CLIARG-09 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -264,6 +280,8 @@ status: current
 
 ## 完了
 
+- [x] **[TUI 権限応答 2 件]** reply 共通化と成功時のみ要求削除
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[port=0 起動 1 件]** state URL / ログに実バインドポートを反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[IPv6 hostname 1 件]** bind/URL 生成と unspecified 正規化
@@ -741,6 +759,15 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm207、2 担当・19 件、観点: CLI 引数 /
+  TUI イベント）: 親が high 2 件（権限 reply）を read で事実確認し即座
+  coding。R4 が high（送信前に要求削除でハング）を指摘し親が
+  reply_permission を Result 化、成功時のみ要求削除へ修正。追加 R4 の
+  low 3 件のうち client None のログ欠落を親が直接修正、他は記録のみ。
+  親が clippy type_complexity を type alias で修正。high 2 件・medium 8 件を
+  処理/triage、low 8 件は記録のみ。残存: 権限ボタン座標（TUIEV-03）、
+  deny/always の失敗時テスト網羅、approve_always が本番パスから外れた
+  保守リスク、CLI 引数 various。
 - 2026-11-23 R4 残存（port=0 起動の修正時、記録のみ）: 回帰テストがヘルパ
   のみを検証し配線・ログは未担保、wildcard bind（0.0.0.0/[::]）では state URL
   に到達不能なホストが入る、local_addr() 取得が副作用の後。親が

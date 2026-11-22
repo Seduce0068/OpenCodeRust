@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T00:42:46+09:00"
+  at: "2026-11-23T01:28:56+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3163 件（all-features は 3162 件）
+  テスト総数 594 → 3168 件（all-features は 3167 件）
 
 ### Changed
 
@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tui`: 権限プロンプトの reply をマウス/キーボード共通化し、送信成功時のみ要求を削除
+  （fail-safe、always の ID 書き換えによる 404 も解消）
+  （swarm-coding R1-R6）
 - `server`: port=0 起動で state URL / ログに実バインドポートを反映
   （swarm-coding R1-R6）
 - `cli`: IPv6 hostname の bind/URL 生成と unspecified の接続先正規化
