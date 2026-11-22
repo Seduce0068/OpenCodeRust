@@ -8,7 +8,7 @@ use ratatui::{
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
@@ -1424,11 +1424,90 @@ fn prompt_state_dir() -> PathBuf {
     path
 }
 
-fn load_history(path: &PathBuf) -> Vec<String> {
-    let store = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<HistoryStore>(&s).ok())
-        .unwrap_or_default();
+/// Best-effort quarantine of a corrupted store file. Only a fixed suffix is
+/// appended; paths and file contents are never included in log messages.
+fn backup_corrupted_store(path: &Path) {
+    let mut backup_name = path.as_os_str().to_os_string();
+    backup_name.push(".bak");
+    let _ = std::fs::rename(path, PathBuf::from(backup_name));
+}
+
+/// Reads and deserializes a store. A missing file is a normal first-run case
+/// and stays silent; read/parse failures emit a fixed warning (kind only),
+/// quarantine the corrupted file, and let the caller fall back to empty data.
+fn read_store<T: serde::de::DeserializeOwned>(path: &Path, kind: &str) -> Option<T> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            tracing::warn!(kind = kind, "prompt store read failed; using empty data");
+            backup_corrupted_store(path);
+            return None;
+        }
+    };
+    match serde_json::from_str::<T>(&raw) {
+        Ok(store) => Some(store),
+        Err(_) => {
+            tracing::warn!(kind = kind, "prompt store parse failed; using empty data");
+            backup_corrupted_store(path);
+            None
+        }
+    }
+}
+
+/// Writes the bytes to a temp sibling, flushes, then renames into place. Any
+/// failure before the rename leaves the existing file untouched.
+fn write_store_to_temp(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // 既存ファイルの権限（例: 0600）を temp へ引き継ぐ。新規 inode の
+    // デフォルトモード（umask 依存の 0644 等）で作ると機密情報が露出する（R4）。
+    let permissions = std::fs::metadata(path).ok().map(|m| m.permissions());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(temp)?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(temp, permissions)?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(temp, path)
+}
+
+/// Atomic store write: temp sibling + `write_all` + `sync_all` + `rename`.
+fn write_store_atomic(path: &Path, json: &str) -> std::io::Result<()> {
+    let mut temp_name = path.as_os_str().to_os_string();
+    temp_name.push(".tmp");
+    let temp = PathBuf::from(temp_name);
+    let result = write_store_to_temp(&temp, path, json.as_bytes());
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Serializes and stores a payload, warning (kind only) on any failure.
+fn write_store<T: serde::Serialize>(path: &Path, payload: &T, kind: &str) {
+    let json = match serde_json::to_string(payload) {
+        Ok(json) => json,
+        Err(_) => {
+            tracing::warn!(
+                kind = kind,
+                "prompt store serialize failed; nothing written"
+            );
+            return;
+        }
+    };
+    if write_store_atomic(path, &json).is_err() {
+        tracing::warn!(kind = kind, "prompt store write failed; existing data kept");
+    }
+}
+
+fn load_history(path: &Path) -> Vec<String> {
+    let store = read_store::<HistoryStore>(path, "history").unwrap_or_default();
     let mut entries = store.entries;
     if entries.len() > MAX_HISTORY_ENTRIES {
         let overflow = entries.len() - MAX_HISTORY_ENTRIES;
@@ -1437,19 +1516,14 @@ fn load_history(path: &PathBuf) -> Vec<String> {
     entries
 }
 
-fn load_frecency(path: &PathBuf) -> HashMap<String, FrecencyEntry> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<FrecencyStore>(&s).ok())
+fn load_frecency(path: &Path) -> HashMap<String, FrecencyEntry> {
+    read_store::<FrecencyStore>(path, "frecency")
         .map(|store| store.entries)
         .unwrap_or_default()
 }
 
-fn load_stash(path: &PathBuf) -> Vec<PromptStashEntry> {
-    let store = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<StashStore>(&s).ok())
-        .unwrap_or_default();
+fn load_stash(path: &Path) -> Vec<PromptStashEntry> {
+    let store = read_store::<StashStore>(path, "stash").unwrap_or_default();
     let mut entries = store.entries;
     if entries.len() > MAX_STASH_ENTRIES {
         let overflow = entries.len() - MAX_STASH_ENTRIES;
@@ -1458,31 +1532,25 @@ fn load_stash(path: &PathBuf) -> Vec<PromptStashEntry> {
     entries
 }
 
-fn store_history(path: &PathBuf, entries: &[String]) {
+fn store_history(path: &Path, entries: &[String]) {
     let payload = HistoryStore {
         entries: entries.to_vec(),
     };
-    if let Ok(json) = serde_json::to_string(&payload) {
-        let _ = std::fs::write(path, json);
-    }
+    write_store(path, &payload, "history");
 }
 
-fn store_frecency(path: &PathBuf, entries: &HashMap<String, FrecencyEntry>) {
+fn store_frecency(path: &Path, entries: &HashMap<String, FrecencyEntry>) {
     let payload = FrecencyStore {
         entries: entries.clone(),
     };
-    if let Ok(json) = serde_json::to_string(&payload) {
-        let _ = std::fs::write(path, json);
-    }
+    write_store(path, &payload, "frecency");
 }
 
-fn store_stash(path: &PathBuf, entries: &[PromptStashEntry]) {
+fn store_stash(path: &Path, entries: &[PromptStashEntry]) {
     let payload = StashStore {
         entries: entries.to_vec(),
     };
-    if let Ok(json) = serde_json::to_string(&payload) {
-        let _ = std::fs::write(path, json);
-    }
+    write_store(path, &payload, "stash");
 }
 
 /// Extract a `#line` or `#line-line` range suffix from a file path reference.
@@ -1523,6 +1591,65 @@ mod tests {
     use super::*;
     use crate::components::prompt::test_support::STATE_DIR_LOCK;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fmt::Write as _;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// Minimal `tracing` capture for warning assertions; avoids adding a
+    /// `tracing-subscriber` dev-dependency to this crate.
+    #[derive(Clone, Default)]
+    struct WarnBuffer(Arc<Mutex<String>>);
+
+    impl WarnBuffer {
+        fn text(&self) -> String {
+            self.0.lock().expect("warning buffer lock").clone()
+        }
+    }
+
+    struct WarnVisitor(WarnBuffer);
+
+    impl Visit for WarnVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={:?} ", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let mut guard = self.0 .0.lock().expect("warning buffer lock");
+            let buffer: &mut String = &mut guard;
+            let _ = write!(buffer, "{}={} ", field.name(), value);
+        }
+    }
+
+    struct WarnSubscriber {
+        buffer: WarnBuffer,
+    }
+
+    impl Subscriber for WarnSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut WarnVisitor(self.buffer.clone()));
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    fn fresh_store_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-tui-store-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create store test dir");
+        dir
+    }
 
     fn with_isolated_prompt<T>(f: impl FnOnce(Prompt) -> T) -> T {
         let _guard = STATE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1722,5 +1849,190 @@ mod tests {
             let idle = line_text(&prompt.render_status_line(&theme));
             assert!(!idle.contains("then n/l/m/a/t/b/s/q/u/r"));
         });
+    }
+
+    #[test]
+    fn corrupted_store_warns_and_is_backed_up() {
+        let dir = fresh_store_dir("corrupt");
+        let path = dir.join("prompt-history.json");
+        let secret = "SECRET_TOKEN_SENTINEL_NEVER_LOG";
+        std::fs::write(
+            &path,
+            format!(r#"{{"entries":"not-an-array","token":"{secret}"}}"#),
+        )
+        .expect("write corrupted store");
+
+        let buffer = WarnBuffer::default();
+        let entries = tracing::subscriber::with_default(
+            WarnSubscriber {
+                buffer: buffer.clone(),
+            },
+            || load_history(&path),
+        );
+
+        assert!(entries.is_empty());
+        let backup = dir.join("prompt-history.json.bak");
+        assert!(backup.exists(), "corrupted store must be quarantined");
+        assert!(!path.exists(), "corrupted file should be moved to .bak");
+        assert!(
+            std::fs::read_to_string(&backup)
+                .expect("read backup")
+                .contains(secret),
+            "backup must keep the original corrupted bytes"
+        );
+        let text = buffer.text();
+        let dir_text = dir.to_string_lossy().to_string();
+        assert!(text.contains("history"), "kind must be logged: {text}");
+        assert!(
+            text.contains("parse failed"),
+            "reason must be logged: {text}"
+        );
+        assert!(
+            !text.contains(secret),
+            "token value leaked into warning: {text}"
+        );
+        assert!(
+            !text.contains(dir_text.as_str()),
+            "path leaked into warning: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_store_write_keeps_existing_data() {
+        let dir = fresh_store_dir("writefail");
+        let path = dir.join("prompt-history.json");
+        let original = r#"{"entries":["keep-me"]}"#;
+        std::fs::write(&path, original).expect("write original store");
+        // A directory at the temp sibling makes the atomic write fail before rename.
+        std::fs::create_dir(dir.join("prompt-history.json.tmp")).expect("create blocking dir");
+
+        let buffer = WarnBuffer::default();
+        tracing::subscriber::with_default(
+            WarnSubscriber {
+                buffer: buffer.clone(),
+            },
+            || store_history(&path, &["replacement-value".to_string()]),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original store still readable"),
+            original,
+            "existing data must survive a failed write"
+        );
+        let text = buffer.text();
+        assert!(text.contains("history"), "kind must be logged: {text}");
+        assert!(
+            text.contains("write failed"),
+            "reason must be logged: {text}"
+        );
+        assert!(
+            !text.contains("replacement-value"),
+            "payload leaked into warning: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_round_trip_keeps_json_layout_and_is_silent() {
+        let dir = fresh_store_dir("roundtrip");
+        let buffer = WarnBuffer::default();
+
+        tracing::subscriber::with_default(
+            WarnSubscriber {
+                buffer: buffer.clone(),
+            },
+            || {
+                let history_path = dir.join("prompt-history.json");
+                let history = vec!["alpha".to_string(), "beta".to_string()];
+                store_history(&history_path, &history);
+                assert_eq!(load_history(&history_path), history);
+                assert_eq!(
+                    std::fs::read_to_string(&history_path).expect("read history"),
+                    serde_json::to_string(&HistoryStore {
+                        entries: history.clone(),
+                    })
+                    .expect("encode history")
+                );
+
+                let frecency_path = dir.join("prompt-frecency.json");
+                let mut frecency = HashMap::new();
+                frecency.insert(
+                    "gamma".to_string(),
+                    FrecencyEntry {
+                        frequency: 3,
+                        last_used: 42,
+                    },
+                );
+                store_frecency(&frecency_path, &frecency);
+                let loaded_frecency = load_frecency(&frecency_path);
+                let loaded_entry = loaded_frecency.get("gamma").expect("frecency entry");
+                assert_eq!(loaded_entry.frequency, 3);
+                assert_eq!(loaded_entry.last_used, 42);
+                assert_eq!(
+                    std::fs::read_to_string(&frecency_path).expect("read frecency"),
+                    serde_json::to_string(&FrecencyStore {
+                        entries: frecency.clone(),
+                    })
+                    .expect("encode frecency")
+                );
+
+                let stash_path = dir.join("prompt-stash.json");
+                let stash = vec![PromptStashEntry {
+                    input: "draft".to_string(),
+                    created_at: 7,
+                }];
+                store_stash(&stash_path, &stash);
+                let loaded_stash = load_stash(&stash_path);
+                assert_eq!(loaded_stash.len(), 1);
+                assert_eq!(loaded_stash[0].input, "draft");
+                assert_eq!(loaded_stash[0].created_at, 7);
+                assert_eq!(
+                    std::fs::read_to_string(&stash_path).expect("read stash"),
+                    serde_json::to_string(&StashStore {
+                        entries: stash.clone(),
+                    })
+                    .expect("encode stash")
+                );
+
+                for name in [
+                    "prompt-history.json.tmp",
+                    "prompt-frecency.json.tmp",
+                    "prompt-stash.json.tmp",
+                ] {
+                    assert!(
+                        !dir.join(name).exists(),
+                        "temporary file must be removed: {name}"
+                    );
+                }
+            },
+        );
+
+        let text = buffer.text();
+        assert!(text.is_empty(), "normal round trip must not warn: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_store_files_load_empty_without_warnings() {
+        let dir = fresh_store_dir("missing");
+        let buffer = WarnBuffer::default();
+        tracing::subscriber::with_default(
+            WarnSubscriber {
+                buffer: buffer.clone(),
+            },
+            || {
+                assert!(load_history(&dir.join("prompt-history.json")).is_empty());
+                assert!(load_frecency(&dir.join("prompt-frecency.json")).is_empty());
+                assert!(load_stash(&dir.join("prompt-stash.json")).is_empty());
+            },
+        );
+
+        let text = buffer.text();
+        assert!(
+            text.is_empty(),
+            "missing stores are a normal first-run case: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

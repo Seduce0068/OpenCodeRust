@@ -2,7 +2,8 @@ use parking_lot::RwLock;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::api::ApiClient;
@@ -384,15 +385,42 @@ impl UiKv {
         let Some(path) = ui_kv_path() else {
             return Self::default();
         };
+        Self::load_from(&path)
+    }
 
-        let values = fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<HashMap<String, Value>>(&content).ok())
-            .unwrap_or_default();
+    /// 指定パスから kv を読み込む。破損/読取不能な既存ファイルは `.bak` へ
+    /// 退避してから空の状態で起動する（初回起動の NotFound は通常ケースとして扱う）。
+    fn load_from(path: &Path) -> Self {
+        let values = match fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str::<HashMap<String, Value>>(&content) {
+                Ok(values) => values,
+                Err(_) => {
+                    Self::quarantine_corrupted(path);
+                    HashMap::new()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(_) => {
+                Self::quarantine_corrupted(path);
+                HashMap::new()
+            }
+        };
 
         Self {
-            path: Some(path),
+            path: Some(path.to_path_buf()),
             values,
+        }
+    }
+
+    /// 破損した kv ファイルを `.bak` へ退避し、固定文言で warn を出す。
+    /// パスや値はログに出さない。退避の成否を文言へ反映する（R4）。
+    fn quarantine_corrupted(path: &Path) {
+        if fs::rename(path, backup_sibling(path)).is_ok() {
+            tracing::warn!(
+                "corrupted TUI kv state detected; moved aside and starting with defaults"
+            );
+        } else {
+            tracing::warn!("corrupted TUI kv state detected; starting with defaults");
         }
     }
 
@@ -455,10 +483,58 @@ impl UiKv {
             }
         };
 
-        if let Err(err) = fs::write(path, payload) {
+        if let Err(err) = Self::atomic_write(path, payload.as_bytes()) {
             tracing::warn!(%err, "failed to persist TUI kv state");
         }
     }
+
+    /// temp sibling に書き出して fsync してから rename することで、
+    /// 途中失敗時に既存 kv を維持する atomic 保存を行う。
+    fn atomic_write(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+        Self::atomic_write_with(path, payload, || Ok(()))
+    }
+
+    /// `before_rename` は sync_all 後・rename 直前の失敗注入ポイント。
+    /// 本番の [`Self::atomic_write`] は常に Ok を渡し、テストで rename 前失敗を模擬する。
+    fn atomic_write_with<F>(path: &Path, payload: &[u8], before_rename: F) -> std::io::Result<()>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
+        let temp = temp_sibling(path);
+        // 既存ファイルの権限を temp へ引き継ぐ（0644 等での露出を防ぐ、R4）。
+        let permissions = fs::metadata(path).ok().map(|m| m.permissions());
+        let result = (|| -> std::io::Result<()> {
+            let mut file = fs::File::create(&temp)?;
+            if let Some(permissions) = permissions {
+                fs::set_permissions(&temp, permissions)?;
+            }
+            file.write_all(payload)?;
+            file.sync_all()?;
+            before_rename()?;
+            fs::rename(&temp, path)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            // 失敗時に temp が残っても次回起動へ影響しないよう削除（失敗は無視）。
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+}
+
+/// kv ファイルの退避先（sibling）を返す。
+fn backup_sibling(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".bak");
+    PathBuf::from(name)
+}
+
+/// kv ファイルの書き込み用 temp（sibling）を返す。
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 fn ui_kv_path() -> Option<PathBuf> {
@@ -477,6 +553,8 @@ fn ui_kv_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // --- ProviderInfo / ModelInfo: データ保持 ---
 
@@ -695,5 +773,140 @@ mod tests {
 
         context.set_auth_token(None);
         assert!(context.auth_token().is_none(), "token must be clearable");
+    }
+
+    // --- SER2-01: kv.json の退避と atomic 保存 ---
+
+    /// テスト用の一意な一時ディレクトリ。Drop で片付ける。
+    struct TempKvDir(PathBuf);
+
+    impl TempKvDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "opencode-tui-kv-{tag}-{}-{nanos}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp kv dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.join("kv.json")
+        }
+
+        fn backup(&self) -> PathBuf {
+            backup_sibling(&self.path())
+        }
+
+        fn temp(&self) -> PathBuf {
+            temp_sibling(&self.path())
+        }
+    }
+
+    impl Drop for TempKvDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn corrupted_kv_is_backed_up_and_values_reset() {
+        let dir = TempKvDir::new("corrupt");
+        let original = "{ this is not valid json";
+        fs::write(dir.path(), original).expect("write corrupted kv");
+
+        let kv = UiKv::load_from(&dir.path());
+
+        assert!(kv.values.is_empty(), "corrupted values must not be used");
+        assert_eq!(
+            fs::read_to_string(dir.backup()).expect("read backup"),
+            original,
+            "corrupted file must be preserved as .bak"
+        );
+        assert!(!dir.path().exists(), "corrupted file must be moved aside");
+    }
+
+    #[test]
+    fn missing_kv_loads_as_empty_without_backup() {
+        let dir = TempKvDir::new("missing");
+
+        let kv = UiKv::load_from(&dir.path());
+
+        assert!(kv.values.is_empty());
+        assert!(!dir.backup().exists());
+    }
+
+    #[test]
+    fn valid_kv_loads_unchanged_without_backup() {
+        let dir = TempKvDir::new("valid");
+        let original = r#"{"header_visible":false,"message_density":"cozy","timestamps":"show"}"#;
+        fs::write(dir.path(), original).expect("write valid kv");
+
+        let kv = UiKv::load_from(&dir.path());
+
+        assert!(!kv.get_bool("header_visible", true));
+        assert_eq!(kv.get_string("message_density", "compact"), "cozy");
+        assert!(kv.get_timestamps());
+        assert!(!dir.backup().exists());
+        assert_eq!(fs::read_to_string(dir.path()).expect("read kv"), original);
+    }
+
+    #[test]
+    fn atomic_write_failure_before_rename_keeps_existing_file_and_removes_temp() {
+        let dir = TempKvDir::new("atomic-fail");
+        let original = r#"{"header_visible":true}"#;
+        fs::write(dir.path(), original).expect("write original kv");
+
+        let result = UiKv::atomic_write_with(&dir.path(), br#"{"header_visible":false}"#, || {
+            Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+        });
+
+        assert!(
+            result.is_err(),
+            "simulated pre-rename failure must propagate"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path()).expect("read original kv"),
+            original,
+            "existing kv must survive a failure before rename"
+        );
+        assert!(!dir.temp().exists(), "temp file must be removed on failure");
+    }
+
+    #[test]
+    fn persist_writes_complete_json_and_reloads() {
+        let dir = TempKvDir::new("persist");
+        fs::write(dir.path(), r#"{"old":true}"#).expect("write original kv");
+        let mut kv = UiKv {
+            path: Some(dir.path()),
+            values: HashMap::new(),
+        };
+
+        kv.set_bool("header_visible", false);
+        kv.set_string("message_density", "cozy");
+
+        let written = fs::read_to_string(dir.path()).expect("read persisted kv");
+        let parsed: HashMap<String, Value> =
+            serde_json::from_str(&written).expect("persisted kv must be valid JSON");
+        assert_eq!(parsed.get("header_visible"), Some(&Value::Bool(false)));
+        assert_eq!(
+            parsed.get("message_density"),
+            Some(&Value::String("cozy".to_string()))
+        );
+        assert!(!parsed.contains_key("old"), "old state must be replaced");
+        assert!(
+            !dir.temp().exists(),
+            "no temp file must remain after success"
+        );
+
+        let reloaded = UiKv::load_from(&dir.path());
+        assert!(!reloaded.get_bool("header_visible", true));
+        assert_eq!(reloaded.get_string("message_density", "compact"), "cozy");
     }
 }
