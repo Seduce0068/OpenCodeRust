@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **global/managed の json/jsonc 優先順と書き戻し選択が逆**
-  — `config/loader.rs:145-153` / CFG-LIFE-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -737,6 +735,13 @@ status: current
 
 ## メモ
 
+- 2026-11-22 却下（CFG-LIFE-02、json/jsonc 優先順）: discovery は「優先順と
+  書き戻し選択が逆」と指摘したが、親が read で事実確認した結果、
+  load_global_from / load_project / load_managed_config はいずれも
+  jsonc→json の順で json が勝ち、update_global_config(:2685) と
+  project_config_write_path(:2555) も json を優先して書き込んでおり
+  読み込み側と一致していた。managed は読み取り専用の別レイヤーで
+  PATCH が project 側へ書くのは設計どおり。誤検知として却下。
 - 2026-11-22 R4 指摘（Agent part status の修正時）: 親が TaskInput に
   `#[serde(alias = "subagent")]` を追加（LLM への指示文 `subagent:` と
   実 TaskTool の引数名の不一致を解消）。残存（記録のみ）: Err のみを成否

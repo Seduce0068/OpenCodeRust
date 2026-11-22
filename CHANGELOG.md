@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T23:17:50+09:00"
+  at: "2026-11-22T23:22:39+09:00"
 ---
 
 # Changelog
