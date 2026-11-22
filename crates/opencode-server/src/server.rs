@@ -550,6 +550,7 @@ pub struct ServerState {
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
     pub(crate) input_repo: Option<InputRepository>,
+
     /// このインスタンス専用の CORS 追加許可オリジン。
     /// 旧 `EXTRA_CORS_WHITELIST`（プロセス共有 static）から移行し、
     /// リクエスト判定は常にこのフィールドのみを参照する。
@@ -557,6 +558,12 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// テスト専用: インメモリ DB の InputRepository を差し込む。
+    #[cfg(test)]
+    pub(crate) fn set_input_repo_for_test(&mut self, repo: InputRepository) {
+        self.input_repo = Some(repo);
+    }
+
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
         let auth_token = generate_auth_token();
@@ -1369,7 +1376,9 @@ fn session_message_from_stored(
 /// 一致せず `missing field` で変換が失敗する。加えて metadata / メッセージの
 /// usage / Text の synthetic / ignored が落ちるため、全フィールドを明示的に写す。
 /// enum は直接 match するため、status / role の wire 形式変更にも影響されない。
-fn stored_session_from_session(session: &opencode_session::Session) -> opencode_types::Session {
+pub(crate) fn stored_session_from_session(
+    session: &opencode_session::Session,
+) -> opencode_types::Session {
     use opencode_session::SessionStatus as SessionStatusInMemory;
     use opencode_types::SessionStatus as StoredSessionStatus;
 

@@ -2806,7 +2806,12 @@ fn spawn_prompt_execution(
                 Ok(pending) => pending,
                 Err(error) => {
                     tracing::error!(%session_id, retry_attempt, %error, "failed reading queued prompts");
-                    retry_queued_prompts(task_state.clone(), session_id.clone(), retry_attempt + 1);
+                    retry_queued_prompts(
+                        task_state.clone(),
+                        session_id.clone(),
+                        retry_attempt + 1,
+                        Some(queue_id.to_string()),
+                    );
                     return;
                 }
             };
@@ -2822,7 +2827,12 @@ fn spawn_prompt_execution(
                 Ok(false) => return,
                 Err(error) => {
                     tracing::error!(%queue_id, retry_attempt, %error, "failed claiming queued prompt");
-                    retry_queued_prompts(task_state.clone(), session_id.clone(), retry_attempt + 1);
+                    retry_queued_prompts(
+                        task_state.clone(),
+                        session_id.clone(),
+                        retry_attempt + 1,
+                        Some(queue_id.to_string()),
+                    );
                     return;
                 }
             }
@@ -3222,7 +3232,7 @@ fn spawn_next_queued_prompt_with_attempt(
             Ok(pending) => pending,
             Err(error) => {
                 tracing::error!(%session_id, attempt, %error, "failed reading queued prompts");
-                retry_queued_prompts(state.clone(), session_id.clone(), attempt + 1);
+                retry_queued_prompts(state.clone(), session_id.clone(), attempt + 1, None);
                 return;
             }
         };
@@ -3264,13 +3274,31 @@ fn spawn_next_queued_prompt_with_attempt(
 
 /// 失敗したキュー処理を指数バックオフ付きで再スケジュールする。
 ///
-/// 上限を超えた場合は task を起動せずエラーを記録するだけで終端し、無限
-/// リトライを防ぐ。再起動時の `resume_queued_prompts` が DB 回復後に pending
-/// を再読込するため、ここでの永続的な状態変更は不要。
-fn retry_queued_prompts(state: Arc<ServerState>, session_id: String, attempt: u32) {
+/// 上限を超えた場合は task を起動せず、既知のキュー項目を `mark_as_failed`
+/// で terminal 化して無限リトライを防ぐ。再起動時の
+/// `resume_queued_prompts` は pending のみを再読込するため、failed 化した行は
+/// 再投入されず attempt がリセットされることもない。
+/// `queue_id` が不明な経路（DB 読取自体の失敗）では terminal 化を行わず、
+/// 既存の error ログのみで終端する。
+fn retry_queued_prompts(
+    state: Arc<ServerState>,
+    session_id: String,
+    attempt: u32,
+    queue_id: Option<String>,
+) {
     let Some(delay) = queued_retry_delay(attempt) else {
         tracing::error!(%session_id, attempt, max = QUEUED_PROMPT_MAX_RETRIES,
             "queued prompt retries exhausted; stopping reschedule");
+        if let Some(queue_id) = queue_id {
+            tokio::spawn(async move {
+                if let Some(input_repo) = state.input_repo.as_ref() {
+                    if input_repo.mark_as_failed(&queue_id).await.is_err() {
+                        tracing::warn!(%queue_id,
+                            "failed terminalizing exhausted queued prompt");
+                    }
+                }
+            });
+        }
         return;
     };
     tokio::spawn(async move {
@@ -9550,6 +9578,21 @@ mod delete_message_tests {
 mod queued_retry_tests {
     use super::*;
 
+    /// session_input の外部キー制約を満たす保存済みセッションを作る。
+    async fn store_session(db: &opencode_storage::Database) -> String {
+        let (session, stored) = {
+            let mut manager = opencode_session::SessionManager::new();
+            let session = manager.create("default", ".");
+            let stored = crate::server::stored_session_from_session(&session);
+            (session, stored)
+        };
+        opencode_storage::SessionRepository::new(db.pool().clone())
+            .create(&stored)
+            .await
+            .expect("stored session must exist for the foreign key");
+        session.id
+    }
+
     /// 連続失敗が上限に達すると再スケジュールが終端することを検証する。
     ///
     /// 各失敗で `retry_queued_prompts` に渡す attempt が 1 ずつ進み、
@@ -9598,6 +9641,96 @@ mod queued_retry_tests {
             failed_attempt += 1;
         }
         assert_eq!(failed_attempt, QUEUED_PROMPT_MAX_RETRIES);
+    }
+
+    /// 回帰ガード (RETRY-02): 上限超過時に当該キュー項目が `mark_as_failed`
+    /// で terminal 化され、再起動時の resume 対象（pending）から外れること。
+    #[tokio::test]
+    async fn exhausted_retries_mark_queued_prompt_failed() {
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let repo = opencode_storage::InputRepository::new(db.pool().clone());
+        let session_id = store_session(&db).await;
+        let secret_prompt = "do-not-leak-secret-token-value";
+        let input = repo
+            .enqueue(&session_id, secret_prompt, None, None)
+            .await
+            .expect("enqueue should succeed");
+
+        // 上限超過 attempt を直接渡す。`mark_as_failed` は spawn 内で非同期に
+        // 呼ばれるため、完了までポーリングする。
+        let mut base = ServerState::new();
+        base.set_input_repo_for_test(repo.clone());
+        let state = Arc::new(base);
+        retry_queued_prompts(
+            state.clone(),
+            session_id.to_string(),
+            QUEUED_PROMPT_MAX_RETRIES + 1,
+            Some(input.id.clone()),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let pending = repo
+                .list_pending(&session_id)
+                .await
+                .expect("list_pending should succeed");
+            if pending.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exhausted queue item was not terminalized"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // failed 行は resume が読む list_pending_all に現れないこと。
+        let all_pending = repo
+            .list_pending_all()
+            .await
+            .expect("list_pending_all should succeed");
+        assert!(
+            !all_pending.iter().any(|item| item.id == input.id),
+            "failed row must not be resumed on restart"
+        );
+    }
+
+    /// 回帰ガード (RETRY-02): 上限内の失敗では DB 行を failed にせず、通常の
+    /// 再スケジュール経路が不変であることを検証する。
+    #[tokio::test]
+    async fn retries_within_limit_keep_prompt_pending() {
+        let db = opencode_storage::Database::in_memory()
+            .await
+            .expect("in-memory database initializes");
+        let repo = opencode_storage::InputRepository::new(db.pool().clone());
+        let session_id = store_session(&db).await;
+        let input = repo
+            .enqueue(&session_id, "keep pending", None, None)
+            .await
+            .expect("enqueue should succeed");
+
+        let mut base = ServerState::new();
+        base.set_input_repo_for_test(repo.clone());
+        let state = Arc::new(base);
+        // 上限内の attempt では sleep 後に再スケジュールが走るが、repo は
+        // 変更されないため pending のままであることを確認する。
+        retry_queued_prompts(
+            state.clone(),
+            session_id.to_string(),
+            1,
+            Some(input.id.clone()),
+        );
+
+        let pending = repo
+            .list_pending(&session_id)
+            .await
+            .expect("list_pending should succeed");
+        assert!(
+            pending.iter().any(|item| item.id == input.id),
+            "in-limit retry must not terminalize the queued prompt"
+        );
     }
 }
 
