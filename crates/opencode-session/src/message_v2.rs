@@ -77,11 +77,23 @@ pub struct AgentSource {
     pub end: i32,
 }
 
+/// 旧データに `auto` が無い場合の既定値。
+///
+/// 旧 V2 変換は `auto` を常に `true` としていたため、欠落時も同じ意味になるようにする。
+fn default_compaction_auto() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionPart {
     pub id: String,
     pub session_id: String,
     pub message_id: String,
+    /// 圧縮要約。旧データには存在しないため `None` を既定とし、出力からも省略する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// 自動圧縮かどうか。保存済みの元値をそのまま保持し、欠落時は従来どおり `true`。
+    #[serde(default = "default_compaction_auto")]
     pub auto: bool,
 }
 
@@ -1166,6 +1178,47 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(patch.id(), Some("prt_patch"));
+    }
+
+    #[test]
+    fn compaction_part_summary_and_auto_roundtrip_with_legacy_defaults() {
+        let part: Part = serde_json::from_value(serde_json::json!({
+            "type": "compaction",
+            "id": "prt_c",
+            "session_id": "ses_1",
+            "message_id": "msg_1",
+            "summary": "kept",
+            "auto": false
+        }))
+        .unwrap();
+        match &part {
+            Part::Compaction(p) => {
+                assert_eq!(p.summary.as_deref(), Some("kept"));
+                assert!(!p.auto, "stored auto value must be preserved");
+            }
+            other => panic!("expected compaction part, got {other:?}"),
+        }
+        let value = serde_json::to_value(&part).unwrap();
+        assert_eq!(value["summary"], "kept");
+        assert_eq!(value["auto"], false);
+
+        // 旧 JSON は summary / auto 欠落でも読め、出力形は従来どおり。
+        let legacy: Part = serde_json::from_value(serde_json::json!({
+            "type": "compaction",
+            "id": "prt_legacy",
+            "session_id": "ses_1",
+            "message_id": "msg_2"
+        }))
+        .unwrap();
+        match &legacy {
+            Part::Compaction(p) => {
+                assert!(p.summary.is_none());
+                assert!(p.auto, "legacy compaction defaults to auto=true");
+            }
+            other => panic!("expected compaction part, got {other:?}"),
+        }
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_value.get("summary").is_none());
     }
 
     #[test]

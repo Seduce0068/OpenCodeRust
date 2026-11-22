@@ -99,7 +99,10 @@ pub fn timestamp(id: &str) -> Option<u64> {
         return None;
     }
 
-    let hex = parts[1].get(0..12)?;
+    // `create` writes the full 16 hex digits of `(timestamp * 0x1000 + counter)`.
+    // Reading only the first 12 shifted away 16 timestamp bits, so the result
+    // was 1/65536 of the real timestamp.
+    let hex = parts[1].get(0..16)?;
     let encoded = u64::from_str_radix(hex, 16).ok()?;
     Some(encoded / 0x1000)
 }
@@ -125,6 +128,14 @@ mod tests {
         let id = create(Prefix::Session, false, Some(1700000000000));
         let ts = timestamp(&id);
         assert!(ts.is_some());
+    }
+
+    #[test]
+    fn test_timestamp_round_trip() {
+        for ts in [1u64, 42, 1_700_000_000_000, u64::MAX / 0x1000] {
+            let id = create(Prefix::Message, false, Some(ts));
+            assert_eq!(timestamp(&id), Some(ts));
+        }
     }
 
     #[test]

@@ -713,6 +713,7 @@ When constructing the summary, try to stick to this template:
             session_id: input.session_id.clone(),
             message_id: persisted_id.clone(),
             auto: input.auto,
+            summary: None,
         });
         session_ops
             .update_part(&input.session_id, &persisted_id, compaction_part.clone())

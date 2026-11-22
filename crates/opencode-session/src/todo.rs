@@ -14,6 +14,18 @@ pub struct TodoInfo {
     pub priority: String,
 }
 
+/// 位置に依存しない安定 ID を `TodoInfo` と合わせて返す session 層の DTO。
+///
+/// wire 型 (`opencode_server::routes::TodoInfo`) は変更せず、ハンドラ側で
+/// `id` にこの値を設定できるようにする。`TodoEntry::id` / DB の
+/// `TodoItem::id` をそのまま露出するため、remove 後の再採番や位置の
+/// 変化に影響されない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoWithId {
+    pub id: String,
+    pub todo: TodoInfo,
+}
+
 /// 安定 ID を保持するための内部エントリ。
 ///
 /// 公開 API (`TodoInfo`) は変更せず、index に依存しない ID を内側で持つことで
@@ -198,21 +210,27 @@ impl TodoManager {
         }
     }
 
-    /// Return the stored todo list for a session.
+    /// Return the stored todo list for a session together with each stable ID.
     ///
-    /// A configured database is read first; if the read fails, the error is
-    /// logged with `tracing::warn!` and the in-memory state is used as a
-    /// fallback rather than reported to the caller as an error.
-    pub async fn get(&self, session_id: &str) -> Vec<TodoInfo> {
+    /// A configured database is read first; the persisted `TodoItem.id` is
+    /// preserved as-is. If the read fails, the error is logged with
+    /// `tracing::warn!` and the in-memory state (whose `TodoEntry.id` is
+    /// preserved) is used as a fallback rather than reported as an error.
+    /// IDs never depend on list position, so removing an item does not change
+    /// the IDs of the survivors.
+    pub async fn get_with_ids(&self, session_id: &str) -> Vec<TodoWithId> {
         if let Some(ref db) = self.db {
             match db.list_for_session(session_id).await {
                 Ok(items) => {
                     return items
                         .into_iter()
-                        .map(|item| TodoInfo {
-                            content: item.content,
-                            status: item.status,
-                            priority: item.priority,
+                        .map(|item| TodoWithId {
+                            id: item.id,
+                            todo: TodoInfo {
+                                content: item.content,
+                                status: item.status,
+                                priority: item.priority,
+                            },
                         })
                         .collect();
                 }
@@ -229,8 +247,33 @@ impl TodoManager {
         let state = self.state.read().await;
         state
             .get(session_id)
-            .map(|entries| entries.iter().map(|entry| entry.todo.clone()).collect())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| TodoWithId {
+                        id: entry.id.clone(),
+                        todo: entry.todo.clone(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// Return the stored todo list for a session.
+    ///
+    /// A configured database is read first; if the read fails, the error is
+    /// logged with `tracing::warn!` and the in-memory state is used as a
+    /// fallback rather than reported to the caller as an error.
+    ///
+    /// This is a thin backward-compatible wrapper over [`Self::get_with_ids`]
+    /// that drops the stable ID; callers needing position-independent IDs
+    /// should use `get_with_ids` directly.
+    pub async fn get(&self, session_id: &str) -> Vec<TodoInfo> {
+        self.get_with_ids(session_id)
+            .await
+            .into_iter()
+            .map(|entry| entry.todo)
+            .collect()
     }
 
     /// Remove a session's todos from memory and, when a database is
@@ -1045,5 +1088,112 @@ mod tests {
                 types_layer::parse_priority(input).as_str()
             );
         }
+    }
+
+    /// get_with_ids が位置に依存しない安定 ID を返し、remove 後も残った
+    /// todo の ID が変化しないことを検証する (ID-TODO-POSITIONAL-01)。
+    /// DB パス (TodoItem.id) とメモリパス (TodoEntry.id) の両方を確認する。
+    #[tokio::test]
+    async fn get_with_ids_returns_stable_ids_on_db_and_memory_paths() {
+        let three = vec![
+            todo("A", "pending", "high"),
+            todo("B", "pending", "medium"),
+            todo("C", "pending", "low"),
+        ];
+
+        // --- DB パス ---
+        let database = test_database().await;
+        let db_manager = TodoManager::with_database(database.pool().clone());
+        db_manager.update(SESSION, three.clone()).await;
+
+        let with_ids = db_manager.get_with_ids(SESSION).await;
+        assert_eq!(with_ids.len(), 3);
+        let db_ids: Vec<String> = with_ids.iter().map(|entry| entry.id.clone()).collect();
+        assert_eq!(
+            db_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                .len(),
+            3,
+            "todo ids must be unique"
+        );
+        // 旧 wire の位置インデックス形式と一致しないこと。
+        for (position, id) in db_ids.iter().enumerate() {
+            assert_ne!(id, &format!("{SESSION}_{position}"));
+        }
+        // DB 行の id をそのまま露出していること。
+        let rows = TodoRepository::new(database.pool().clone())
+            .list_for_session(SESSION)
+            .await
+            .expect("db rows");
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            db_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            with_ids
+                .iter()
+                .map(|entry| entry.todo.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+
+        // 先頭を削除しても残った B/C の ID は不変。
+        assert!(db_manager.remove(SESSION, 0).await);
+        let after = db_manager.get_with_ids(SESSION).await;
+        assert_eq!(
+            after
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![db_ids[1].as_str(), db_ids[2].as_str()],
+            "surviving todo ids must not change after remove"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .map(|entry| entry.todo.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B", "C"]
+        );
+
+        // --- メモリパス ---
+        let memory_manager = TodoManager::new();
+        memory_manager.update(SESSION, three).await;
+        let memory_ids: Vec<String> = memory_manager
+            .get_with_ids(SESSION)
+            .await
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(memory_ids.len(), 3);
+        assert_eq!(
+            memory_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        for (position, id) in memory_ids.iter().enumerate() {
+            assert_ne!(id, &format!("{SESSION}_{position}"));
+        }
+        assert!(memory_manager.remove(SESSION, 0).await);
+        let after = memory_manager.get_with_ids(SESSION).await;
+        assert_eq!(
+            after
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![memory_ids[1].as_str(), memory_ids[2].as_str()],
+            "memory-path ids must be stable after remove"
+        );
+
+        // 既存 get() は ID を落とす従来の契約を維持する。
+        assert_eq!(
+            memory_manager.get(SESSION).await,
+            vec![todo("B", "pending", "medium"), todo("C", "pending", "low")]
+        );
     }
 }

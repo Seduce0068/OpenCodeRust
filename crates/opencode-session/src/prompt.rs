@@ -1234,7 +1234,13 @@ impl SessionPrompt {
                 );
                 match Self::trigger_compaction(session, &filtered_messages) {
                     Some(summary) => {
-                        tracing::info!("Compaction complete, summary: {}", summary);
+                        // 要約本文にはローカルパスが含まれ得るため全文を出さず、
+                        // 長さのみを記録する（compaction.rs と同方針、R4）。
+                        tracing::info!(
+                            session_id = %session_id,
+                            summary_length = summary.len(),
+                            "Compaction complete"
+                        );
 
                         // Notify plugins that compaction occurred (mirrors TS Plugin.trigger).
                         let _ = opencode_plugin::trigger_collect(
@@ -2467,13 +2473,17 @@ impl SessionPrompt {
                 .parts
                 .iter()
                 .filter_map(|part| match &part.part_type {
-                    PartType::Text { text, .. } => Some(V2Part::Text {
+                    PartType::Text {
+                        text,
+                        synthetic,
+                        ignored,
+                    } => Some(V2Part::Text {
                         id: part.id.clone(),
                         session_id: msg.session_id.clone(),
                         message_id: msg.id.clone(),
                         text: text.clone(),
-                        synthetic: None,
-                        ignored: None,
+                        synthetic: *synthetic,
+                        ignored: *ignored,
                         time: None,
                         metadata: None,
                     }),
@@ -2490,12 +2500,15 @@ impl SessionPrompt {
                         filename: Some(filename.clone()),
                         source: None,
                     })),
-                    PartType::Compaction { .. } => Some(V2Part::Compaction(V2CompactionPart {
-                        id: part.id.clone(),
-                        session_id: msg.session_id.clone(),
-                        message_id: msg.id.clone(),
-                        auto: true,
-                    })),
+                    PartType::Compaction { summary } => {
+                        Some(V2Part::Compaction(V2CompactionPart {
+                            id: part.id.clone(),
+                            session_id: msg.session_id.clone(),
+                            message_id: msg.id.clone(),
+                            summary: Some(summary.clone()),
+                            auto: true,
+                        }))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -4225,6 +4238,93 @@ mod tests {
             .parts
             .iter()
             .any(|p| matches!(p.part_type, PartType::Compaction { .. })));
+    }
+
+    #[test]
+    fn to_message_with_parts_preserves_text_synthetic_and_ignored() {
+        let mut msg = SessionMessage::assistant("ses_test");
+        msg.parts.push(crate::MessagePart {
+            id: "prt_flags".to_string(),
+            part_type: PartType::Text {
+                text: "flagged".to_string(),
+                synthetic: Some(true),
+                ignored: Some(false),
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+        msg.parts.push(crate::MessagePart {
+            id: "prt_plain".to_string(),
+            part_type: PartType::Text {
+                text: "plain".to_string(),
+                synthetic: None,
+                ignored: None,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+
+        let out = SessionPrompt::to_message_with_parts(&[msg], "provider", "model");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].parts.len(), 2);
+        match &out[0].parts[0] {
+            V2Part::Text {
+                synthetic, ignored, ..
+            } => {
+                assert_eq!(*synthetic, Some(true));
+                assert_eq!(*ignored, Some(false));
+            }
+            other => panic!("expected text part, got {other:?}"),
+        }
+        match &out[0].parts[1] {
+            V2Part::Text {
+                synthetic, ignored, ..
+            } => {
+                // None の既存 part では従来どおり出力が変わらない。
+                assert!(synthetic.is_none());
+                assert!(ignored.is_none());
+                let value = serde_json::to_value(&out[0].parts[1]).unwrap();
+                assert!(value.get("synthetic").is_none());
+                assert!(value.get("ignored").is_none());
+            }
+            other => panic!("expected text part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_message_with_parts_preserves_compaction_summary() {
+        let mut msg = SessionMessage::assistant("ses_test");
+        msg.parts.push(crate::MessagePart {
+            id: "prt_compact".to_string(),
+            part_type: PartType::Compaction {
+                summary: "kept summary".to_string(),
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+
+        let out = SessionPrompt::to_message_with_parts(&[msg], "provider", "model");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].parts.len(), 1);
+        match &out[0].parts[0] {
+            V2Part::Compaction(part) => {
+                assert_eq!(part.summary.as_deref(), Some("kept summary"));
+                assert!(part.auto);
+            }
+            other => panic!("expected compaction part, got {other:?}"),
+        }
+
+        // 旧 V2 JSON は summary / auto が欠落していても既定値で読める。
+        let legacy: V2CompactionPart = serde_json::from_value(serde_json::json!({
+            "id": "prt_legacy",
+            "session_id": "ses_test",
+            "message_id": "msg_legacy"
+        }))
+        .unwrap();
+        assert!(legacy.summary.is_none());
+        assert!(legacy.auto, "legacy compaction must default to auto=true");
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("summary").is_none());
     }
 
     #[test]

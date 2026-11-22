@@ -670,15 +670,15 @@ async fn get_session_todos(
     }
     drop(sessions);
 
-    let todos = state.todo_manager.get(&id).await;
+    let todos = state.todo_manager.get_with_ids(&id).await;
     let items = todos
         .into_iter()
-        .enumerate()
-        .map(|(idx, todo)| {
-            let (status, priority) = normalize_todo_wire_values(&todo.status, &todo.priority);
+        .map(|entry| {
+            let (status, priority) =
+                normalize_todo_wire_values(&entry.todo.status, &entry.todo.priority);
             TodoInfo {
-                id: format!("{}_{}", id, idx),
-                content: todo.content,
+                id: entry.id,
+                content: entry.todo.content,
                 status,
                 priority,
             }
@@ -10033,5 +10033,149 @@ mod tui_response_queue_tests {
             Some((total - 1) as u64),
             "newest entry must be retained"
         );
+    }
+}
+
+#[cfg(test)]
+mod todo_route_stable_id_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// tower が workspace から削除済みのため、ループバックの素の HTTP/1.1 GET で
+    /// 実際のルーティングを通す（api_alias_tests と同じ方式）。
+    async fn http_get(addr: SocketAddr, path: &str) -> (StatusCode, String) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect to loopback test server");
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.expect("read response");
+            let raw = String::from_utf8(raw).expect("response should be utf-8");
+            let status: u16 = raw
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("status line")
+                .parse()
+                .expect("numeric status");
+            let body = raw
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_string())
+                .unwrap_or_default();
+            (StatusCode::from_u16(status).expect("valid status"), body)
+        })
+        .await
+        .expect("http exchange should not hang")
+    }
+
+    /// GET /session/{id}/todo が `{session}_{position}` ではなく安定 ID を返し、
+    /// todo 削除後も残った todo の ID が変化しないことを検証する
+    /// (ID-TODO-POSITIONAL-01)。wire 型 (TodoInfo) の形は不変。
+    #[tokio::test]
+    async fn get_session_todos_returns_stable_ids_after_remove() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id
+        };
+        state
+            .todo_manager
+            .update(
+                &session_id,
+                vec![
+                    opencode_session::TodoInfo {
+                        content: "A".to_string(),
+                        status: "pending".to_string(),
+                        priority: "high".to_string(),
+                    },
+                    opencode_session::TodoInfo {
+                        content: "B".to_string(),
+                        status: "pending".to_string(),
+                        priority: "medium".to_string(),
+                    },
+                    opencode_session::TodoInfo {
+                        content: "C".to_string(),
+                        status: "pending".to_string(),
+                        priority: "low".to_string(),
+                    },
+                ],
+            )
+            .await;
+
+        let app = router().with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed in tests; skipping hides failures");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("test server stopped: {err}");
+            }
+        });
+
+        let path = format!("/session/{session_id}/todo");
+        let (status, body) = http_get(addr, &path).await;
+        assert_eq!(status, StatusCode::OK, "GET {path} should succeed");
+        let before: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("todo response should be a JSON array");
+        assert_eq!(before.len(), 3);
+        let ids: Vec<String> = before
+            .iter()
+            .map(|item| {
+                item.get("id")
+                    .and_then(|id| id.as_str())
+                    .expect("id field")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            ids.iter().map(String::as_str).collect::<HashSet<_>>().len(),
+            3,
+            "todo ids must be unique"
+        );
+        // 旧実装の位置インデックス形式にはならないこと。
+        for (position, id) in ids.iter().enumerate() {
+            assert_ne!(id, &format!("{session_id}_{position}"));
+        }
+        // wire 型の他フィールドは従来どおり。
+        assert_eq!(before[0]["content"], "A");
+        assert_eq!(before[0]["status"], "pending");
+        assert_eq!(before[0]["priority"], "high");
+
+        // 先頭を削除して再取得しても、残った B/C の ID は不変。
+        assert!(state.todo_manager.remove(&session_id, 0).await);
+        let (status, body) = http_get(addr, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        let after: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("todo response should be a JSON array");
+        assert_eq!(after.len(), 2);
+        let after_ids: Vec<String> = after
+            .iter()
+            .map(|item| {
+                item.get("id")
+                    .and_then(|id| id.as_str())
+                    .expect("id field")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(after_ids, vec![ids[1].clone(), ids[2].clone()]);
+        assert_eq!(
+            after
+                .iter()
+                .map(|item| item["content"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["B", "C"]
+        );
+
+        server.abort();
     }
 }

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use uuid::Uuid;
 
 use crate::api::{
     ApiClient, McpStatusInfo, MessageInfo, QuestionRequestInfo, SessionInfo, SessionRevertInfo,
@@ -3333,7 +3334,11 @@ impl App {
 
     fn create_optimistic_session(&mut self) -> String {
         let now = Utc::now();
-        let session_id = format!("local_session_{}", now.timestamp_millis());
+        let session_id = format!(
+            "local_session_{}_{}",
+            now.timestamp_millis(),
+            Uuid::new_v4().simple()
+        );
         let session = Session {
             id: session_id.clone(),
             title: "New Session".to_string(),
@@ -3409,7 +3414,11 @@ impl App {
         variant: Option<String>,
     ) -> String {
         let now = Utc::now();
-        let id = format!("local_user_{}", now.timestamp_millis());
+        let id = format!(
+            "local_user_{}_{}",
+            now.timestamp_millis(),
+            Uuid::new_v4().simple()
+        );
         let message = Message {
             id: id.clone(),
             role: MessageRole::User,
@@ -4685,6 +4694,45 @@ mod tests {
     use super::*;
     use std::io::Read as _;
     use std::net::TcpListener;
+
+    #[test]
+    fn optimistic_ids_include_unique_uuid_suffix() {
+        fn assert_uuid_suffix(id: &str) {
+            let suffix = id.rsplit('_').next().expect("id must contain '_'");
+            assert_eq!(suffix.len(), 32, "id must end with UUID simple: {id}");
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+                "UUID suffix must be hex: {id}"
+            );
+        }
+
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(context);
+        let session_ids: Vec<String> = (0..64).map(|_| app.create_optimistic_session()).collect();
+        let unique_sessions: HashSet<_> = session_ids.iter().collect();
+        assert_eq!(unique_sessions.len(), session_ids.len());
+        for id in &session_ids {
+            assert_uuid_suffix(id);
+        }
+
+        let session_id = &session_ids[0];
+        let message_ids: Vec<String> = (0..64)
+            .map(|i| {
+                app.append_optimistic_user_message(
+                    session_id,
+                    &format!("probe-{i}"),
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let unique_messages: HashSet<_> = message_ids.iter().collect();
+        assert_eq!(unique_messages.len(), message_ids.len());
+        for id in &message_ids {
+            assert_uuid_suffix(id);
+        }
+    }
 
     #[test]
     fn modal_single_char_shortcuts_ignore_ctrl_and_alt() {

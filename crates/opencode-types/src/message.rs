@@ -88,6 +88,9 @@ pub struct MessagePart {
     /// 部分の種別と内容。
     pub part_type: PartType,
     /// 作成時刻。
+    ///
+    /// 旧データにフィールドが無い場合は UNIX epoch を既定値とする。
+    #[serde(default = "default_message_created_at")]
     pub created_at: DateTime<Utc>,
     /// 属するメッセージの ID。独立した部分の場合は `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -562,6 +565,25 @@ mod tests {
                 ignored: None,
             }
         );
+    }
+
+    #[test]
+    fn message_part_defaults_created_at_for_legacy_json() {
+        // 旧データの part には created_at が無いため、既定値で読み込める必要がある。
+        let legacy = json!({
+            "id": "prt_legacy",
+            "part_type": { "type": "text", "text": "legacy" }
+        });
+        let decoded: MessagePart = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.id, "prt_legacy");
+        assert_eq!(decoded.created_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert!(decoded.message_id.is_none());
+
+        // 現行 JSON では created_at は従来どおり出力される。
+        let value = serde_json::to_value(&decoded).unwrap();
+        assert!(value.get("created_at").is_some());
+        let roundtrip: MessagePart = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, decoded);
     }
 
     #[test]

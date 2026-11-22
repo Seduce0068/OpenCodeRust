@@ -53,6 +53,7 @@ pub enum MessageRole {
 pub struct MessagePart {
     pub id: String,
     pub part_type: PartType,
+    #[serde(default = "default_message_created_at")]
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
@@ -370,6 +371,32 @@ mod tests {
         assert!(msg.metadata.is_empty());
         assert_eq!(msg.created_at, DateTime::<Utc>::UNIX_EPOCH);
         assert!(msg.usage.is_none());
+    }
+
+    #[test]
+    fn legacy_json_part_without_created_at_is_accepted() {
+        // 旧メッセージ JSON では part に created_at が無い場合がある。
+        let value = serde_json::json!({
+            "id": "msg_1",
+            "session_id": "ses_1",
+            "role": "user",
+            "parts": [{
+                "id": "prt_1",
+                "part_type": { "type": "text", "text": "hello" }
+            }]
+        });
+        let msg: SessionMessage =
+            serde_json::from_value(value).expect("legacy part JSON must load");
+        assert_eq!(msg.parts.len(), 1);
+        assert_eq!(msg.parts[0].created_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert!(msg.parts[0].message_id.is_none());
+
+        // 現行 JSON の出力形は不変（created_at は従来どおり出力される）。
+        let value = serde_json::to_value(&msg).expect("must serialize");
+        assert!(value["parts"][0].get("created_at").is_some());
+        let roundtrip: SessionMessage = serde_json::from_value(value).expect("roundtrip must load");
+        assert_eq!(roundtrip.parts[0].created_at, msg.parts[0].created_at);
+        assert_eq!(roundtrip.get_text(), "hello");
     }
 
     #[test]
