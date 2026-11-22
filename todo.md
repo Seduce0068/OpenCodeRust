@@ -241,8 +241,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **ToolResult 添付の本番経路への配線（StreamProcessor は未使用）**
-  — `prompt.rs:1448` / ATTACH-01-FOLLOWUP / 中（R4 事実確認済み）
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -268,7 +266,7 @@ status: current
 
 ## 完了
 
-- [x] **[ToolResult 添付 1 件]** FilePart として保持（StreamProcessor 経路）
+- [x] **[ToolResult 添付 2 件]** FilePart 保持と本番 prompt/HTTP wire への配線
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ID/Part 境界 7 件]** timestamp・todo ID・旧 JSON 互換・要約 redact
   （2026-11-21、swarm-coding R1-R6）
@@ -729,6 +727,14 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 重要指摘（本番配線後も未達の実益）: 実 provider（responses.rs
+  の全 ToolResultOutput）が `attachments: Some(...)` を一切生成せず、新規テストの
+  モック 1 件のみ。したがって本番配線は仕組みとしては動くが実経路では常に None。
+  さらに永続化往復（server.rs:1175/1264）で attachments が落ちる（HTTP wire は
+  受け渡す）、provider-executed ツール（file_search 等）は ToolCallEnd を出さず
+  Part 生成ループに到達しない。実益を得るには provider 側の添付生成・永続化
+  スキーマ・provider-executed ツールの Part 生成が別途必要（設計判断）。親が
+  DRY 化（llm.rs の変換ヘルパを pub(crate) 化し prompt.rs から利用）を直接修正。
 - 2026-11-22 R4 重要指摘（ToolResult 添付の修正時）: `StreamProcessor::new` は
   テスト内のみで本番呼び出しが無く、実運用の prompt.rs:1448 は
   StreamEvent::ToolResult を no-op で無視するため、本次の FilePart 保持修正は
