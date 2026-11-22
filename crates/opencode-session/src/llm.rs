@@ -11,7 +11,7 @@ use opencode_provider::{
 };
 
 use crate::compaction::{CompactionConfig, CompactionEngine, ModelLimits, TokenUsage};
-use crate::message_v2::{CompletedTime, ErrorTime, RunningTime, ToolState};
+use crate::message_v2::{CompletedTime, ErrorTime, FilePart, RunningTime, ToolState};
 use crate::retry::{self, ApiErrorInfo};
 use crate::snapshot::{Snapshot, SnapshotPatch};
 use crate::{MessageError, MessageInfo, MessageUsage, MessageWithParts, Part};
@@ -935,6 +935,16 @@ impl StreamProcessor {
                     ..
                 } => {
                     let now = chrono::Utc::now().timestamp_millis();
+                    // Build parts before taking a mutable borrow of `tool_calls`.
+                    // `None` and empty/all-invalid lists stay `None`, so the
+                    // pre-existing output is bit-for-bit unchanged.
+                    let attachments = output.attachments.as_deref().and_then(|values| {
+                        tool_attachments_to_file_parts(
+                            values,
+                            &self.session_id,
+                            &self._assistant_message_id,
+                        )
+                    });
                     if let Some(tc) = self.tool_calls.get_mut(&tool_call_id) {
                         if matches!(tc.state, ToolState::Running { .. }) {
                             let start_time = match &tc.state {
@@ -951,7 +961,7 @@ impl StreamProcessor {
                                     end: now,
                                     compacted: None,
                                 },
-                                attachments: None,
+                                attachments,
                             };
                         }
                     }
@@ -2076,6 +2086,71 @@ fn part_to_content_part(part: &Part) -> Option<opencode_provider::ContentPart> {
         }
         _ => None,
     }
+}
+
+/// Convert opaque provider tool-result attachments into session [`FilePart`]s.
+///
+/// Provider attachments are JSON values (normally objects carrying `mime`,
+/// `url` and an optional `filename`, with `mimeType`/`data` accepted as
+/// aliases). Only objects with non-empty string `mime` and `url` are kept;
+/// malformed elements are silently skipped. The URL is retained purely as
+/// part data — it is never logged nor embedded in an error message, so signed
+/// query strings and token values cannot leak into logs.
+fn tool_attachments_to_file_parts(
+    values: &[serde_json::Value],
+    session_id: &str,
+    message_id: &str,
+) -> Option<Vec<FilePart>> {
+    // Fall back to fixed, sanitized ids only when the current stream has none.
+    let session_id = if session_id.is_empty() {
+        "ses_unknown"
+    } else {
+        session_id
+    };
+    let message_id = if message_id.is_empty() {
+        "msg_unknown"
+    } else {
+        message_id
+    };
+
+    let mut parts = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let mime = object
+            .get("mime")
+            .or_else(|| object.get("mimeType"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let url = object
+            .get("url")
+            .or_else(|| object.get("data"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let (Some(mime), Some(url)) = (mime, url) else {
+            continue;
+        };
+        let filename = object
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        parts.push(FilePart {
+            id: opencode_core::id::create(opencode_core::id::Prefix::Part, false, None),
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            mime: mime.to_string(),
+            url: url.to_string(),
+            filename,
+            source: None,
+        });
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts)
 }
 
 #[cfg(test)]
@@ -3248,5 +3323,123 @@ mod tests {
         assert!(!processor.blocked);
         assert!(processor.tool_calls.is_empty());
         assert!(processor.pending_patches.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // R2 ATTACH-01: ToolResultOutput.attachments -> ToolState::Completed
+    // -----------------------------------------------------------------------
+
+    fn tool_result_events(attachments: Option<Vec<serde_json::Value>>) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCallStart {
+                id: "call-attach".to_string(),
+                name: "read".to_string(),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "call-attach".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+            },
+            StreamEvent::ToolResult {
+                tool_call_id: "call-attach".to_string(),
+                tool_name: "read".to_string(),
+                input: None,
+                output: opencode_provider::ToolResultOutput {
+                    output: "done".to_string(),
+                    title: "read".to_string(),
+                    metadata: HashMap::new(),
+                    attachments,
+                },
+            },
+            StreamEvent::Done,
+        ]
+    }
+
+    /// 添付ありの ToolResult が FilePart へ変換され Completed に保持されること。
+    /// 変換不能要素はスキップされ、URL/トークンはログ・エラーへ出ないこと。
+    #[tokio::test]
+    async fn test_tool_result_attachments_are_kept_in_completed_state() {
+        let secret_url = "data:image/png;base64,AAAA?token=DO_NOT_LOG";
+        let attachments = vec![
+            serde_json::json!({
+                "mime": "image/png",
+                "url": secret_url,
+                "filename": "shot.png"
+            }),
+            serde_json::json!({ "mime": "text/plain" }), // url 欠落 -> skip
+            serde_json::json!("not-an-object"),          // 型不正 -> skip
+        ];
+        let provider = Arc::new(ScriptedProvider {
+            scripts: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                tool_result_events(Some(attachments)),
+            ])),
+        });
+        let mut processor =
+            StreamProcessor::new("ses_attach".to_string(), "msg_attach".to_string());
+
+        let _ = processor.process(make_stream_input(), provider).await;
+
+        let tc = processor
+            .tool_calls
+            .get("call-attach")
+            .expect("completed tool call must be retained");
+        let ToolState::Completed {
+            attachments,
+            output,
+            ..
+        } = &tc.state
+        else {
+            panic!("tool result must be Completed");
+        };
+        assert_eq!(output, "done");
+        let parts = attachments.as_ref().expect("file parts must be present");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].mime, "image/png");
+        assert_eq!(parts[0].url, secret_url);
+        assert_eq!(parts[0].filename.as_deref(), Some("shot.png"));
+        assert_eq!(parts[0].session_id, "ses_attach");
+        assert_eq!(parts[0].message_id, "msg_attach");
+        assert!(parts[0].id.starts_with("prt_"));
+        assert!(parts[0].source.is_none());
+
+        // 添付 URL / トークン値は processor のイベント・エラーへも露出しない。
+        let events = format!("{:?}", processor.take_events());
+        assert!(!events.contains("DO_NOT_LOG"));
+        assert!(processor.error().is_none());
+    }
+
+    /// attachments: None（および空リスト）の既存ケースで出力が不変であること。
+    #[tokio::test]
+    async fn test_tool_result_without_attachments_keeps_existing_behavior() {
+        for attachments in [None, Some(Vec::new())] {
+            let provider = Arc::new(ScriptedProvider {
+                scripts: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                    tool_result_events(attachments),
+                ])),
+            });
+            let mut processor =
+                StreamProcessor::new("ses_attach".to_string(), "msg_attach".to_string());
+
+            let _ = processor.process(make_stream_input(), provider).await;
+
+            let tc = processor
+                .tool_calls
+                .get("call-attach")
+                .expect("completed tool call must be retained");
+            let ToolState::Completed {
+                attachments,
+                output,
+                title,
+                metadata,
+                ..
+            } = &tc.state
+            else {
+                panic!("tool result must be Completed");
+            };
+            assert!(attachments.is_none());
+            assert_eq!(output, "done");
+            assert_eq!(title, "read");
+            assert!(metadata.is_empty());
+        }
     }
 }
