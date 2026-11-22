@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **権限ダイアログのクリック座標がボタン行と一致しない**
-  — `tui/components/permission.rs:310-325` / TUIEV-03 / 中
 - [ ] **5 秒ごとの背景更新でセッション一覧の選択が先頭へ戻る**
   — `tui/dialogs/session_list.rs:207-225` / TUIEV-04 / 中
 - [ ] **Ctrl+Shift+C が input_copy を奪いプロンプトをコピーできない**
@@ -280,6 +278,8 @@ status: current
 
 ## 完了
 
+- [x] **[権限ボタン座標 1 件]** render 時の実ボタン行を記録
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI 権限応答 2 件]** reply 共通化と成功時のみ要求削除
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[port=0 起動 1 件]** state URL / ログに実バインドポートを反映
