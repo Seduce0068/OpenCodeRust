@@ -241,8 +241,6 @@ status: current
 
 - [ ] **McpClient::close が in-flight receive() とデッドロック**
   — `mcp/client.rs:892` / SIG-01 / 中（high）
-- [ ] **BashTool がパイプ EOF を待ち背景子で Timeout**
-  — `tool/bash.rs:402` / SIG-03 / 中
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -270,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[BashTool 完了判定 1 件]** 背景子の EOF 待ちでハングしない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP stderr 1 件]** stdio 子の stderr を null 化してブロック防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[clipboard zombie 1 件]** 書込失敗時も子を reap
@@ -773,6 +773,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（BashTool 完了判定、3 回目の修正で停止）: 後段の
+  残り時間 wait / グレース drain の間は abort トークンをポールしないため、
+  その間に取り消されると Cancelled にならない可能性（low）。親の初期診断
+  「child.wait() の再 poll」は誤りで、実原因は完了済み drain future の
+  グレース再 poll だった（子が訂正）。drain_completed フラグ・wait future
+  単一化・pending の Drop flush・biased abort で主要経路は修正済み。
 - 2026-11-23 R4 指摘（MCP stderr の修正時）: 子は inherit() を選んだが、
   親が null() へ変更。子側トークン値・パスの親ログ流出と大量 stderr による
   ログフラッドを防ぐため（plugin 側は inherit のまま）。回帰テストのダミー
