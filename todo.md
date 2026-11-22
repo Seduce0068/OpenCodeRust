@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **Anthropic tool_use の id/name 欠落が空文字列へ化ける**
-  — `provider/stream.rs:338` / ERRPROP-03 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -272,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[Anthropic tool_use 1 件]** 空 ID イベントを出さない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[session status 1 件]** 取得失敗時に busy 表示を維持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[username 永続化 1 件]** 環境由来既定値をファイルへ書かない
@@ -787,6 +787,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（Anthropic tool_use の修正時）: 同一 index に旧ブロック
+  が残ると後続 partial_json が誤った id へ属性付けされる可能性（R4 も
+  confidence low）、マルチブロック混在の回帰テスト不足。親が空白のみ
+  id/name の trim ガードを直接修正。
 - 2026-11-23 R4 指摘（session status の修正時）: 親が到達回数アサーション
   を == 2 へ、api.rs の get_session_status 生 reqwest エラーを固定文言へ
   直接修正。残存 low 1 件（テストの loopback スタブ JoinHandle が 10 秒
