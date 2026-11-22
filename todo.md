@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[デコード/既定値 5 件]** warn 可視化・max_tokens/URL 共有定数化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[compact status 1 件]** Archived/Completed を往復で復元
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ログ redact 2 件]** SSE エラー・chat_stream 開始エラーの生出力防止
@@ -719,6 +721,14 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm187、2 担当・16 件、観点: シリアライズ
+  / 初期化デフォルト）: 親が high 1 件（tool_calls.arguments）を read で事実確認、
+  5 件（args/tc_args/headers の固定 warn、max_tokens→OUTPUT_TOKEN_MAX、
+  DEFAULT_SERVER_URL→3000）を coding。R4 が compaction max_output の 8192
+  残存と空 arguments の誤警告を指摘し親が直接修正。残存（記録のみ）: TUI
+  kv/prompt 履歴の読み込み空化と非 atomic 保存、SSE data 行の無音無視、
+  question/permission の型不一致ドロップ、watch.ignore 未配線、
+  既定ポートの共有定数化、timeout コメントの食い違い。
 - 2026-11-22 R4 指摘（compact status の修正時）: 親が finish_compacting の冪等
   ガード、skip_deserializing、永続化 Compacting の Archived 救済を直接修正。
   残存: 永続化を跨ぐ Completed の復元は現スキーマで判定不能（要スキーマ変更
