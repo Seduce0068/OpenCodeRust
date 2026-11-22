@@ -327,20 +327,42 @@ impl AnthropicSseParser {
             "content_block_start" => {
                 if let Some(block) = event.content_block {
                     let index = event.index.unwrap_or(0);
+
+                    if block.block_type == "tool_use" {
+                        // id / name が欠落または空文字の tool_use は、空 ID の
+                        // ToolCallStart を下流へ流さないため状態登録ごとスキップする（ERRPROP-03）。
+                        let (id, name) = match (block.id, block.name) {
+                            (Some(id), Some(name))
+                                if !id.trim().is_empty() && !name.trim().is_empty() =>
+                            {
+                                (id, name)
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    event = "content_block_start",
+                                    reason = "missing_or_empty_id_or_name",
+                                    "dropping malformed Anthropic tool_use block"
+                                );
+                                return None;
+                            }
+                        };
+                        self.blocks.insert(
+                            index,
+                            AnthropicBlockState {
+                                block_type: block.block_type,
+                                id: Some(id.clone()),
+                            },
+                        );
+                        return Some(StreamEvent::ToolCallStart { id, name });
+                    }
+
                     self.blocks.insert(
                         index,
                         AnthropicBlockState {
-                            block_type: block.block_type.clone(),
-                            id: block.id.clone(),
+                            block_type: block.block_type,
+                            id: block.id,
                         },
                     );
-
-                    if block.block_type == "tool_use" {
-                        return Some(StreamEvent::ToolCallStart {
-                            id: block.id.unwrap_or_default(),
-                            name: block.name.unwrap_or_default(),
-                        });
-                    }
                 }
             }
             "content_block_delta" => {
@@ -354,6 +376,11 @@ impl AnthropicSseParser {
                             .and_then(|index| self.blocks.get(&index))
                             .and_then(|block| block.id.clone())
                             .unwrap_or_default();
+                        // 対応する tool_use id が無い partial_json は空 ID の
+                        // ToolCallDelta になるため発行しない（ERRPROP-03）。
+                        if id.is_empty() {
+                            return None;
+                        }
                         return Some(StreamEvent::ToolCallDelta { id, input: json });
                     }
                 }
@@ -363,9 +390,11 @@ impl AnthropicSseParser {
                 return self.blocks.remove(&index).and_then(|block| {
                     let AnthropicBlockState { block_type, id } = block;
                     match block_type.as_str() {
-                        "tool_use" => Some(StreamEvent::ToolInputEnd {
-                            id: id.unwrap_or_default(),
-                        }),
+                        "tool_use" => {
+                            let id = id.unwrap_or_default();
+                            // 空 ID の ToolInputEnd は下流へ流さない（ERRPROP-03）。
+                            (!id.is_empty()).then_some(StreamEvent::ToolInputEnd { id })
+                        }
                         "text" => Some(StreamEvent::TextEnd),
                         _ => None,
                     }
@@ -639,6 +668,141 @@ mod tests {
             parser.push(data),
             Some(StreamEvent::Error(detail)) if detail == "rate_limit_error"
         ));
+    }
+
+    /// 欠落 / 空文字の id または name を持つ tool_use から空 ID の
+    /// ツールイベントが一切発行されないことを検証する共通ヘルパ。
+    fn assert_no_empty_tool_events(events: &[StreamEvent]) {
+        assert!(
+            events.iter().all(|event| match event {
+                StreamEvent::ToolCallStart { id, name } => !id.is_empty() && !name.is_empty(),
+                StreamEvent::ToolCallDelta { id, .. } | StreamEvent::ToolInputEnd { id } => {
+                    !id.is_empty()
+                }
+                _ => true,
+            }),
+            "empty tool id/name leaked: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn anthropic_parser_drops_tool_use_without_id() {
+        let lines = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let events = anthropic_events(&lines);
+        assert_no_empty_tool_events(&events);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallDelta { .. }
+                    | StreamEvent::ToolInputEnd { .. }
+            )),
+            "tool events should be dropped entirely: {:?}",
+            events
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
+    }
+
+    #[test]
+    fn anthropic_parser_drops_tool_use_without_name() {
+        let lines = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let events = anthropic_events(&lines);
+        assert_no_empty_tool_events(&events);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallDelta { .. }
+                    | StreamEvent::ToolInputEnd { .. }
+            )),
+            "tool events should be dropped entirely: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn anthropic_parser_drops_tool_use_with_empty_id_or_name() {
+        for start in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"bash","input":{}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"","input":{}}}"#,
+        ] {
+            let lines = [
+                start,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+            ];
+            let events = anthropic_events(&lines);
+            assert_no_empty_tool_events(&events);
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::ToolCallStart { .. }
+                        | StreamEvent::ToolCallDelta { .. }
+                        | StreamEvent::ToolInputEnd { .. }
+                )),
+                "tool events should be dropped entirely: {:?}",
+                events
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_parser_drops_partial_json_without_tool_id() {
+        // tool_use 以外のブロック状態に partial_json が来た場合も空 ID を出さない。
+        let lines = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"k\":1}"}}"#,
+        ];
+        let events = anthropic_events(&lines);
+        assert_no_empty_tool_events(&events);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallDelta { .. })),
+            "unexpected tool delta: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn anthropic_parser_keeps_valid_tool_use_event_sequence_unchanged() {
+        let lines = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ok","name":"bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let events = anthropic_events(&lines);
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ToolCallStart { id, name } if id == "toolu_ok" && name == "bash"
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ToolCallDelta { id, input } if id == "toolu_ok" && input == "{\"cmd\":"
+        ));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::ToolCallDelta { id, input } if id == "toolu_ok" && input == "\"ls\"}"
+        ));
+        assert!(matches!(
+            &events[3],
+            StreamEvent::ToolInputEnd { id } if id == "toolu_ok"
+        ));
+        assert!(matches!(events[4], StreamEvent::Done));
     }
 
     #[test]
