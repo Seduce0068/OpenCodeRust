@@ -272,9 +272,10 @@ impl PermissionPrompt {
     }
 
     pub fn approve_always(&mut self) -> Option<PermissionRequest> {
-        let mut request = self.approve()?;
-        request.id = format!("{}_always", request.id);
-        Some(request)
+        // 「常に許可」の意志は reply 文字列 "always" で表現する。
+        // サーバは permission id の完全一致で pending を解決するため、
+        // ここで id にサフィックスを付与すると reply が 404 になる。
+        self.approve()
     }
 
     pub fn close(&mut self) {
@@ -329,6 +330,12 @@ impl PermissionPrompt {
 
     pub fn take_pending_action(&mut self) -> Option<PermissionAction> {
         self.pending_action.take()
+    }
+
+    /// テスト専用: `render` を経由せずにクリック判定の基準領域を設定する。
+    #[cfg(test)]
+    pub(crate) fn set_last_rendered_area_for_test(&self, area: Rect) {
+        self.last_rendered_area.set(Some(area));
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -674,11 +681,14 @@ mod tests {
     }
 
     #[test]
-    fn approve_always_appends_suffix_to_taken_request_id() {
+    fn approve_always_keeps_original_request_id() {
+        // サーバは permission id の完全一致で pending を解決するため、
+        // "always" の意志に関わらず id は書き換えない（reply 文字列で表現する）。
         let mut prompt = PermissionPrompt::new();
         prompt.add_request(sample_request());
         let approved = prompt.approve_always().expect("pending request");
-        assert_eq!(approved.id, "perm-1_always");
+        assert_eq!(approved.id, "perm-1");
+        assert!(!approved.id.ends_with("_always"));
         assert!(prompt.is_empty());
         assert!(!prompt.is_open);
     }

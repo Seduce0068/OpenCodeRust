@@ -447,14 +447,65 @@ impl App {
     }
 
     /// Reply to a permission request, surfacing delivery failures to the user.
-    fn reply_permission(&mut self, id: &str, decision: &str) {
-        if let Some(client) = self.context.get_api_client() {
-            if let Err(error) = client.reply_permission(id, decision) {
-                self.toast.show(
-                    ToastVariant::Error,
-                    &format!("Failed to send permission reply: {}", error),
-                    3000,
-                );
+    ///
+    /// 送信失敗時は `Err` を返す。クライアント未設定もサイレントに捨てず、
+    /// 呼び出し側がローカルの要求を残して再試行できるようにする。
+    fn reply_permission(&mut self, id: &str, decision: &str) -> anyhow::Result<()> {
+        let Some(client) = self.context.get_api_client() else {
+            // id・トークン・パスを出さない固定文言（他失敗経路とログ方針を統一、R4）。
+            tracing::warn!("permission reply skipped: API client unavailable");
+            self.toast.show(
+                ToastVariant::Error,
+                "Failed to send permission reply: API client unavailable",
+                3000,
+            );
+            return Err(anyhow::anyhow!("API client unavailable"));
+        };
+        if let Err(error) = client.reply_permission(id, decision) {
+            self.toast.show(
+                ToastVariant::Error,
+                &format!("Failed to send permission reply: {}", error),
+                3000,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 権限アクションをプロンプトへ適用し、サーバへ reply をちょうど 1 回送る。
+    ///
+    /// キーボード入力とマウスクリックの両方からこれを呼ぶことで、
+    /// 決定文字列（once / reject / always）と id の扱いを一致させる。
+    /// Enter / Esc の既定 Deny は `permission_action_for_key` が
+    /// `PermissionAction::Deny` を返すことで維持され、ここでは変更しない。
+    ///
+    /// fail-safe のため、要求を削除する前に reply を送り、成功時のみ削除する。
+    /// 送信失敗時は要求を残し（トーストは `reply_permission` が表示）、
+    /// ユーザーが同じ要求を再試行できるようにする。
+    fn apply_permission_action(&mut self, action: PermissionAction) {
+        // 削除せずに現在の要求を参照して id を取得する。
+        let Some(request) = self.permission_prompt.current_request() else {
+            return;
+        };
+        let id = request.id.clone();
+        let decision = match action {
+            PermissionAction::Approve => "once",
+            PermissionAction::Deny => "reject",
+            PermissionAction::ApproveAlways => "always",
+        };
+
+        // 先に送信し、失敗したら要求を残す（ローカルだけプロンプトが消えるのを防ぐ）。
+        if self.reply_permission(&id, decision).is_err() {
+            return;
+        }
+
+        // 送信成功時のみ要求を削除してプロンプトを閉じる。
+        match action {
+            PermissionAction::Approve | PermissionAction::ApproveAlways => {
+                self.permission_prompt.approve();
+            }
+            PermissionAction::Deny => {
+                self.permission_prompt.deny();
             }
         }
     }
@@ -468,23 +519,7 @@ impl App {
                 if self.permission_prompt.is_open {
                     // Enter/Esc は暗黙 approve せず既定で Deny（fail-safe）。
                     if let Some(action) = permission_action_for_key(*key) {
-                        match action {
-                            PermissionAction::Approve => {
-                                if let Some(request) = self.permission_prompt.approve() {
-                                    self.reply_permission(&request.id, "once");
-                                }
-                            }
-                            PermissionAction::Deny => {
-                                if let Some(request) = self.permission_prompt.deny() {
-                                    self.reply_permission(&request.id, "reject");
-                                }
-                            }
-                            PermissionAction::ApproveAlways => {
-                                if let Some(request) = self.permission_prompt.approve_always() {
-                                    self.reply_permission(&request.id, "always");
-                                }
-                            }
-                        }
+                        self.apply_permission_action(action);
                     }
                     return Ok(());
                 }
@@ -773,17 +808,10 @@ impl App {
                         if self.permission_prompt.is_open {
                             self.permission_prompt.handle_click(col, row);
                             if let Some(action) = self.permission_prompt.take_pending_action() {
-                                match action {
-                                    PermissionAction::Approve => {
-                                        let _ = self.permission_prompt.approve();
-                                    }
-                                    PermissionAction::Deny => {
-                                        let _ = self.permission_prompt.deny();
-                                    }
-                                    PermissionAction::ApproveAlways => {
-                                        let _ = self.permission_prompt.approve_always();
-                                    }
-                                }
+                                // キーボード経路と同じくサーバへ reply を送る。
+                                // 戻り値を捨てるとローカル表示は消えるがサーバ側の
+                                // pending が残りツールがハングするため必ず送る。
+                                self.apply_permission_action(action);
                             }
                             return Ok(());
                         }
@@ -5529,6 +5557,307 @@ mod tests {
         assert!(
             shell_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "the stub /shell endpoint must actually be reached (success path)"
+        );
+    }
+
+    /// 権限 reply スタブが記録する (パス, 本文)。
+    type RecordedReply = (String, String);
+    /// 権限 reply スタブの (base_url, 呼び出し回数, 記録済みリクエスト)。
+    type PermissionReplyStub = (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<RecordedReply>>>,
+    );
+
+    /// 権限 reply エンドポイント専用のローカル HTTP スタブ（成功 200）。
+    /// reply の回数とリクエスト（パス＋本文）を記録する。
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_permission_reply_api() -> PermissionReplyStub {
+        spawn_permission_reply_api_with_statuses(vec!["200 OK"])
+    }
+
+    /// `status` を返す権限 reply スタブ。送信失敗の再試行テストで使う。
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_permission_reply_api_with_status(status: &'static str) -> PermissionReplyStub {
+        spawn_permission_reply_api_with_statuses(vec![status])
+    }
+
+    /// リクエストごとに `statuses` を順に返す権限 reply スタブ。
+    /// 最後のステータスは以降のリクエストにも使う（再試行の成否を切り替える）。
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_permission_reply_api_with_statuses(
+        statuses: Vec<&'static str>,
+    ) -> PermissionReplyStub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        let reply_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits = Arc::clone(&reply_hits);
+        let log = Arc::clone(&recorded);
+        let status_queue = Arc::new(std::sync::Mutex::new(statuses));
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                // Content-Length 分だけ追加で読み、reply 本文も記録する。
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end + 4]).to_string();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    while request.len() < body_start + content_length {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                let first_line = text.lines().next().unwrap_or("").to_string();
+                if first_line.contains("/permission/") && first_line.contains("/reply") {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    log.lock().expect("record lock").push((first_line, text));
+                }
+                let status = {
+                    let mut queue = status_queue.lock().expect("status lock");
+                    if queue.len() > 1 {
+                        queue.remove(0)
+                    } else {
+                        queue.first().copied().unwrap_or("200 OK")
+                    }
+                };
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), reply_hits, recorded)
+    }
+
+    #[test]
+    fn mouse_click_sends_exactly_one_permission_reply_with_original_id() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        // (column, 期待する decision) — permission.rs のボタン列割当てに合わせる。
+        let cases = [(11, "once"), (25, "reject"), (40, "always")];
+        for (column, decision) in cases {
+            let (base_url, reply_hits, recorded) = spawn_permission_reply_api();
+            let context = Arc::new(AppContext::new());
+            context.set_api_client(Arc::new(ApiClient::new(base_url)));
+            let mut app = headless_app(context);
+
+            app.permission_prompt.add_request(PermissionRequest {
+                id: "perm_mouse_1".to_string(),
+                permission_type: PermissionType::Bash,
+                resource: "ls -la".to_string(),
+                tool_name: "bash".to_string(),
+            });
+            // x=10, y=20, width=40, height=8 -> ボタン行は 26。
+            app.permission_prompt
+                .set_last_rendered_area_for_test(ratatui::layout::Rect::new(10, 20, 40, 8));
+
+            app.handle_event(&Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 26,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .expect("mouse event must be handled without error");
+
+            assert_eq!(
+                reply_hits.load(Ordering::SeqCst),
+                1,
+                "decision={decision}: mouse click must send exactly one reply"
+            );
+            let recorded = recorded.lock().expect("record lock");
+            assert_eq!(recorded.len(), 1, "decision={decision}");
+            let (path, full) = &recorded[0];
+            assert!(
+                path.contains("/permission/perm_mouse_1/reply"),
+                "reply must use the original request id: {path}"
+            );
+            assert!(
+                !path.contains("_always"),
+                "request id must not be suffixed: {path}"
+            );
+            assert!(
+                full.contains(&format!("\"reply\":\"{decision}\"")),
+                "reply decision must be {decision}: {full}"
+            );
+            assert!(
+                app.permission_prompt.is_empty(),
+                "prompt must be closed after click"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_reply_http_failure_keeps_request_for_retry() {
+        // 送信失敗（500 / 404）時は要求を残し、トーストを出して再試行可能にする。
+        for status in ["500 Internal Server Error", "404 Not Found"] {
+            let (base_url, reply_hits, recorded) = spawn_permission_reply_api_with_status(status);
+            let context = Arc::new(AppContext::new());
+            context.set_api_client(Arc::new(ApiClient::new(base_url)));
+            let mut app = headless_app(context);
+
+            app.permission_prompt.add_request(PermissionRequest {
+                id: "perm_retry_1".to_string(),
+                permission_type: PermissionType::Bash,
+                resource: "ls -la".to_string(),
+                tool_name: "bash".to_string(),
+            });
+
+            // y = Approve ("once")。キーボード経路で送信。
+            app.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+            .expect("key event must be handled without error");
+
+            assert_eq!(
+                reply_hits.load(Ordering::SeqCst),
+                1,
+                "status={status}: reply must be attempted exactly once"
+            );
+            assert!(
+                app.permission_prompt.is_open,
+                "status={status}: prompt must stay open after send failure"
+            );
+            assert_eq!(
+                app.permission_prompt.pending_count(),
+                1,
+                "status={status}: request must be kept for retry"
+            );
+            assert_eq!(
+                app.permission_prompt
+                    .current_request()
+                    .map(|r| r.id.as_str()),
+                Some("perm_retry_1"),
+                "status={status}: same request must remain for retry"
+            );
+            {
+                let recorded = recorded.lock().expect("record lock");
+                assert_eq!(recorded.len(), 1, "status={status}");
+                assert!(
+                    recorded[0].0.contains("/permission/perm_retry_1/reply"),
+                    "status={status}: original id must be used: {}",
+                    recorded[0].0
+                );
+            }
+            assert!(
+                app.toast.is_visible(),
+                "status={status}: failure must surface a toast"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_reply_without_client_keeps_request_for_retry() {
+        // API クライアント未設定でもサイレントに捨てず、要求を残す。
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(context);
+        app.permission_prompt.add_request(PermissionRequest {
+            id: "perm_no_client".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: "ls -la".to_string(),
+            tool_name: "bash".to_string(),
+        });
+
+        app.apply_permission_action(PermissionAction::Approve);
+
+        assert!(
+            app.permission_prompt.is_open,
+            "prompt must stay open when no API client is available"
+        );
+        assert_eq!(
+            app.permission_prompt.pending_count(),
+            1,
+            "request must be kept when no API client is available"
+        );
+        assert_eq!(
+            app.permission_prompt
+                .current_request()
+                .map(|r| r.id.as_str()),
+            Some("perm_no_client")
+        );
+        assert!(
+            app.toast.is_visible(),
+            "missing client must surface a toast instead of silently dropping"
+        );
+    }
+
+    #[test]
+    fn permission_reply_retry_after_failure_closes_prompt_on_success() {
+        // 1 回目は 500 で失敗、2 回目は 200 で成功 → プロンプトが閉じる。
+        let (base_url, reply_hits, recorded) =
+            spawn_permission_reply_api_with_statuses(vec!["500 Internal Server Error", "200 OK"]);
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(context);
+
+        app.permission_prompt.add_request(PermissionRequest {
+            id: "perm_retry_flow".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: "ls -la".to_string(),
+            tool_name: "bash".to_string(),
+        });
+
+        // 失敗: 要求が残る。
+        app.apply_permission_action(PermissionAction::Approve);
+        assert!(
+            app.permission_prompt.is_open,
+            "failed first reply must keep the request"
+        );
+
+        // 再試行成功: 要求が削除されプロンプトが閉じる。
+        app.apply_permission_action(PermissionAction::Approve);
+        assert!(
+            app.permission_prompt.is_empty(),
+            "successful retry must remove the request and close the prompt"
+        );
+        assert_eq!(
+            reply_hits.load(Ordering::SeqCst),
+            2,
+            "both attempts must reach the server"
+        );
+        let recorded = recorded.lock().expect("record lock");
+        assert_eq!(recorded.len(), 2, "both attempts must be recorded");
+        assert!(
+            recorded
+                .iter()
+                .all(|(path, _)| path.contains("/permission/perm_retry_flow/reply")),
+            "both attempts must reuse the original request id"
         );
     }
 }
