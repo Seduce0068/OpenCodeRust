@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **5 秒ごとの背景更新でセッション一覧の選択が先頭へ戻る**
-  — `tui/dialogs/session_list.rs:207-225` / TUIEV-04 / 中
 - [ ] **Ctrl+Shift+C が input_copy を奪いプロンプトをコピーできない**
   — `tui/app/app.rs:557-564` / TUIEV-05 / 中
 - [ ] **`attach` の空 URL が既定ローカルサーバへ黙って接続する**
@@ -278,6 +276,8 @@ status: current
 
 ## 完了
 
+- [x] **[セッション一覧選択 1 件]** 背景更新時も選択を維持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[権限ボタン座標 1 件]** render 時の実ボタン行を記録
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI 権限応答 2 件]** reply 共通化と成功時のみ要求削除
