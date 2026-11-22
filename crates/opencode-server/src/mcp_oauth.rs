@@ -104,10 +104,23 @@ pub struct McpServerLogEntry {
     pub message: String,
 }
 
+/// Where a server entry came from.
+///
+/// Disk-sourced entries are reconciled by `sync_mcp_from_disk`: a server that
+/// disappeared from the config file is removed from memory. CRUD-sourced
+/// entries are created through the API and are deliberately left untouched by
+/// that reconciliation so existing add/connect behaviour stays unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerOrigin {
+    Disk,
+    Crud,
+}
+
 #[derive(Debug, Clone)]
 struct ManagedServer {
     config: McpRuntimeConfig,
     enabled: bool,
+    origin: ServerOrigin,
 }
 
 pub struct McpOAuthManager {
@@ -221,13 +234,60 @@ impl McpOAuthManager {
         self.servers.read().await.contains_key(server_name)
     }
 
+    /// Registers a server created through the API (CRUD).
+    ///
+    /// CRUD entries are not reconciled against the on-disk config, so they
+    /// survive later `GET /mcp` synchronizations.
     pub async fn add_server(
         &self,
         server_name: String,
         config: McpRuntimeConfig,
         enabled: bool,
     ) -> McpServerInfo {
-        let managed = ManagedServer { config, enabled };
+        self.add_server_with_origin(server_name, config, enabled, ServerOrigin::Crud)
+            .await
+    }
+
+    /// Registers a server loaded from the on-disk configuration.
+    ///
+    /// Disk entries are the only ones eligible for removal by
+    /// `sync_mcp_from_disk` when their config section disappears.
+    pub(crate) async fn add_disk_server(
+        &self,
+        server_name: String,
+        config: McpRuntimeConfig,
+        enabled: bool,
+    ) -> McpServerInfo {
+        self.add_server_with_origin(server_name, config, enabled, ServerOrigin::Disk)
+            .await
+    }
+
+    async fn add_server_with_origin(
+        &self,
+        server_name: String,
+        config: McpRuntimeConfig,
+        enabled: bool,
+        origin: ServerOrigin,
+    ) -> McpServerInfo {
+        // 同名エントリが既に disk 由来なら origin を保持する。CRUD 追加が
+        // 後から来ても disk 由来として扱い、設定削除時に消せるようにする（R4）。
+        let origin = if origin == ServerOrigin::Crud
+            && self
+                .servers
+                .read()
+                .await
+                .get(&server_name)
+                .is_some_and(|existing| existing.origin == ServerOrigin::Disk)
+        {
+            ServerOrigin::Disk
+        } else {
+            origin
+        };
+        let managed = ManagedServer {
+            config,
+            enabled,
+            origin,
+        };
         self.servers
             .write()
             .await
@@ -247,6 +307,87 @@ impl McpOAuthManager {
         self.log_event(&server_name, "info", "Server registered")
             .await;
         status
+    }
+
+    /// Returns the names of servers that were registered from disk.
+    ///
+    /// Used by the disk synchronizer to decide which in-memory entries are
+    /// stale. CRUD-created servers are intentionally excluded.
+    pub(crate) async fn disk_server_names(&self) -> Vec<String> {
+        self.servers
+            .read()
+            .await
+            .iter()
+            .filter(|(_, managed)| managed.origin == ServerOrigin::Disk)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Removes a server from memory, including its cached status, logs and
+    /// OAuth/client state, without touching the persisted config file.
+    ///
+    /// Returns the last known status when the server was registered.
+    pub async fn remove_server(&self, server_name: &str) -> Option<McpServerInfo> {
+        self.servers.write().await.remove(server_name)?;
+
+        let status = self.statuses.write().await.remove(server_name);
+        self.oauth_states.write().await.remove(server_name);
+        self.oauth_clients.write().await.remove(server_name);
+        self.clients.remove_oauth_manager(server_name).await;
+        if self.clients.remove(server_name).await.is_err() {
+            // Log only a fixed message: client errors may embed URLs or paths.
+            tracing::warn!(
+                server = server_name,
+                "failed to remove MCP client while removing server"
+            );
+        }
+        self.logs.write().await.remove(server_name);
+
+        status
+    }
+
+    /// Applies an `enabled` change to an already registered server.
+    ///
+    /// Returns `true` when the server existed and the value was applied. The
+    /// cached status is updated so `GET /mcp` reflects a disable immediately,
+    /// without needing a reconnect.
+    pub async fn set_server_enabled(&self, server_name: &str, enabled: bool) -> bool {
+        let managed = {
+            let mut servers = self.servers.write().await;
+            let Some(managed) = servers.get_mut(server_name) else {
+                return false;
+            };
+            if managed.enabled == enabled {
+                // Nothing changed: keep the cached runtime status (e.g.
+                // "connected") intact. `GET /mcp` calls this on every sync.
+                return true;
+            }
+            managed.enabled = enabled;
+            managed.clone()
+        };
+
+        let oauth_status = self.oauth_status_for(server_name).await;
+        let status = if enabled {
+            self.default_status_for(server_name, &managed, oauth_status)
+                .await
+        } else {
+            McpServerInfo {
+                name: server_name.to_string(),
+                status: "disabled".to_string(),
+                tools: 0,
+                resources: 0,
+                error: None,
+                oauth_required: managed.config.oauth_required(),
+                oauth_status,
+            }
+        };
+        self.statuses
+            .write()
+            .await
+            .insert(server_name.to_string(), status);
+        self.log_event(server_name, "info", "Server enabled state updated")
+            .await;
+        true
     }
 
     pub async fn connect(&self, server_name: &str) -> Result<McpServerInfo, McpOAuthError> {
@@ -877,6 +1018,64 @@ mod tests {
             .map(|(_, value)| value.into_owned())
             .expect("authorization URL must carry a state");
         format!("{server_name}-oauth-flow-{state}")
+    }
+
+    #[tokio::test]
+    async fn remove_server_drops_registered_entry_and_status() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "to-remove".to_string(),
+                McpRuntimeConfig::Local(LocalMcpConfig {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: None,
+                    cwd: None,
+                    timeouts: McpTimeouts::default(),
+                    protocol: None,
+                }),
+                true,
+            )
+            .await;
+
+        let removed = manager.remove_server("to-remove").await;
+        assert_eq!(removed.map(|info| info.name), Some("to-remove".to_string()));
+        assert!(!manager.has_server("to-remove").await);
+        assert!(manager.get_server("to-remove").await.is_none());
+        assert!(manager.list_servers().await.is_empty());
+        assert!(manager.remove_server("to-remove").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_server_enabled_updates_cached_status() {
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "toggle".to_string(),
+                McpRuntimeConfig::Local(LocalMcpConfig {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: None,
+                    cwd: None,
+                    timeouts: McpTimeouts::default(),
+                    protocol: None,
+                }),
+                true,
+            )
+            .await;
+
+        assert!(manager.set_server_enabled("toggle", false).await);
+        assert_eq!(
+            manager
+                .get_server("toggle")
+                .await
+                .expect("server exists")
+                .status,
+            "disabled"
+        );
+        assert!(manager.set_server_enabled("toggle", true).await);
+        assert!(manager.has_server("toggle").await);
+        assert!(!manager.set_server_enabled("missing", false).await);
     }
 
     #[tokio::test]

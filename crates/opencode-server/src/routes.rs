@@ -4790,22 +4790,45 @@ async fn sync_mcp_from_disk(manager: &McpOAuthManager) -> Result<()> {
     let config = load_config(&cwd)
         .map_err(|e| ApiError::BadRequest(format!("Failed to load config: {}", e)))?;
 
-    let Some(section) = config.mcp else {
-        return Ok(());
+    // An empty (or absent) MCP section still means "no servers on disk", so
+    // previously disk-loaded entries must be evicted rather than cached
+    // forever.
+    let (mcp_map, global_timeout) = match config.mcp {
+        Some(section) => (section.servers.unwrap_or_default(), section.timeout.clone()),
+        None => (std::collections::HashMap::new(), None),
     };
-    let Some(mcp_map) = section.servers else {
-        return Ok(());
-    };
-    let global_timeout = section.timeout.clone();
+
+    // Reconciliation is limited to entries that were originally loaded from
+    // disk. CRUD-created servers are intentionally left alone so API-added
+    // servers keep surviving later GET /mcp calls (existing behaviour).
+    let disk_names: std::collections::HashSet<String> =
+        manager.disk_server_names().await.into_iter().collect();
+    for name in &disk_names {
+        if !mcp_map.contains_key(name) {
+            manager.remove_server(name).await;
+        }
+    }
 
     for (name, server_config) in mcp_map {
+        let enabled = match &server_config {
+            LoadedMcpServerConfig::Enabled { enabled } => Some(*enabled),
+            LoadedMcpServerConfig::Full(server) => server.enabled,
+        };
+
         if manager.has_server(&name).await {
+            // Only disk-sourced entries follow the config file's enabled flag.
+            // Existing runtime/config values are preserved for compatibility.
+            if disk_names.contains(&name) {
+                if let Some(enabled) = enabled {
+                    manager.set_server_enabled(&name, enabled).await;
+                }
+            }
             continue;
         }
         if let Some((runtime, enabled)) =
             parse_runtime_from_loaded_config(server_config, global_timeout.as_ref())?
         {
-            manager.add_server(name, runtime, enabled).await;
+            manager.add_disk_server(name, runtime, enabled).await;
         }
     }
 
@@ -7139,6 +7162,190 @@ mod mcp_callback_tests {
             "unexpected error: {error}"
         );
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+// テスト専用のプロセスグローバル env 直列化ロックは non-Send ガードを非同期処理
+// 跨ぎで保持するが、#[tokio::test] の single-thread runtime 内だけで実害はない。
+#[allow(clippy::await_holding_lock)]
+mod mcp_disk_reconcile_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// `OPENCODE_CONFIG` is process-global, so tests that change it must not
+    /// run concurrently (including with tests in other modules of this binary
+    /// that happen to read config). A fresh temp file per test keeps the
+    /// fixture self-contained.
+    static CONFIG_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct ConfigEnvGuard {
+        previous_config: Option<std::ffi::OsString>,
+        previous_content: Option<std::ffi::OsString>,
+        path: std::path::PathBuf,
+    }
+
+    impl ConfigEnvGuard {
+        fn install(servers_json: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "opencode-mcp-sync-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::write(&path, format!("{{\"mcp\":{{\"servers\":{servers_json}}}}}"))
+                .expect("write temp config");
+            let previous_config = std::env::var_os("OPENCODE_CONFIG");
+            let previous_content = std::env::var_os("OPENCODE_CONFIG_CONTENT");
+            std::env::set_var("OPENCODE_CONFIG", &path);
+            // Inline content has higher precedence than the explicit file.
+            std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+            Self {
+                previous_config,
+                previous_content,
+                path,
+            }
+        }
+
+        fn rewrite(&self, servers_json: &str) {
+            std::fs::write(
+                &self.path,
+                format!("{{\"mcp\":{{\"servers\":{servers_json}}}}}"),
+            )
+            .expect("rewrite temp config");
+        }
+    }
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous_config {
+                Some(value) => std::env::set_var("OPENCODE_CONFIG", value),
+                None => std::env::remove_var("OPENCODE_CONFIG"),
+            }
+            match &self.previous_content {
+                Some(value) => std::env::set_var("OPENCODE_CONFIG_CONTENT", value),
+                None => std::env::remove_var("OPENCODE_CONFIG_CONTENT"),
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn local_server_json(enabled: bool) -> String {
+        format!("{{\"command\":[\"true\"],\"enabled\":{enabled}}}")
+    }
+
+    #[tokio::test]
+    async fn disk_removed_server_disappears_from_status() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = ConfigEnvGuard::install(&format!(
+            "{{\"sync-removed-a\":{}, \"sync-removed-b\":{}}}",
+            local_server_json(true),
+            local_server_json(true)
+        ));
+        let manager = McpOAuthManager::new();
+
+        sync_mcp_from_disk(&manager).await.expect("initial sync");
+        assert!(manager.has_server("sync-removed-a").await);
+        assert!(manager.has_server("sync-removed-b").await);
+
+        config.rewrite(&format!(
+            "{{\"sync-removed-a\":{}}}",
+            local_server_json(true)
+        ));
+        sync_mcp_from_disk(&manager).await.expect("second sync");
+
+        assert!(manager.has_server("sync-removed-a").await);
+        assert!(
+            !manager.has_server("sync-removed-b").await,
+            "server removed from disk must disappear from in-memory status"
+        );
+        assert!(
+            manager.get_server("sync-removed-b").await.is_none(),
+            "GET /mcp must no longer report the removed server"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_false_from_disk_is_applied_to_existing_server() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let enabled_json = "{\"url\":\"http://127.0.0.1:1/mcp\",\"enabled\":true}";
+        let disabled_json = "{\"url\":\"http://127.0.0.1:1/mcp\",\"enabled\":false}";
+        let config = ConfigEnvGuard::install(&format!("{{\"sync-enabled\":{enabled_json}}}"));
+        let manager = McpOAuthManager::new();
+
+        sync_mcp_from_disk(&manager).await.expect("initial sync");
+        // A failed connection gives a non-disabled status, so the transition
+        // to `disabled` below proves the disk flag was actually applied.
+        let connected = manager
+            .connect("sync-enabled")
+            .await
+            .expect("connect returns runtime status");
+        assert_ne!(connected.status, "disabled");
+
+        config.rewrite(&format!("{{\"sync-enabled\":{disabled_json}}}"));
+        sync_mcp_from_disk(&manager)
+            .await
+            .expect("sync after disable");
+
+        let status = manager
+            .get_server("sync-enabled")
+            .await
+            .expect("server still exists");
+        assert_eq!(
+            status.status, "disabled",
+            "enabled=false from disk must be reflected in GET /mcp status"
+        );
+
+        config.rewrite(&format!("{{\"sync-enabled\":{enabled_json}}}"));
+        sync_mcp_from_disk(&manager)
+            .await
+            .expect("sync after enable");
+        assert!(
+            manager.has_server("sync-enabled").await,
+            "re-enabling must keep the server registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn crud_added_server_survives_disk_sync() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = ConfigEnvGuard::install(&format!(
+            "{{\"sync-crud-disk\":{}}}",
+            local_server_json(true)
+        ));
+        let manager = McpOAuthManager::new();
+        sync_mcp_from_disk(&manager).await.expect("initial sync");
+
+        manager
+            .add_server(
+                "sync-crud-only".to_string(),
+                McpRuntimeConfig::Local(LocalMcpConfig {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: None,
+                    cwd: None,
+                    timeouts: McpTimeouts::default(),
+                    protocol: None,
+                }),
+                true,
+            )
+            .await;
+
+        config.rewrite("{}");
+        sync_mcp_from_disk(&manager)
+            .await
+            .expect("sync with empty disk config");
+
+        assert!(
+            manager.has_server("sync-crud-only").await,
+            "CRUD-added servers must not be removed by disk reconciliation"
+        );
+        assert!(
+            !manager.has_server("sync-crud-disk").await,
+            "disk-sourced server must still be removed"
+        );
     }
 }
 
