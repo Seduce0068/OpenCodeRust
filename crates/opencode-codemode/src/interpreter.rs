@@ -6362,18 +6362,39 @@ fn construct_url(arguments: &[Value], span: Span) -> Result<Value, RuntimeError>
 
 fn construct_url_search_params(arguments: &[Value], _span: Span) -> Result<Value, RuntimeError> {
     let mut params = Vec::new();
-    if let Some(Value::String(text)) = arguments.first() {
-        for pair in text.split('&') {
-            if pair.is_empty() {
-                continue;
+    if let Some(first) = arguments.first() {
+        match first {
+            Value::String(text) => {
+                for pair in text.split('&') {
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    let (key, value) = match pair.split_once('=') {
+                        Some((k, v)) => (k, v),
+                        None => (pair, ""),
+                    };
+                    let key = crate::uri::form_decode(key).unwrap_or_else(|_| key.to_string());
+                    let value =
+                        crate::uri::form_decode(value).unwrap_or_else(|_| value.to_string());
+                    params.push((key, value));
+                }
             }
-            let (key, value) = match pair.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => (pair, ""),
-            };
-            let key = crate::uri::decode(key, false).unwrap_or_else(|_| key.to_string());
-            let value = crate::uri::decode(value, false).unwrap_or_else(|_| value.to_string());
-            params.push((key, value));
+            // WHATWG accepts a sequence of name/value sequences. Entries are
+            // literal strings here (not query text), so no form decoding.
+            Value::Array(entries) => {
+                for entry in entries.borrow().iter() {
+                    match entry {
+                        Value::Array(pair) => {
+                            let pair = pair.borrow();
+                            let key = pair.first().map(to_js_string).unwrap_or_default();
+                            let value = pair.get(1).map(to_js_string).unwrap_or_default();
+                            params.push((key, value));
+                        }
+                        other => params.push((to_js_string(other), String::new())),
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
@@ -6902,8 +6923,8 @@ fn params_to_query(params: &[(String, String)]) -> String {
         .map(|(k, v)| {
             format!(
                 "{}={}",
-                crate::uri::encode(k, false),
-                crate::uri::encode(v, false)
+                crate::uri::form_encode(k),
+                crate::uri::form_encode(v)
             )
         })
         .collect::<Vec<_>>()
@@ -10304,6 +10325,36 @@ mod tests {
                return u.search;"#,
         );
         assert_eq!(value, Value::String("?r=2".to_string()));
+    }
+
+    #[test]
+    fn url_search_params_uses_urlencoded_plus_rules() {
+        assert_eq!(
+            run_value("return new URLSearchParams('a=b+c').get('a');"),
+            string("b c")
+        );
+        assert_eq!(
+            run_value("return new URLSearchParams([['a', 'b c']]).toString();"),
+            string("a=b+c")
+        );
+        // Existing %XX escapes keep their meaning, including %20 -> space -> '+'.
+        assert_eq!(
+            run_value(
+                "const p = new URLSearchParams('a=b%20c&d=%2B'); \
+                 return p.get('a') + '|' + p.get('d') + '|' + p.toString();"
+            ),
+            string("b c|+|a=b+c&d=%2B")
+        );
+        // A literal '+' must not turn back into a space when serialized.
+        assert_eq!(
+            run_value("return new URLSearchParams([['a', 'b+c']]).toString();"),
+            string("a=b%2Bc")
+        );
+        // The URI globals must keep their own, different rules.
+        assert_eq!(
+            run_value("return encodeURI('a b+c') + '|' + decodeURI('a%20b+c');"),
+            string("a%20b+c|a b+c")
+        );
     }
 
     #[test]

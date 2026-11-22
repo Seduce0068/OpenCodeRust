@@ -103,9 +103,48 @@ pub(crate) fn decode(text: &str, preserve_reserved: bool) -> Result<String, ()> 
     Ok(output)
 }
 
+/// Decodes an `application/x-www-form-urlencoded` fragment: `'+'` is turned
+/// into a space before the regular percent-decoding rules apply. This is used
+/// only by `URLSearchParams`; the URI globals and the URL query parser keep
+/// their existing behavior.
+pub(crate) fn form_decode(text: &str) -> Result<String, ()> {
+    decode(&text.replace('+', " "), false)
+}
+
+/// Serializes text with the urlencoded space rule: a space becomes `'+'`,
+/// while every other character goes through [`encode`] unchanged. Calling
+/// `encode` on a pre-replaced string would escape the `'+'` as `%2B`, so the
+/// space is handled per character and the rest is delegated to `encode`.
+pub(crate) fn form_encode(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut buffer = [0u8; 4];
+    for character in text.chars() {
+        if character == ' ' {
+            output.push('+');
+        } else {
+            let bytes = character.encode_utf8(&mut buffer).as_bytes();
+            // WHATWG urlencoded serializer の unreserved は ASCII 英数字と
+            // `* - . _` のみ。`! ~ ' ( )` は %XX へエスケープする（R4）。
+            if bytes.len() == 1
+                && (bytes[0].is_ascii_alphanumeric()
+                    || matches!(bytes[0], b'*' | b'-' | b'.' | b'_'))
+            {
+                output.push(bytes[0] as char);
+            } else {
+                for byte in bytes {
+                    output.push('%');
+                    output.push(hex_digit(byte >> 4));
+                    output.push(hex_digit(byte & 0x0f));
+                }
+            }
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, encode, form_decode, form_encode};
 
     #[test]
     fn encodes_unreserved_and_reserved_sets() {
@@ -128,5 +167,33 @@ mod tests {
         assert!(decode("%", false).is_err());
         assert!(decode("%G0", false).is_err());
         assert!(decode("%E0%A4", false).is_err());
+    }
+
+    #[test]
+    fn form_encode_uses_plus_only_for_spaces() {
+        assert_eq!(form_encode("b c"), "b+c");
+        assert_eq!(form_encode("a b&c"), "a+b%26c");
+        assert_eq!(form_encode("a+b"), "a%2Bb");
+        assert_eq!(form_encode("b%20c"), "b%2520c");
+        assert_eq!(form_encode("é 😀"), "%C3%A9+%F0%9F%98%80");
+        assert_eq!(form_encode(""), "");
+        // WHATWG urlencoded: ! ~ ' ( ) は %XX、* - . _ はそのまま（R4）。
+        assert_eq!(form_encode("!~'()*-._"), "%21%7E%27%28%29*-._");
+    }
+
+    #[test]
+    fn form_decode_treats_plus_as_space() {
+        assert_eq!(form_decode("b+c").unwrap(), "b c");
+        assert_eq!(form_decode("a+b%26c").unwrap(), "a b&c");
+        assert_eq!(form_decode("a%2Bb").unwrap(), "a+b");
+        assert_eq!(form_decode("%20").unwrap(), " ");
+        assert_eq!(form_decode("plain").unwrap(), "plain");
+    }
+
+    #[test]
+    fn form_decode_rejects_malformed_escapes() {
+        assert!(form_decode("%").is_err());
+        assert!(form_decode("%G0").is_err());
+        assert!(form_decode("%E0%A4").is_err());
     }
 }
