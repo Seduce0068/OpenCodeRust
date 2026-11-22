@@ -166,8 +166,6 @@ status: current
 
 - [ ] **Anthropic tool_use の id/name 欠落が空文字列へ化ける**
   — `provider/stream.rs:338` / ERRPROP-03 / 低
-- [ ] **TUI セッション status 取得失敗が全 busy=false へ化ける**
-  — `tui/app.rs:3040` / ERRPROP-04 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -274,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[session status 1 件]** 取得失敗時に busy 表示を維持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[username 永続化 1 件]** 環境由来既定値をファイルへ書かない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[glob 1 件]** 不正メタ文字の全マッチ化を修正
@@ -787,6 +787,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（session status の修正時）: 親が到達回数アサーション
+  を == 2 へ、api.rs の get_session_status 生 reqwest エラーを固定文言へ
+  直接修正。残存 low 1 件（テストの loopback スタブ JoinHandle が 10 秒
+  残存）は記録のみ。
 - 2026-11-23 R4 指摘（username 永続化の修正時）: 親が routes.rs の blocker
   （新シグネチャ呼び出し）と PATCH インメモリ側の引数 false 検証テストを
   直接修正。残存 low 2 件（update_global_config の回帰テスト欠落、

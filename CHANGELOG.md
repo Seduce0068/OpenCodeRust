@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T07:25:12+09:00"
+  at: "2026-11-23T07:42:56+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tui`: セッション status 取得失敗時に既存の busy 表示を維持
+  （swarm-coding R1-R6）
 - `config`: PATCH 永続化で環境由来 username を書き出さない
   （swarm-coding R1-R6）
 - `grep`: 不正 glob メタ文字が全ファイルにマッチする問題を修正
