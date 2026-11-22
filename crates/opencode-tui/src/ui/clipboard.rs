@@ -146,15 +146,29 @@ fn write_with_command(program: &str, args: &[&str], text: &str) -> anyhow::Resul
         .spawn()
         .with_context(|| format!("failed to execute clipboard write command: {program}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).with_context(|| {
-            format!("failed to write text to clipboard command stdin: {program}")
-        })?;
-    }
+    // Keep the stdin write error instead of returning early: an early `?`
+    // would skip `child.wait()`, and `Child`'s `Drop` does not reap the
+    // process, leaving a zombie. The `stdin` guard is dropped at the end of
+    // this match, closing the pipe's write end so the child sees EOF and can
+    // exit before we wait on it.
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
+            .write_all(text.as_bytes())
+            .with_context(|| format!("failed to write text to clipboard command stdin: {program}")),
+        None => Ok(()),
+    };
 
-    let status = child
+    // Always reap the child, on both the success and the write-failure path.
+    // This is the same `wait()` call as before, unchanged on the success path.
+    let wait_result = child
         .wait()
-        .with_context(|| format!("failed waiting for clipboard command: {program}"))?;
+        .with_context(|| format!("failed waiting for clipboard command: {program}"));
+
+    // Propagate the original stdin-write error (same message and type as
+    // before) ahead of any wait error, restoring the previous error behaviour.
+    write_result?;
+
+    let status = wait_result?;
     if !status.success() {
         anyhow::bail!(
             "clipboard write command `{}` failed with status {}",
@@ -441,6 +455,52 @@ mod tests {
         assert_eq!(
             build_osc52_sequence("", true),
             "\x1bPtmux;\x1b\x1b]52;c;\x07\x1b\\"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_with_command_reaps_child_when_stdin_write_fails() {
+        use std::time::{Duration, Instant};
+
+        // The child closes its stdin read end, then sleeps before exiting.
+        // A payload larger than the pipe capacity is guaranteed to fail with
+        // EPIPE once the read end is closed. If `write_with_command` skipped
+        // `wait()` on the write error, it would return almost immediately;
+        // with the reap in place it blocks until the child exits (~1s), which
+        // is what the elapsed-time assertion verifies.
+        let oversized_payload = "x".repeat(1024 * 1024);
+        let started = Instant::now();
+        let result =
+            write_with_command("/bin/sh", &["-c", "exec 0<&-; sleep 1"], &oversized_payload);
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("oversized stdin write to a closed pipe must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to write text to clipboard command stdin"),
+            "original stdin-write error must be preserved, got: {rendered}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "child was not waited for (elapsed {elapsed:?}); zombie risk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_with_command_success_path_is_unchanged() {
+        write_with_command("/bin/true", &[], "hello").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_with_command_nonzero_status_message_is_unchanged() {
+        let err = write_with_command("/bin/false", &[], "hello").unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("clipboard write command `/bin/false` failed with status"),
+            "nonzero-status message changed, got: {rendered}"
         );
     }
 }
