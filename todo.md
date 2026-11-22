@@ -67,9 +67,10 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **空配列クリアが他 4 フィールドで未対応**
-  — skills.paths/urls, provider.whitelist/blacklist, primary_tools /
+- [ ] **空配列クリアが他 3 フィールドで未対応**
+  — skills.paths/urls, provider.whitelist/blacklist /
   watcher.ignore と同パターンで ExplicitStringList 化
+  （primary_tools は 2026-11-21 対応済み）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -271,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[空配列クリア 1 件]** primary_tools を ExplicitStringList 化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[空配列クリア 1 件]** watcher.ignore を ExplicitStringList 化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[Anthropic tool_use 1 件]** 空 ID イベントを出さない
@@ -790,6 +793,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（primary_tools の修正時）: 親が
+  merge_explicit_string_list_replace の doc コメントを provider 専用から
+  replacement セマンティクス一般（provider lists / watcher.ignore /
+  primary_tools）へ直接修正。機能バグではない。
 - 2026-11-23 R4 残存（watcher.ignore の修正時）: 同種の残り 4 フィールド
   （skills.paths/urls、provider.whitelist/blacklist、primary_tools）は今回
   スコープ外として中優先 TODO へ明示。なお config の watcher.ignore は
