@@ -164,6 +164,12 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **PATCH 永続化で username が設定ファイルへ書き出される**
+  — `config/loader.rs:2383` / CFGCONV-R1-02 / 低
+- [ ] **Anthropic tool_use の id/name 欠落が空文字列へ化ける**
+  — `provider/stream.rs:338` / ERRPROP-03 / 低
+- [ ] **TUI セッション status 取得失敗が全 busy=false へ化ける**
+  — `tui/app.rs:3040` / ERRPROP-04 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -239,6 +245,10 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **空配列によるクリアが watcher.ignore 等で無視される**
+  — `config/schema.rs:967` / CFGCONV-R1-01 / 中
+- [ ] **grep ディレクトリ検索の一部ファイル失敗が握りつぶされる**
+  — `grep/search.rs:74` / ERRPROP-02 / 中
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -266,6 +276,8 @@ status: current
 
 ## 完了
 
+- [x] **[glob 1 件]** 不正メタ文字の全マッチ化を修正
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[codemode 2 件]** NaN ソート順序と truncated 判定
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[McpClient close 1 件]** in-flight receive とデッドロックしない
@@ -775,6 +787,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm228、2 担当・6 件、観点: 設定値変換 /
+  エラー伝播）: ERRPROP-01（不正 glob が全マッチ）を read で事実確認し即座
+  coding、他 5 件を triage。R4 は git_diff 取得制約のため read で全体検証し
+  findings なし。ERRPROP-02 は opencode-tool 側 M-24 と同一方針か要確認。
 - 2026-11-23 cross-skill 集約（swarm226、2 担当・2 件、観点: コレクション /
   状態遷移）: 両件を read で事実確認し即座 coding（Array.sort の NaN を
   unorderable として末尾退避、bound_output の truncated を Some/None 根拠に）。
