@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **IPv6 hostname で SocketAddr/URL 生成が失敗する**
-  — `cli/main.rs:1692-1698` / NET-01 / 中
 - [ ] **port=0 起動で実際のバインドポートではなく 0 が使われる**
   — `cli/main.rs:1692` / NET-05 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[IPv6 hostname 1 件]** bind/URL 生成と unspecified 正規化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider URL 1 件]** Vertex/Google base_url の末尾スラッシュ正規化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[Agent part status 1 件]** task 成否を completed/error へ反映
@@ -741,6 +741,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（IPv6 hostname の修正時）: 親が unspecified（:: / [::]）
+  の接続先 loopback 正規化、角括弧付き [::1] の loopback 判定、完全形式 IPv6
+  の URL assertion を直接追加。port=0 は CLI が 3000 へ置換する既存挙動で、
+  ライブラリ直接呼び出しのみの課題として残存。
 - 2026-11-23 却下（DATETIME-02、存在しない日付）: 子の実装後 parity corpus
   が失敗（expected 2024-03-01、V8 生成）。MDN 非標準日付文字列の表によれば
   V8 は 2024-02-30 を正常な日付へ正規化し、厳密化は V8 互換からの意図的な
