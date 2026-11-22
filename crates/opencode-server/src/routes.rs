@@ -1069,6 +1069,9 @@ pub struct ToolResultInfo {
     pub tool_call_id: String,
     pub content: String,
     pub is_error: bool,
+    /// provider 添付を session 側 `FilePart` に正規化したもの。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<opencode_session::FilePart>>,
 }
 
 /// enum の wire 名を serde の `rename_all` から導出する単一の変換経路。
@@ -1149,12 +1152,14 @@ fn part_to_info(part: &opencode_session::MessagePart) -> PartInfo {
             tool_call_id,
             content,
             is_error,
+            attachments,
         } = &part.part_type
         {
             Some(ToolResultInfo {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
                 is_error: *is_error,
+                attachments: attachments.clone(),
             })
         } else {
             None
@@ -1287,6 +1292,7 @@ fn session_parts_to_provider_content(
                 tool_call_id,
                 content,
                 is_error,
+                ..
             } => Some(opencode_provider::ContentPart {
                 content_type: "tool_result".to_string(),
                 text: None,
@@ -1555,6 +1561,7 @@ fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<opencode_sess
                 )
             })?,
             is_error: req.is_error.unwrap_or(false),
+            attachments: None,
         },
         unsupported => {
             return Err(ApiError::BadRequest(format!(
@@ -8395,6 +8402,7 @@ mod message_info_wire_format_tests {
                 tool_call_id: "call-1".to_string(),
                 content: "done".to_string(),
                 is_error: false,
+                attachments: None,
             }),
             synthetic: None,
             ignored: Some(true),

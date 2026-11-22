@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::message_v2::FilePart;
+
 fn default_message_created_at() -> DateTime<Utc> {
     DateTime::<Utc>::UNIX_EPOCH
 }
@@ -78,6 +80,9 @@ pub enum PartType {
         tool_call_id: String,
         content: String,
         is_error: bool,
+        /// provider が ToolResult に添付したファイル。`None` のときは wire に出しない。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<FilePart>>,
     },
 
     Reasoning {
@@ -208,6 +213,7 @@ impl SessionMessage {
                 tool_call_id: tool_call_id.into(),
                 content: content.into(),
                 is_error,
+                attachments: None,
             },
             created_at: Utc::now(),
             message_id: None,

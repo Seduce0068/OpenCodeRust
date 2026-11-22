@@ -2096,7 +2096,7 @@ fn part_to_content_part(part: &Part) -> Option<opencode_provider::ContentPart> {
 /// malformed elements are silently skipped. The URL is retained purely as
 /// part data — it is never logged nor embedded in an error message, so signed
 /// query strings and token values cannot leak into logs.
-fn tool_attachments_to_file_parts(
+pub(crate) fn tool_attachments_to_file_parts(
     values: &[serde_json::Value],
     session_id: &str,
     message_id: &str,

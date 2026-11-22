@@ -19,6 +19,7 @@ use crate::compaction::{
     CompactionConfig, CompactionEngine, MessageForPrune, ModelLimits, PruneToolPart, TokenUsage,
     ToolPartStatus,
 };
+use crate::llm::tool_attachments_to_file_parts;
 use crate::message_v2::{
     AssistantTime, AssistantTokens, CacheTokens, CompactionPart as V2CompactionPart, MessageInfo,
     MessagePath, MessageWithParts, ModelRef as V2ModelRef, Part as V2Part, StepFinishPart,
@@ -1344,6 +1345,11 @@ impl SessionPrompt {
             // Consume stream events to build the assistant message incrementally.
             // tool_calls keyed by id: (name, input_json_fragments)
             let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
+            // Responses API の ToolResult 添付を tool_call_id 単位で一時保持し、
+            // 今回のツール実行結果 Part に渡す。ループを跨いで誤って付与しない
+            // よう、ツール実行後に必ずクリアする。
+            let mut stream_tool_attachments: HashMap<String, Vec<serde_json::Value>> =
+                HashMap::new();
             let mut finish_reason: Option<String> = None;
             let mut prompt_tokens: u64 = 0;
             let mut completion_tokens: u64 = 0;
@@ -1445,7 +1451,22 @@ impl SessionPrompt {
                     }
                     // ToolResult/ToolError come from Responses API; legacy stream
                     // doesn't produce them — tool execution is handled below.
-                    Ok(StreamEvent::ToolResult { .. } | StreamEvent::ToolError { .. }) => {}
+                    // ToolResult の attachments だけを収集し、Part 生成時に渡す。
+                    Ok(StreamEvent::ToolResult {
+                        tool_call_id,
+                        output,
+                        ..
+                    }) => {
+                        if let Some(values) = output.attachments.as_deref() {
+                            if !values.is_empty() {
+                                stream_tool_attachments
+                                    .entry(tool_call_id)
+                                    .or_default()
+                                    .extend(values.iter().cloned());
+                            }
+                        }
+                    }
+                    Ok(StreamEvent::ToolError { .. }) => {}
                     Ok(StreamEvent::StartStep) => {}
                     Err(e) => {
                         tracing::error!("Stream error for session {}: {}", session_id, e);
@@ -1593,18 +1614,21 @@ impl SessionPrompt {
                 }
 
                 let registry = Arc::new(opencode_tool::create_default_registry().await);
-                if let Err(e) = Self::execute_tool_calls(
+                if let Err(e) = Self::execute_tool_calls_with_attachments(
                     session,
                     registry,
                     tool_context,
                     provider.clone(),
                     &provider_id,
                     &model_id,
+                    &stream_tool_attachments,
                 )
                 .await
                 {
                     tracing::error!("Tool execution error for session {}: {}", session_id, e);
                 }
+                // 次のステップで同じ ID が使われても添付が混入しないようにする。
+                stream_tool_attachments.clear();
                 session.touch();
                 Self::emit_session_update(update_hook.as_ref(), session);
                 continue;
@@ -1750,6 +1774,29 @@ impl SessionPrompt {
         provider_id: &str,
         model_id: &str,
     ) -> anyhow::Result<()> {
+        let no_attachments: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        Self::execute_tool_calls_with_attachments(
+            session,
+            tool_registry,
+            ctx,
+            provider,
+            provider_id,
+            model_id,
+            &no_attachments,
+        )
+        .await
+    }
+
+    /// `execute_tool_calls` と同じ処理に、stream で受け取った添付を結び付ける。
+    async fn execute_tool_calls_with_attachments(
+        session: &mut Session,
+        tool_registry: Arc<opencode_tool::ToolRegistry>,
+        ctx: opencode_tool::ToolContext,
+        provider: Arc<dyn Provider>,
+        provider_id: &str,
+        model_id: &str,
+        stream_attachments: &HashMap<String, Vec<serde_json::Value>>,
+    ) -> anyhow::Result<()> {
         let last_assistant = session
             .messages
             .iter()
@@ -1800,12 +1847,16 @@ impl SessionPrompt {
                     Err(e) => (format!("Error: {}", e), true),
                 };
 
+                let attachments = stream_attachments.get(&call_id).and_then(|values| {
+                    tool_attachments_to_file_parts(values, &ctx.session_id, &msg.id)
+                });
                 msg.parts.push(crate::MessagePart {
                     id: format!("prt_{}", uuid::Uuid::new_v4()),
                     part_type: PartType::ToolResult {
                         tool_call_id: call_id,
                         content: result.0,
                         is_error: result.1,
+                        attachments,
                     },
                     created_at: chrono::Utc::now(),
                     message_id: None,
@@ -2146,6 +2197,7 @@ impl SessionPrompt {
                     tool_call_id,
                     content,
                     is_error,
+                    ..
                 } => Some(ContentPart {
                     content_type: "tool_result".to_string(),
                     text: None,
@@ -2750,6 +2802,7 @@ impl SessionPrompt {
                             tool_call_id,
                             content,
                             is_error,
+                            ..
                         } => Some(PruneToolPart {
                             id: p.id.clone(),
                             tool: tool_name_by_call
@@ -5704,5 +5757,156 @@ mod tests {
             &part.part_type,
             PartType::Text { text, .. } if text.as_str() == "uppercase-file"
         )));
+    }
+
+    /// 本番 chat_stream 経路で provider の ToolResult 添付が Part に残ること。
+    #[tokio::test]
+    async fn tool_result_attachments_from_chat_stream_are_kept_in_part() {
+        let prompt = SessionPrompt::default();
+        let mut session = Session::new("proj", ".");
+        session.add_user_message("Use a tool that returns an attachment");
+
+        let model = ModelInfo {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            provider: "mock".to_string(),
+            context_window: 8192,
+            max_output_tokens: 1024,
+            supports_vision: false,
+            supports_tools: true,
+            cost_per_million_input: 0.0,
+            cost_per_million_output: 0.0,
+        };
+
+        let question_input = serde_json::json!({
+            "questions": [{
+                "question": "Continue?",
+                "header": "Confirm",
+                "options": [{"label": "Yes"}, {"label": "No"}],
+                "multiple": false
+            }]
+        });
+        let attachment_url = "https://example.invalid/report.pdf";
+        let tool_call_script = vec![
+            StreamEvent::Start,
+            StreamEvent::ToolCallStart {
+                id: "call_attach".to_string(),
+                name: "question".to_string(),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "call_attach".to_string(),
+                name: "question".to_string(),
+                input: question_input,
+            },
+            StreamEvent::ToolResult {
+                tool_call_id: "call_attach".to_string(),
+                tool_name: "question".to_string(),
+                input: None,
+                output: opencode_provider::ToolResultOutput {
+                    output: "question result".to_string(),
+                    title: String::new(),
+                    metadata: HashMap::new(),
+                    attachments: Some(vec![serde_json::json!({
+                        "mime": "application/pdf",
+                        "url": attachment_url,
+                        "filename": "report.pdf",
+                    })]),
+                },
+            },
+            StreamEvent::FinishStep {
+                finish_reason: Some("tool-calls".to_string()),
+                usage: StreamUsage::default(),
+                provider_metadata: None,
+            },
+            StreamEvent::Done,
+        ];
+        let finish_script = vec![
+            StreamEvent::Start,
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::FinishStep {
+                finish_reason: Some("stop".to_string()),
+                usage: StreamUsage::default(),
+                provider_metadata: None,
+            },
+            StreamEvent::Done,
+        ];
+        let provider = Arc::new(SequencedStreamProvider {
+            model,
+            scripts: StdMutex::new(vec![tool_call_script, finish_script].into()),
+        });
+        let question_callback: QuestionCallback = Some(Arc::new(move |_questions| {
+            Box::pin(async { Ok(vec![vec!["Yes".to_string()]]) })
+        }));
+
+        prompt
+            .prompt_with_update_hook(
+                PromptInput {
+                    session_id: session.id.clone(),
+                    message_id: None,
+                    model: Some(ModelRef {
+                        provider_id: "mock".to_string(),
+                        model_id: "test-model".to_string(),
+                    }),
+                    agent: None,
+                    no_reply: false,
+                    system: None,
+                    variant: None,
+                    parts: vec![PartInput::Text {
+                        text: "Use a tool that returns an attachment".to_string(),
+                    }],
+                    tools: Some([("question".to_string(), true)].into_iter().collect()),
+                },
+                &mut session,
+                provider,
+                None,
+                vec![ToolDefinition {
+                    name: "question".to_string(),
+                    description: Some("Ask the user a question".to_string()),
+                    parameters: serde_json::json!({"type": "object"}),
+                }],
+                AgentParams::default(),
+                None,
+                None,
+                question_callback,
+            )
+            .await
+            .expect("prompt_with_update_hook should succeed");
+
+        let files = session
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .find_map(|part| match &part.part_type {
+                PartType::ToolResult {
+                    tool_call_id,
+                    attachments,
+                    ..
+                } if tool_call_id == "call_attach" => attachments.clone(),
+                _ => None,
+            })
+            .expect("tool result attachments should be kept");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].mime, "application/pdf");
+        assert_eq!(files[0].url, attachment_url);
+        assert_eq!(files[0].filename.as_deref(), Some("report.pdf"));
+        assert_eq!(files[0].session_id, session.id);
+
+        // 添付が無い ToolResult では wire に attachments が現れない（後方互換）。
+        let serialized =
+            serde_json::to_value(&session.messages).expect("messages should serialize");
+        let messages = serialized.as_array().expect("messages should be an array");
+        let has_null_attachments = messages.iter().any(|message| {
+            message
+                .get("parts")
+                .and_then(|parts| parts.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| matches!(part.get("attachments"), Some(v) if v.is_null()))
+                })
+                .unwrap_or(false)
+        });
+        assert!(!has_null_attachments);
     }
 }

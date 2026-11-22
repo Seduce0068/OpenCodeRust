@@ -129,6 +129,13 @@ pub enum PartType {
         content: String,
         /// 実行が失敗したかどうか。
         is_error: bool,
+        /// provider が返した添付の生データ。
+        ///
+        /// `opencode_session` 側は `FilePart` へ正規化して保持するが、このクレートは
+        /// 下位クレートへ依存できないため JSON 値のまま保持する。`None` のときは
+        /// wire に出さず、既存データとの後方互換を保つ。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<serde_json::Value>>,
     },
     /// モデルの推論内容。
     Reasoning {
@@ -397,6 +404,7 @@ mod tests {
                     tool_call_id: "tc".into(),
                     content: "ok".into(),
                     is_error: false,
+                    attachments: None,
                 },
                 "toolResult",
             ),
@@ -480,6 +488,7 @@ mod tests {
             tool_call_id: "tc_1".to_string(),
             content: "ok".to_string(),
             is_error: false,
+            attachments: None,
         };
         assert_eq!(
             serde_json::to_value(&part).unwrap(),

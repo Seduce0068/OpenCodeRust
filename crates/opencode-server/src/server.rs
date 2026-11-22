@@ -1167,10 +1167,14 @@ fn stored_part_from_session(part: &opencode_session::MessagePart) -> opencode_ty
             tool_call_id,
             content,
             is_error,
+            ..
         } => StoredPart::ToolResult {
             tool_call_id: tool_call_id.clone(),
             content: content.clone(),
             is_error: *is_error,
+            // 型が異なる（FilePart vs serde_json::Value）ためここでは落とす。
+            // HTTP wire の添付受け渡しは routes.rs の ToolResultInfo が担う。
+            attachments: None,
         },
         SessionPart::Reasoning { text } => StoredPart::Reasoning { text: text.clone() },
         SessionPart::File {
@@ -1252,10 +1256,13 @@ fn session_part_from_stored(part: opencode_types::MessagePart) -> opencode_sessi
             tool_call_id,
             content,
             is_error,
+            ..
         } => SessionPart::ToolResult {
             tool_call_id,
             content,
             is_error,
+            // 型が異なるためここでは落とす（永続化経路の添付は将来の課題）。
+            attachments: None,
         },
         StoredPart::Reasoning { text } => SessionPart::Reasoning { text },
         StoredPart::File {
