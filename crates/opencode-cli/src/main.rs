@@ -107,6 +107,73 @@ fn validate_attach_url(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CLI の `--agent` 名を `AgentRegistry` から解決する。
+///
+/// レジストリに存在する名前は従来どおりそのクローンを返す。未登録で
+/// `agent_name == "build"` の場合だけ、後方互換の既定経路として
+/// `AgentInfo::build()` を返す。それ以外の未知名は `build` へ黙って化けさせず、
+/// 明示的な `unknown agent` エラーとして伝播させる（CLIARG-05）。
+///
+/// エラー本文は固定文言で、CLI 引数・設定値・トークン・パスを一切エコーしない。
+fn resolve_agent(registry: &AgentRegistry, agent_name: &str) -> anyhow::Result<AgentInfo> {
+    resolve_agent_from(registry.get(agent_name).cloned(), agent_name)
+}
+
+/// `resolve_agent` の判定核。ルックアップ結果を注入できる純粋関数。
+///
+/// 未知名を `build` にフォールバックしてよいのは `agent_name == "build"` の
+/// ときだけであり、それ以外は必ずエラーにする。
+fn resolve_agent_from(found: Option<AgentInfo>, agent_name: &str) -> anyhow::Result<AgentInfo> {
+    match found {
+        Some(agent) => Ok(agent),
+        None if agent_name == "build" => Ok(AgentInfo::build()),
+        None => anyhow::bail!("unknown agent"),
+    }
+}
+
+#[cfg(test)]
+mod resolve_agent_tests {
+    use super::*;
+
+    /// レジストリに存在する名前は従来どおり解決されること。
+    #[test]
+    fn registered_agent_is_resolved_from_registry() {
+        let registry = AgentRegistry::new();
+        let agent = resolve_agent(&registry, "plan").expect("registered agent must resolve");
+        assert_eq!(agent.name, "plan");
+    }
+
+    /// `build` がレジストリに登録されていればその定義が返ること。
+    #[test]
+    fn registered_build_is_resolved_from_registry() {
+        let registry = AgentRegistry::new();
+        let agent = resolve_agent(&registry, "build").expect("build must resolve");
+        assert_eq!(agent.name, "build");
+    }
+
+    /// 未登録の `build` は後方互換のため `AgentInfo::build()` へ戻ること。
+    #[test]
+    fn unregistered_build_falls_back_to_default_build_agent() {
+        let agent = resolve_agent_from(None, "build").expect("build fallback must succeed");
+        assert_eq!(agent.name, "build");
+    }
+
+    /// 未知名（build 以外）は `build` へ化けず、明示エラーになること。
+    #[test]
+    fn unknown_agent_returns_error_instead_of_build_fallback() {
+        let err = resolve_agent_from(None, "does-not-exist").expect_err("unknown must fail");
+        assert_eq!(err.to_string(), "unknown agent");
+    }
+
+    /// 実レジストリ経由でも未知名がエラーになること（呼び出し側の配線回帰）。
+    #[test]
+    fn unknown_agent_is_rejected_through_registry_path() {
+        let registry = AgentRegistry::new();
+        let err = resolve_agent(&registry, "does-not-exist").expect_err("unknown must fail");
+        assert_eq!(err.to_string(), "unknown agent");
+    }
+}
+
 #[cfg(test)]
 mod host_port_format_tests {
     use super::*;
@@ -2840,10 +2907,8 @@ async fn run_chat_session(
     let tool_registry = Arc::new(create_default_registry().await);
 
     let agent_registry = AgentRegistry::from_config(&config);
-    let mut agent_info = agent_registry
-        .get(&agent_name)
-        .cloned()
-        .unwrap_or_else(AgentInfo::build);
+    // CLIARG-05: 未知名を黙って build に化けさせない（resolve_agent 内で明示エラー）。
+    let mut agent_info = resolve_agent(&agent_registry, &agent_name)?;
 
     if let Some(ref model_id) = model {
         let provider_id = provider.clone().unwrap_or_else(|| {
@@ -6817,10 +6882,8 @@ async fn generate_agent_response(
 
     let tool_registry = Arc::new(create_default_registry().await);
     let agent_registry = AgentRegistry::from_config(&config);
-    let mut agent_info = agent_registry
-        .get(agent_name)
-        .cloned()
-        .unwrap_or_else(AgentInfo::build);
+    // CLIARG-05: 未知名を黙って build に化けさせない（resolve_agent 内で明示エラー）。
+    let mut agent_info = resolve_agent(&agent_registry, agent_name)?;
 
     let (provider, model_id) = parse_model_and_provider(model);
     if let Some(model_id) = model_id {
