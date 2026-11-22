@@ -634,7 +634,13 @@ impl AgentRegistry {
         } else if let Some(mode) = cfg.mode.clone() {
             agent.mode = map_loaded_agent_mode(mode);
         }
-        if let Some(steps) = cfg.steps.or(cfg.max_steps) {
+        // 0 steps は「未指定」と同じ扱いとし、executor の既定値（100）を適用する。
+        // 正の値はそのまま維持する。steps が 0 のときは max_steps へフォールバックする。
+        if let Some(steps) = cfg
+            .steps
+            .filter(|steps| *steps > 0)
+            .or_else(|| cfg.max_steps.filter(|steps| *steps > 0))
+        {
             agent.max_steps = Some(steps);
         }
         if let Some(max_tokens) = cfg.max_tokens {
@@ -1001,6 +1007,56 @@ mod tests {
             PermissionNext::evaluate_any(&explore, "websearch"),
             PermissionDecision::Deny
         );
+    }
+
+    /// max_steps=0 が executor のループを一度も回さず空応答にする回帰ガード。
+    /// 0 は未指定扱いとし、正の値はそのまま維持されること。
+    #[test]
+    fn zero_steps_from_config_are_treated_as_unspecified() {
+        let mut config = LoadedConfig::default();
+        config.agent = Some(LoadedAgentConfigs {
+            entries: HashMap::from([
+                (
+                    "build".to_string(),
+                    LoadedAgentConfig {
+                        steps: Some(0),
+                        max_steps: Some(0),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "custom".to_string(),
+                    LoadedAgentConfig {
+                        steps: Some(0),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "general".to_string(),
+                    LoadedAgentConfig {
+                        steps: Some(8),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "plan".to_string(),
+                    LoadedAgentConfig {
+                        steps: Some(0),
+                        max_steps: Some(6),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        });
+
+        let registry = AgentRegistry::from_config(&config);
+        // build の組み込み既定値 Some(100) が 0 で上書きされないこと。
+        assert_eq!(registry.get("build").expect("build").max_steps, Some(100));
+        // カスタムエージェントの組み込み既定値 Some(100) も 0 で上書きされない。
+        assert_eq!(registry.get("custom").expect("custom").max_steps, Some(100));
+        assert_eq!(registry.get("general").expect("general").max_steps, Some(8));
+        // steps が 0 の場合は正の max_steps へフォールバックすること。
+        assert_eq!(registry.get("plan").expect("plan").max_steps, Some(6));
     }
 
     #[test]

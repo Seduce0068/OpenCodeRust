@@ -579,6 +579,19 @@ impl Session {
         self.touch();
     }
 
+    /// アーカイブを解除して通常のアクティブ状態へ戻す。
+    ///
+    /// `set_archived(None)` は「現在時刻」を設定するためクリアを表現できない。
+    /// タイムスタンプと status を明示的に初期化し、更新時刻を進める。
+    pub fn unarchive(&mut self) {
+        self.time.archived = None;
+        // Compacting を経由したセッションの古いタイムスタンプも消し、status と
+        // タイムスタンプを整合させる（R4）。
+        self.time.compacting = None;
+        self.status = SessionStatus::Active;
+        self.touch();
+    }
+
     /// Set the permission ruleset
     pub fn set_permission(&mut self, permission: PermissionRuleset) {
         self.permission = Some(permission);
@@ -924,6 +937,19 @@ impl SessionManager {
         Some(updated)
     }
 
+    /// セッションのアーカイブを解除し、更新イベントを発行する。
+    pub fn unarchive(&mut self, session_id: &str) -> Option<Session> {
+        let updated = {
+            let session = self.sessions.get_mut(session_id)?;
+            session.unarchive();
+            session.clone()
+        };
+        self.events.push(SessionEvent::Updated {
+            info: updated.clone(),
+        });
+        Some(updated)
+    }
+
     /// Set permission rules.
     ///
     /// ポリシー更新時は、それまで `Always` 応答で記録されていた動的 allow も破棄する。
@@ -1246,6 +1272,43 @@ mod tests {
         assert!(session.title.starts_with("New session"));
         assert!(session.parent_id.is_none());
         assert_eq!(session.status, SessionStatus::Active);
+    }
+
+    /// archive:false の no-op 回帰ガード。
+    /// set_archived は None を現在時刻と解釈するため、解除は unarchive で行う。
+    #[test]
+    fn unarchive_clears_archived_time_and_reactivates() {
+        let mut manager = SessionManager::new();
+        let session_id = manager.create("project-1", "/path/to/project").id;
+
+        let archived = manager
+            .set_archived(&session_id, None)
+            .expect("archived session");
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(archived.time.archived.is_some());
+
+        let updated_before = archived.time.updated;
+        let restored = manager
+            .unarchive(&session_id)
+            .expect("unarchived session must exist");
+        assert_eq!(restored.status, SessionStatus::Active);
+        assert_eq!(restored.time.archived, None);
+        assert!(restored.time.updated >= updated_before);
+
+        // 内部状態も更新され、to_row の往復でも Archived に戻らないこと。
+        let row = manager
+            .get(&session_id)
+            .expect("session should still exist")
+            .to_row();
+        assert_eq!(row.status, Some(SessionStatus::Active));
+        assert_eq!(row.time_archived, None);
+        assert_eq!(Session::from_row(row).status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn unarchive_missing_session_is_noop() {
+        let mut manager = SessionManager::new();
+        assert!(manager.unarchive("ses_missing").is_none());
     }
 
     #[test]

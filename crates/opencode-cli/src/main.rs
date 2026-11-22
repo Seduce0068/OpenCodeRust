@@ -1164,7 +1164,9 @@ enum McpCommands {
         args: Vec<String>,
         #[arg(long, default_value_t = true)]
         enabled: bool,
-        #[arg(long)]
+        // Zero would make every MCP operation time out immediately. Require a
+        // positive millisecond value; omitted means "use the schema defaults".
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
     #[command(about = "Connect MCP server")]
@@ -5218,6 +5220,16 @@ async fn parse_http_json<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_str(&body)?)
 }
 
+/// `mcp add --timeout` accepts positive millisecond values only.
+///
+/// The error names the flag but never echoes the rejected value or any path.
+fn validate_mcp_add_timeout(timeout: Option<u64>) -> anyhow::Result<()> {
+    if timeout == Some(0) {
+        anyhow::bail!("--timeout must be at least 1 millisecond");
+    }
+    Ok(())
+}
+
 async fn handle_mcp_command(server: String, action: McpCommands) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
@@ -5255,6 +5267,7 @@ async fn handle_mcp_command(server: String, action: McpCommands) -> anyhow::Resu
             enabled,
             timeout,
         } => {
+            validate_mcp_add_timeout(timeout)?;
             let config = if let Some(url) = url {
                 serde_json::json!({
                     "type": "remote",
@@ -7318,6 +7331,49 @@ mod tests {
     #[test]
     fn rejects_unknown_subcommand() {
         assert!(Cli::try_parse_from(["opencoderust", "unknown-cmd"]).is_err());
+    }
+
+    #[test]
+    fn mcp_add_rejects_zero_timeout_and_keeps_positive_values() {
+        // `--timeout 0` は clap の range parser で解析時に拒否される。
+        let err = Cli::try_parse_from(["opencoderust", "mcp", "add", "demo", "--timeout", "0"])
+            .err()
+            .expect("zero timeout must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("--timeout"), "{message}");
+        // トークン値・パスは出さない（0 はタイムアウト値でありトークンではない）。
+        assert!(!message.contains("/home/"), "{message}");
+        assert!(!message.contains("sk-"), "{message}");
+
+        // 正のミリ秒値は従来どおり通る。
+        let cli = Cli::try_parse_from(["opencoderust", "mcp", "add", "demo", "--timeout", "1500"])
+            .expect("positive timeout parses");
+        match cli.command {
+            Some(Commands::Mcp {
+                action: McpCommands::Add { timeout, .. },
+                ..
+            }) => assert_eq!(timeout, Some(1500)),
+            _ => panic!("expected mcp add"),
+        }
+
+        // 未指定も従来どおり許可される。
+        let cli = Cli::try_parse_from(["opencoderust", "mcp", "add", "demo"])
+            .expect("omitted timeout parses");
+        match cli.command {
+            Some(Commands::Mcp {
+                action: McpCommands::Add { timeout, .. },
+                ..
+            }) => assert_eq!(timeout, None),
+            _ => panic!("expected mcp add"),
+        }
+
+        // argv を経由せずコマンドを組み立てた場合も実行時に拒否する。
+        assert!(validate_mcp_add_timeout(Some(0)).is_err());
+        assert!(validate_mcp_add_timeout(Some(1)).is_ok());
+        assert!(validate_mcp_add_timeout(None).is_ok());
+        let guard_error = validate_mcp_add_timeout(Some(0)).unwrap_err().to_string();
+        assert!(guard_error.contains("--timeout"), "{guard_error}");
+        assert!(!guard_error.contains("/home/"), "{guard_error}");
     }
 
     #[test]

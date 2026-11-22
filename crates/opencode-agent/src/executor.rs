@@ -89,7 +89,9 @@ impl AgentExecutor {
         providers: Arc<ProviderRegistry>,
         tools: Arc<ToolRegistry>,
     ) -> Self {
-        let max_steps = agent.max_steps.unwrap_or(100);
+        // 設定ロード時に 0 は正規化されるが、AgentInfo が直接構築された場合も
+        // 0 を「未指定」として扱い、既定値を適用して空応答を防ぐ。
+        let max_steps = agent.max_steps.filter(|steps| *steps > 0).unwrap_or(100);
         let conversation = Conversation::new();
 
         Self {
@@ -867,6 +869,22 @@ mod tests {
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
+    }
+
+    /// 回帰ガード: max_steps=0 は既定値へ正規化され、正の値は不変。
+    #[test]
+    fn zero_max_steps_falls_back_to_default_and_positive_values_are_kept() {
+        let zero = build_executor(AgentInfo::general().with_max_steps(0));
+        assert_eq!(zero.max_steps, 100);
+
+        let unset = build_executor(AgentInfo {
+            max_steps: None,
+            ..AgentInfo::general()
+        });
+        assert_eq!(unset.max_steps, 100);
+
+        let positive = build_executor(AgentInfo::general().with_max_steps(5));
+        assert_eq!(positive.max_steps, 5);
     }
 
     /// 回帰ガード: モデル未指定かつモデル一覧が空なら、空文字を

@@ -1302,7 +1302,10 @@ impl McpTimeoutConfig {
     ///
     /// Per the OpenCode schema, the global `mcp.timeout` provides defaults and
     /// a server's own `timeout` overrides matching keys. Anything still unset
-    /// falls back to the documented defaults.
+    /// falls back to the documented defaults. A zero is not a usable duration
+    /// (`Duration::from_millis(0)` expires immediately and makes every MCP
+    /// operation fail), so a resolved zero is replaced by that field's
+    /// documented default. Positive values and unset fields are unchanged.
     pub fn resolve(global: Option<&Self>, server: Option<&Self>) -> (u64, u64, u64) {
         let mut effective = (None, None, None);
         for layer in [global, server].into_iter().flatten() {
@@ -1317,10 +1320,29 @@ impl McpTimeoutConfig {
                 effective.2 = execution;
             }
         }
+        if [effective.0, effective.1, effective.2]
+            .into_iter()
+            .flatten()
+            .any(|value| value == 0)
+        {
+            // Value-free: never echo the configured number into logs.
+            tracing::warn!(
+                "mcp.timeout zero value normalized to the documented default (value not logged)"
+            );
+        }
         (
-            effective.0.unwrap_or(DEFAULT_MCP_STARTUP_MS),
-            effective.1.unwrap_or(DEFAULT_MCP_CATALOG_MS),
-            effective.2.unwrap_or(DEFAULT_MCP_EXECUTION_MS),
+            effective
+                .0
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_MCP_STARTUP_MS),
+            effective
+                .1
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_MCP_CATALOG_MS),
+            effective
+                .2
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_MCP_EXECUTION_MS),
         )
     }
 }
@@ -3219,6 +3241,78 @@ mod tests {
         assert_eq!(
             McpTimeoutConfig::resolve(None, Some(&server)),
             (DEFAULT_MCP_STARTUP_MS, 60000, DEFAULT_MCP_EXECUTION_MS)
+        );
+    }
+
+    #[test]
+    fn resolve_replaces_zero_with_defaults_per_field() {
+        use super::{DEFAULT_MCP_CATALOG_MS, DEFAULT_MCP_EXECUTION_MS, DEFAULT_MCP_STARTUP_MS};
+
+        // Legacy millis form with zero: every field becomes unusable.
+        let zero_millis = McpTimeoutConfig::Millis(0);
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&zero_millis), None),
+            (
+                DEFAULT_MCP_STARTUP_MS,
+                DEFAULT_MCP_CATALOG_MS,
+                DEFAULT_MCP_EXECUTION_MS
+            )
+        );
+
+        // Per-operation form with all zeros: same defaults.
+        let zeros: McpTimeoutConfig =
+            serde_json::from_str(r#"{"startup":0,"catalog":0,"execution":0}"#).unwrap();
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&zeros), None),
+            (
+                DEFAULT_MCP_STARTUP_MS,
+                DEFAULT_MCP_CATALOG_MS,
+                DEFAULT_MCP_EXECUTION_MS
+            )
+        );
+
+        // Only the zero fields fall back; positive fields are preserved.
+        let mixed: McpTimeoutConfig =
+            serde_json::from_str(r#"{"startup":0,"catalog":1500,"execution":0}"#).unwrap();
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&mixed), None),
+            (DEFAULT_MCP_STARTUP_MS, 1500, DEFAULT_MCP_EXECUTION_MS)
+        );
+
+        // A zero in the higher-precedence server layer falls back to each
+        // field's documented default, even when the global layer had a value.
+        let global: McpTimeoutConfig =
+            serde_json::from_str(r#"{"startup":45000,"catalog":30000,"execution":600000}"#)
+                .unwrap();
+        let server_zeros: McpTimeoutConfig =
+            serde_json::from_str(r#"{"startup":0,"catalog":0,"execution":0}"#).unwrap();
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&global), Some(&server_zeros)),
+            (
+                DEFAULT_MCP_STARTUP_MS,
+                DEFAULT_MCP_CATALOG_MS,
+                DEFAULT_MCP_EXECUTION_MS
+            )
+        );
+        // And a zero global value does not hide a valid server override.
+        let server: McpTimeoutConfig = serde_json::from_str(r#"{"catalog":60000}"#).unwrap();
+        assert_eq!(
+            McpTimeoutConfig::resolve(Some(&zero_millis), Some(&server)),
+            (DEFAULT_MCP_STARTUP_MS, 60000, DEFAULT_MCP_EXECUTION_MS)
+        );
+
+        // Positive millisecond values (including 1) and unset keys are unchanged.
+        let positive: McpTimeoutConfig =
+            serde_json::from_str(r#"{"startup":1,"catalog":2,"execution":3}"#).unwrap();
+        assert_eq!(McpTimeoutConfig::resolve(Some(&positive), None), (1, 2, 3));
+        assert_eq!(McpTimeoutConfig::resolve(None, Some(&positive)), (1, 2, 3));
+        assert_eq!(
+            McpTimeoutConfig::resolve(None, None),
+            (
+                DEFAULT_MCP_STARTUP_MS,
+                DEFAULT_MCP_CATALOG_MS,
+                DEFAULT_MCP_EXECUTION_MS
+            )
         );
     }
 

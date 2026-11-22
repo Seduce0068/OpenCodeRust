@@ -2417,8 +2417,39 @@ fn apply_post_load_transforms(config: &mut Config) {
     // Deduplicate plugins, preserving whether the source explicitly set the key.
     config.plugin = std::mem::take(&mut config.plugin).map_values(deduplicate_plugins);
 
+    // `steps` / `max_steps` の 0 は未指定として扱い、executor の既定値を適用する。
+    normalize_agent_steps(config);
+
     // Fold the current-schema `providers` map into the runtime `provider` map.
     normalize_provider_configs(config);
+}
+
+/// `steps` / `max_steps` が `0` のエージェント設定を未指定（`None`）へ正規化する。
+///
+/// executor は `max_steps` が `None` のとき既定値（100 steps）を用いるが、
+/// `Some(0)` のまま渡ると実行ループが一回も回らず空応答になる。
+/// 正の値は変更しない。警告は正規化の事実のみを示し、設定値やエージェント ID は
+/// ログへ出さない。
+fn normalize_agent_steps(config: &mut Config) {
+    let mut normalized = false;
+    for configs in [config.agent.as_mut(), config.mode.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        for agent in configs.entries.values_mut() {
+            for steps in [&mut agent.steps, &mut agent.max_steps] {
+                if *steps == Some(0) {
+                    *steps = None;
+                    normalized = true;
+                }
+            }
+        }
+    }
+    if normalized {
+        tracing::warn!(
+            "agent steps/max_steps of zero is treated as unspecified; the default step limit applies (value not logged)"
+        );
+    }
 }
 
 /// Folds the current-schema `providers` map into the runtime `provider` map.
@@ -5172,6 +5203,79 @@ theme = "dark"
         let b_foo = b.get("foo").expect("foo command");
         assert_eq!(a_foo.template.as_deref(), Some("from commands"));
         assert_eq!(b_foo.template.as_deref(), Some("from commands"));
+    }
+}
+
+#[cfg(test)]
+mod agent_steps_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn zero_steps_are_normalized_to_unspecified_and_positive_values_are_kept() {
+        let mut config = Config {
+            agent: Some(AgentConfigs {
+                entries: HashMap::from([
+                    (
+                        "zero".to_string(),
+                        AgentConfig {
+                            steps: Some(0),
+                            max_steps: Some(0),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "positive".to_string(),
+                        AgentConfig {
+                            steps: Some(7),
+                            max_steps: Some(12),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "mixed".to_string(),
+                        AgentConfig {
+                            steps: Some(0),
+                            max_steps: Some(9),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        };
+
+        normalize_agent_steps(&mut config);
+
+        let agent_configs = config.agent.expect("agent configs");
+        let entries = &agent_configs.entries;
+        assert_eq!(entries["zero"].steps, None);
+        assert_eq!(entries["zero"].max_steps, None);
+        assert_eq!(entries["positive"].steps, Some(7));
+        assert_eq!(entries["positive"].max_steps, Some(12));
+        assert_eq!(entries["mixed"].steps, None);
+        assert_eq!(entries["mixed"].max_steps, Some(9));
+    }
+
+    #[test]
+    fn load_all_normalizes_zero_steps_from_config_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // find-up をここで止め、祖先の設定へ依存しないようにする。
+        fs::create_dir_all(temp.path().join(".git")).expect("git dir");
+        fs::write(
+            temp.path().join("opencode.json"),
+            r#"{"agent":{"zero":{"steps":0,"max_steps":0},"positive":{"steps":3,"max_steps":5}}}"#,
+        )
+        .expect("config file");
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let config = loader.load_all(temp.path()).expect("load config");
+
+        let agent_configs = config.agent.expect("agent configs");
+        let entries = &agent_configs.entries;
+        assert_eq!(entries["zero"].steps, None);
+        assert_eq!(entries["zero"].max_steps, None);
+        assert_eq!(entries["positive"].steps, Some(3));
+        assert_eq!(entries["positive"].max_steps, Some(5));
     }
 }
 

@@ -751,14 +751,103 @@ async fn archive_session(
             .ok_or_else(|| ApiError::SessionNotFound(id.clone()))?;
         session_to_info(&updated)
     } else {
-        let session = sessions
-            .get(&id)
+        let updated = sessions
+            .unarchive(&id)
             .ok_or_else(|| ApiError::SessionNotFound(id.clone()))?;
-        session_to_info(session)
+        session_to_info(&updated)
     };
     drop(sessions);
     persist_sessions_if_enabled(&state).await;
     Ok(Json(info))
+}
+
+#[cfg(test)]
+mod archive_session_tests {
+    use super::*;
+    use opencode_session::SessionStatus;
+
+    async fn state_with_session() -> (Arc<ServerState>, String) {
+        let state = Arc::new(ServerState::new());
+        let id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id
+        };
+        (state, id)
+    }
+
+    /// archive:false が no-op だった回帰ガード。
+    /// 解除後は status=Active / time.archived=None になること。
+    #[tokio::test]
+    async fn archive_false_reactivates_archived_session() {
+        let (state, id) = state_with_session().await;
+
+        let archived = archive_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(ArchiveSessionRequest {
+                archive: Some(true),
+            }),
+        )
+        .await
+        .expect("archive should succeed");
+        assert!(archived.time.archived.is_some());
+        {
+            let sessions = state.sessions.lock().await;
+            assert_eq!(
+                sessions.get(&id).expect("session should exist").status,
+                SessionStatus::Archived
+            );
+        }
+
+        let restored = archive_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(ArchiveSessionRequest {
+                archive: Some(false),
+            }),
+        )
+        .await
+        .expect("unarchive should succeed");
+        assert_eq!(restored.time.archived, None);
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&id).expect("session should exist");
+        assert_eq!(session.status, SessionStatus::Active);
+        assert_eq!(session.time.archived, None);
+    }
+
+    /// archive=true と未指定（既定の archive）の wire 挙動は従来どおり。
+    #[tokio::test]
+    async fn archive_true_and_default_keep_legacy_behaviour() {
+        let (state, id) = state_with_session().await;
+
+        let archived = archive_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(ArchiveSessionRequest {
+                archive: Some(true),
+            }),
+        )
+        .await
+        .expect("archive should succeed");
+        assert!(archived.time.archived.is_some());
+        let original_archived_at = archived.time.archived;
+
+        let again = archive_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(ArchiveSessionRequest { archive: None }),
+        )
+        .await
+        .expect("default archive should succeed");
+        assert!(again.time.archived.is_some());
+        assert!(again.time.archived >= original_archived_at);
+        let sessions = state.sessions.lock().await;
+        assert_eq!(
+            sessions.get(&id).expect("session should exist").status,
+            SessionStatus::Archived
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
