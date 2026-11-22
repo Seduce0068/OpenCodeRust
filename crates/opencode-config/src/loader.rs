@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub struct ConfigLoader {
     config: Config,
@@ -2640,6 +2641,20 @@ fn parse_existing_config_for_update(content: &str) -> Result<Config> {
     })
 }
 
+/// プロセス共有の設定書き込み直列化ロック。
+///
+/// `read_to_string → merge → apply_post_load_transforms → write_config_file`
+/// は不可分でなければならない。2 並行の PATCH が同じ旧ディスク内容を読むと、
+/// 後から書いた側が先のパッチを上書きして消してしまう（再起動後も復元しない）。
+/// `update_config` / `update_global_config` は同期 fn なので、auth.rs の
+/// tokio::Mutex パターンを `std::sync::Mutex` に置き換えて採用する。
+static CONFIG_WRITE_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+/// 書き込み直列化ロックを取得する（初回呼び出しで初期化）。
+fn config_write_lock() -> &'static std::sync::Mutex<()> {
+    CONFIG_WRITE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// Update project-level config by merging a patch.
 ///
 /// Writes to the file chosen by [`project_config_write_path`]. If that file is
@@ -2648,6 +2663,11 @@ fn parse_existing_config_for_update(content: &str) -> Result<Config> {
 /// to parse aborts the update rather than being replaced with a default
 /// config, so secrets and permission rules are never silently discarded.
 pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
+    // read-modify-write 全体を直列化する。poisoned でもパニックせずガードを回収する。
+    let _guard = config_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     let config_path = project_config_write_path(project_dir);
 
     let existing = if config_path.exists() {
@@ -2682,6 +2702,11 @@ pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
 /// aborts the update instead of being replaced with a default config,
 /// preserving the user's secrets and permission rules.
 pub fn update_global_config(patch: &Config) -> Result<()> {
+    // read-modify-write 全体を直列化する。poisoned でもパニックせずガードを回収する。
+    let _guard = config_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     let global_path = get_global_config_path();
 
     // `load_global_from` reads jsonc first and json second, so json is the
@@ -3611,6 +3636,38 @@ mod tests {
         let content = fs::read_to_string(temp.path.join("opencode.json")).unwrap();
         let config: Config = serde_json::from_str(&content).unwrap();
         assert_eq!(config.model, Some("claude-3-opus".to_string()));
+    }
+
+    #[test]
+    fn concurrent_update_config_keeps_both_patches() {
+        let temp = TestDir::new("opencode_concurrent_update");
+
+        // 2 スレッドを同じタイミングで解放し、両者が同じ旧内容を読む競合を狙う。
+        // 注: Barrier は呼び出し直前の同時解放に過ぎず、実際の read 開始は
+        // スケジューリング次第。ロックが無くても両キーが残り得るため、この
+        // テストはベストエフォートの回帰ガードであり、決定的な競合再現ではない（R4）。
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for json in [
+            r#"{"model":"concurrent-model"}"#,
+            r#"{"theme":"concurrent-theme"}"#,
+        ] {
+            let path = temp.path.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let patch: Config = serde_json::from_str(json).expect("patch");
+                barrier.wait();
+                update_config(&path, &patch).expect("update config");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+
+        let written = fs::read_to_string(temp.path.join("opencode.json")).expect("written config");
+        let raw: serde_json::Value = serde_json::from_str(&written).expect("parse written config");
+        assert_eq!(raw["model"], serde_json::json!("concurrent-model"));
+        assert_eq!(raw["theme"], serde_json::json!("concurrent-theme"));
     }
 
     #[test]
