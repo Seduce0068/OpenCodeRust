@@ -9,7 +9,7 @@ tags:
   - compatibility
 verified:
   by: dsh
-  at: "2026-11-22T10:53:11+09:00"
+  at: "2026-11-22T11:10:41+09:00"
 ---
 
 ## 目標

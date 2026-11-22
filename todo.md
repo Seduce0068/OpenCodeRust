@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[ログ redact 2 件]** SSE エラー・chat_stream 開始エラーの生出力防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定/状態不変 3 件]** timeout 0・archive 解除・steps 0
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[文字列/I/O 5 件]** auth atomic 0600・非UTF8 上書き防止・truncate 境界
@@ -715,6 +717,13 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm185、2 担当・8 件、観点: 型/所有権 /
+  構造化ログ一貫性）: 親が high 1 件（MCP SSE エラー生ログ）を read で事実確認、
+  2 件（SSE 固定文言化、切断 warn→info）を即座修正。R4 が chat_stream 開始
+  エラーの生ログを指摘し親が status_code のみ記録へ修正。残存（記録のみ）:
+  prompt.rs の session_id 構造化、mcp_name/server・retry_attempt/attempt・
+  queue_id/input_id・err/error のフィールド別名、event の snake_case 規約、
+  TextComplete フック結果の no-op、正常 SSE 終端の error ログ。
 - 2026-11-22 cross-skill 集約（swarm183、2 担当・12 件、観点: 設定値検証 /
   状態遷移不変）: 親が high 1 件（MCP timeout 0）と medium 2 件を read で
   事実確認、3 件（timeout 0 fallback、archive:false unarchive、steps=0 既定化）

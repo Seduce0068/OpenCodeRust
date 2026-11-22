@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T10:53:11+09:00"
+  at: "2026-11-22T11:10:41+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mcp` / `session`: SSE エラーと chat_stream 開始エラーの redact（生エラー非出力）
+  （swarm-coding R1-R6）
 - `config` / `cli` / `session` / `server` / `agent`: MCP timeout 0 と archive 解除
   （timeout 0→既定、archive:false で unarchive、steps=0→既定）
   （swarm-coding R1-R6）
