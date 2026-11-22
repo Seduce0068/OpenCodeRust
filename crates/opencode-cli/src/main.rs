@@ -2091,7 +2091,9 @@ fn append_cli_file_attachments(input: &mut String, files: &[PathBuf]) -> anyhow:
         let mut text = String::from_utf8_lossy(&bytes).to_string();
         const MAX_ATTACHMENT_BYTES: usize = 120_000;
         if text.len() > MAX_ATTACHMENT_BYTES {
-            text.truncate(MAX_ATTACHMENT_BYTES);
+            // バイト上限の途中で文字を切ると panic するため、文字境界へ戻す（R4）。
+            let boundary = text.floor_char_boundary(MAX_ATTACHMENT_BYTES);
+            text.truncate(boundary);
             text.push_str("\n\n[truncated]");
         }
         input.push_str("\n\n[Attachment: file ");
@@ -4413,7 +4415,12 @@ async fn list_models(
 
     for provider in providers {
         if let Some(ref filter) = provider_filter {
-            if !provider.id().contains(filter.to_lowercase().as_str()) {
+            // 設定由来の provider id は大文字を含み得るため両側を正規化（R4）。
+            if !provider
+                .id()
+                .to_lowercase()
+                .contains(filter.to_lowercase().as_str())
+            {
                 continue;
             }
         }

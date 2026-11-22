@@ -626,6 +626,15 @@ fn strip_html(html: &str) -> String {
 
         if !in_tag && !in_script && !in_style {
             if c == '&' {
+                // &amp; は 5 文字。4 文字スライスでは "&amp;" に一致しない（R4）。
+                if i + 5 <= len {
+                    let entity5: String = chars[i..i + 5].iter().collect();
+                    if entity5 == "&amp;" {
+                        result.push('&');
+                        i += 5;
+                        continue;
+                    }
+                }
                 if i + 4 <= len {
                     let entity: String = chars[i..i + 4].iter().collect();
                     match entity.as_str() {
@@ -637,11 +646,6 @@ fn strip_html(html: &str) -> String {
                         "&gt;" => {
                             result.push('>');
                             i += 4;
-                            continue;
-                        }
-                        "&amp;" => {
-                            result.push('&');
-                            i += 5;
                             continue;
                         }
                         _ => {}

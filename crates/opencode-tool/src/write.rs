@@ -102,8 +102,18 @@ impl Tool for WriteTool {
         // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
         // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
         // がスキップされ、並行編集による上書きを防げなくなる。
-        let exists = fs::try_exists(&path).await.unwrap_or(false);
-        let old_content = fs::read_to_string(&path).await.unwrap_or_default();
+        let exists = fs::try_exists(&path).await.map_err(|e| {
+            ToolError::execution_with_source(format!("Failed to check file existence: {}", e), e)
+        })?;
+        // 既存ファイルが非 UTF-8 等の理由で読めない場合、空文字として扱うと
+        // 「新規作成」として無警告に上書きされる。EditTool と同じく伝播する（R4）。
+        let old_content = if exists {
+            fs::read_to_string(&path).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+            })?
+        } else {
+            String::new()
+        };
 
         if exists {
             ctx.do_file_time_assert(path_str.clone()).await?;

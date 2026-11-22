@@ -4,6 +4,60 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// 認証情報を安全に永続化する（umask に依存せず 0600、atomic rename）。
+///
+/// 直接 `fs::write` してから chmod する方式では、作成直後に umask 依存の
+/// 緩い権限（例 0644）で API key / OAuth token が world-readable になる
+/// 期間があり、chmod 失敗時は緩い権限のまま残る。また書き込み途中失敗で
+/// 既存 auth.json が切り詰められる。一時ファイルを 0600 で作って rename
+/// することでこれらを防ぐ（mcp/auth.rs と同方針、R4）。
+#[cfg(unix)]
+async fn write_auth_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_extension(format!("tmp-{nanos}-{seq}"));
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut file = opts.open(&tmp).await?;
+
+    // open 後の全操作（chmod 含む）を 1 つのブロックへ入れ、どこで失敗しても
+    // tmp を削除する（R4）。chmod 失敗時に空の一時ファイルが残ると後続の
+    // create_new が衝突し得る。
+    let written = async {
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    drop(file);
+
+    if let Err(err) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(err);
+    }
+    if let Err(err) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn write_auth_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, bytes).await
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AuthInfo {
@@ -439,14 +493,7 @@ impl AuthManager {
         // Persist exactly the map supplied by the caller; no key/token value is
         // added here, and the map is the primary after any committed rotation.
         let json = serde_json::to_vec_pretty(primary)?;
-        tokio::fs::write(path, json).await?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-        }
-
+        write_auth_file(path, &json).await?;
         Ok(())
     }
 }
