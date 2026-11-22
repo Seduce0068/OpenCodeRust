@@ -128,7 +128,13 @@ impl StdioTransport {
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // stderr は破棄する。piped() のままハンドルを読まないと子が
+            // パイプ容量（Linux 既定 64 KiB、設定で増える場合もある）を超えて
+            // stderr へ書いた時点でブロックし、JSON-RPC 応答が届かず
+            // initialize/call がタイムアウトする。inherit() なら回避できるが、
+            // 子側のトークン値・パスが親ログへ流出し大量出力でログを圧迫する
+            // ため、ここでは null() を選ぶ（R4）。
+            .stderr(Stdio::null())
             .kill_on_drop(true);
 
         if let Some(dir) = cwd {
@@ -737,6 +743,13 @@ impl McpTransport for SseTransport {
 #[cfg(test)]
 mod stdio_framing_tests {
     use super::*;
+    use std::time::Duration;
+
+    /// stderr パイプの既定容量（Linux 64 KiB）を確実に超えるダミー量。
+    /// 実際の値は環境に依存するため、旧 `piped()` 実装では子がここで詰まる。
+    // Linux 既定のパイプ容量 64 KiB を確実に超える値。fs.pipe-max-size で
+    // 容量が引き上げられた環境でも検出感度を保つため 1 MiB を使う（R4）。
+    const STDERR_FLOOD_BYTES: usize = 1024 * 1024;
 
     #[tokio::test]
     async fn reads_consecutive_content_length_framed_messages() {
@@ -770,6 +783,37 @@ mod stdio_framing_tests {
             .expect("second message");
         match second_message {
             JsonRpcMessage::Response(response) => assert_eq!(response.id, 2),
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        transport.close().await.expect("close");
+    }
+
+    /// SIG-02 回帰: stderr に大量出力するローカル stdio MCP サーバでも
+    /// 子がブロックせず、stdout の JSON-RPC 応答を期限内に受け取れること。
+    /// 書き出すのはダミーの `X` のみで、トークン値やパスは一切含めない。
+    #[tokio::test]
+    async fn heavy_stderr_output_does_not_block_stdio_transport() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        // 先に 256 KiB のダミーを stderr へ流してから、正常なフレームを stdout へ出す。
+        // 旧 `piped()` では最初の書き込みで子が止まり、このフレームが届かない。
+        let script = format!(
+            "head -c {flood} /dev/zero | tr '\\000' X 1>&2; printf 'Content-Length: {n}\\r\\n\\r\\n{body}'",
+            flood = STDERR_FLOOD_BYTES,
+            n = body.len(),
+        );
+
+        let transport = StdioTransport::new("sh", &["-c".to_string(), script], None, None)
+            .await
+            .expect("spawn stderr-flooding fixture");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), transport.receive()).await;
+        let message = outcome
+            .expect("receive must not block when the child floods stderr")
+            .expect("receive must succeed")
+            .expect("receive must return a message");
+        match message {
+            JsonRpcMessage::Response(response) => assert_eq!(response.id, 1),
             other => panic!("expected response, got {other:?}"),
         }
 
