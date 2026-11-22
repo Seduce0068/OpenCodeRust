@@ -1731,10 +1731,16 @@ impl SessionPrompt {
         }
 
         let subsessions = Arc::new(Mutex::new(Self::load_persisted_subsessions(session)?));
+        // subsession_id（task_id）単位の writer ロックを保持するレジストリ。
+        // `subsessions` の Mutex とは独立に、current 取得〜LLM 実行〜history.push
+        // を跨いで同一 ID の呼び出しだけを直列化する（todo.rs の writer_lock と同型）。
+        let subsession_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let default_model = format!("{}:{}", provider_id, model_id);
         let ctx = Self::with_persistent_subsession_callbacks(
             ctx,
             subsessions.clone(),
+            subsession_locks,
             provider,
             tool_registry.clone(),
             default_model,
@@ -1846,6 +1852,7 @@ impl SessionPrompt {
     fn with_persistent_subsession_callbacks(
         ctx: opencode_tool::ToolContext,
         subsessions: Arc<Mutex<HashMap<String, PersistedSubsession>>>,
+        subsession_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
         provider: Arc<dyn Provider>,
         tool_registry: Arc<opencode_tool::ToolRegistry>,
         default_model: String,
@@ -1881,11 +1888,24 @@ impl SessionPrompt {
 
         ctx.with_prompt_subsession(move |session_id, prompt| {
             let subsessions = subsessions.clone();
+            let subsession_locks = subsession_locks.clone();
             let provider = provider.clone();
             let tool_registry = tool_registry.clone();
             let default_model = default_model.clone();
 
             async move {
+                // レジストリの Mutex は Arc のクローンを得た時点で解放し、
+                // 待機中は保持しない。同一 session_id の呼び出し同士だけが
+                // current 取得〜実行〜history.push の全区間で直列化される。
+                let lock = {
+                    let mut registry = subsession_locks.lock().await;
+                    registry
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone()
+                };
+                let _guard = lock.lock().await;
+
                 let current = {
                     let state = subsessions.lock().await;
                     state.get(&session_id).cloned()
@@ -4675,6 +4695,32 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded["task_explore_1"].agent, "explore");
         assert_eq!(loaded["task_explore_1"].history.len(), 1);
+    }
+
+    /// 回帰ガード (SUBSESSION-PARALLEL-CONTEXT): prompt_subsession が
+    /// current 取得より前に session_id 単位のガードを取り、history.push
+    /// まで保持して同一 ID の並行呼び出しを直列化していること。
+    #[test]
+    fn persisted_prompt_subsession_serializes_full_critical_section() {
+        let source = include_str!("prompt.rs");
+        let start = source
+            .find("ctx.with_prompt_subsession(move |session_id, prompt|")
+            .expect("callback must exist");
+        let body = &source[start..];
+        let body = &body[..body.find("\n        })\n").expect("callback closing")];
+        let guard = body
+            .find("let _guard = lock.lock().await")
+            .expect("per-session guard must exist");
+        let read = body
+            .find("state.get(&session_id).cloned()")
+            .expect("current read must exist");
+        let write = body
+            .find("existing.history.push")
+            .expect("history write must exist");
+        assert!(
+            guard < read && read < write,
+            "guard must cover current read through history push: {body}"
+        );
     }
 
     /// 壊れた subsessions メタデータは空 Map ではなくエラーとして扱われ、

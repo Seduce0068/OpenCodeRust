@@ -61,6 +61,18 @@ fn default_format() -> String {
     "markdown".to_string()
 }
 
+/// timeout（秒）を `1..=MAX_TIMEOUT_SECS` の範囲へクランプする。
+///
+/// 0 秒は `Duration::from_secs(0)` の sleep が select で即座に勝ち、
+/// リクエストを送らず "Request timed out after 0 seconds" を返すため 1 秒へ
+/// 引き上げる。1..=120 の既存挙動（既定 30、上限 120）は不変。
+fn effective_timeout_secs(timeout: Option<u64>) -> u64 {
+    // `.min(MAX).max(1)` と同値（1..=MAX へクランプ）。
+    timeout
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .clamp(1, MAX_TIMEOUT_SECS)
+}
+
 /// Content-Length に依存せず、`bytes_stream()` の累計バイトで 5MB 上限を強制する。
 /// 超過時はここでストリームをドロップし、残りのボディ受信を破棄する。
 /// Content-Length は欠落・虚偽があり得るため、上限の強制には使わない。
@@ -366,10 +378,7 @@ impl Tool for WebFetchTool {
         ctx.ask_permission(webfetch_permission_request(&parsed_url))
             .await?;
 
-        let timeout_secs = input
-            .timeout
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .min(MAX_TIMEOUT_SECS);
+        let timeout_secs = effective_timeout_secs(input.timeout);
 
         let accept_header = match input.format.as_str() {
             "markdown" => "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1",
@@ -399,7 +408,17 @@ impl Tool for WebFetchTool {
 
         // Content-Length は参考値にすぎない（欠落・虚偽があり得る）ため、
         // ヘッダ値での早期リジェクトは行わず、実バイトの累計で上限を強制する。
-        let bytes = read_body_limited(response).await?;
+        // ボディ読み取りも時間制限と abort の対象にする（R4）: 少量ずつ遅延送信
+        // されると 5MB 上限に達するまで無限に待つため。
+        let bytes = tokio::select! {
+            result = read_body_limited(response) => result?,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                return Err(ToolError::Timeout(format!("Request timed out after {} seconds", timeout_secs)));
+            }
+            _ = ctx.abort.cancelled() => {
+                return Err(ToolError::Cancelled);
+            }
+        };
 
         let mime = content_type
             .split(';')
@@ -694,6 +713,20 @@ mod tests {
         .unwrap();
         assert_eq!(input.format, "text");
         assert_eq!(input.timeout, Some(10));
+    }
+
+    #[test]
+    fn effective_timeout_secs_clamps_zero_and_preserves_existing_range() {
+        // timeout=0 は即時タイムアウトせず 1 秒へクランプされる。
+        assert_eq!(effective_timeout_secs(Some(0)), 1);
+        // 1..=120 の既存挙動は不変。
+        assert_eq!(effective_timeout_secs(Some(1)), 1);
+        assert_eq!(effective_timeout_secs(Some(10)), 10);
+        assert_eq!(effective_timeout_secs(Some(120)), MAX_TIMEOUT_SECS);
+        // 未指定は既定値、上限超えは MAX に丸められる。
+        assert_eq!(effective_timeout_secs(None), DEFAULT_TIMEOUT_SECS);
+        assert_eq!(effective_timeout_secs(Some(121)), MAX_TIMEOUT_SECS);
+        assert_eq!(effective_timeout_secs(Some(u64::MAX)), MAX_TIMEOUT_SECS);
     }
 
     #[test]

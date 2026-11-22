@@ -31,6 +31,10 @@ pub enum AgentError {
     InvalidResponse,
 }
 
+/// サブセッション単位の writer ロック。`subsessions` の Mutex とは独立で、
+/// current 取得〜LLM 実行〜conversation 上書きを同一 ID 内で直列化する。
+type SubsessionLock = Arc<tokio::sync::Mutex<()>>;
+
 pub struct AgentExecutor {
     agent: AgentInfo,
     conversation: Conversation,
@@ -38,6 +42,8 @@ pub struct AgentExecutor {
     tools: Arc<ToolRegistry>,
     disabled_tools: HashSet<String>,
     subsessions: Arc<Mutex<HashMap<String, SubsessionState>>>,
+    /// session_id（task_id）単位の writer ロックを保持するレジストリ。
+    subsession_locks: Arc<Mutex<HashMap<String, SubsessionLock>>>,
     max_steps: u32,
     /// この executor がサブエージェントとして動いている深さ（ルートは 0）。
     subagent_depth: u32,
@@ -62,6 +68,21 @@ pub struct PersistedSubsessionState {
     pub subagent_depth: u32,
 }
 
+/// session_id 単位の writer ロックをレジストリから取得する。
+/// レジストリの Mutex は Arc のクローンを得た時点で解放し、待機中は保持しない
+/// （todo.rs の writer_lock と同パターン）。ガードは Arc クローンから取るため
+/// レジストリを跨いだデッドロックは起きない。
+async fn subsession_lock_for(
+    registry: &Arc<Mutex<HashMap<String, SubsessionLock>>>,
+    session_id: &str,
+) -> SubsessionLock {
+    let mut registry = registry.lock().await;
+    registry
+        .entry(session_id.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 impl AgentExecutor {
     pub fn new(
         agent: AgentInfo,
@@ -78,6 +99,7 @@ impl AgentExecutor {
             tools,
             disabled_tools: HashSet::new(),
             subsessions: Arc::new(Mutex::new(HashMap::new())),
+            subsession_locks: Arc::new(Mutex::new(HashMap::new())),
             max_steps,
             subagent_depth: 0,
         }
@@ -522,6 +544,7 @@ impl AgentExecutor {
             serde_json::json!(self.subagent_depth),
         );
         let subsessions = self.subsessions.clone();
+        let subsession_locks = self.subsession_locks.clone();
         let providers = self.providers.clone();
         let tools = self.tools.clone();
         // 親セッションの無効ツールを子セッションへ継承するためのスナップショット。
@@ -577,13 +600,21 @@ impl AgentExecutor {
         })
         .with_prompt_subsession({
             let subsessions = subsessions.clone();
+            let subsession_locks = subsession_locks.clone();
             let providers = providers.clone();
             let tools = tools.clone();
             move |session_id, prompt| {
                 let subsessions = subsessions.clone();
+                let subsession_locks = subsession_locks.clone();
                 let providers = providers.clone();
                 let tools = tools.clone();
                 async move {
+                    // current 取得〜LLM 実行〜conversation 上書きを同一 ID 内で
+                    // 直列化する。ガードはレジストリから取り出した Arc から作るため、
+                    // レジストリの Mutex を await 中に保持しない（デッドロック回避）。
+                    let lock = subsession_lock_for(&subsession_locks, &session_id).await;
+                    let _guard = lock.lock().await;
+
                     let state = {
                         let store = subsessions.lock().await;
                         store.get(&session_id).cloned()
@@ -1022,6 +1053,49 @@ mod tests {
         assert_eq!(
             disabled,
             vec!["bash".to_string(), "edit".to_string(), "write".to_string()]
+        );
+    }
+
+    /// 回帰ガード (SUBSESSION-PARALLEL-CONTEXT): 同一 session_id の
+    /// subsession 呼び出しは writer ロックを共有し、別 ID とは独立であること。
+    #[tokio::test]
+    async fn subsession_locks_are_scoped_per_session_id() {
+        let executor = build_executor(AgentInfo::general());
+        let first = subsession_lock_for(&executor.subsession_locks, "task_same").await;
+        let again = subsession_lock_for(&executor.subsession_locks, "task_same").await;
+        let other = subsession_lock_for(&executor.subsession_locks, "task_other").await;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same session id must share the writer lock"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "different session ids must not share the lock"
+        );
+    }
+
+    /// 回帰ガード: prompt_subsession が conversation 読み取りより前に
+    /// ガードを取り、conversation 上書きまで保持していること。
+    #[test]
+    fn prompt_subsession_serializes_full_critical_section() {
+        let source = include_str!("executor.rs");
+        let start = source
+            .find("with_prompt_subsession(")
+            .expect("callback must exist");
+        let body = &source[start..];
+        let body = &body[..body.find("\n        })\n").expect("callback closing")];
+        let guard = body
+            .find("let _guard = lock.lock().await")
+            .expect("per-session guard must exist");
+        let read = body
+            .find("store.get(&session_id).cloned()")
+            .expect("current read must exist");
+        let write = body
+            .find("state.conversation =")
+            .expect("conversation write must exist");
+        assert!(
+            guard < read && read < write,
+            "guard must cover current read through conversation write: {body}"
         );
     }
 

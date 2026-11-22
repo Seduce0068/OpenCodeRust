@@ -1897,6 +1897,8 @@ async fn stream_message(
     let stream_state = state.clone();
     let stream_session_id = session_id.clone();
     let stream_msg_id = msg_id.clone();
+    // /prompt と同じく、親の AbortHandle 登録をタスク本体より先に確定させる。
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
 
     let stream_task = tokio::spawn(async move {
         // /prompt と同じ後始末（AbortHandle 登録済みタスクの解除）を行う。
@@ -1909,6 +1911,9 @@ async fn stream_message(
             claimed: Arc::new(AtomicBool::new(false)),
             queue_finalized: Arc::new(AtomicBool::new(true)),
         };
+        // 親が AbortHandle を登録し終えるまで待ち、早期 return 時の
+        // cleanup が残骸を残さない順序を保証する。
+        let _ = start_rx.await;
         // ハンドラで取得したセッション単位ロックを完了まで保持する。
         let _run_guard = run_guard;
         send_sse_event(
@@ -2193,6 +2198,7 @@ async fn stream_message(
 
     // /prompt と同じくセッション単位で AbortHandle を登録し、abort からも止められるようにする。
     state.register_prompt_task(session_id, stream_task.abort_handle());
+    let _ = start_tx.send(());
 
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
@@ -2643,7 +2649,9 @@ fn spawn_prompt_execution(
     {
         Ok(provider) => provider,
         Err(error) => {
-            tracing::error!(session_id = %session_id, %error, "prompt provider unavailable");
+            // 生エラー（トークン値・パスを含み得る）はログへ出さない（R4）。
+            let _ = &error;
+            tracing::error!(session_id = %session_id, "prompt provider unavailable");
             if let (Some(queue_id), Some(repo)) =
                 (queue_id.as_deref(), task_state.input_repo.as_ref())
             {
@@ -2668,6 +2676,11 @@ fn spawn_prompt_execution(
     // 通常の終端処理が済んだら finalized を立てて二重処理を防ぐ。
     let queue_claimed = Arc::new(AtomicBool::new(false));
     let queue_finalized = Arc::new(AtomicBool::new(false));
+    // 親の登録がタスク本体（早期 return とその Drop を含む）より必ず先に
+    // 完了するようバリアを張る。spawn 直後に親がハンドルとキュー ID を登録
+    // してから解放するため、cleanup の clear が対象を見つけられずに
+    // running_prompt_tasks / running_prompt_queue_ids へ残骸が残る競合を排除する。
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let _cleanup = PromptTaskCleanup {
             state: task_state.clone(),
@@ -2677,6 +2690,8 @@ fn spawn_prompt_execution(
             claimed: queue_claimed.clone(),
             queue_finalized: queue_finalized.clone(),
         };
+        // 親が AbortHandle / キュー ID の登録を終えるまでここで待つ。
+        let _ = start_rx.await;
         let run_lock = {
             let mut locks = task_state.prompt_locks.write().await;
             locks
@@ -3059,6 +3074,9 @@ fn spawn_prompt_execution(
         register_state.register_prompt_queue_id(task_session_id.clone(), queue_id);
     }
     register_state.register_prompt_task(task_session_id, task.abort_handle());
+    // 登録完了後にタスク本体を解放する。早期 return 経路でも cleanup の
+    // clear が必ず自分のハンドルを見つけられる順序が保証される。
+    let _ = start_tx.send(());
 }
 
 /// キュー投入プロンプトの連続失敗に対する再試行上限。
@@ -7867,6 +7885,75 @@ mod abort_tests {
         };
         drop(cleanup_again);
         assert_run_status_idle(&state, &session_id).await;
+    }
+
+    /// 残骸防止バリアの回帰: 親が AbortHandle を登録してからタスク本体を
+    /// 解放する順序なら、早期 return 経路でも cleanup が自分のハンドルを
+    /// 見つけて running_prompt_tasks に残骸が残らない。
+    #[tokio::test]
+    async fn registration_barrier_leaves_no_handle_on_early_return() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id.clone()
+        };
+        set_session_run_status(&state, &session_id, SessionRunStatus::Busy).await;
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let task_state = state.clone();
+        let task_session = session_id.clone();
+        let task = tokio::spawn(async move {
+            let _cleanup = PromptTaskCleanup {
+                state: task_state.clone(),
+                session_id: task_session.clone(),
+                task_id: tokio::task::id(),
+                queue_id: None,
+                claimed: Arc::new(AtomicBool::new(false)),
+                queue_finalized: Arc::new(AtomicBool::new(true)),
+            };
+            let _ = start_rx.await;
+            // 早期 return 相当（登録済みロックを触らずに終了）。
+        });
+        state.register_prompt_task(session_id.clone(), task.abort_handle());
+        let _ = start_tx.send(());
+        let _ = task.await;
+        assert!(state
+            .running_prompt_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert_run_status_idle(&state, &session_id).await;
+    }
+
+    /// spawn_prompt_execution / stream_message が「登録 → 解放」の順序を
+    /// 守っていることを静的にガードする。旧実装（spawn 直後に登録）では
+    /// 早期 return の Drop が登録より先に clear して残骸が残っていた。
+    #[test]
+    fn prompt_tasks_release_only_after_registration() {
+        let source = include_str!("routes.rs");
+        for marker in ["fn spawn_prompt_execution(", "async fn stream_message("] {
+            let start = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker}"));
+            let body = &source[start..];
+            let body = &body[..body.find("\n}\n").expect("function closing brace")];
+            let wait = body
+                .find("start_rx.await")
+                .unwrap_or_else(|| panic!("{marker}: task must wait for registration"));
+            let register = body
+                .find("register_prompt_task(")
+                .unwrap_or_else(|| panic!("{marker}: parent must register handle"));
+            let release = body
+                .find("start_tx.send")
+                .unwrap_or_else(|| panic!("{marker}: parent must release after registration"));
+            assert!(
+                wait < register,
+                "{marker}: barrier wait must precede registration"
+            );
+            assert!(
+                register < release,
+                "{marker}: registration must precede release"
+            );
+        }
     }
 }
 

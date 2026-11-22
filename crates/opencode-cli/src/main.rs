@@ -3762,6 +3762,25 @@ fn stats_cost_note(total_cost: Option<f64>) -> Option<&'static str> {
     }
 }
 
+/// `--days` から stats の cutoff（epoch millis）を計算する純粋ヘルパ。
+///
+/// `days <= 0`、乗算 / 減算のオーバーフロー、または結果が負になる場合は
+/// `None` を返す。呼び出し側は `None` のとき cutoff を 0（全セッション対象）
+/// へクランプするかエラー化し、負値を `as u64` で巨大値にしない。
+/// 正の妥当な `days` では `now_ms - days * 86_400_000` をそのまま返す。
+fn stats_cutoff_ms(now_ms: i64, days: i64) -> Option<i64> {
+    const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+    if days <= 0 {
+        return None;
+    }
+    let elapsed = days.checked_mul(MS_PER_DAY)?;
+    let cutoff = now_ms.checked_sub(elapsed)?;
+    if cutoff < 0 {
+        return None;
+    }
+    Some(cutoff)
+}
+
 async fn handle_stats_command(
     days: Option<i64>,
     tools_limit: Option<usize>,
@@ -3792,7 +3811,9 @@ async fn handle_stats_command(
             chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
                 .timestamp_millis()
         } else {
-            now - (days * 24 * 60 * 60 * 1000)
+            // オーバーフロー / 負の days は None。cutoff=0 にクランプして
+            // 全セッションを対象にし、負値の `as u64` キャストを避ける。
+            stats_cutoff_ms(now, days).unwrap_or(0)
         };
         sessions.retain(|s| s.time.updated >= cutoff as u64);
     }
@@ -7361,6 +7382,39 @@ mod tests {
             format_stats_total_cost(Some(f64::INFINITY)),
             "Cost unavailable"
         );
+    }
+
+    #[test]
+    fn stats_cutoff_ms_preserves_valid_positive_days() {
+        // 後方互換: 正の妥当な days では従来の計算結果と一致する。
+        let now = 1_700_000_000_000i64;
+        let ms_per_day = 24 * 60 * 60 * 1000i64;
+        for days in [1i64, 7, 30, 365] {
+            assert_eq!(
+                stats_cutoff_ms(now, days),
+                Some(now - days * ms_per_day),
+                "valid days must be unchanged: {days}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_cutoff_ms_rejects_non_positive_days() {
+        // days=0 / 負は None（呼び出し側でクランプまたはエラー化）。
+        let now = 1_700_000_000_000i64;
+        assert_eq!(stats_cutoff_ms(now, 0), None);
+        assert_eq!(stats_cutoff_ms(now, -1), None);
+        assert_eq!(stats_cutoff_ms(now, i64::MIN), None);
+    }
+
+    #[test]
+    fn stats_cutoff_ms_rejects_overflow_and_negative_cutoff() {
+        let now = 1_700_000_000_000i64;
+        // checked_mul がオーバーフローする極端な days で panic しない。
+        assert_eq!(stats_cutoff_ms(now, i64::MAX), None);
+        // 乗算は成功するが cutoff が負になるケースも None。
+        assert_eq!(stats_cutoff_ms(0, 1), None);
+        assert_eq!(stats_cutoff_ms(86_400_000 - 1, 1), None);
     }
 
     #[test]
