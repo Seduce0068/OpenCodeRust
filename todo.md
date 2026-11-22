@@ -243,8 +243,6 @@ status: current
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **PATCH /config の read-modify-write が無ロックでパッチ消失**
   — `config/loader.rs:2650` / TX-03 / 中
-- [ ] **URLSearchParams が '+' ↔ 空白変換を欠落（WHATWG 非準拠）**
-  — `codemode/interpreter.rs:5885` / ENC-01 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -270,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[URLSearchParams 1 件]** WHATWG urlencoded 規則（'+' ↔ 空白）
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[トランザクション/エンコーディング 2 件]** cascade 削除・ログ Cf 除去
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[agent 解決 1 件]** 未知名を build へ黙って化けさせない
@@ -761,6 +761,13 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（URLSearchParams の修正時）: 親が form_encode の
+  unreserved 集合を WHATWG 準拠（英数字と `* - . _` のみ、! ~ ' ( ) は %XX）
+  へ直接修正。残存 low: 配列初期化子の非 sequence 要素が TypeError に
+  ならない、un-awaited Promise が文字列化されデータ境界を通る、
+  URL 本体の searchParams は '+' を空白と解釈しない（受け入れ条件(3)で
+  不変と指定した設計）。受け入れ条件(1)の期待値は配列エントリがリテラル
+  なので 'a=b%2Bc' が正（親の条件文の誤記）。
 - 2026-11-23 cross-skill 集約（swarm214、2 担当・7 件、観点: トランザクション /
   エンコーディング）: 親が medium 2 件を read で事実確認し即座 coding（session
   削除の FK cascade 一本化、ログ Cf 除去）。R4 がツリー横断の原子性 limits を
