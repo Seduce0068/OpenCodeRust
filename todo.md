@@ -239,10 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **SseTransport::connect が旧 sse_task を abort せずリーク**
-  — `mcp/transport.rs:586` / LIFE-01 / 中（本番未到達）
-- [ ] **SseTransport::close が violation/queue をリセットしない**
-  — `mcp/transport.rs:684` / LIFE-02 / 中（本番未到達）
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -270,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP SSE 再接続 2 件]** 旧リスナ abort と violation/Notify リセット
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[乱数並行安全性 1 件]** Math.random を CAS 更新へ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[config 並行更新 1 件]** PATCH の read-modify-write を直列化
@@ -767,6 +765,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（MCP SSE 再接続の修正時、2 回目のレビューで停止）:
+  close() が Notify 差し替え時に待機中の receive() を古い Notify へ取り残す
+  可能性、connect() 側の差し替えが回帰テストで未検証（close を挟むため）。
+  いずれも同一インスタンス再接続の公開 API 課題で本番では新規トランスポート
+  生成のため未到達。親が型エラー（Arc::clone(&*guard)）を直接修正。
 - 2026-11-23 cross-skill 集約（swarm218、2 担当・4 件、観点: リソース寿命 /
   並行アクセス）: 親が CONC-01 を read で事実確認し即座 coding（AtomicU64 の
   load/store を try_update CAS へ）。親が deprecated fetch_update→try_update、
