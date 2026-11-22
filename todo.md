@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[TUI ローカル保存 2 件]** atomic 化・権限保持・破損時退避
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[デコード/既定値 5 件]** warn 可視化・max_tokens/URL 共有定数化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[compact status 1 件]** Archived/Completed を往復で復元
@@ -721,6 +723,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（TUI ローカル保存の修正時）: 親が atomic write の権限
+  引き継ぎ（0600 が 0644 に落ちる機密性リグレッション）、退避 warn の
+  rename 成否反映、clippy ptr_arg 6 件を直接修正。残存: 親ディレクトリの
+  fsync なし、prompt 側の失敗時テストが temp 削除を未検証。
 - 2026-11-22 cross-skill 集約（swarm187、2 担当・16 件、観点: シリアライズ
   / 初期化デフォルト）: 親が high 1 件（tool_calls.arguments）を read で事実確認、
   5 件（args/tc_args/headers の固定 warn、max_tokens→OUTPUT_TOKEN_MAX、
