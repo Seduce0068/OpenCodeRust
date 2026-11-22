@@ -67,6 +67,8 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **OpenAI tool_calls index の u64→u32 切詰で衝突**
+  — `provider/openai.rs:433` / NUM-03 / 中
 - [ ] **空配列クリアが他 3 フィールドで未対応**
   — skills.paths/urls, provider.whitelist/blacklist /
   watcher.ignore と同パターンで ExplicitStringList 化
@@ -168,6 +170,20 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **差分表示の折返しが表示幅ではなく scalar 数を使用**
+  — `tui/components/diff.rs:249` / NUM-04 / 低
+- [ ] **LSP ドキュメントバージョンが i32 へ非チェックキャスト**
+  — `lsp/lib.rs:468` / NUM-05 / 低
+- [ ] **CodeMode 診断 column が UTF-16 ではなく scalar 数**
+  — `codemode/api.rs:304` / NUM-06 / 低
+- [ ] **token::estimate がバイト数を文字数として扱う**
+  — `util/util.rs:91` / NUM-07 / 低
+- [ ] **color::ansi_length がバイト数を返す**
+  — `util/util.rs:31` / NUM-08 / 低
+- [ ] **ツール名の TaskKind 分類が部分文字列一致で誤分類**
+  — `tui/app.rs:4018` / STRING-01 / 低
+- [ ] **空ファイル名のパスで候補が全マッチ**
+  — `tool/read.rs:51` / STRING-02 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -272,6 +288,8 @@ status: current
 
 ## 完了
 
+- [x] **[数値境界 2 件]** 使用率 100% クランプ・選択肢キー境界
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[空配列クリア 1 件]** primary_tools を ExplicitStringList 化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[空配列クリア 1 件]** watcher.ignore を ExplicitStringList 化
@@ -793,6 +811,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm235、2 担当・10 件、観点: 文字列 / 数値）:
+  親が NUM-01/02 を read で事実確認し即座 coding（使用率 100% クランプ、
+  選択肢 27 個目以降の番号キー）。親が子のテスト期待（160 件ではヒント行が
+  描画されない）と R4 指摘（27 個目以降はキー選択不可の明記）を直接修正。
+  残り 8 件を triage（NUM-03 中、他低）。
 - 2026-11-23 R4 指摘（primary_tools の修正時）: 親が
   merge_explicit_string_list_replace の doc コメントを provider 専用から
   replacement セマンティクス一般（provider lists / watcher.ignore /

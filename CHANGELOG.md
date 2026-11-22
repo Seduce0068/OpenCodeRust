@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T08:25:29+09:00"
+  at: "2026-11-23T08:50:33+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3238 件（all-features は 3237 件）
+  テスト総数 594 → 3245 件（all-features は 3244 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tui`: コンテキスト使用率を 100% でクランプ、選択肢キー境界を修正
+  （swarm-coding R1-R6）
 - `config`: 明示的空配列で primary_tools をクリアできるように修正
   （swarm-coding R1-R6）
 - `config`: 明示的空配列で watcher.ignore をクリアできるように修正
