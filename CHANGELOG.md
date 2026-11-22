@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T09:58:10+09:00"
+  at: "2026-11-22T10:22:55+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `provider` / `cli` / `tool`: 認証情報の atomic 永続化と文字列境界の安全性
+  （0600 + rename、非 UTF-8 上書き防止、truncate 境界、&amp; デコード）
+  （swarm-coding R1-R6）
 - `cli` / `tool` / `server` / `session` / `agent`: 数値境界と並行の安全性
   （--days オーバーフロー、webfetch timeout/subsession 直列化、prompt 登録競合）
   （swarm-coding R1-R6）

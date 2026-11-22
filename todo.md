@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[文字列/I/O 5 件]** auth atomic 0600・非UTF8 上書き防止・truncate 境界
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[数値/並行 4 件]** days 境界・timeout・登録競合・subsession 直列化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[パス/URL 安全性 7 件]** symlink・共有 URL・blacklist・スキーム等
@@ -711,6 +713,14 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm182、2 担当・10 件、観点: 文字列エンコーディング
+  / ファイル I/O）: 親が high 1 件（auth.json 非 atomic + 権限露出）を read で
+  事実確認、5 件（auth atomic 0600、WriteTool 非 UTF-8、添付 truncate、&amp;
+  デコード、provider フィルタ）を即座修正。R4 が set_permissions 失敗時の tmp
+  残留を指摘し親が直接修正。残存（記録のみ）: apply_patch 部分適用、models
+  キャッシュ親ディレクトリ、find/text と markdown の read 失敗スキップ、
+  TUI サジェスト非 ASCII 自己除外、auth エラーのパス出力（既存設計）、非 Unix
+  の 0600 保証なし（umask は Unix 固有）。
 - 2026-11-22 cross-skill 集約（swarm180、2 担当・6 件、観点: 並行/ロック /
   数値単位）: 親が中 2 件を read で事実確認、4 件（数値2+並行2）即座 coding
   完了。R4 が webfetch ボディのタイムアウト未適用と prompt provider エラーの
