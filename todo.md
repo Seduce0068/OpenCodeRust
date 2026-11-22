@@ -243,8 +243,6 @@ status: current
 
 - [ ] **global/managed の json/jsonc 優先順と書き戻し選択が逆**
   — `config/loader.rs:145-153` / CFG-LIFE-02 / 中
-- [ ] **キュー投入プロンプトの再試行上限が再起動でリセットされる**
-  — `server/routes.rs:3269-3279` / RETRY-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -270,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[キュー再試行 1 件]** 上限超過を failed 終端化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP ディスク同期 1 件]** 削除・無効化をインメモリへ反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定/再試行 2 件]** PATCH 正規化と Retry-After 大小文字対応
@@ -737,6 +737,11 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 残存（キュー再試行の修正時、記録のみ）: DB 読取失敗経路は
+  queue_id 不明のため None を渡し failed 化できない。DB 障害が永続する場合は
+  再起動時の再投入で attempt がリセットされる（運用監視でカバー、または
+  session_id キーの failed 化 API が別途必要）。親がテストの private
+  フィールド／FK／型エラー／clippy を直接修正。
 - 2026-11-22 R4 指摘（MCP ディスク同期の修正時）: 親が origin 上書き
   （CRUD 追加が disk 由来を消す）を直接修正。High 残存: remove_server が
   永続化済み OAuth 認証情報を消さず再追加時に古いトークンが復活する（削除
