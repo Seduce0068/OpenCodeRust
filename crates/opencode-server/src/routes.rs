@@ -4256,7 +4256,8 @@ async fn patch_config(
     config.merge(patch.clone());
     // PATCH 後のインメモリ設定にも起動時と同じ post-load 変換を適用し、
     // mode/tools 移行や steps=0 の既定化が PATCH でも欠落しないようにする。
-    apply_post_load_transforms(&mut config);
+    // 環境由来の username 注入は永続化時と同じく行わない（親が R2 blocker を修正）。
+    apply_post_load_transforms(&mut config, false);
     let updated = config.clone();
     drop(config);
 
@@ -10161,6 +10162,12 @@ mod config_patch_runtime_tests {
         assert!(
             merge_at < transform_at && transform_at < clone_at,
             "transforms must run after merge and before response snapshot: {body}"
+        );
+        // R4: PATCH のインメモリ経路では環境由来 username を注入しない。
+        let call = &body[transform_at..];
+        assert!(
+            call.starts_with("apply_post_load_transforms(&mut config, false)"),
+            "PATCH transforms must not inject environment username: {body}"
         );
     }
 

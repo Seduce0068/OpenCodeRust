@@ -328,7 +328,8 @@ impl ConfigLoader {
         self.load_managed_config()?;
 
         // Apply legacy field migrations, plugin dedup, provider normalization.
-        apply_post_load_transforms(&mut self.config);
+        // Startup load injects environment-derived defaults such as username.
+        apply_post_load_transforms(&mut self.config, true);
 
         // Log only the count: config paths can contain user identifiers and
         // must not be emitted to logs.
@@ -2332,7 +2333,14 @@ fn resolve_legacy_tools_actions(
 ///
 /// Public so the server can normalize PATCH-merged config the same way the
 /// startup loader does. Only key names are logged, never values.
-pub fn apply_post_load_transforms(config: &mut Config) {
+///
+/// `inject_environment_defaults` gates environment-derived defaults (currently
+/// only `username` from `USER`/`USERNAME`). The startup loader passes `true`;
+/// persistence paths pass `false` so a PATCH on an unrelated key never
+/// materializes an environment value into the config file, where it would
+/// outrank later environment changes on the next load. All other transforms
+/// (legacy migrations, dedup, normalization) run regardless of this flag.
+pub fn apply_post_load_transforms(config: &mut Config, inject_environment_defaults: bool) {
     // Migrate deprecated `mode` field to `agent` field. The warning names only
     // the keys — never the mode names or any other config value.
     if let Some(mode_configs) = config.mode.take() {
@@ -2380,8 +2388,10 @@ pub fn apply_post_load_transforms(config: &mut Config) {
         config.permission = Some(PermissionConfig::Map(perms));
     }
 
-    // Set default username from system
-    if config.username.is_none() {
+    // Set default username from the system only on the startup load path.
+    // Persistence passes `false`: writing an environment-derived username into
+    // the config file would make that stale value win over later env changes.
+    if inject_environment_defaults && config.username.is_none() {
         config.username = env::var("USER").or_else(|_| env::var("USERNAME")).ok();
     }
 
@@ -2682,7 +2692,9 @@ pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
     let mut merged = existing;
     merged.merge(patch.clone());
     // PATCH 経由のマージ結果も起動時ロードと同じ正規化を適用する。
-    apply_post_load_transforms(&mut merged);
+    // 環境由来の既定値（username）は注入しない: 書き出すと次回ロードで
+    // 環境変更よりファイル値が優先されてしまうため。
+    apply_post_load_transforms(&mut merged, false);
 
     let json =
         serde_json::to_string_pretty(&merged).with_context(|| "Failed to serialize config")?;
@@ -2736,7 +2748,9 @@ pub fn update_global_config(patch: &Config) -> Result<()> {
     let mut merged = existing;
     merged.merge(patch.clone());
     // PATCH 経由のマージ結果も起動時ロードと同じ正規化を適用する。
-    apply_post_load_transforms(&mut merged);
+    // 環境由来の既定値（username）は注入しない: 書き出すと次回ロードで
+    // 環境変更よりファイル値が優先されてしまうため。
+    apply_post_load_transforms(&mut merged, false);
 
     let json =
         serde_json::to_string_pretty(&merged).with_context(|| "Failed to serialize config")?;
@@ -4732,7 +4746,7 @@ theme = "dark"
             .unwrap();
 
         let mut config = loader.get_config();
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         assert!(
             config.providers.is_none(),
@@ -4759,7 +4773,7 @@ theme = "dark"
             .unwrap();
 
         let mut config = loader.get_config();
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         let provider = config
             .provider
@@ -4852,7 +4866,7 @@ theme = "dark"
     fn experimental_mcp_timeout_migrates_to_mcp_timeout() {
         let mut config: Config =
             serde_json::from_str(r#"{"experimental":{"mcp_timeout":1234}}"#).unwrap();
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         let timeout = config
             .mcp
@@ -4879,7 +4893,7 @@ theme = "dark"
             }"#,
         )
         .unwrap();
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         let timeout = config.mcp.expect("mcp").timeout.expect("timeout");
         assert_eq!(
@@ -4892,6 +4906,117 @@ theme = "dark"
             .as_ref()
             .and_then(|experimental| experimental.mcp_timeout)
             .is_none());
+    }
+
+    // ── CFGCONV-R1-02 regression tests: env username must not be persisted ──
+
+    /// Restores USER/USERNAME on drop so env mutation never leaks to other tests.
+    struct EnvUsernameGuard {
+        user: Option<std::ffi::OsString>,
+        username: Option<std::ffi::OsString>,
+    }
+
+    impl EnvUsernameGuard {
+        fn capture() -> Self {
+            Self {
+                user: env::var_os("USER"),
+                username: env::var_os("USERNAME"),
+            }
+        }
+    }
+
+    impl Drop for EnvUsernameGuard {
+        fn drop(&mut self) {
+            match self.user.take() {
+                Some(value) => env::set_var("USER", value),
+                None => env::remove_var("USER"),
+            }
+            match self.username.take() {
+                Some(value) => env::set_var("USERNAME", value),
+                None => env::remove_var("USERNAME"),
+            }
+        }
+    }
+
+    /// 回帰 (CFGCONV-R1-02): ファイルに username が無くても無関係なキーを PATCH
+    /// すると環境由来の username が書き出され、次回ロードで環境変更より
+    /// ファイル値が優先される問題を防ぐ。値やパスはメッセージに出さない。
+    #[test]
+    fn update_config_does_not_persist_environment_username() {
+        const SENTINEL: &str = "cfgconv-r1-02-env-user";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvUsernameGuard::capture();
+        env::set_var("USER", SENTINEL);
+        env::set_var("USERNAME", SENTINEL);
+
+        let temp = TestDir::new("opencode_patch_no_username");
+        let file = temp.path.join("opencode.json");
+        fs::write(&file, r#"{"theme":"dark"}"#).unwrap();
+
+        let patch: Config = serde_json::from_str(r#"{"model":"patched-model"}"#).unwrap();
+        update_config(&temp.path, &patch).expect("unrelated PATCH must persist");
+
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).expect("written config")).unwrap();
+        assert!(
+            written.get("username").is_none(),
+            "environment username must not be persisted by PATCH"
+        );
+        assert_eq!(written.get("theme").and_then(|v| v.as_str()), Some("dark"));
+        assert_eq!(
+            written.get("model").and_then(|v| v.as_str()),
+            Some("patched-model")
+        );
+    }
+
+    /// 回帰 (CFGCONV-R1-02): 環境由来の username 注入はフラグでのみ行われる。
+    /// 起動時ロードは `true` を渡すため従来どおり補完され、永続化は `false`
+    /// を渡すため注入されない。他の transform はフラグ非依存で従来どおり。
+    #[test]
+    fn post_load_transforms_username_injection_respects_flag() {
+        const SENTINEL: &str = "cfgconv-r1-02-startup-user";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvUsernameGuard::capture();
+        env::set_var("USER", SENTINEL);
+        env::set_var("USERNAME", SENTINEL);
+
+        let mut startup: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        apply_post_load_transforms(&mut startup, true);
+        assert!(
+            startup.username.as_deref() == Some(SENTINEL),
+            "startup load must still inject username from environment"
+        );
+
+        let mut persisted: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        apply_post_load_transforms(&mut persisted, false);
+        assert!(
+            persisted.username.is_none(),
+            "persistence flag must not inject environment username"
+        );
+    }
+
+    /// 回帰 (CFGCONV-R1-02): 起動時ロードの経路でも環境から username が補完される。
+    #[test]
+    fn startup_load_injects_username_from_environment() {
+        const SENTINEL: &str = "cfgconv-r1-02-load-user";
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvUsernameGuard::capture();
+        env::set_var("USER", SENTINEL);
+        env::set_var("USERNAME", SENTINEL);
+
+        let temp = TestDir::new("opencode_startup_username");
+        // find-up を止め、祖先の設定へ依存しないようにする。
+        fs::create_dir_all(temp.path.join(".git")).unwrap();
+        fs::write(temp.path.join("opencode.json"), r#"{"theme":"dark"}"#).unwrap();
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        let config = loader
+            .load_all(&temp.path)
+            .expect("startup load must succeed");
+        assert!(
+            config.username.as_deref() == Some(SENTINEL),
+            "startup load must inject username from environment"
+        );
     }
 
     // ── R2 regression tests: silent legacy migrations / explicit config ───
@@ -4965,7 +5090,7 @@ theme = "dark"
             buffer: buffer.clone(),
         };
         tracing::subscriber::with_default(subscriber, || {
-            apply_post_load_transforms(&mut config);
+            apply_post_load_transforms(&mut config, true);
         });
 
         let text = buffer.text();
@@ -5026,7 +5151,7 @@ theme = "dark"
         let mut config: Config =
             serde_json::from_str(r#"{"tools": {"write": true, "edit": false}}"#)
                 .expect("legacy tools config must parse");
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         assert!(
             config.tools.is_none(),
@@ -5052,7 +5177,7 @@ theme = "dark"
         )
         .expect("config with an explicit agent mode must parse");
 
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         let agent = config
             .agent
@@ -5079,7 +5204,7 @@ theme = "dark"
         )
         .expect("config without an explicit agent mode must parse");
 
-        apply_post_load_transforms(&mut config);
+        apply_post_load_transforms(&mut config, true);
 
         let agent = config
             .agent
