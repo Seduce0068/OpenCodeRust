@@ -84,6 +84,7 @@ struct RawUsage {
 impl RawChatResponse {
     /// Convert the lenient wire format into our internal `ChatResponse`.
     fn into_chat_response(self) -> ChatResponse {
+        let mut tool_args_warned = false;
         let choices = self
             .choices
             .into_iter()
@@ -115,8 +116,18 @@ impl RawChatResponse {
                         let func = tc.function.as_ref();
                         let name = func.and_then(|f| f.name.as_deref()).unwrap_or("");
                         let args_str = func.and_then(|f| f.arguments.as_deref()).unwrap_or("{}");
-                        let input: serde_json::Value =
-                            serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                        let input: serde_json::Value = if args_str.trim().is_empty() {
+                            // 引数なしツール呼び出しの空 arguments は不正ではない（R4）。
+                            serde_json::json!({})
+                        } else {
+                            match serde_json::from_str(args_str) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    warn_tool_arguments_decode_failure_once(&mut tool_args_warned);
+                                    serde_json::json!({})
+                                }
+                            }
+                        };
                         let id = tc
                             .id
                             .clone()
@@ -222,6 +233,19 @@ fn warn_usage_decode_failure_once(warned: &mut bool) {
     tracing::warn!(
         event = "provider_usage_decode_failed",
         "usage decode failed"
+    );
+}
+
+// tool_calls.arguments のデコード失敗は引数値を一切ログに出さず、同一レスポンス内では
+// 最初の 1 回だけ固定文言の構造化 warn を出す。
+fn warn_tool_arguments_decode_failure_once(warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        event = "provider_tool_arguments_decode_failed",
+        "tool arguments decode failed"
     );
 }
 
@@ -1390,6 +1414,65 @@ mod tests {
         assert_eq!(usage.prompt_tokens, Some(5));
         assert_eq!(usage.completion_tokens, Some(6));
         assert_eq!(usage.total_tokens, Some(11));
+        assert!(capture.events.lock().expect("mutex poisoned").is_empty());
+    }
+
+    #[test]
+    fn into_chat_response_warns_once_on_invalid_tool_arguments_and_defaults_to_empty_object() {
+        let capture = UsageWarnCapture::default();
+        let raw: RawChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[
+                {"id":"tc1","function":{"name":"f","arguments":"leak-marker-args-1"}},
+                {"id":"tc2","function":{"name":"g","arguments":"leak-marker-args-2"}}
+            ]}}]}"#,
+        )
+        .expect("raw response fixture should parse");
+
+        let response =
+            tracing::subscriber::with_default(capture.clone(), || raw.into_chat_response());
+
+        let parts = match &response.choices[0].message.content {
+            crate::Content::Parts(parts) => parts,
+            other => panic!("expected tool_use parts, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        for part in parts {
+            assert_eq!(
+                part.tool_use.as_ref().expect("tool_use part").input,
+                serde_json::json!({})
+            );
+        }
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "repeated failures must warn only once");
+        assert_eq!(events[0].0, "provider_tool_arguments_decode_failed");
+        assert!(events[0].1.contains("tool arguments decode failed"));
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
+    }
+
+    #[test]
+    fn into_chat_response_accepts_valid_tool_arguments_without_warning() {
+        let capture = UsageWarnCapture::default();
+        let raw: RawChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[
+                {"id":"tc1","function":{"name":"f","arguments":"{\"leak-marker-args-3\":1}"}}
+            ]}}]}"#,
+        )
+        .expect("raw response fixture should parse");
+
+        let response =
+            tracing::subscriber::with_default(capture.clone(), || raw.into_chat_response());
+
+        let parts = match &response.choices[0].message.content {
+            crate::Content::Parts(parts) => parts,
+            other => panic!("expected tool_use parts, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].tool_use.as_ref().expect("tool_use part").input,
+            serde_json::json!({"leak-marker-args-3": 1})
+        );
         assert!(capture.events.lock().expect("mutex poisoned").is_empty());
     }
 

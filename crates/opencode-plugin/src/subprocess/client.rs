@@ -34,6 +34,37 @@ const STREAM_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// チャンクキューが満杯のとき、終端エラーを届けるための猶予。
 const STREAM_OVERFLOW_ERROR_GRACE: Duration = Duration::from_millis(100);
 
+// 開始レスポンスの headers デコード失敗はヘッダ値を一切ログに出さず、同一ストリーム内では
+// 最初の 1 回だけ固定文言の構造化 warn を出す。
+fn warn_stream_headers_decode_failure_once(warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        event = "plugin_stream_headers_decode_failed",
+        "plugin stream headers decode failed"
+    );
+}
+
+/// 開始レスポンスの headers をデコードする。
+/// 型不一致時は従来どおり空マップを返し、値を含まない固定 warn を 1 回だけ出す。
+fn parse_stream_headers(
+    result: &Value,
+    warned: &mut bool,
+) -> std::collections::HashMap<String, String> {
+    match result.get("headers") {
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(headers) => headers,
+            Err(_) => {
+                warn_stream_headers_decode_failure_once(warned);
+                std::collections::HashMap::new()
+            }
+        },
+        None => std::collections::HashMap::new(),
+    }
+}
+
 type StreamStart = Result<(u16, std::collections::HashMap<String, String>), PluginSubprocessError>;
 type StreamChunk = Result<String, PluginSubprocessError>;
 
@@ -419,6 +450,7 @@ impl PluginSubprocess {
         // when the plugin never sends `auth.fetch.stream.end`.
         let task = tokio::spawn(async move {
             let mut start_tx = Some(start_tx);
+            let mut headers_warned = false;
             let mut reader = stdout.lock().await;
             let overall_deadline = tokio::time::Instant::now() + total_timeout;
 
@@ -489,11 +521,7 @@ impl PluginSubprocess {
                         .and_then(Value::as_u64)
                         .and_then(|v| u16::try_from(v).ok())
                         .unwrap_or(200);
-                    let headers = result
-                        .get("headers")
-                        .cloned()
-                        .and_then(|v| serde_json::from_value(v).ok())
-                        .unwrap_or_default();
+                    let headers = parse_stream_headers(&result, &mut headers_warned);
                     if let Some(tx) = start_tx.take() {
                         let _ = tx.send(Ok((status, headers)));
                     }
@@ -738,6 +766,113 @@ impl PluginSubprocess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // tracing-subscriber を依存に追加せず、WARN イベントだけを捕捉する最小限の Subscriber。
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct WarnVisitor {
+        event: Option<String>,
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for WarnVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = Some(value.to_owned()),
+                "message" => self.message = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = WarnVisitor {
+                event: None,
+                message: None,
+            };
+            event.record(&mut visitor);
+            self.events.lock().expect("mutex poisoned").push((
+                visitor.event.unwrap_or_default(),
+                visitor.message.unwrap_or_default(),
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn stream_headers_type_mismatch_warns_once_and_defaults_to_empty_map() {
+        let capture = WarnCapture::default();
+        let mut warned = false;
+        let results = tracing::subscriber::with_default(capture.clone(), || {
+            vec![
+                parse_stream_headers(
+                    &serde_json::json!({"headers": ["leak-marker-hdr-1"]}),
+                    &mut warned,
+                ),
+                parse_stream_headers(
+                    &serde_json::json!({"headers": "leak-marker-hdr-2"}),
+                    &mut warned,
+                ),
+            ]
+        });
+        assert!(results.iter().all(|headers| headers.is_empty()));
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "repeated failures must warn only once");
+        assert_eq!(events[0].0, "plugin_stream_headers_decode_failed");
+        assert!(events[0].1.contains("plugin stream headers decode failed"));
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
+    }
+
+    #[test]
+    fn stream_headers_valid_or_absent_value_does_not_warn() {
+        let capture = WarnCapture::default();
+        let mut warned = false;
+        let (valid, absent) = tracing::subscriber::with_default(capture.clone(), || {
+            (
+                parse_stream_headers(
+                    &serde_json::json!({"headers": {"x-custom": "leak-marker-hdr-3"}}),
+                    &mut warned,
+                ),
+                parse_stream_headers(&serde_json::json!({}), &mut warned),
+            )
+        });
+        assert_eq!(
+            valid.get("x-custom").map(String::as_str),
+            Some("leak-marker-hdr-3")
+        );
+        assert!(absent.is_empty());
+        assert!(capture.events.lock().expect("mutex poisoned").is_empty());
+    }
 
     /// A stream start timeout must release `rpc_lock`; otherwise every later RPC
     /// call blocks forever on `call()`'s lock acquisition (todo.md H-08).

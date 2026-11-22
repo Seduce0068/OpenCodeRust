@@ -28,7 +28,45 @@ use crate::summary::{summarize_into_session, SummarizeInput};
 use crate::system::SystemPrompt;
 use crate::{
     MessageRole, PartType, Session, SessionMessage, SessionStateManager, SessionStatus, TodoInfo,
+    OUTPUT_TOKEN_MAX,
 };
+
+/// `ChatRequest.max_tokens` の既定値を解決する。
+///
+/// `agent.max_tokens` が明示指定されていればその値を優先し、未指定なら
+/// `LlmProcessor` と同じ共有定数 `OUTPUT_TOKEN_MAX` を使う。
+fn resolve_chat_max_tokens(agent_max_tokens: Option<u64>) -> u64 {
+    agent_max_tokens.unwrap_or(OUTPUT_TOKEN_MAX)
+}
+
+// 永続化済み assistant tool_call の引数デコード失敗は引数値を一切ログに出さず、
+// 同一メッセージ内では最初の 1 回だけ固定文言の構造化 warn を出す。
+fn warn_persisted_tool_arguments_decode_failure_once(warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        event = "session_persisted_tool_arguments_decode_failed",
+        "persisted tool arguments decode failed"
+    );
+}
+
+/// 永続化済み tool_call 引数を `Value` へデコードする。
+/// 失敗時は従来どおり `{}` を返し、値を含まない固定 warn を 1 回だけ出す。
+fn parse_persisted_tool_arguments(tc_args: &str, warned: &mut bool) -> serde_json::Value {
+    if tc_args.trim().is_empty() {
+        // 引数なしツール呼び出しの空引数は不正ではない（R4）。
+        return serde_json::json!({});
+    }
+    match serde_json::from_str(tc_args) {
+        Ok(value) => value,
+        Err(_) => {
+            warn_persisted_tool_arguments_decode_failure_once(warned);
+            serde_json::json!({})
+        }
+    }
+}
 
 // Permission callback type for tool execution
 pub type PermissionCallback = Option<
@@ -1247,7 +1285,7 @@ impl SessionPrompt {
             let request = ChatRequest {
                 model: model_id.clone(),
                 messages: chat_messages,
-                max_tokens: Some(agent_params.max_tokens.unwrap_or(8192)),
+                max_tokens: Some(resolve_chat_max_tokens(agent_params.max_tokens)),
                 temperature: agent_params.temperature,
                 system: None,
                 tools: if resolved_tools.is_empty() {
@@ -1412,9 +1450,9 @@ impl SessionPrompt {
 
             // Finalize the placeholder assistant message with tool calls and usage.
             if let Some(assistant_msg) = session.messages.get_mut(assistant_index) {
+                let mut tool_args_warned = false;
                 for (tc_id, (tc_name, tc_args)) in &tool_calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(tc_args).unwrap_or(serde_json::json!({}));
+                    let input = parse_persisted_tool_arguments(tc_args, &mut tool_args_warned);
                     assistant_msg.parts.push(crate::MessagePart {
                         id: opencode_core::id::create(opencode_core::id::Prefix::Part, true, None),
                         part_type: PartType::ToolCall {
@@ -2373,7 +2411,7 @@ impl SessionPrompt {
             max_input: None,
             max_output: max_output_tokens
                 .or_else(|| model.map(|info| info.max_output_tokens))
-                .unwrap_or(8192),
+                .unwrap_or(OUTPUT_TOKEN_MAX),
         };
         let engine = CompactionEngine::new(CompactionConfig::default());
         if engine.is_overflow(&usage, &limits) {
@@ -3029,7 +3067,7 @@ impl SubtaskExecutor {
         let request = ChatRequest {
             model: model.model_id,
             messages,
-            max_tokens: Some(self.agent_params.max_tokens.unwrap_or(8192)),
+            max_tokens: Some(resolve_chat_max_tokens(self.agent_params.max_tokens)),
             temperature: self.agent_params.temperature,
             system: None,
             tools: Some(tool_defs),
@@ -3735,6 +3773,121 @@ mod tests {
         StreamUsage,
     };
     use std::sync::Mutex as StdMutex;
+
+    // tracing-subscriber を依存に追加せず、WARN イベントだけを捕捉する最小限の Subscriber。
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct WarnVisitor {
+        event: Option<String>,
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for WarnVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = Some(value.to_owned()),
+                "message" => self.message = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = WarnVisitor {
+                event: None,
+                message: None,
+            };
+            event.record(&mut visitor);
+            self.events.lock().expect("mutex poisoned").push((
+                visitor.event.unwrap_or_default(),
+                visitor.message.unwrap_or_default(),
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn persisted_tool_arguments_decode_warns_once_and_defaults_to_empty_object() {
+        let capture = WarnCapture::default();
+        let mut warned = false;
+        let parsed: Vec<serde_json::Value> =
+            tracing::subscriber::with_default(capture.clone(), || {
+                vec![
+                    parse_persisted_tool_arguments("leak-marker-args-1", &mut warned),
+                    parse_persisted_tool_arguments("leak-marker-args-2", &mut warned),
+                ]
+            });
+        assert_eq!(parsed, vec![serde_json::json!({}), serde_json::json!({})]);
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "repeated failures must warn only once");
+        assert_eq!(
+            events[0].0,
+            "session_persisted_tool_arguments_decode_failed"
+        );
+        assert!(events[0]
+            .1
+            .contains("persisted tool arguments decode failed"));
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
+    }
+
+    #[test]
+    fn persisted_tool_arguments_valid_value_does_not_warn() {
+        let capture = WarnCapture::default();
+        let mut warned = false;
+        let parsed = tracing::subscriber::with_default(capture.clone(), || {
+            parse_persisted_tool_arguments("{\"leak-marker-args-3\":1}", &mut warned)
+        });
+        assert_eq!(parsed, serde_json::json!({"leak-marker-args-3": 1}));
+        assert!(capture.events.lock().expect("mutex poisoned").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // R2: ChatRequest の max_tokens 既定値不整合の回帰テスト
+    // -----------------------------------------------------------------------
+
+    /// `SessionPrompt` の既定値が `LlmProcessor` と同じ共有定数へ解決され、
+    /// 明示指定値が不変であることを固定する。
+    #[test]
+    fn chat_default_max_tokens_matches_llm_processor_and_honors_override() {
+        // 未指定なら LlmProcessor と同一の共有定数（== provider 定数）になる。
+        assert_eq!(resolve_chat_max_tokens(None), OUTPUT_TOKEN_MAX);
+        assert_eq!(
+            resolve_chat_max_tokens(None),
+            opencode_provider::OUTPUT_TOKEN_MAX
+        );
+        // 明示指定は不変。
+        assert_eq!(resolve_chat_max_tokens(Some(1234)), 1234);
+    }
 
     /// Concurrent `start` calls must register exactly one cancellation token:
     /// the busy check and the insertion share a single lock acquisition.

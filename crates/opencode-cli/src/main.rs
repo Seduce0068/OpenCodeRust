@@ -7176,6 +7176,21 @@ mod tests {
         );
     }
 
+    /// プラグイン認証ブリッジの既定 URL ポートが CLI の実効 bind 既定と一致すること。
+    /// CLI は `runtime.port == 0` を 3000 へ解決するため、共有既定 URL も 3000 である必要がある。
+    #[test]
+    fn plugin_server_url_default_port_matches_cli_bind_default() {
+        let default_url = plugin_server_url(None);
+        assert_eq!(default_url, "http://127.0.0.1:3000");
+        assert!(
+            default_url.ends_with(":3000"),
+            "default plugin server URL port must match CLI bind default"
+        );
+        // 明示 URL は不変。
+        let explicit = "http://example.test:1234";
+        assert_eq!(plugin_server_url(Some(explicit)), explicit);
+    }
+
     #[test]
     fn config_server_port_is_used_and_cli_overrides_only_when_explicit() {
         let configured = ConfigServerConfig {
