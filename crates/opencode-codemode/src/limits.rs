@@ -213,10 +213,12 @@ pub struct BoundedOutput {
 ///
 /// The value is charged first; logs use the remaining budget.
 pub fn bound_output(serialized_value: &str, logs: &[String], max_bytes: usize) -> BoundedOutput {
-    let value = match bound_serialized_value(serialized_value, max_bytes) {
-        Some(truncated) => truncated,
-        None => serialized_value.to_owned(),
-    };
+    // Keep the `Option` so truncation is derived from the decision, not from a
+    // length comparison: the replacement (value prefix + marker) can be shorter
+    // than the original value when the truncated tail exceeds the marker length.
+    let bounded_value = bound_serialized_value(serialized_value, max_bytes);
+    let value_truncated = bounded_value.is_some();
+    let value = bounded_value.unwrap_or_else(|| serialized_value.to_owned());
     let value_bytes = if value.len() > max_bytes {
         // The marker pushes the replacement over the budget; the budget charge is
         // capped at `max_bytes`, matching upstream.
@@ -227,7 +229,6 @@ pub fn bound_output(serialized_value: &str, logs: &[String], max_bytes: usize) -
 
     let log_budget = max_bytes.saturating_sub(value_bytes);
     let bounded_logs = bound_logs(logs, log_budget);
-    let value_truncated = value.len() > serialized_value.len();
 
     BoundedOutput {
         value,
@@ -324,6 +325,18 @@ mod tests {
         assert_eq!(
             bounded.logs,
             vec!["[logs truncated: showing 0 of 1 lines]".to_owned()]
+        );
+        assert!(bounded.truncated);
+    }
+
+    #[test]
+    fn reports_truncation_when_the_replacement_is_shorter_than_the_value() {
+        let value = "x".repeat(1_000);
+        let bounded = bound_output(&value, &[], 500);
+
+        assert!(
+            bounded.value.len() < value.len(),
+            "precondition: the marker-bearing replacement must be shorter than the original"
         );
         assert!(bounded.truncated);
     }

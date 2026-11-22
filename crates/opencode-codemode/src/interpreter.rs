@@ -3030,6 +3030,13 @@ impl<'a> Interpreter<'a> {
         Ok(output)
     }
 
+    /// Returns `true` for values ECMAScript treats as unorderable in
+    /// `Array.sort`: `undefined` and `NaN` (ES2019+). Such values are never
+    /// passed to the comparator and are placed at the end of the result.
+    fn is_unorderable_sort_value(value: &Value) -> bool {
+        value.is_undefined() || matches!(value, Value::Number(number) if number.is_nan())
+    }
+
     fn sort_items(
         &mut self,
         items: &mut [Value],
@@ -3044,16 +3051,26 @@ impl<'a> Interpreter<'a> {
                 ));
             }
         }
-        let undefined_count = items.iter().filter(|value| value.is_undefined()).count();
-        if undefined_count > 0 {
-            let mut defined = items
+        // `undefined` and `NaN` are unorderable: exclude them from comparisons
+        // (including a user comparator) and move them to the tail, preserving
+        // their original relative order. The recursive call only receives
+        // orderable values, so this branch runs at most once per sort.
+        let unorderable = items
+            .iter()
+            .filter(|value| Self::is_unorderable_sort_value(value))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unorderable.is_empty() {
+            let mut orderable = items
                 .iter()
-                .filter(|value| !value.is_undefined())
+                .filter(|value| !Self::is_unorderable_sort_value(value))
                 .cloned()
                 .collect::<Vec<_>>();
-            self.sort_items(&mut defined, comparator, span)?;
-            let tail = std::iter::repeat_with(|| Value::Undefined).take(undefined_count);
-            for (slot, value) in items.iter_mut().zip(defined.into_iter().chain(tail)) {
+            self.sort_items(&mut orderable, comparator, span)?;
+            for (slot, value) in items
+                .iter_mut()
+                .zip(orderable.into_iter().chain(unorderable))
+            {
                 *slot = value;
             }
             return Ok(());
@@ -14078,6 +14095,48 @@ mod tests {
         assert_eq!(
             run_value(r#"return "\u{0085}x\u{0085}".trim().length;"#),
             number(3.0)
+        );
+    }
+
+    #[test]
+    fn sort_treats_nan_as_unorderable_like_undefined() {
+        // ES2019+: NaN joins undefined at the tail of the default sort.
+        assert_eq!(
+            run_value("return ['z', NaN, 'a'].sort().map(String).join(',');"),
+            string("a,z,NaN")
+        );
+        // Unorderable values keep their original relative order in the tail.
+        assert_eq!(
+            run_value("return [NaN, 'b', undefined, 'a', NaN].sort().map(String).join(',');"),
+            string("a,b,NaN,undefined,NaN")
+        );
+        // A user comparator neither sees unorderable values nor changes their placement.
+        assert_eq!(
+            run_value(
+                "const seen = []; \
+                 const r = [NaN, 3, 1, undefined].sort((a, b) => { \
+                     seen.push(String(a) + '/' + String(b)); return a - b; \
+                 }); \
+                 return [r.map(String).join(','), seen.join(';')].join('|');"
+            ),
+            string("1,3,NaN,undefined|3/1")
+        );
+        assert_eq!(
+            run_value("return [NaN, 2, 1].sort((a, b) => a - b).map(String).join(',');"),
+            string("1,2,NaN")
+        );
+        // Existing all-orderable sorts remain unchanged.
+        assert_eq!(
+            run_value("return [3, 1, 2].sort().join(',');"),
+            string("1,2,3")
+        );
+        assert_eq!(
+            run_value("return ['z', 'a'].sort().join(',');"),
+            string("a,z")
+        );
+        assert_eq!(
+            run_value("return [undefined, undefined].sort().map(String).join(',');"),
+            string("undefined,undefined")
         );
     }
 
