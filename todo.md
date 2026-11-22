@@ -243,8 +243,6 @@ status: current
 
 - [ ] **global/managed の json/jsonc 優先順と書き戻し選択が逆**
   — `config/loader.rs:145-153` / CFG-LIFE-02 / 中
-- [ ] **MCP 設定をディスクから削除してもインメモリに残る**
-  — `server/routes.rs:4783-4808` / CFG-LIFE-03 / 中
 - [ ] **キュー投入プロンプトの再試行上限が再起動でリセットされる**
   — `server/routes.rs:3269-3279` / RETRY-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -272,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP ディスク同期 1 件]** 削除・無効化をインメモリへ反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定/再試行 2 件]** PATCH 正規化と Retry-After 大小文字対応
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider 添付生成 1 件]** 画像出力から ToolResult attachments を生成
@@ -737,6 +737,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（MCP ディスク同期の修正時）: 親が origin 上書き
+  （CRUD 追加が disk 由来を消す）を直接修正。High 残存: remove_server が
+  永続化済み OAuth 認証情報を消さず再追加時に古いトークンが復活する（削除
+  semantics の設計判断が必要）。他: set_server_enabled(true) が status を
+  デフォルトで上書き、マルチソース Config のマージ結果と削除判定の食い違い、
+  設定書き換え中間状態での全削除リスク。
 - 2026-11-22 cross-skill 集約（swarm196、2 担当・8 件、観点: 設定ライフサイクル /
   再試行バックオフ）: 親が high 1 件（PATCH が transforms を通らない）と
   medium 1 件（Retry-After 大小文字）を read で事実確認、2 件即座 coding。

@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T21:39:55+09:00"
+  at: "2026-11-22T22:16:10+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3126 件（all-features は 3125 件）
+  テスト総数 594 → 3131 件（all-features は 3130 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `server`: MCP 設定のディスク削除・無効化をインメモリへ反映（origin 分離）
+  （swarm-coding R1-R6）
 - `config` / `server` / `session`: PATCH 時の設定正規化と Retry-After の大小文字対応
   （swarm-coding R1-R6）
 - `provider`: Responses API の画像出力を ToolResult 添付として生成
