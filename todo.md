@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **存在しない `--agent` が既定 build へ黙ってフォールバック**
-  — `cli/main.rs:2795` / CLIARG-05 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -266,6 +264,8 @@ status: current
 
 ## 完了
 
+- [x] **[agent 解決 1 件]** 未知名を build へ黙って化けさせない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI 引数検証 4 件]** attach URL / mcp 排他 / session ID / upgrade
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[Ctrl+Shift+C 1 件]** プロンプト入力のコピーへルーティング
@@ -753,6 +753,8 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（agent 解決の修正時）: 親が unknown agent エラーを
+  固定文言化（CLI 引数をエコーしない方針へ他ヘルパと統一）。
 - 2026-11-23 R4 指摘（CLI 引数検証の修正時）: 親が validate_attach_url の
   scheme/authority 厳格化、mcp add 実行時排他ガード、session/upgrade の
   trim 済み値使用、attach テストの回帰検出力を直接修正。子のテスト期待
