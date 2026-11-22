@@ -243,8 +243,6 @@ status: current
   — `cli/main.rs:1692-1698` / NET-01 / 中
 - [ ] **port=0 起動で実際のバインドポートではなく 0 が使われる**
   — `cli/main.rs:1692` / NET-05 / 中
-- [ ] **存在しない日付が正規化されて有効値になる（JS 非互換）**
-  — `codemode/date.rs:189-212` / DATETIME-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -743,6 +741,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 却下（DATETIME-02、存在しない日付）: 子の実装後 parity corpus
+  が失敗（expected 2024-03-01、V8 生成）。MDN 非標準日付文字列の表によれば
+  V8 は 2024-02-30 を正常な日付へ正規化し、厳密化は V8 互換からの意図的な
+  逸脱になる。repo の Date.parse は V8 準拠を正とし、親が date.rs の変更を
+  `git checkout --` で取り消し（codemode テスト green を再確認）。
 - 2026-11-23 R4 指摘（provider URL の修正時）: 親が "https://" のような
   スキームのみ base が trim で "https:" に退化するケースを protection
   （元 base を維持）へ直接修正。共通ヘルパ化（vertex/google/azure/openai に
