@@ -590,12 +590,25 @@ impl App {
                 }
 
                 // Ctrl+Shift+C (crossterm reports uppercase 'C' with SHIFT modifier)
+                // 選択があるときだけ画面選択をコピーする。選択が無い場合は
+                // 下流の input_copy (copy_prompt_to_clipboard) へ fall through させる。
                 if (key.code == KeyCode::Char('C') || key.code == KeyCode::Char('c'))
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.modifiers.contains(KeyModifiers::SHIFT)
                 {
-                    self.copy_selection();
-                    return Ok(());
+                    // copy_selection() が選択をクリアするため、判定前に退避する。
+                    let had_selection = self.selection.is_active();
+                    if had_selection {
+                        self.copy_selection();
+                    } else if key.code == KeyCode::Char('C') {
+                        // 大文字 'C' は input_copy（小文字 'c'）にマッチしないため、
+                        // 選択なしではここでプロンプトを直接コピーする（R4）。
+                        self.copy_prompt_to_clipboard();
+                    }
+                    // 小文字 'c' かつ選択なしは input_copy へ fall through。
+                    if had_selection || key.code == KeyCode::Char('C') {
+                        return Ok(());
+                    }
                 }
 
                 if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
@@ -2115,6 +2128,8 @@ impl App {
         if content.is_empty() {
             return;
         }
+        #[cfg(test)]
+        clipboard_probe::record("prompt", content);
         if let Err(err) = Clipboard::write_text(content) {
             self.alert_dialog
                 .set_message(&format!("Failed to write clipboard:\n{}", err));
@@ -2146,6 +2161,8 @@ impl App {
             .selection
             .get_selected_text(|row| lines.get(row as usize).cloned());
         if !text.is_empty() {
+            #[cfg(test)]
+            clipboard_probe::record("selection", &text);
             match Clipboard::write_text(&text) {
                 Ok(()) => {
                     self.toast
@@ -4726,6 +4743,25 @@ fn default_export_filename(title: &str, session_id: &str) -> String {
     format!("{slug}.md")
 }
 
+/// テスト専用: クリップボード書き込みの経路と内容を記録する。
+/// 実クリップボードや外部コマンドへ依存せず、キー入力のルーティングを検証する。
+#[cfg(test)]
+mod clipboard_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static WRITES: RefCell<Vec<(&'static str, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(kind: &'static str, text: &str) {
+        WRITES.with(|writes| writes.borrow_mut().push((kind, text.to_string())));
+    }
+
+    pub(super) fn drain() -> Vec<(&'static str, String)> {
+        WRITES.with(|writes| std::mem::take(&mut *writes.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5278,6 +5314,135 @@ mod tests {
         ));
         assert_eq!(screen_lines, captured);
         assert!(selection.is_active());
+    }
+
+    /// 選択が無い Ctrl+Shift+C は input_copy へ fall through し、
+    /// プロンプト入力をコピーする（TUIEV-05 回帰）。
+    #[test]
+    fn ctrl_shift_c_without_selection_copies_prompt() {
+        super::clipboard_probe::drain();
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(context);
+        let dummy_prompt = "dummy prompt for ctrl shift c regression";
+        app.prompt.set_input(dummy_prompt.to_string());
+
+        let key = KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(!app.selection.is_active());
+        assert!(
+            app.matches_keybind("input_copy", key),
+            "default input_copy must be Ctrl+Shift+C"
+        );
+
+        app.handle_event(&Event::Key(key))
+            .expect("Ctrl+Shift+C must be handled without error");
+
+        let writes = super::clipboard_probe::drain();
+        assert_eq!(writes.len(), 1, "exactly one clipboard write expected");
+        assert_eq!(
+            writes[0].0, "prompt",
+            "prompt must be copied when no selection is active"
+        );
+        assert_eq!(writes[0].1, dummy_prompt);
+        assert_eq!(
+            app.prompt.get_input(),
+            dummy_prompt,
+            "copy must not alter the prompt input"
+        );
+    }
+
+    /// 選択がある Ctrl+Shift+C は従来どおり画面選択をコピーし、
+    /// プロンプト入力には触れない（後方互換）。
+    #[test]
+    fn ctrl_shift_c_with_selection_copies_selection_only() {
+        super::clipboard_probe::drain();
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(context);
+        let dummy_prompt = "dummy prompt must stay untouched";
+        app.prompt.set_input(dummy_prompt.to_string());
+        app.screen_lines = vec!["dummy selected line".to_string()];
+        app.selection.start(0, 0);
+        app.selection.update(0, 4);
+        app.selection.finalize();
+        assert!(app.selection.is_active());
+
+        let key = KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_event(&Event::Key(key))
+            .expect("Ctrl+Shift+C must be handled without error");
+
+        let writes = super::clipboard_probe::drain();
+        assert_eq!(writes.len(), 1, "exactly one clipboard write expected");
+        assert_eq!(
+            writes[0].0, "selection",
+            "active selection must take priority over prompt copy"
+        );
+        assert_eq!(writes[0].1, "dummy", "columns 0..=4 must be copied");
+        assert!(
+            !app.selection.is_active(),
+            "selection must be cleared after copy"
+        );
+        assert_eq!(
+            app.prompt.get_input(),
+            dummy_prompt,
+            "prompt must not be copied while a selection is active"
+        );
+    }
+
+    /// crossterm が SHIFT 付きで大文字 'C' を報告する場合も、
+    /// 選択アクティブなら画面選択をコピーする従来動作を維持する。
+    #[test]
+    fn ctrl_shift_uppercase_c_with_selection_still_copies_selection() {
+        super::clipboard_probe::drain();
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(context);
+        app.screen_lines = vec!["dummy selected line".to_string()];
+        app.selection.start(0, 0);
+        app.selection.update(0, 4);
+        app.selection.finalize();
+
+        let key = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_event(&Event::Key(key))
+            .expect("uppercase Ctrl+Shift+C must be handled without error");
+
+        let writes = super::clipboard_probe::drain();
+        assert_eq!(writes.len(), 1, "exactly one clipboard write expected");
+        assert_eq!(writes[0].0, "selection");
+        assert_eq!(writes[0].1, "dummy");
+    }
+
+    /// 選択なし・大文字 'C' でもプロンプトがコピーされる（R4 回帰）。
+    #[test]
+    fn ctrl_shift_uppercase_c_without_selection_copies_prompt() {
+        super::clipboard_probe::drain();
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(context);
+        let dummy_prompt = "dummy prompt uppercase";
+        app.prompt.set_input(dummy_prompt.to_string());
+
+        let key = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.handle_event(&Event::Key(key))
+            .expect("uppercase Ctrl+Shift+C must be handled without error");
+
+        let writes = super::clipboard_probe::drain();
+        assert_eq!(writes.len(), 1, "exactly one clipboard write expected");
+        assert_eq!(writes[0].0, "prompt");
+        assert_eq!(writes[0].1, dummy_prompt);
+        assert_eq!(
+            app.prompt.get_input(),
+            dummy_prompt,
+            "prompt must stay intact"
+        );
     }
 
     /// TTY を必要としない `App` を組み立てる（テスト専用）。
