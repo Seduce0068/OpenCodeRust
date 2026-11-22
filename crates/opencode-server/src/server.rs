@@ -974,6 +974,17 @@ impl ServerState {
                         opencode_session::SessionStatus::Compacting
                     }
                 },
+                // 一時フィールド（wire 非公開）。永続化済み Compacting のうち
+                // time.archived が残るものは Archived だったと判定して復元する
+                // （R4）。Completed は現スキーマでは判定不能のため Active 復帰。
+                status_before_compacting: if stored.status
+                    == opencode_types::SessionStatus::Compacting
+                    && stored.time.archived.is_some()
+                {
+                    Some(opencode_session::SessionStatus::Archived)
+                } else {
+                    None
+                },
                 // 従来は空 HashMap で上書きしており、保存済み metadata を
                 // 起動時に失していた。保存値をそのまま復元する。
                 metadata: stored.metadata.clone(),

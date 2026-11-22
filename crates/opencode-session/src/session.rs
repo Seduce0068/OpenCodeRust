@@ -309,6 +309,12 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing)]
     pub updated_at: DateTime<Utc>,
+    /// compact 開始直前のステータス（一時保持用）。
+    ///
+    /// wire 形状を変えずに Archived / Completed を finish_compacting で復元するために使う。
+    /// 永続化・イベント配信には含めない（`skip_serializing`）。
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub status_before_compacting: Option<SessionStatus>,
 }
 
 impl Session {
@@ -338,6 +344,7 @@ impl Session {
             metadata: HashMap::new(),
             created_at: now,
             updated_at: now,
+            status_before_compacting: None,
         }
     }
 
@@ -365,6 +372,7 @@ impl Session {
             metadata: HashMap::new(),
             created_at: now,
             updated_at: now,
+            status_before_compacting: None,
         }
     }
 
@@ -636,14 +644,28 @@ impl Session {
 
     /// Start compacting
     pub fn start_compacting(&mut self) {
+        // 既に Compacting の場合は保存済みの直前ステータスを上書きしない。
+        // これにより二重 start → finish でも元の Archived / Completed が失われない。
+        if self.status != SessionStatus::Compacting {
+            self.status_before_compacting = Some(self.status.clone());
+        }
         self.time.compacting = Some(Utc::now().timestamp_millis());
         self.status = SessionStatus::Compacting;
     }
 
     /// Finish compacting
     pub fn finish_compacting(&mut self) {
+        // Compacting でないなら二重 finish / 他 status への変更後であり、
+        // 一時値を復元せず何もしない（冪等、R4）。
+        if self.status != SessionStatus::Compacting {
+            return;
+        }
         self.time.compacting = None;
-        self.status = SessionStatus::Active;
+        // 保存値が無い（Active から compact した）場合は従来どおり Active に戻す。
+        self.status = self
+            .status_before_compacting
+            .take()
+            .unwrap_or(SessionStatus::Active);
         self.touch();
     }
 
@@ -743,6 +765,7 @@ impl Session {
             metadata: HashMap::new(),
             created_at,
             updated_at,
+            status_before_compacting: None,
         }
     }
 }
@@ -1353,6 +1376,81 @@ mod tests {
             restored.status,
             SessionStatus::Completed,
             "status must be restored from the row instead of derived from timestamps"
+        );
+    }
+
+    /// R1-INV-02 回帰: Archived → compact → finish で Archived と time.archived が保たれる。
+    #[test]
+    fn test_compacting_preserves_archived_status() {
+        let mut session = Session::new("project-1", "/path/to/project");
+        session.set_archived(Some(1_700_000_000_123));
+        let archived_at = session.time.archived;
+        assert_eq!(session.status, SessionStatus::Archived);
+        assert!(archived_at.is_some());
+
+        session.start_compacting();
+        assert_eq!(session.status, SessionStatus::Compacting);
+        assert!(session.time.compacting.is_some());
+        assert_eq!(
+            session.status_before_compacting,
+            Some(SessionStatus::Archived)
+        );
+
+        // 二重 start でも保存済みの直前ステータスを上書きしない。
+        session.start_compacting();
+        assert_eq!(session.status, SessionStatus::Compacting);
+        assert_eq!(
+            session.status_before_compacting,
+            Some(SessionStatus::Archived)
+        );
+
+        session.finish_compacting();
+        assert_eq!(session.status, SessionStatus::Archived);
+        assert_eq!(session.time.archived, archived_at);
+        assert!(session.time.archived.is_some());
+        assert!(session.time.compacting.is_none());
+        assert!(session.status_before_compacting.is_none());
+    }
+
+    /// R1-INV-02 回帰: Completed → compact → finish で Completed が復元される。
+    #[test]
+    fn test_compacting_preserves_completed_status() {
+        let mut session = Session::new("project-1", "/path/to/project");
+        session.complete();
+        assert_eq!(session.status, SessionStatus::Completed);
+
+        session.start_compacting();
+        assert_eq!(session.status, SessionStatus::Compacting);
+        assert_eq!(
+            session.status_before_compacting,
+            Some(SessionStatus::Completed)
+        );
+
+        session.finish_compacting();
+        assert_eq!(session.status, SessionStatus::Completed);
+        assert!(session.status_before_compacting.is_none());
+        assert!(session.time.compacting.is_none());
+        assert!(session.time.archived.is_none());
+    }
+
+    /// 後方互換: Active → compact → finish は従来どおり Active に戻り、
+    /// 一時フィールドは wire 形状に現れないこと。
+    #[test]
+    fn test_compacting_from_active_returns_to_active() {
+        let mut session = Session::new("project-1", "/path/to/project");
+        assert_eq!(session.status, SessionStatus::Active);
+
+        session.start_compacting();
+        assert_eq!(session.status, SessionStatus::Compacting);
+
+        session.finish_compacting();
+        assert_eq!(session.status, SessionStatus::Active);
+        assert!(session.status_before_compacting.is_none());
+
+        let value = serde_json::to_value(&session).expect("session must serialize");
+        assert!(
+            value.get("status_before_compacting").is_none(),
+            "temporary field must not change the wire shape"
         );
     }
 
