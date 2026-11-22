@@ -61,8 +61,11 @@ impl SessionListDialog {
     pub fn set_sessions(&mut self, mut sessions: Vec<SessionItem>) {
         sessions.retain(|s| s.parent_id.is_none());
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // 5 秒 Tick による再設定で選択が先頭へ戻らないよう、
+        // sessions の差し替え前に現在の選択 ID を退避する。
+        let preserve_id = self.selected_session_id();
         self.sessions = sessions;
-        self.filter();
+        self.filter(preserve_id.as_deref());
     }
 
     pub fn open(&mut self, current_session_id: Option<&str>) {
@@ -72,7 +75,8 @@ impl SessionListDialog {
         self.rename_session_id = None;
         self.rename_input.clear();
         self.active_session_id = current_session_id.map(|id| id.to_string());
-        self.filter();
+        // open() の既存挙動を維持: 先頭または current_session_id から選択する。
+        self.filter(None);
 
         if let Some(current_id) = current_session_id {
             if let Some(filtered_index) = self
@@ -105,15 +109,17 @@ impl SessionListDialog {
     }
 
     pub fn handle_input(&mut self, c: char) {
+        let preserve_id = self.selected_session_id();
         self.query.push(c);
         self.pending_delete_session_id = None;
-        self.filter();
+        self.filter(preserve_id.as_deref());
     }
 
     pub fn handle_backspace(&mut self) {
+        let preserve_id = self.selected_session_id();
         self.query.pop();
         self.pending_delete_session_id = None;
-        self.filter();
+        self.filter(preserve_id.as_deref());
     }
 
     pub fn move_up(&mut self) {
@@ -204,7 +210,13 @@ impl SessionListDialog {
         Some(DeleteState::Armed(selected_id))
     }
 
-    fn filter(&mut self) {
+    /// Rebuild `filtered` and keep the selection on the same session when possible.
+    ///
+    /// `preserve_id` must be resolved from the pre-filter state
+    /// (`state.selected()` + `filtered` + `sessions`) by the caller before it
+    /// mutates `sessions` or `query`. `None` restores the legacy behaviour of
+    /// selecting the first item.
+    fn filter(&mut self, preserve_id: Option<&str>) {
         let query = self.query.to_lowercase();
         self.filtered = self
             .sessions
@@ -217,10 +229,16 @@ impl SessionListDialog {
             })
             .map(|(idx, _)| idx)
             .collect();
-        self.state.select(if self.filtered.is_empty() {
-            None
-        } else {
-            Some(0)
+
+        let preserved_index = preserve_id.and_then(|id| {
+            self.filtered
+                .iter()
+                .position(|idx| self.sessions.get(*idx).is_some_and(|s| s.id == id))
+        });
+        self.state.select(match preserved_index {
+            Some(index) => Some(index),
+            None if self.filtered.is_empty() => None,
+            None => Some(0),
         });
     }
 
@@ -924,11 +942,103 @@ mod tests {
         dialog.handle_backspace();
 
         assert!(dialog.query().is_empty());
-        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+        // 新しい filter() は選択 ID を保持するため、query 解除後も s2 が選択されたまま。
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
         assert!(matches!(
             dialog.trigger_delete_selected(),
-            Some(DeleteState::Armed(id)) if id == "s3"
+            Some(DeleteState::Armed(id)) if id == "s2"
         ));
+    }
+
+    // --- 背景更新による選択保持 (TUIEV-04) ---
+
+    #[test]
+    fn repeated_set_sessions_keeps_selected_session() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s1"));
+        assert_eq!(dialog.state.selected(), Some(2));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+
+        // 5 秒 Tick による再設定を模擬（同一データ）。
+        dialog.set_sessions(sample_sessions());
+
+        assert_eq!(dialog.state.selected(), Some(2));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn set_sessions_keeps_manually_moved_selection_over_active_session_id() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s3"));
+        dialog.move_down(); // ユーザーが s2 へ手動移動
+        assert_eq!(dialog.active_session_id.as_deref(), Some("s3"));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+
+        dialog.set_sessions(sample_sessions());
+
+        // state.selected() が active_session_id より優先される。
+        assert_eq!(dialog.state.selected(), Some(1));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn set_sessions_falls_back_when_selected_session_disappears() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s1"));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+
+        // 選択中だった s1 を除外したデータで再設定。
+        dialog.set_sessions(vec![
+            session("s2", "Beta", "/proj/beta", None, 1_700_000_060_000, true),
+            session("s3", "Gamma", "/proj/gamma", None, 1_700_000_120_000, false),
+        ]);
+
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn set_sessions_to_empty_falls_back_to_none() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s1"));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+
+        dialog.set_sessions(Vec::new());
+
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    #[test]
+    fn query_change_falls_back_deterministically_when_no_match() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s1"));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s1"));
+
+        // どのセッションにも一致しない query。
+        dialog.handle_input('z');
+
+        assert_eq!(dialog.state.selected(), None);
+        assert!(dialog.selected_session_id().is_none());
+    }
+
+    #[test]
+    fn query_change_keeps_selection_when_match_remains() {
+        let mut dialog = SessionListDialog::new();
+        dialog.set_sessions(sample_sessions());
+        dialog.open(Some("s2"));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
+
+        // "b" は s2 (Beta) のみに一致するため、選択 ID は残る。
+        dialog.handle_input('b');
+
+        assert_eq!(dialog.state.selected(), Some(0));
+        assert_eq!(dialog.selected_session_id().as_deref(), Some("s2"));
     }
 
     // --- render ---
