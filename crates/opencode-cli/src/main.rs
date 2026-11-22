@@ -62,6 +62,51 @@ fn format_http_url(host: &str, port: u16) -> String {
     format!("http://{}", format_host_port(host, port))
 }
 
+/// 外部入力が trim 後に非空であることを検証する。
+///
+/// エラーにはラベル名のみを含め、入力値（トークン値・パス等）を一切エコーしない。
+fn validate_non_empty(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("{} must not be empty", label);
+    }
+    Ok(())
+}
+
+/// attach 先 URL の最小検証: trim 後に非空で、scheme (`://`) と host を持つこと。
+///
+/// URL パーサ依存を避け、scheme と authority（host 部分）の存在だけを確認する。
+/// エラーには入力値を含めない。
+fn validate_attach_url(url: &str) -> anyhow::Result<()> {
+    validate_non_empty(url, "attach URL")?;
+    let trimmed = url.trim();
+    let has_scheme_and_host = trimmed.split_once("://").is_some_and(|(scheme, rest)| {
+        // scheme は英字で始まる ASCII トークン（空白なし）のみを許す（R4）。
+        let scheme_ok = !scheme.is_empty()
+            && scheme.as_bytes()[0].is_ascii_alphabetic()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.');
+        // authority の host 部分（':' より前、IPv6 は [] の内側）が非空であること。
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = if let Some(inner) = authority
+            .strip_prefix('[')
+            .and_then(|a| a.split_once(']').map(|(h, _)| h))
+        {
+            inner
+        } else {
+            authority
+                .split_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(authority)
+        };
+        scheme_ok && !host.trim().is_empty()
+    });
+    if !has_scheme_and_host {
+        anyhow::bail!("attach URL must include a scheme and a host (e.g. http://host:port)");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod host_port_format_tests {
     use super::*;
@@ -1235,11 +1280,13 @@ enum McpCommands {
     Add {
         #[arg(value_name = "NAME")]
         name: String,
-        #[arg(long)]
+        // URL モードはローカルモード（command/args）と排他和。併用すると url 側が黙って勝つため
+        // clap 段階で拒否する。command と args は従来どおり併用可能（実行ファイル＋引数）。
+        #[arg(long, conflicts_with_all = ["command", "args"])]
         url: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "url")]
         command: Option<String>,
-        #[arg(long = "arg")]
+        #[arg(long = "arg", conflicts_with = "url")]
         args: Vec<String>,
         #[arg(long, default_value_t = true)]
         enabled: bool,
@@ -1442,6 +1489,7 @@ async fn main() -> anyhow::Result<()> {
             session,
             password,
         }) => {
+            validate_attach_url(&url)?;
             run_tui(
                 dir,
                 None,
@@ -4263,7 +4311,8 @@ async fn handle_upgrade_command(
     }
 
     let target = if let Some(target) = target {
-        target.trim_start_matches('v').to_string()
+        validate_non_empty(&target, "upgrade target")?;
+        target.trim().trim_start_matches('v').to_string()
     } else {
         latest_version(method).await?
     };
@@ -4649,12 +4698,14 @@ async fn handle_session_command(action: SessionCommands) -> anyhow::Result<()> {
             println!("  Messages: {}", messages.len());
         }
         SessionCommands::Delete { session_id } => {
+            validate_non_empty(&session_id, "session id")?;
+            let session_id = session_id.trim();
             message_repo
-                .delete_for_session(&session_id)
+                .delete_for_session(session_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to delete session messages: {}", e))?;
             session_repo
-                .delete(&session_id)
+                .delete(session_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to delete session: {}", e))?;
             println!("Session {} deleted.", session_id);
@@ -5364,7 +5415,12 @@ async fn handle_mcp_command(server: String, action: McpCommands) -> anyhow::Resu
             timeout,
         } => {
             validate_mcp_add_timeout(timeout)?;
+            // clap の conflicts_with は argv 経由のみ。実行時にも排他を守る（R4）。
+            if url.is_some() && (command.is_some() || !args.is_empty()) {
+                anyhow::bail!("--url conflicts with --command and --arg");
+            }
             let config = if let Some(url) = url {
+                validate_attach_url(&url)?;
                 serde_json::json!({
                     "type": "remote",
                     "url": url,
@@ -7485,6 +7541,144 @@ mod tests {
         let guard_error = validate_mcp_add_timeout(Some(0)).unwrap_err().to_string();
         assert!(guard_error.contains("--timeout"), "{guard_error}");
         assert!(!guard_error.contains("/home/"), "{guard_error}");
+    }
+
+    #[test]
+    fn validate_non_empty_rejects_blank_and_keeps_valid_input() {
+        // 空 / 空白のみは明示エラー。
+        assert!(validate_non_empty("", "label").is_err());
+        assert!(validate_non_empty("   \t\n ", "label").is_err());
+        // 有効入力（前後の空白を含む）は不変。
+        assert!(validate_non_empty("ok", "label").is_ok());
+        assert!(validate_non_empty("  ok  ", "label").is_ok());
+
+        // エラーにはラベル名のみを含め、トークン値・パスは出さない。
+        let err = validate_non_empty("", "session id")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("session id"), "{err}");
+        assert!(!err.contains("sk-secret-token-xyz"), "{err}");
+        assert!(!err.contains("/home/"), "{err}");
+    }
+
+    #[test]
+    fn validate_attach_url_requires_scheme_and_host() {
+        // 無効: 空 / 空白のみ / scheme なし / host なし / authority が空 / scheme が空。
+        for invalid in [
+            "",
+            "   ",
+            "localhost:3000",
+            "http://",
+            "http:///path",
+            " ://host",
+        ] {
+            assert!(validate_attach_url(invalid).is_err(), "{invalid}");
+        }
+        // 有効: 従来どおり通る（前後の空白も許容）。
+        for valid in [
+            "http://127.0.0.1:3000",
+            "https://example.test/path",
+            "  http://localhost:3000  ",
+        ] {
+            assert!(validate_attach_url(valid).is_ok(), "{valid}");
+        }
+        // エラーに入力値（トークン値・パス）は出さない。
+        let err = validate_attach_url("sk-secret-token-xyz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("attach URL"), "{err}");
+        assert!(!err.contains("sk-secret-token-xyz"), "{err}");
+        assert!(!err.contains("/home/"), "{err}");
+    }
+
+    #[test]
+    fn attach_validation_is_applied_to_parsed_url() {
+        // 有効 URL は従来どおり解析・検証を通る（未指定の既定 TUI も不変）。
+        let cli = Cli::try_parse_from(["opencoderust", "attach", "http://localhost:3000"]).unwrap();
+        match cli.command {
+            Some(Commands::Attach { url, .. }) => assert!(validate_attach_url(&url).is_ok()),
+            _ => panic!("expected attach"),
+        }
+        // 空 URL は parse を通ることを前提に、実行時検証で拒否されることを担保する。
+        let cli = Cli::try_parse_from(["opencoderust", "attach", ""])
+            .expect("empty URL must parse so runtime validation can reject it");
+        match cli.command {
+            Some(Commands::Attach { url, .. }) => {
+                assert!(validate_attach_url(&url).is_err());
+            }
+            _ => panic!("expected attach"),
+        }
+        assert!(Cli::try_parse_from(["opencoderust"]).is_ok());
+    }
+
+    #[test]
+    fn mcp_add_modes_are_mutually_exclusive() {
+        // --url + --command / --url + --arg は clap 段階で拒否される。
+        let url_and_command = Cli::try_parse_from([
+            "opencoderust",
+            "mcp",
+            "add",
+            "demo",
+            "--url",
+            "http://example.test",
+            "--command",
+            "node",
+        ]);
+        assert!(url_and_command.is_err());
+        let err = url_and_command.err().unwrap().to_string();
+        assert!(!err.contains("/home/"), "{err}");
+        assert!(!err.contains("sk-"), "{err}");
+
+        assert!(Cli::try_parse_from([
+            "opencoderust",
+            "mcp",
+            "add",
+            "demo",
+            "--url",
+            "http://example.test",
+            "--arg",
+            "server.js",
+        ])
+        .is_err());
+
+        // 合法: --url のみ / --command + --arg（従来どおり）/ 未指定。
+        assert!(Cli::try_parse_from([
+            "opencoderust",
+            "mcp",
+            "add",
+            "demo",
+            "--url",
+            "http://example.test",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "opencoderust",
+            "mcp",
+            "add",
+            "demo",
+            "--command",
+            "node",
+            "--arg",
+            "server.js",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["opencoderust", "mcp", "add", "demo"]).is_ok());
+    }
+
+    #[test]
+    fn upgrade_and_session_delete_blank_guards() {
+        // session delete: 空 ID は 0 件削除の成功表示を防ぐため拒否。
+        assert!(validate_non_empty("", "session id").is_err());
+        assert!(validate_non_empty("   ", "session id").is_err());
+        // upgrade: Some(target) が空/空白のみなら拒否、None は最新版解決のまま不変。
+        assert!(validate_non_empty("", "upgrade target").is_err());
+        assert!(validate_non_empty("  ", "upgrade target").is_err());
+        assert!(validate_non_empty("v1.2.3", "upgrade target").is_ok());
+        let cli = Cli::try_parse_from(["opencoderust", "upgrade"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Upgrade { target: None, .. })
+        ));
     }
 
     #[test]
