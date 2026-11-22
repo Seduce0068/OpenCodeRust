@@ -239,6 +239,14 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **IPv6 hostname で SocketAddr/URL 生成が失敗する**
+  — `cli/main.rs:1692-1698` / NET-01 / 中
+- [ ] **port=0 起動で実際のバインドポートではなく 0 が使われる**
+  — `cli/main.rs:1692` / NET-05 / 中
+- [ ] **存在しない日付が正規化されて有効値になる（JS 非互換）**
+  — `codemode/date.rs:189-212` / DATETIME-02 / 中
+- [ ] **Vertex/Google base_url の末尾スラッシュで二重スラッシュ**
+  — `provider/{vertex,google}.rs` / NET-06 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -735,6 +743,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm201、2 担当・9 件、観点: 日時 / ネットワーク）
+  : 親が medium 4 件を read で事実確認、4 件（TUI base_url 正規化・時刻 Local
+  化、CLI wait probe の no_proxy + timeout）を即座 coding。R4 がテストの
+  識別力（UTC ホスト、timeout 上限 3s）を指摘し親が timeout テストを強化、
+  時刻テストは本番コードが正しいため既存の制約コメントを維持。親が子の
+  LocalResult::expect→single() を直接修正。残存 5 件を中優先で triage。
 - 2026-11-22 却下（CFG-LIFE-02、json/jsonc 優先順）: discovery は「優先順と
   書き戻し選択が逆」と指摘したが、親が read で事実確認した結果、
   load_global_from / load_project / load_managed_config はいずれも

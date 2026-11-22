@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-22T23:22:39+09:00"
+  at: "2026-11-22T23:45:22+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3142 件（all-features は 3141 件）
+  テスト総数 594 → 3150 件（all-features は 3149 件）
 
 ### Changed
 
@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tui` / `cli`: API URL の二重スラッシュ、時刻表示のローカル化、起動待ちの
+  no_proxy 化と probe timeout（無期限ハングを防止）
+  （swarm-coding R1-R6）
 - `session` / `tool`: Agent part の完了 status と task ツールの subagent 別名
   （swarm-coding R1-R6）
 - `server`: キュー再試行の上限超過を failed 終端化（再起動でリセットされない）
