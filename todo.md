@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **PATCH 永続化で username が設定ファイルへ書き出される**
-  — `config/loader.rs:2383` / CFGCONV-R1-02 / 低
 - [ ] **Anthropic tool_use の id/name 欠落が空文字列へ化ける**
   — `provider/stream.rs:338` / ERRPROP-03 / 低
 - [ ] **TUI セッション status 取得失敗が全 busy=false へ化ける**
@@ -276,6 +274,8 @@ status: current
 
 ## 完了
 
+- [x] **[username 永続化 1 件]** 環境由来既定値をファイルへ書かない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[glob 1 件]** 不正メタ文字の全マッチ化を修正
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[codemode 2 件]** NaN ソート順序と truncated 判定
@@ -787,6 +787,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（username 永続化の修正時）: 親が routes.rs の blocker
+  （新シグネチャ呼び出し）と PATCH インメモリ側の引数 false 検証テストを
+  直接修正。残存 low 2 件（update_global_config の回帰テスト欠落、
+  起動時注入テストが他設定ソースを分離していない）は記録のみ。
 - 2026-11-23 cross-skill 集約（swarm228、2 担当・6 件、観点: 設定値変換 /
   エラー伝播）: ERRPROP-01（不正 glob が全マッチ）を read で事実確認し即座
   coding、他 5 件を triage。R4 は git_diff 取得制約のため read で全体検証し
