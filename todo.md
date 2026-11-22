@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **Ctrl+Shift+C が input_copy を奪いプロンプトをコピーできない**
-  — `tui/app/app.rs:557-564` / TUIEV-05 / 中
 - [ ] **`attach` の空 URL が既定ローカルサーバへ黙って接続する**
   — `cli/main.rs:791` / CLIARG-01 / 中
 - [ ] **`mcp add --url` と `--command` の併用が競合検知されない**
@@ -276,6 +274,8 @@ status: current
 
 ## 完了
 
+- [x] **[Ctrl+Shift+C 1 件]** プロンプト入力のコピーへルーティング
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[セッション一覧選択 1 件]** 背景更新時も選択を維持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[権限ボタン座標 1 件]** render 時の実ボタン行を記録
@@ -759,6 +759,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（Ctrl+Shift+C の修正時）: 親が大文字 'C'（crossterm の
+  SHIFT 報告）の直接コピー分岐、copy_selection が選択をクリアすることによる
+  二重コピー（had_selection 退避）、clippy missing_const_for_thread_local を
+  直接修正。R4 が大文字分岐のテスト欠落を指摘し親が回帰 1 件追加。
 - 2026-11-23 cross-skill 集約（swarm207、2 担当・19 件、観点: CLI 引数 /
   TUI イベント）: 親が high 2 件（権限 reply）を read で事実確認し即座
   coding。R4 が high（送信前に要求削除でハング）を指摘し親が
