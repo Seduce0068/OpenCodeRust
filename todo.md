@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[ID/Part 境界 7 件]** timestamp・todo ID・旧 JSON 互換・要約 redact
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI ローカル保存 2 件]** atomic 化・権限保持・破損時退避
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[デコード/既定値 5 件]** warn 可視化・max_tokens/URL 共有定数化
@@ -723,6 +725,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm190、2 担当・10 件、観点: ID 生成 / Part 変換）:
+  親が medium 4 件を read で事実確認、7 件を即座 coding。子の blocker 2 件
+  （compaction.rs:711 の summary:None、todo 安定 ID getter）を親が直接補完。
+  R4 が要約全文の info ログ（パス漏洩）を指摘し親が長さのみ記録へ修正。
+  残存（記録のみ）: timestamp u64::MAX 近傍の round-trip、todo ID が読み取り
+  専用（set_status/remove は index ベース）、provider 添付の落ちる 3 件。
 - 2026-11-22 R4 指摘（TUI ローカル保存の修正時）: 親が atomic write の権限
   引き継ぎ（0600 が 0644 に落ちる機密性リグレッション）、退避 warn の
   rename 成否反映、clippy ptr_arg 6 件を直接修正。残存: 親ディレクトリの
