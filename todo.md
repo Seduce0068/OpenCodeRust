@@ -241,6 +241,8 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **ToolResult 添付の本番経路への配線（StreamProcessor は未使用）**
+  — `prompt.rs:1448` / ATTACH-01-FOLLOWUP / 中（R4 事実確認済み）
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -266,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[ToolResult 添付 1 件]** FilePart として保持（StreamProcessor 経路）
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[ID/Part 境界 7 件]** timestamp・todo ID・旧 JSON 互換・要約 redact
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI ローカル保存 2 件]** atomic 化・権限保持・破損時退避
@@ -725,6 +729,14 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 重要指摘（ToolResult 添付の修正時）: `StreamProcessor::new` は
+  テスト内のみで本番呼び出しが無く、実運用の prompt.rs:1448 は
+  StreamEvent::ToolResult を no-op で無視するため、本次の FilePart 保持修正は
+  デッドコードパス。本番配線には prompt.rs の chat_stream ループと
+  PartType::ToolResult（wire 拡張）への伝播が必要。親が read で事実確認し
+  フォローアップタスクとして未着手に追加。他 R4 指摘（添付が LLM メッセージ
+  変換で読み捨てられる、テストのログ非捕捉、alias/空文字テスト欠落、
+  ToolCall 状態確認前の変換）も記録のみ。
 - 2026-11-22 cross-skill 集約（swarm190、2 担当・10 件、観点: ID 生成 / Part 変換）:
   親が medium 4 件を read で事実確認、7 件を即座 coding。子の blocker 2 件
   （compaction.rs:711 の summary:None、todo 安定 ID getter）を親が直接補完。
