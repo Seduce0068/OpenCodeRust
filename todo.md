@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定/状態不変 3 件]** timeout 0・archive 解除・steps 0
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[文字列/I/O 5 件]** auth atomic 0600・非UTF8 上書き防止・truncate 境界
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[数値/並行 4 件]** days 境界・timeout・登録競合・subsession 直列化
@@ -713,6 +715,14 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm183、2 担当・12 件、観点: 設定値検証 /
+  状態遷移不変）: 親が high 1 件（MCP timeout 0）と medium 2 件を read で
+  事実確認、3 件（timeout 0 fallback、archive:false unarchive、steps=0 既定化）
+  を即座 coding。R4 が unarchive の time.compacting 残存を指摘し親が直接修正。
+  残存（記録のみ）: start_compacting→finish の Archived/Completed 格下げ、
+  abort_incomplete_tools の時刻上書き、shutdown の Busy 残存、StreamProcessor
+  attempt リセット、logLevel 不正値、temperature/top_p 範囲、model 区切り子、
+  LSP true、URL 形式検証。
 - 2026-11-22 cross-skill 集約（swarm182、2 担当・10 件、観点: 文字列エンコーディング
   / ファイル I/O）: 親が high 1 件（auth.json 非 atomic + 権限露出）を read で
   事実確認、5 件（auth atomic 0600、WriteTool 非 UTF-8、添付 truncate、&amp;
