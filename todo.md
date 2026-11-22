@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[数値/並行 4 件]** days 境界・timeout・登録競合・subsession 直列化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[パス/URL 安全性 7 件]** symlink・共有 URL・blacklist・スキーム等
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[serde/後始末 5 件]** old-key alias・round-trip・busy リーク・楽観 msg
@@ -709,6 +711,13 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm180、2 担当・6 件、観点: 並行/ロック /
+  数値単位）: 親が中 2 件を read で事実確認、4 件（数値2+並行2）即座 coding
+  完了。R4 が webfetch ボディのタイムアウト未適用と prompt provider エラーの
+  生ログを指摘し親が直接修正。残存: TUI Notify permit 合体（ループ先頭で
+  キュー再確認があるため実害低いと保留）、prompt/agent の subsession ロックが
+  別レジストリ（ID は uuid 付きで衝突稀）、limit クランプ通知ヘッダが
+  list_sessions のみ、不正 days が全期間へフォールバック。
 - 2026-11-22 cross-skill 集約（swarm178、2 担当・7 件、観点: パス/URL 安全性
   / コレクション境界）: 親が medium 3 件を read で事実確認、7 件すべて即座
   coding 完了。R4 が symlink 走査の不完全さ（glob literal base / find_up）を
