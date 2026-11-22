@@ -34,7 +34,8 @@ use crate::worktree::{self, WorktreeError, WorktreeInfo as WorktreeInfoStruct};
 use crate::{ApiError, Result, ServerState, MAX_TUI_RESPONSE_QUEUE};
 use opencode_agent::{AgentInfo as AgentConfigInfo, AgentMode, AgentRegistry, BuiltinAgent};
 use opencode_config::{
-    load_config, Config as AppConfig, McpServerConfig as LoadedMcpServerConfig, McpTimeoutConfig,
+    apply_post_load_transforms, load_config, Config as AppConfig,
+    McpServerConfig as LoadedMcpServerConfig, McpTimeoutConfig,
 };
 use opencode_mcp::client::McpTimeouts;
 use opencode_plugin::subprocess::{PluginAuthBridge, PluginLoader, PluginSubprocessError};
@@ -4225,6 +4226,9 @@ async fn patch_config(
 ) -> Result<Json<serde_json::Value>> {
     let mut config = state.config.write().await;
     config.merge(patch.clone());
+    // PATCH 後のインメモリ設定にも起動時と同じ post-load 変換を適用し、
+    // mode/tools 移行や steps=0 の既定化が PATCH でも欠落しないようにする。
+    apply_post_load_transforms(&mut config);
     let updated = config.clone();
     drop(config);
 
@@ -9781,6 +9785,27 @@ mod config_patch_runtime_tests {
         assert!(
             persist_at < rebuild_at,
             "provider registry must be rebuilt after config persistence: {body}"
+        );
+    }
+
+    #[test]
+    fn patch_config_applies_post_load_transforms_to_merged_config() {
+        // R2: PATCH 後のメモリ上設定にも起動時と同じ変換を適用すること。
+        let source = include_str!("routes.rs");
+        let start = source
+            .find("async fn patch_config(")
+            .expect("patch_config must exist");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("patch_config closing brace");
+        let body = &rest[..end];
+        let merge_at = body.find("config.merge(").expect("merge call");
+        let transform_at = body
+            .find("apply_post_load_transforms(")
+            .expect("post-load transform call");
+        let clone_at = body.find("let updated = config.clone()").expect("clone");
+        assert!(
+            merge_at < transform_at && transform_at < clone_at,
+            "transforms must run after merge and before response snapshot: {body}"
         );
     }
 

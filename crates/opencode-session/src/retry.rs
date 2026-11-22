@@ -53,7 +53,14 @@ pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
 
     if let Some(err) = error {
         if let Some(ref headers) = err.response_headers {
-            if let Some(retry_after_ms) = headers.get("retry-after-ms") {
+            // HTTP ヘッダ名は大小文字非依存。provider.rs の
+            // parse_retry_after_seconds と同じ eq_ignore_ascii_case で探す。
+            // 完全一致（小文字）の既存挙動も変わらない。
+            let retry_after_ms = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after-ms"))
+                .map(|(_, value)| value);
+            if let Some(retry_after_ms) = retry_after_ms {
                 if let Ok(parsed_ms) = retry_after_ms.parse::<f64>() {
                     if let Some(delay_ms) = clamp_retry_after_ms(parsed_ms) {
                         return delay_ms;
@@ -61,7 +68,11 @@ pub fn delay(attempt: u32, error: Option<&ApiErrorInfo>) -> u64 {
                 }
             }
 
-            if let Some(retry_after) = headers.get("retry-after") {
+            let retry_after = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value);
+            if let Some(retry_after) = retry_after {
                 if let Ok(parsed_seconds) = retry_after.parse::<f64>() {
                     if let Some(delay_ms) = clamp_retry_after_ms(parsed_seconds * 1000.0) {
                         return delay_ms;
@@ -267,6 +278,34 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("retry-after".to_owned(), "not-a-number".to_owned());
         assert_eq!(delay(1, Some(&info(Some(headers)))), 2_000);
+    }
+
+    #[test]
+    fn delay_retry_after_headers_are_case_insensitive() {
+        // R2: "Retry-After: 5" を返す server でもバックオフが無視されないこと。
+        for name in ["Retry-After", "RETRY-AFTER", "rEtRy-aFtEr"] {
+            let mut headers = HashMap::new();
+            headers.insert(name.to_owned(), "5".to_owned());
+            assert_eq!(delay(1, Some(&info(Some(headers)))), 5_000, "name={name}");
+        }
+    }
+
+    #[test]
+    fn delay_retry_after_ms_headers_are_case_insensitive() {
+        for name in ["Retry-After-Ms", "RETRY-AFTER-MS", "rEtRy-aFtEr-Ms"] {
+            let mut headers = HashMap::new();
+            headers.insert(name.to_owned(), "1500".to_owned());
+            assert_eq!(delay(1, Some(&info(Some(headers)))), 1_500, "name={name}");
+        }
+    }
+
+    #[test]
+    fn delay_lowercase_headers_keep_existing_behavior() {
+        // 小文字キーの既存挙動は不変。
+        let mut headers = HashMap::new();
+        headers.insert("retry-after-ms".to_owned(), "1500".to_owned());
+        headers.insert("retry-after".to_owned(), "5".to_owned());
+        assert_eq!(delay(1, Some(&info(Some(headers)))), 1_500);
     }
 
     #[test]

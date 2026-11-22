@@ -2328,7 +2328,10 @@ fn resolve_legacy_tools_actions(
 }
 
 /// Apply post-load transforms: legacy migrations, plugin dedup, provider normalization.
-fn apply_post_load_transforms(config: &mut Config) {
+///
+/// Public so the server can normalize PATCH-merged config the same way the
+/// startup loader does. Only key names are logged, never values.
+pub fn apply_post_load_transforms(config: &mut Config) {
     // Migrate deprecated `mode` field to `agent` field. The warning names only
     // the keys — never the mode names or any other config value.
     if let Some(mode_configs) = config.mode.take() {
@@ -2658,6 +2661,8 @@ pub fn update_config(project_dir: &Path, patch: &Config) -> Result<()> {
 
     let mut merged = existing;
     merged.merge(patch.clone());
+    // PATCH 経由のマージ結果も起動時ロードと同じ正規化を適用する。
+    apply_post_load_transforms(&mut merged);
 
     let json =
         serde_json::to_string_pretty(&merged).with_context(|| "Failed to serialize config")?;
@@ -2705,6 +2710,8 @@ pub fn update_global_config(patch: &Config) -> Result<()> {
 
     let mut merged = existing;
     merged.merge(patch.clone());
+    // PATCH 経由のマージ結果も起動時ロードと同じ正規化を適用する。
+    apply_post_load_transforms(&mut merged);
 
     let json =
         serde_json::to_string_pretty(&merged).with_context(|| "Failed to serialize config")?;
@@ -5276,6 +5283,52 @@ mod agent_steps_normalization_tests {
         assert_eq!(entries["zero"].max_steps, None);
         assert_eq!(entries["positive"].steps, Some(3));
         assert_eq!(entries["positive"].max_steps, Some(5));
+    }
+
+    // ── R2 regression: PATCH 経由の更新にも post-load transforms を適用 ──
+    #[test]
+    fn update_config_applies_post_load_transforms_like_startup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // find-up を止め、祖先の設定へ依存しないようにする。
+        fs::create_dir_all(temp.path().join(".git")).expect("git dir");
+        fs::write(
+            temp.path().join("opencode.json"),
+            r#"{"agent":{"zero":{"steps":0,"max_steps":0}}}"#,
+        )
+        .expect("config file");
+
+        let patch: Config = serde_json::from_str(
+            r#"{
+                "mode": {"legacy-agent": {"model": "legacy-model"}},
+                "tools": {"write": true},
+                "agent": {"zero": {"steps": 0, "max_steps": 0}}
+            }"#,
+        )
+        .expect("patch");
+
+        update_config(temp.path(), &patch).expect("update config");
+
+        let written = fs::read_to_string(temp.path().join("opencode.json")).expect("written");
+        let updated: Config = serde_json::from_str(&written).expect("parse written");
+
+        // 起動時ロードと同じ正規化結果になること。
+        let mut loader = ConfigLoader::new().without_global_config();
+        let loaded = loader.load_all(temp.path()).expect("load config");
+
+        for config in [&updated, &loaded] {
+            assert!(config.mode.is_none(), "mode must be migrated to agent");
+            assert!(
+                config.tools.is_none(),
+                "tools must be migrated to permission"
+            );
+            let entries = &config.agent.as_ref().expect("agent configs").entries;
+            let zero = entries.get("zero").expect("zero agent");
+            assert_eq!(zero.steps, None, "steps=0 must be normalized");
+            assert_eq!(zero.max_steps, None, "max_steps=0 must be normalized");
+            let legacy = entries.get("legacy-agent").expect("legacy agent");
+            assert_eq!(legacy.model.as_deref(), Some("legacy-model"));
+            assert!(config.permission.is_some(), "permission must be populated");
+        }
     }
 }
 
