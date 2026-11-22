@@ -1645,6 +1645,64 @@ impl OpenAIResponsesLanguageModel {
     }
 }
 
+/// Build an opaque attachment object for a code-interpreter image output.
+///
+/// The URL is retained verbatim as part data and is never logged or embedded
+/// in an error. MIME is inferred conservatively from an explicit `data:` URL or
+/// a file extension; anything unrecognized falls back to `image/png`.
+fn code_interpreter_image_attachment(url: &str) -> Value {
+    json!({ "mime": infer_image_mime(url), "url": url })
+}
+
+/// Infer an image MIME type from a URL without exposing or logging its value.
+fn infer_image_mime(url: &str) -> &'static str {
+    if let Some(data) = url.strip_prefix("data:") {
+        let declared = data.split([';', ',']).next().unwrap_or("");
+        return match declared {
+            "image/jpeg" => "image/jpeg",
+            "image/gif" => "image/gif",
+            "image/webp" => "image/webp",
+            "image/svg+xml" => "image/svg+xml",
+            _ => "image/png",
+        };
+    }
+    // Ignore any query/fragment so token-bearing query strings are not parsed.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "image/png",
+    }
+}
+
+/// Collect code-interpreter image outputs into attachment values.
+///
+/// Returns `None` when there is no image output, preserving the existing wire
+/// format (no `attachments` key) for logs-only or empty outputs.
+fn code_interpreter_attachments(outputs: Option<&[CodeInterpreterOutput]>) -> Option<Vec<Value>> {
+    let values: Vec<Value> = outputs
+        .into_iter()
+        .flatten()
+        .filter_map(|output| match output {
+            CodeInterpreterOutput::Image { url } => Some(code_interpreter_image_attachment(url)),
+            CodeInterpreterOutput::Logs { .. } => None,
+        })
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_stream_chunk(
     chunk: ResponsesStreamChunk,
@@ -1846,6 +1904,7 @@ fn process_stream_chunk(
                     });
                     *has_function_call = true;
                 }
+                let attachments = code_interpreter_attachments(outputs.as_deref());
                 let output_json = json!({ "outputs": outputs });
                 events.push(StreamEvent::ToolResult {
                     tool_call_id: id,
@@ -1858,7 +1917,7 @@ fn process_stream_chunk(
                             "providerExecuted".to_string(),
                             Value::Bool(true),
                         )]),
-                        attachments: None,
+                        attachments,
                     },
                 });
             }
@@ -1887,6 +1946,14 @@ fn process_stream_chunk(
                 });
             }
             OutputItemDoneItem::ImageGenerationCall { id, result } => {
+                let attachments = if result.is_empty() {
+                    None
+                } else {
+                    Some(vec![json!({
+                        "mime": "image/png",
+                        "url": format!("data:image/png;base64,{}", result),
+                    })])
+                };
                 events.push(StreamEvent::ToolResult {
                     tool_call_id: id,
                     tool_name: "image_generation_call".to_string(),
@@ -1898,7 +1965,7 @@ fn process_stream_chunk(
                             "providerExecuted".to_string(),
                             Value::Bool(true),
                         )]),
-                        attachments: None,
+                        attachments,
                     },
                 });
             }
@@ -2783,6 +2850,258 @@ mod runtime_tests {
             .iter()
             .any(|e| matches!(e, StreamEvent::ToolCallEnd { .. })));
         assert!(has_function_call);
+    }
+
+    // -----------------------------------------------------------------------
+    // R2: ToolResultOutput.attachments 生成の回帰テスト
+    // -----------------------------------------------------------------------
+
+    /// `output_item.done` を処理して ToolResult イベント群を返すテストヘルパー。
+    fn process_item_done(item: OutputItemDoneItem) -> Vec<StreamEvent> {
+        let mut finish_reason = FinishReason::Unknown;
+        let mut usage = ResponsesUsage::default();
+        let mut logprobs = Vec::new();
+        let mut response_id = None;
+        let mut ongoing_tool_calls = HashMap::new();
+        let mut has_function_call = false;
+        let mut active_reasoning = HashMap::new();
+        let mut current_reasoning_output_index = None;
+        let mut reasoning_item_to_output_index = HashMap::new();
+        let mut current_text_id = None;
+        let mut text_open = false;
+        let mut service_tier = None;
+
+        process_stream_chunk(
+            ResponsesStreamChunk::OutputItemDone {
+                output_index: 0,
+                item,
+            },
+            &mut finish_reason,
+            &mut usage,
+            &mut logprobs,
+            &mut response_id,
+            &mut ongoing_tool_calls,
+            &mut has_function_call,
+            &mut active_reasoning,
+            &mut current_reasoning_output_index,
+            &mut reasoning_item_to_output_index,
+            &mut current_text_id,
+            &mut text_open,
+            &mut service_tier,
+        )
+    }
+
+    /// 単一の ToolResultOutput を取り出すテストヘルパー。
+    fn single_tool_result_output(events: &[StreamEvent]) -> ToolResultOutput {
+        let mut outputs = events.iter().filter_map(|event| match event {
+            StreamEvent::ToolResult { output, .. } => Some(output.clone()),
+            _ => None,
+        });
+        let output = outputs.next().expect("expected a ToolResult event");
+        assert!(outputs.next().is_none(), "expected exactly one ToolResult");
+        output
+    }
+
+    /// CodeInterpreterCall の画像出力が attachments へ変換されること。
+    /// logs 出力は添付せず、既存 output JSON は不変。
+    #[test]
+    fn code_interpreter_image_outputs_become_attachments() {
+        let events = process_item_done(OutputItemDoneItem::CodeInterpreterCall {
+            id: "ci_1".to_string(),
+            code: Some("print(1)".to_string()),
+            container_id: "container_1".to_string(),
+            outputs: Some(vec![
+                CodeInterpreterOutput::Logs {
+                    logs: "1".to_string(),
+                },
+                CodeInterpreterOutput::Image {
+                    url: "https://example.test/out.png".to_string(),
+                },
+            ]),
+        });
+
+        let output = single_tool_result_output(&events);
+        let attachments = output
+            .attachments
+            .expect("image output must produce attachments");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "only image outputs become attachments"
+        );
+        assert_eq!(attachments[0]["mime"], "image/png");
+        assert_eq!(attachments[0]["url"], "https://example.test/out.png");
+        assert!(attachments[0].get("filename").is_none());
+        assert!(
+            output.output.contains("out.png"),
+            "existing output JSON keeps the original outputs"
+        );
+    }
+
+    /// data URL / 拡張子から MIME を控えめに推論すること。
+    /// クエリ文字列は MIME 推論に使わず、URL はそのまま保持する。
+    #[test]
+    fn code_interpreter_image_mime_is_inferred_from_url() {
+        let events = process_item_done(OutputItemDoneItem::CodeInterpreterCall {
+            id: "ci_2".to_string(),
+            code: None,
+            container_id: "container_2".to_string(),
+            outputs: Some(vec![
+                CodeInterpreterOutput::Image {
+                    url: "data:image/jpeg;base64,AAAA".to_string(),
+                },
+                CodeInterpreterOutput::Image {
+                    url: "https://example.test/plot.svg?download=1".to_string(),
+                },
+            ]),
+        });
+
+        let attachments = single_tool_result_output(&events)
+            .attachments
+            .expect("attachments must be present");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0]["mime"], "image/jpeg");
+        assert_eq!(attachments[1]["mime"], "image/svg+xml");
+        assert_eq!(
+            attachments[1]["url"],
+            "https://example.test/plot.svg?download=1"
+        );
+    }
+
+    /// 画像出力が無い code_interpreter は attachments を出さない（wire 不変）。
+    #[test]
+    fn code_interpreter_without_image_keeps_attachments_none() {
+        for outputs in [
+            None,
+            Some(Vec::new()),
+            Some(vec![CodeInterpreterOutput::Logs {
+                logs: "ok".to_string(),
+            }]),
+        ] {
+            let events = process_item_done(OutputItemDoneItem::CodeInterpreterCall {
+                id: "ci_3".to_string(),
+                code: None,
+                container_id: "container_3".to_string(),
+                outputs,
+            });
+            assert!(
+                single_tool_result_output(&events).attachments.is_none(),
+                "no image output must keep attachments None"
+            );
+        }
+    }
+
+    /// ImageGenerationCall の base64 result が data URL 添付へ変換されること。
+    #[test]
+    fn image_generation_result_becomes_data_url_attachment() {
+        let b64 = "iVBORw0KGgoAAAANSUhEUg==";
+        let events = process_item_done(OutputItemDoneItem::ImageGenerationCall {
+            id: "img_1".to_string(),
+            result: b64.to_string(),
+        });
+
+        let output = single_tool_result_output(&events);
+        let attachments = output
+            .attachments
+            .expect("image generation must produce attachment");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["mime"], "image/png");
+        assert_eq!(
+            attachments[0]["url"],
+            format!("data:image/png;base64,{}", b64)
+        );
+        assert_eq!(
+            output.output, b64,
+            "existing output text must remain unchanged"
+        );
+    }
+
+    /// 空の ImageGeneration result は attachments を出さない。
+    #[test]
+    fn image_generation_empty_result_keeps_attachments_none() {
+        let events = process_item_done(OutputItemDoneItem::ImageGenerationCall {
+            id: "img_2".to_string(),
+            result: String::new(),
+        });
+
+        let output = single_tool_result_output(&events);
+        assert!(output.attachments.is_none());
+        assert!(output.output.is_empty());
+    }
+
+    /// web_search / file_search は従来どおり attachments を出さない。
+    /// file_search の results は従来の output JSON に残る。
+    #[test]
+    fn web_search_and_file_search_keep_attachments_none() {
+        let web = process_item_done(OutputItemDoneItem::WebSearchCall {
+            id: "web_1".to_string(),
+            status: "completed".to_string(),
+            action: Some(json!({"queries": ["x"]})),
+        });
+        assert!(single_tool_result_output(&web).attachments.is_none());
+
+        let file = process_item_done(OutputItemDoneItem::FileSearchCall {
+            id: "file_1".to_string(),
+            queries: Some(vec!["q".to_string()]),
+            results: Some(vec![FileSearchResult {
+                attributes: HashMap::new(),
+                file_id: "file_x".to_string(),
+                filename: "doc.txt".to_string(),
+                score: 0.9,
+                text: "body".to_string(),
+            }]),
+        });
+        let output = single_tool_result_output(&file);
+        assert!(output.attachments.is_none());
+        assert!(
+            output.output.contains("doc.txt"),
+            "file search results must stay in the existing output JSON"
+        );
+    }
+
+    /// 添付変換は URL / base64 をトレースログやエラーへ出さないこと。
+    #[test]
+    fn attachment_conversion_does_not_expose_urls_or_base64_in_logs() {
+        let capture = UsageWarnCapture::default();
+        let marker_b64 = "BASE64_MARKER_DO_NOT_LOG";
+        let marker_url = "https://example.test/TOKEN_MARKER/image.png";
+
+        let (ci_events, gen_events) = tracing::subscriber::with_default(capture.clone(), || {
+            (
+                process_item_done(OutputItemDoneItem::CodeInterpreterCall {
+                    id: "ci_4".to_string(),
+                    code: None,
+                    container_id: "container_4".to_string(),
+                    outputs: Some(vec![CodeInterpreterOutput::Image {
+                        url: marker_url.to_string(),
+                    }]),
+                }),
+                process_item_done(OutputItemDoneItem::ImageGenerationCall {
+                    id: "img_3".to_string(),
+                    result: marker_b64.to_string(),
+                }),
+            )
+        });
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert!(
+            events.is_empty(),
+            "attachment conversion must not emit tracing events"
+        );
+        for (event, message) in events.iter() {
+            assert!(!event.contains("TOKEN_MARKER") && !message.contains("TOKEN_MARKER"));
+            assert!(!event.contains(marker_b64) && !message.contains(marker_b64));
+        }
+        drop(events);
+
+        // 値は part data として保持される（ログに出さないだけで破棄しない）。
+        let ci_out = single_tool_result_output(&ci_events);
+        assert_eq!(ci_out.attachments.unwrap()[0]["url"], marker_url);
+        let gen_out = single_tool_result_output(&gen_events);
+        assert!(gen_out.attachments.unwrap()[0]["url"]
+            .as_str()
+            .unwrap()
+            .contains(marker_b64));
     }
 
     #[tokio::test]
