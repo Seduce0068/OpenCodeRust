@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **Agent part の status が pending のまま更新されない**
-  — `session/message.rs:234-244` / AGENT-PART-PENDING / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[Agent part status 1 件]** task 成否を completed/error へ反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[キュー再試行 1 件]** 上限超過を failed 終端化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP ディスク同期 1 件]** 削除・無効化をインメモリへ反映
@@ -737,6 +737,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（Agent part status の修正時）: 親が TaskInput に
+  `#[serde(alias = "subagent")]` を追加（LLM への指示文 `subagent:` と
+  実 TaskTool の引数名の不一致を解消）。残存（記録のみ）: Err のみを成否
+  根拠にしている、同名全件更新のため反復 task 呼び出しの 2 回目以降が
+  no-op（子が全件更新を選択、决定済み仕様）。親がテストの text part 混在
+  と wire の part_type ネストを直接修正。
 - 2026-11-22 R4 残存（キュー再試行の修正時、記録のみ）: DB 読取失敗経路は
   queue_id 不明のため None を渡し failed 化できない。DB 障害が永続する場合は
   再起動時の再投入で attempt がリセットされる（運用監視でカバー、または
