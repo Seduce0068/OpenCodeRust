@@ -239,6 +239,12 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **McpClient::close が in-flight receive() とデッドロック**
+  — `mcp/client.rs:892` / SIG-01 / 中（high）
+- [ ] **StdioTransport が stderr を未ドレインで子がブロック**
+  — `mcp/transport.rs:127` / SIG-02 / 中
+- [ ] **BashTool がパイプ EOF を待ち背景子で Timeout**
+  — `tool/bash.rs:402` / SIG-03 / 中
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -266,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[clipboard zombie 1 件]** 書込失敗時も子を reap
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP SSE 再接続 2 件]** 旧リスナ abort と violation/Notify リセット
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[乱数並行安全性 1 件]** Math.random を CAS 更新へ
@@ -765,6 +773,14 @@ status: current
 
 ## メモ
 
+- 2026-11-23 却下（FILEIO-01、apply_patch 末尾改行）: 子が元ファイルの
+  末尾改行を復元する修正を実装したが、既存テスト 5 件が「末尾改行は付かない」
+  と明記して仕様化しており（OpenCode 互換）、discovery の「バグ」判定は
+  誤検知。親が差分を `git checkout --` で取り消し、全テスト green を再確認。
+- 2026-11-23 cross-skill 集約（swarm221、2 担当・13 件、観点: ファイル IO /
+  シグナル）: clipboard の zombie 回収 1 件を coding、他 12 件を triage。
+  R4 指摘なし。残存には MCP close デッドロック（SIG-01 high）、stderr
+  未ドレイン（SIG-02/04）、BashTool の EOF 待ち（SIG-03）等がある。
 - 2026-11-23 R4 残存（MCP SSE 再接続の修正時、2 回目のレビューで停止）:
   close() が Notify 差し替え時に待機中の receive() を古い Notify へ取り残す
   可能性、connect() 側の差し替えが回帰テストで未検証（close を挟むため）。
