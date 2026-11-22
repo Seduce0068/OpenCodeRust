@@ -40,6 +40,25 @@ pub const CHOICE_KEY_HINT: &str =
 /// テキスト question のキーヒント。Esc でキャンセルできることを明示する。
 pub const TEXT_KEY_HINT: &str = "Type your answer, Enter to confirm, Esc to cancel";
 
+/// 選択肢のキーヒントを返す。
+///
+/// 先頭 26 件は `a`..`z` の 1 文字（既存表示を不変に保つ）、27 件目以降は
+/// 1 始まりの番号（例: 27 件目は `"27"`）。`u8` 加算は `index < 26` の
+/// 範囲でのみ行うため、159 件目を超えてもオーバーフローせず、
+/// `{` や制御文字も現れない。
+/// 選択肢のキーヒントを返す。
+///
+/// 0..=25 は対応する小文字キー（a..z）で直接選択できる。26 個目以降は
+/// 番号を表示するが、キーボードのダイレクト選択は a..z のみなので、
+/// 这些选择肢は Up/Down / Space / クリックで選ぶ必要がある（R4）。
+fn option_key_hint(index: usize) -> String {
+    if index < 26 {
+        ((b'a' + index as u8) as char).to_string()
+    } else {
+        (index + 1).to_string()
+    }
+}
+
 pub struct QuestionPrompt {
     current_question: Option<QuestionRequest>,
     pub is_open: bool,
@@ -271,7 +290,7 @@ impl QuestionPrompt {
                 let is_selected = self.selected_options.get(i).copied().unwrap_or(false);
                 let is_highlighted = i == self.selected_index;
                 let marker = if is_selected { "[x]" } else { "[ ]" };
-                let key = (b'a' + i as u8) as char;
+                let key = option_key_hint(i);
                 let label_style = if is_highlighted {
                     Style::default().fg(theme.primary).bold()
                 } else {
@@ -608,5 +627,105 @@ mod tests {
         assert!(CHOICE_KEY_HINT.contains("Esc to cancel"));
         assert!(TEXT_KEY_HINT.contains("Enter to confirm"));
         assert!(TEXT_KEY_HINT.contains("Esc to cancel"));
+    }
+
+    #[test]
+    fn option_key_hint_keeps_letters_and_switches_to_numbers() {
+        // 先頭 26 件は既存表示のまま（1 文字の小文字）。
+        assert_eq!(option_key_hint(0), "a");
+        assert_eq!(option_key_hint(25), "z");
+        // 27 件目以降は 1 始まりの番号。
+        assert_eq!(option_key_hint(26), "27");
+        assert_eq!(option_key_hint(158), "159");
+        assert_eq!(option_key_hint(159), "160");
+        assert_eq!(option_key_hint(999), "1000");
+    }
+
+    #[test]
+    fn option_key_hint_never_emits_braces_or_control_chars() {
+        // 旧実装では 27 件目が '{' になり、160 件目で u8 加算がオーバーフローした。
+        for index in 0..2000 {
+            let key = option_key_hint(index);
+            assert!(
+                key.chars().all(|c| c.is_ascii_alphanumeric()),
+                "key for option {index} was {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_many_options_shows_numbers_for_27th_onward() {
+        let options: Vec<QuestionOption> = (0..30)
+            .map(|i| QuestionOption {
+                id: format!("opt_{i}"),
+                label: format!("Option {i}"),
+            })
+            .collect();
+        let mut prompt = QuestionPrompt::new();
+        prompt.ask(QuestionRequest {
+            id: "qst_many".to_string(),
+            question: "Pick one".to_string(),
+            question_type: QuestionType::SingleChoice,
+            options,
+        });
+        let theme = Theme::default();
+
+        // 30 件すべてが収まる高さで描画し、文字→番号の境界を検証する。
+        let text = render_to_string(80, 40, |frame| {
+            prompt.render(frame, Rect::new(0, 0, 80, 40), &theme);
+        });
+
+        assert!(
+            text.contains("(a) Option 0"),
+            "first option must stay a letter"
+        );
+        assert!(text.contains("(z) Option 25"), "26th option must stay z");
+        assert!(
+            text.contains("(27) Option 26"),
+            "27th option must be numbered"
+        );
+        assert!(
+            text.contains("(30) Option 29"),
+            "last option must be numbered"
+        );
+        assert!(!text.contains("{"), "no brace key hint must be rendered");
+    }
+
+    #[test]
+    fn render_beyond_159_options_does_not_panic() {
+        // 旧実装は i=159 で b'a' + 159 > 255 となり debug ビルドでパニックした。
+        // 表示領域は小さくても content 構築時に全選択肢のキーが計算されるため、
+        // このテストはオーバーフロー回帰を確実に検出できる。
+        let options: Vec<QuestionOption> = (0..160)
+            .map(|i| QuestionOption {
+                id: format!("opt_{i}"),
+                label: format!("Option {i}"),
+            })
+            .collect();
+        let mut prompt = QuestionPrompt::new();
+        prompt.ask(QuestionRequest {
+            id: "qst_overflow".to_string(),
+            question: "Pick one".to_string(),
+            question_type: QuestionType::SingleChoice,
+            options,
+        });
+        let theme = Theme::default();
+
+        let text = render_to_string(80, 24, |frame| {
+            prompt.render(frame, Rect::new(0, 0, 80, 24), &theme);
+        });
+
+        // 160 件は 24 行の枠からあふれるためヒント行は描画されない。
+        // ここでは render が完了してパニックしないことと、括弧キーが出ないことを確認する。
+        assert!(!text.is_empty(), "render must complete without panic");
+        // 最大 26 個目まで文字キー、27 個目以降は番号。'{'+ や制御文字は出ない。
+        assert!(
+            !text.contains('{'),
+            "brace must not be rendered as a key hint"
+        );
+        assert!(
+            text.bytes().all(|b| b >= 0x20 || b == b'\n'),
+            "control characters must not be rendered"
+        );
     }
 }

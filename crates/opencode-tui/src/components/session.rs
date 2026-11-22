@@ -15,7 +15,7 @@ use ratatui::{
 };
 
 use super::message_palette;
-use super::sidebar::SidebarState;
+use super::sidebar::{context_usage_percent, SidebarState};
 use crate::components::{Prompt, Sidebar};
 use crate::context::{AppContext, Message, MessagePart, MessageRole, SidebarMode};
 
@@ -318,8 +318,7 @@ impl SessionView {
 
                 let mut context_text = format_number(total_tokens);
                 if model_context_limit > 0 {
-                    let pct =
-                        ((total_tokens as f64 / model_context_limit as f64) * 100.0).round() as u64;
+                    let pct = context_usage_percent(total_tokens, model_context_limit);
                     context_text.push_str(&format!(" {}%", pct));
                 }
 

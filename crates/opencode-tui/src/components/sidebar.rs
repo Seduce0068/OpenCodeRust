@@ -298,8 +298,7 @@ impl Sidebar {
                         Span::styled(format_number(total_tokens), Style::default().fg(theme.text)),
                     ];
                     if model_context_limit > 0 && total_tokens > 0 {
-                        let used_pct = ((total_tokens as f64 / model_context_limit as f64) * 100.0)
-                            .round() as u64;
+                        let used_pct = context_usage_percent(total_tokens, model_context_limit);
                         spans.push(Span::styled(
                             format!("  {}%", used_pct),
                             Style::default().fg(theme.text_muted),
@@ -653,6 +652,20 @@ fn split_path_segments(path: &str) -> (String, String) {
     (String::new(), path.to_string())
 }
 
+/// コンテキストウィンドウの使用率（%）を 100 を上限として返す。
+///
+/// `total_tokens` が `context_limit` を超えても 100% を超えて表示しない。
+/// 100% 以下の丸め挙動は変更しない。純粋関数にすることでヘッダーと
+/// サイドバーで同じ値を使い、回帰テストを直接記述できるようにする。
+pub(crate) fn context_usage_percent(total_tokens: u64, context_limit: u64) -> u64 {
+    if context_limit == 0 {
+        return 0;
+    }
+    ((total_tokens as f64 / context_limit as f64) * 100.0)
+        .min(100.0)
+        .round() as u64
+}
+
 fn format_number(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + (digits.len() / 3));
@@ -730,5 +743,31 @@ mod tests {
         assert_eq!(format_number(999), "999");
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn context_usage_percent_caps_over_limit_at_100() {
+        // 回帰: 従前は 150/100 が 150% と表示されていた。
+        assert_eq!(context_usage_percent(150, 100), 100);
+        assert_eq!(context_usage_percent(123, 100), 100);
+        assert_eq!(context_usage_percent(u64::MAX, 1), 100);
+    }
+
+    #[test]
+    fn context_usage_percent_keeps_existing_rounding_at_or_below_limit() {
+        assert_eq!(context_usage_percent(100, 100), 100);
+        assert_eq!(context_usage_percent(99, 100), 99);
+        assert_eq!(context_usage_percent(50, 100), 50);
+        assert_eq!(context_usage_percent(0, 100), 0);
+        assert_eq!(context_usage_percent(1, 3), 33);
+        assert_eq!(context_usage_percent(2, 3), 67);
+        // 99.6% は丸めて 100% になる（従来どおり）。
+        assert_eq!(context_usage_percent(996, 1000), 100);
+    }
+
+    #[test]
+    fn context_usage_percent_zero_limit_is_zero() {
+        assert_eq!(context_usage_percent(0, 0), 0);
+        assert_eq!(context_usage_percent(1_000, 0), 0);
     }
 }
