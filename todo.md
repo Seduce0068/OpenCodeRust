@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[provider 添付生成 1 件]** 画像出力から ToolResult attachments を生成
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[ToolResult 添付 2 件]** FilePart 保持と本番 prompt/HTTP wire への配線
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ID/Part 境界 7 件]** timestamp・todo ID・旧 JSON 互換・要約 redact
@@ -727,6 +729,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（却下、provider 添付生成の修正時）: 「非画像 MIME が
+  伝播する」「大文字拡張子を取りこぼす」の 2 件を指摘されたが、親が read で
+  事実確認した結果、前者は match が許容リスト方式で text/html 等は既に
+  image/png へフォールバック、後者は `to_ascii_lowercase()` で既に対応済み
+  （符号化クエリ %3F は「クエリをパースしない」設計と整合）。コード変更不要
+  と判断し却下。親が clippy manual_pattern_char_comparison 2 件を直接修正。
 - 2026-11-22 R4 重要指摘（本番配線後も未達の実益）: 実 provider（responses.rs
   の全 ToolResultOutput）が `attachments: Some(...)` を一切生成せず、新規テストの
   モック 1 件のみ。したがって本番配線は仕組みとしては動くが実経路では常に None。
