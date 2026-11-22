@@ -760,7 +760,13 @@ impl ApiClient {
 
     pub fn get_session_status(&self) -> anyhow::Result<HashMap<String, SessionStatusInfo>> {
         let url = format!("{}/session/status", self.base_url);
-        let response = self.client.get(&url).send()?;
+        // reqwest の生エラーは完全な URL（パスを含む）を表示し得るため、
+        // list_sessions と同じく固定文言へ変換する（R4）。
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send session status request"))?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();

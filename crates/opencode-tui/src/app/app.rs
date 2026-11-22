@@ -3045,7 +3045,9 @@ impl App {
         let Ok(sessions) = sessions_result else {
             return;
         };
-        let status_map = client.get_session_status().unwrap_or_default();
+        let Ok(status_map) = client.get_session_status() else {
+            return;
+        };
         {
             let mut session_ctx = self.context.session.write();
             for session in &sessions {
@@ -6023,6 +6025,139 @@ mod tests {
                 .iter()
                 .all(|(path, _)| path.contains("/permission/perm_retry_flow/reply")),
             "both attempts must reuse the original request id"
+        );
+    }
+
+    /// セッション一覧は成功させ、`/session/status` の成否を `status_fails`
+    /// フラグで切り替えられるローカル HTTP スタブ（loopback のみ、外部送信なし）。
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_session_status_api() -> (
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        let status_fails = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let status_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub_fails = Arc::clone(&status_fails);
+        let stub_hits = Arc::clone(&status_hits);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let (status, body) = if first_line.contains("/session/status") {
+                    stub_hits.fetch_add(1, Ordering::SeqCst);
+                    if stub_fails.load(Ordering::SeqCst) {
+                        (
+                            "500 Internal Server Error",
+                            r#"{"type":"error","message":"status failed"}"#,
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"ses_busy_1":{"status":"running","idle":false,"busy":true}}"#,
+                        )
+                    }
+                } else if first_line.contains("/session") {
+                    (
+                        "200 OK",
+                        r#"[{"id":"ses_busy_1","slug":"s","project_id":"p","directory":"","parent_id":null,"title":"Busy Session","version":"1","time":{"created":0,"updated":1,"compacting":null,"archived":null},"revert":null}]"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), status_fails, status_hits)
+    }
+
+    /// セッション一覧ダイアログを TestBackend に描画し、文本内容を返す。
+    fn render_session_list_dialog(dialog: &SessionListDialog) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should initialize");
+        let theme = crate::theme::Theme::default();
+        terminal
+            .draw(|frame| {
+                dialog.render(frame, ratatui::layout::Rect::new(0, 0, 100, 30), &theme);
+            })
+            .expect("draw should succeed");
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn session_status_error_preserves_existing_busy_display() {
+        let (base_url, status_fails, status_hits) = spawn_session_status_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(context);
+        app.session_list_dialog.open(None);
+
+        // 1 回目: status 取得成功（busy=true）→ ビジー表示が描画される。
+        status_fails.store(false, Ordering::SeqCst);
+        app.refresh_session_list_dialog();
+        let before = render_session_list_dialog(&app.session_list_dialog);
+        assert!(
+            before.contains('◌') && before.contains("ses_busy_1"),
+            "successful status refresh must render the busy marker: {before}"
+        );
+
+        // 2 回目: status 取得失敗 → 早期 return し、既存のビジー表示が維持される。
+        status_fails.store(true, Ordering::SeqCst);
+        app.refresh_session_list_dialog();
+        let after = render_session_list_dialog(&app.session_list_dialog);
+        assert_eq!(
+            before, after,
+            "status failure must not overwrite the existing session display"
+        );
+        assert!(
+            after.contains('◌'),
+            "busy session must stay busy after a status fetch error: {after}"
+        );
+        assert_eq!(
+            status_hits.load(Ordering::SeqCst),
+            2,
+            "each refresh must reach the /session/status stub exactly once"
         );
     }
 }
