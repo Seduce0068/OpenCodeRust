@@ -224,6 +224,10 @@ pub struct PermissionPrompt {
     current_index: usize,
     pub is_open: bool,
     last_rendered_area: Cell<Option<Rect>>,
+    /// 直近の描画でボタン行が配置された絶対 row。
+    /// resource やヒントが折り返すとボタン行は末尾から固定ではないため、
+    /// 描画時に実際の位置を記録してクリック判定に使う。
+    last_rendered_button_row: Cell<Option<u16>>,
     pending_action: Option<PermissionAction>,
 }
 
@@ -234,6 +238,7 @@ impl PermissionPrompt {
             current_index: 0,
             is_open: false,
             last_rendered_area: Cell::new(None),
+            last_rendered_button_row: Cell::new(None),
             pending_action: None,
         }
     }
@@ -296,10 +301,6 @@ impl PermissionPrompt {
         if !self.is_open || self.requests.is_empty() {
             return;
         }
-        // Button row is the last content line inside the border.
-        // We store the last rendered area to check clicks.
-        // For simplicity, check if the click is on the button hints row
-        // and map x-position to the three buttons.
         if let Some(area) = self.last_rendered_area.get() {
             if row < area.y
                 || row >= area.y + area.height
@@ -308,8 +309,13 @@ impl PermissionPrompt {
             {
                 return;
             }
-            // The button line is at the bottom of the content (area.y + area.height - 2 for border)
-            let button_row = area.y.saturating_add(area.height.saturating_sub(2));
+            // 描画時に記録した実際のボタン行を使う。折り返しでボタン行が
+            // 下に移動してもヒント行を誤って押すことがない。
+            // render を経ていない場合のみ、末尾から 3 行目をフォールバックとする。
+            let button_row = self
+                .last_rendered_button_row
+                .get()
+                .unwrap_or_else(|| area.y.saturating_add(area.height.saturating_sub(3)));
             if row == button_row {
                 // "[y] Allow  [n] Deny  [a] Always allow"
                 // Rough column ranges inside the border:
@@ -333,9 +339,15 @@ impl PermissionPrompt {
     }
 
     /// テスト専用: `render` を経由せずにクリック判定の基準領域を設定する。
+    ///
+    /// 既存テストは `area.y + area.height - 2` をボタン行として前提にしている
+    /// ため、ヘルパーでもその座標を記録して互換性を保つ。本番の `render` は
+    /// 折り返しを考慮した実際のボタン行を記録する。
     #[cfg(test)]
     pub(crate) fn set_last_rendered_area_for_test(&self, area: Rect) {
         self.last_rendered_area.set(Some(area));
+        self.last_rendered_button_row
+            .set(Some(area.y.saturating_add(area.height.saturating_sub(2))));
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -401,7 +413,20 @@ impl PermissionPrompt {
             height,
         );
 
+        // ボタンは content の index 5。直前の行（title / 空行 / Tool /
+        // Resource / 空行）が折り返すとボタン行も下がるため、描画と同じ
+        // 折り返し計算でボタン行の内容内位置を求め、上枠 1 行を足して
+        // 絶対 row を記録する。
+        const BUTTON_CONTENT_INDEX: usize = 5;
+        let rows_before_buttons =
+            wrapped_row_count(&content[..BUTTON_CONTENT_INDEX], content_width);
+        let button_row = popup_area
+            .y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(rows_before_buttons).unwrap_or(u16::MAX));
+
         self.last_rendered_area.set(Some(popup_area));
+        self.last_rendered_button_row.set(Some(button_row));
 
         let paragraph = Paragraph::new(content)
             .block(
@@ -721,9 +746,7 @@ mod tests {
         prompt.add_request(sample_request());
         // Simulate the area that render() would record, without creating a Frame.
         // x=10, y=20, width=40, height=8 -> button row 26, inner origin 11.
-        prompt
-            .last_rendered_area
-            .set(Some(Rect::new(10, 20, 40, 8)));
+        prompt.set_last_rendered_area_for_test(Rect::new(10, 20, 40, 8));
 
         let cases = [
             (11, PermissionAction::Approve),
@@ -743,9 +766,7 @@ mod tests {
     fn handle_click_ignores_outside_area_and_non_button_rows() {
         let mut prompt = PermissionPrompt::new();
         prompt.add_request(sample_request());
-        prompt
-            .last_rendered_area
-            .set(Some(Rect::new(10, 20, 40, 8)));
+        prompt.set_last_rendered_area_for_test(Rect::new(10, 20, 40, 8));
 
         prompt.handle_click(9, 26);
         prompt.handle_click(50, 26);
@@ -766,9 +787,7 @@ mod tests {
         assert!(prompt.take_pending_action().is_none());
 
         prompt.close();
-        prompt
-            .last_rendered_area
-            .set(Some(Rect::new(10, 20, 40, 8)));
+        prompt.set_last_rendered_area_for_test(Rect::new(10, 20, 40, 8));
         prompt.handle_click(11, 26);
         assert!(prompt.take_pending_action().is_none());
     }
@@ -831,12 +850,11 @@ mod tests {
 
     #[test]
     fn handle_click_keeps_button_mapping_with_extra_hint_row() {
-        // ヒント行を追加してもボタン行（area.y + height - 2）の割り当ては不変。
+        // テストヘルパーが記録するボタン行（area.y + height - 2）でも
+        // 列割当ては変わらない。
         let mut prompt = PermissionPrompt::new();
         prompt.add_request(sample_request());
-        prompt
-            .last_rendered_area
-            .set(Some(Rect::new(10, 20, 40, 9)));
+        prompt.set_last_rendered_area_for_test(Rect::new(10, 20, 40, 9));
 
         prompt.handle_click(11, 27);
         assert_eq!(
@@ -849,6 +867,125 @@ mod tests {
         assert_eq!(
             prompt.take_pending_action(),
             Some(PermissionAction::ApproveAlways)
+        );
+    }
+
+    /// render を実際に通し、記録されたボタン行とポップアップ領域を返す。
+    fn render_and_locate_buttons(prompt: &PermissionPrompt) -> (Rect, u16) {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = render_to_string(80, 24, |frame| {
+            prompt.render(frame, area, &theme);
+        });
+        let popup = prompt
+            .last_rendered_area
+            .get()
+            .expect("render must record the popup area");
+        let button_row = prompt
+            .last_rendered_button_row
+            .get()
+            .expect("render must record the button row");
+        (popup, button_row)
+    }
+
+    /// 記録済みのボタン行を押すと 3 種のアクションが返り、
+    /// その 1 行下のヒント行は発動しないことを検証する。
+    fn assert_buttons_clickable_at_recorded_row(
+        prompt: &mut PermissionPrompt,
+        popup: Rect,
+        row: u16,
+    ) {
+        assert!(
+            row > popup.y && row + 1 < popup.y + popup.height,
+            "button row must be an interior row of the popup"
+        );
+        // inner_col = col - (popup.x + 1)。列割当ては従来どおり (<11 / <21)。
+        let cases = [
+            (popup.x + 1 + 3, PermissionAction::Approve),
+            (popup.x + 1 + 15, PermissionAction::Deny),
+            (popup.x + 1 + 30, PermissionAction::ApproveAlways),
+        ];
+        for (col, expected) in cases {
+            prompt.handle_click(col, row);
+            assert_eq!(
+                prompt.take_pending_action(),
+                Some(expected),
+                "click at col={col}, row={row}"
+            );
+        }
+
+        // 旧実装の決め打ち行（末尾から 2 行目）はヒント行なので発動しない。
+        let hint_row = row + 1;
+        for col in [popup.x + 1, popup.x + 1 + 15, popup.x + 1 + 30] {
+            prompt.handle_click(col, hint_row);
+            assert!(
+                prompt.take_pending_action().is_none(),
+                "hint row must not trigger an action: col={col}, row={hint_row}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_records_button_row_and_hint_row_click_is_ignored_for_short_resource() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.add_request(sample_request());
+        let (popup, button_row) = render_and_locate_buttons(&prompt);
+
+        // 短い resource では content 7 行 + 枠 2 行 = 高さ 9。
+        // ボタンは content index 5 -> 上枠の 1 行下を合わせた絶対 row。
+        assert_eq!(popup.height, 9, "short resource should not wrap");
+        assert_eq!(button_row, popup.y + 6);
+        assert_ne!(
+            button_row,
+            popup.y + popup.height - 2,
+            "the old hardcoded row points at the hint line"
+        );
+        assert_buttons_clickable_at_recorded_row(&mut prompt, popup, button_row);
+    }
+
+    #[test]
+    fn render_records_button_row_after_wrapped_resource_and_clicks_still_work() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.add_request(PermissionRequest {
+            id: "perm-long-click".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: format!("HEAD-{} -TAIL", "x".repeat(150)),
+            tool_name: "bash".to_string(),
+        });
+        let (popup, button_row) = render_and_locate_buttons(&prompt);
+
+        // 折り返しでボタン行が下がっても、末尾からの固定値ではなく
+        // 実際に描画された行を指すこと。
+        assert!(popup.height > 9, "long resource should wrap");
+        assert_ne!(
+            button_row,
+            popup.y + popup.height - 2,
+            "the old hardcoded row must not match the recorded button row"
+        );
+        assert_buttons_clickable_at_recorded_row(&mut prompt, popup, button_row);
+    }
+
+    #[test]
+    fn handle_click_falls_back_to_third_row_from_bottom_without_recorded_button_row() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.add_request(sample_request());
+        // render もテストヘルパーも通さず、領域だけを設定した未 render 状態。
+        assert!(prompt.last_rendered_button_row.get().is_none());
+        prompt
+            .last_rendered_area
+            .set(Some(Rect::new(10, 20, 40, 8)));
+
+        prompt.handle_click(11, 25);
+        assert_eq!(
+            prompt.take_pending_action(),
+            Some(PermissionAction::Approve),
+            "fallback row is area.y + area.height - 3"
+        );
+
+        prompt.handle_click(11, 26);
+        assert!(
+            prompt.take_pending_action().is_none(),
+            "the row one below the fallback is not a button row"
         );
     }
 }
