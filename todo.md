@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[codemode 2 件]** NaN ソート順序と truncated 判定
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[McpClient close 1 件]** in-flight receive とデッドロックしない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[BashTool 完了判定 1 件]** 背景子の EOF 待ちでハングしない
@@ -773,6 +775,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm226、2 担当・2 件、観点: コレクション /
+  状態遷移）: 両件を read で事実確認し即座 coding（Array.sort の NaN を
+  unorderable として末尾退避、bound_output の truncated を Some/None 根拠に）。
+  親が clippy explicit_auto_deref 2 件を直接修正。R4 指摘なし。
 - 2026-11-23 R4 指摘（McpClient close の修正時）: 親が notify_waiters() を
   notify_one()（permit 保存で notified 登録前の競合を解消）へ、progress 側の
   timeout 分岐で shutdown 再確認・hard_deadline チェックを shutdown の後ろへ
