@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[compact status 1 件]** Archived/Completed を往復で復元
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[ログ redact 2 件]** SSE エラー・chat_stream 開始エラーの生出力防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定/状態不変 3 件]** timeout 0・archive 解除・steps 0
@@ -717,6 +719,10 @@ status: current
 
 ## メモ
 
+- 2026-11-22 R4 指摘（compact status の修正時）: 親が finish_compacting の冪等
+  ガード、skip_deserializing、永続化 Compacting の Archived 救済を直接修正。
+  残存: 永続化を跨ぐ Completed の復元は現スキーマで判定不能（要スキーマ変更
+  または storage 有効時の Archived/Completed compact 拒否の設計判断）。
 - 2026-11-22 cross-skill 集約（swarm185、2 担当・8 件、観点: 型/所有権 /
   構造化ログ一貫性）: 親が high 1 件（MCP SSE エラー生ログ）を read で事実確認、
   2 件（SSE 固定文言化、切断 warn→info）を即座修正。R4 が chat_stream 開始
