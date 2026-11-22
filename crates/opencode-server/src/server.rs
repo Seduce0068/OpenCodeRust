@@ -2480,20 +2480,40 @@ where
     }
 }
 
+/// bind 済み listener の実アドレスから state URL を組み立てる（NET-05）。
+///
+/// `port=0` で bind した場合も `local_addr()` は OS が割り当てた実ポートを返すため、
+/// URL に `:0` が残らない。トークン値やストレージパスは含まない。
+fn state_url_from_listener(listener: &tokio::net::TcpListener) -> anyhow::Result<String> {
+    Ok(format!("http://{}", listener.local_addr()?))
+}
+
 pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
-    let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
+    // NET-05: bind を state 生成より前に移し、port=0 でも実ポートを URL / ログに使う。
+    // port!=0 では local_addr() == addr のため既存出力は不変。
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let state =
+        Arc::new(ServerState::new_with_storage_for_url(state_url_from_listener(&listener)?).await?);
     // serve / web / acp の共通経路。OS シグナルのみで停止する。
     // `_guard` を関数末尾まで生かし、送信側ドロップによる誤停止を防ぐ。
     let (_guard, signal) = shutdown_channel();
-    serve_with_shutdown(addr, state, signal).await
+    serve_with_shutdown(listener, state, signal).await
 }
 
+/// 呼び出し側が所有する `state` を使ってサーバを起動する。
+///
+/// `state` の base URL は更新しない（呼び出し側の契約を維持するため）。
+/// `addr.port() == 0` の場合、ログの "Server listening on" だけが OS が
+/// 割り当てた実ポートを表示する。state URL と実ポートが食い違う点に注意。
 pub async fn run_server_with_state(
     addr: SocketAddr,
     state: Arc<ServerState>,
 ) -> anyhow::Result<()> {
+    // state は呼び出し側が所有するため state URL は更新しない（wire 互換維持）。
+    // ログの実ポートは serve_with_shutdown が listener.local_addr() から取得する。
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     let (_guard, signal) = shutdown_channel();
-    serve_with_shutdown(addr, state, signal).await
+    serve_with_shutdown(listener, state, signal).await
 }
 
 /// TUI がローカルサーバを起動する経路。プログラムからの停止要求も受け付ける。
@@ -2501,13 +2521,19 @@ pub async fn run_server_with_shutdown(
     addr: SocketAddr,
     shutdown: ShutdownSignal,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
-    serve_with_shutdown(addr, state, shutdown).await
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let state =
+        Arc::new(ServerState::new_with_storage_for_url(state_url_from_listener(&listener)?).await?);
+    serve_with_shutdown(listener, state, shutdown).await
 }
 
 /// ルーター構築から graceful shutdown + 最終 flush までの共通実装。
+///
+/// `listener` は呼び出し側で bind 済みのものを受け取る（NET-05）。
+/// ログには `addr` ではなく `listener.local_addr()`（実ポート）を使うため、
+/// `port=0` で起動した場合も実際に割り当てられたポートが出力される。
 async fn serve_with_shutdown(
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     state: Arc<ServerState>,
     shutdown: ShutdownSignal,
 ) -> anyhow::Result<()> {
@@ -2533,9 +2559,10 @@ async fn serve_with_shutdown(
         .layer(middleware::from_fn(request_span_middleware))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    tracing::info!("Server listening on {}", addr);
+    // NET-05: 表示用アドレスは要求された addr ではなく bind 済み listener の実アドレス。
+    // port=0 のとき実際に割り当てられたポートが入り、port!=0 では addr と一致する。
+    let log_addr = listener.local_addr()?;
+    tracing::info!("Server listening on {}", log_addr);
 
     let serve_result = axum::serve(
         listener,
@@ -2565,6 +2592,30 @@ mod tests {
     fn default_server_url_is_the_shared_loopback_endpoint() {
         // server クレートが唯一の定義元。CLI はこの定数を参照する。
         assert_eq!(DEFAULT_SERVER_URL, "http://127.0.0.1:3000");
+    }
+
+    #[tokio::test]
+    async fn port_zero_bind_uses_real_address_in_state_url() {
+        // NET-05 回帰: port=0 で bind しても state URL / ログに :0 が残らないこと。
+        // run_server / run_server_with_shutdown は bind 後に listener.local_addr() を
+        // state URL へ埋め込むため、ここでその実アドレス由来の URL を検証する。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed in tests");
+        let assigned = listener.local_addr().expect("local addr");
+        assert_ne!(assigned.port(), 0, "OS must assign a real port for port=0");
+
+        let state_url = state_url_from_listener(&listener).expect("state url from bound listener");
+        let parsed = Url::parse(&state_url).expect("state url must be a valid URL");
+        assert_eq!(
+            parsed.port(),
+            Some(assigned.port()),
+            "state URL must carry the real bound port, not 0"
+        );
+        assert!(
+            parsed.port().unwrap_or(0) > 0,
+            "state URL must not contain :0"
+        );
     }
 
     #[test]
