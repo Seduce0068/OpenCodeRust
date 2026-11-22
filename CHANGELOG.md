@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T02:21:44+09:00"
+  at: "2026-11-23T02:40:43+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `cli`: attach URL / mcp 排他 / session ID / upgrade の引数検証
+  （swarm-coding R1-R6）
 - `tui`: Ctrl+Shift+C でプロンプト入力をコピーできるように修正
   （swarm-coding R1-R6）
 - `tui`: 背景更新時にセッション一覧の選択を維持（先頭へ戻らない）

@@ -239,16 +239,8 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **`attach` の空 URL が既定ローカルサーバへ黙って接続する**
-  — `cli/main.rs:791` / CLIARG-01 / 中
-- [ ] **`mcp add --url` と `--command` の併用が競合検知されない**
-  — `cli/main.rs:1238` / CLIARG-02 / 中
 - [ ] **存在しない `--agent` が既定 build へ黙ってフォールバック**
   — `cli/main.rs:2795` / CLIARG-05 / 中
-- [ ] **`session delete` が空 ID を許し 0 件削除を成功表示**
-  — `cli/main.rs:4651` / CLIARG-06 / 中
-- [ ] **`upgrade <TARGET>` の空文字が暗黙最新版として扱われる**
-  — `cli/main.rs:4265` / CLIARG-09 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -274,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[CLI 引数検証 4 件]** attach URL / mcp 排他 / session ID / upgrade
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[Ctrl+Shift+C 1 件]** プロンプト入力のコピーへルーティング
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[セッション一覧選択 1 件]** 背景更新時も選択を維持
@@ -759,6 +753,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（CLI 引数検証の修正時）: 親が validate_attach_url の
+  scheme/authority 厳格化、mcp add 実行時排他ガード、session/upgrade の
+  trim 済み値使用、attach テストの回帰検出力を直接修正。子のテスト期待
+  （有効入力が Err になる矛盾）も親が空入力へ修正。
 - 2026-11-23 R4 指摘（Ctrl+Shift+C の修正時）: 親が大文字 'C'（crossterm の
   SHIFT 報告）の直接コピー分岐、copy_selection が選択をクリアすることによる
   二重コピー（had_selection 退避）、clippy missing_const_for_thread_local を
