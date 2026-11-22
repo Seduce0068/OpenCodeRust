@@ -1787,6 +1787,19 @@ impl SessionPrompt {
         .await
     }
 
+    /// `task` ツール引数から subagent 名を取り出す。
+    ///
+    /// `TaskTool` の正規パラメータは `subagent_type` だが、プロンプト側の
+    /// 指示文は `subagent` という語を使うため、両方を受け付ける。
+    /// 値が文字列でない場合は `None` を返し、Agent part の更新は行わない。
+    fn task_tool_subagent_name(input: &serde_json::Value) -> Option<String> {
+        let name = input
+            .get("subagent_type")
+            .or_else(|| input.get("subagent"))
+            .and_then(|value| value.as_str())?;
+        Some(name.to_string())
+    }
+
     /// `execute_tool_calls` と同じ処理に、stream で受け取った添付を結び付ける。
     async fn execute_tool_calls_with_attachments(
         session: &mut Session,
@@ -1837,15 +1850,27 @@ impl SessionPrompt {
             default_model,
         );
 
+        let mut agent_status_updates: Vec<(String, &'static str)> = Vec::new();
         let tool_results_msg = {
             let mut msg = SessionMessage::assistant(ctx.session_id.clone());
             for (call_id, tool_name, input) in tool_calls {
+                // `task` ツールが subagent 名を持つ場合、その名前で Agent part を
+                // 対応付ける。input は execute に移動する前に名前を抜き出しておく。
+                let task_agent_name = if tool_name == "task" {
+                    Self::task_tool_subagent_name(&input)
+                } else {
+                    None
+                };
                 let mut tool_ctx = ctx.clone();
                 tool_ctx.call_id = Some(call_id.clone());
                 let result = match tool_registry.execute(&tool_name, input, tool_ctx).await {
                     Ok(result) => (result.output, false),
                     Err(e) => (format!("Error: {}", e), true),
                 };
+
+                if let Some(name) = task_agent_name {
+                    agent_status_updates.push((name, if result.1 { "error" } else { "completed" }));
+                }
 
                 let attachments = stream_attachments.get(&call_id).and_then(|values| {
                     tool_attachments_to_file_parts(values, &ctx.session_id, &msg.id)
@@ -1866,6 +1891,9 @@ impl SessionPrompt {
         };
 
         session.messages.push(tool_results_msg);
+        for (name, status) in agent_status_updates {
+            session.set_agent_part_status(&name, status);
+        }
         let persisted = subsessions.lock().await.clone();
         Self::save_persisted_subsessions(session, &persisted);
         Ok(())
@@ -5908,5 +5936,181 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(!has_null_attachments);
+    }
+
+    // task ツールの成否で Agent part の status が更新されることを検証するスタブ。
+    struct StubTaskTool {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl opencode_tool::Tool for StubTaskTool {
+        fn id(&self) -> &str {
+            "task"
+        }
+
+        fn description(&self) -> &str {
+            "stub task tool"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: opencode_tool::ToolContext,
+        ) -> Result<opencode_tool::ToolResult, opencode_tool::ToolError> {
+            if self.fail {
+                Err(opencode_tool::ToolError::ExecutionError(
+                    "stub failure".to_string(),
+                ))
+            } else {
+                Ok(opencode_tool::ToolResult::simple("stub", "stub output"))
+            }
+        }
+    }
+
+    fn session_with_agent_and_task_call(
+        agent_names: &[&str],
+        task_args: serde_json::Value,
+    ) -> Session {
+        let mut session = Session::new("proj", ".");
+        {
+            let msg = session.add_user_message("go");
+            for name in agent_names {
+                msg.add_agent(*name);
+            }
+        }
+        {
+            let msg = session.add_assistant_message();
+            msg.add_tool_call("call_task", "task", task_args);
+        }
+        session
+    }
+
+    async fn run_task_tool(session: &mut Session, fail: bool) {
+        let registry = Arc::new(opencode_tool::ToolRegistry::new());
+        registry.register(StubTaskTool { fail }).await;
+        let provider: Arc<dyn Provider> = Arc::new(StaticModelProvider::with_model(
+            "mock:mock-model",
+            4096,
+            512,
+        ));
+        let ctx = opencode_tool::ToolContext::new(
+            session.id.clone(),
+            session
+                .messages
+                .last()
+                .map(|m| m.id.clone())
+                .unwrap_or_default(),
+            session.directory.clone(),
+        );
+        SessionPrompt::execute_tool_calls(session, registry, ctx, provider, "mock", "mock-model")
+            .await
+            .expect("execute_tool_calls should succeed");
+    }
+
+    fn agent_statuses(session: &Session) -> Vec<(&str, &str)> {
+        session
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match &p.part_type {
+                PartType::Agent { name, status } => Some((name.as_str(), status.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn task_tool_success_marks_agent_part_completed() {
+        let mut session = session_with_agent_and_task_call(
+            &["build"],
+            serde_json::json!({
+                "subagent_type": "build",
+                "description": "stub",
+                "prompt": "stub"
+            }),
+        );
+
+        run_task_tool(&mut session, false).await;
+
+        assert_eq!(agent_statuses(&session), vec![("build", "completed")]);
+    }
+
+    #[tokio::test]
+    async fn task_tool_failure_marks_agent_part_error() {
+        let mut session = session_with_agent_and_task_call(
+            &["build"],
+            serde_json::json!({
+                "subagent_type": "build",
+                "description": "stub",
+                "prompt": "stub"
+            }),
+        );
+
+        run_task_tool(&mut session, true).await;
+
+        assert_eq!(agent_statuses(&session), vec![("build", "error")]);
+    }
+
+    #[tokio::test]
+    async fn task_tool_no_matching_agent_part_is_noop() {
+        let mut session = session_with_agent_and_task_call(
+            &["build"],
+            serde_json::json!({
+                "subagent_type": "explore",
+                "description": "stub",
+                "prompt": "stub"
+            }),
+        );
+
+        run_task_tool(&mut session, false).await;
+
+        // 対応する Agent part が無ければ何も更新しない。
+        assert_eq!(agent_statuses(&session), vec![("build", "pending")]);
+    }
+
+    #[tokio::test]
+    async fn task_tool_updates_all_duplicate_agent_parts_deterministically() {
+        let mut session = session_with_agent_and_task_call(
+            &["build", "explore", "build"],
+            serde_json::json!({
+                "subagent_type": "build",
+                "description": "stub",
+                "prompt": "stub"
+            }),
+        );
+
+        run_task_tool(&mut session, false).await;
+
+        // 同名は全て更新する（最新のみではない）。決定論的に全件 completed。
+        assert_eq!(
+            agent_statuses(&session),
+            vec![
+                ("build", "completed"),
+                ("explore", "pending"),
+                ("build", "completed"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_tool_accepts_subagent_alias_field() {
+        let mut session = session_with_agent_and_task_call(
+            &["build"],
+            serde_json::json!({
+                "subagent": "build",
+                "description": "stub",
+                "prompt": "stub"
+            }),
+        );
+
+        run_task_tool(&mut session, false).await;
+
+        // プロンプト指示文の "subagent: <name>" にも対応する。
+        assert_eq!(agent_statuses(&session), vec![("build", "completed")]);
     }
 }

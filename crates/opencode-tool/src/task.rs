@@ -51,6 +51,7 @@ impl Default for TaskTool {
 struct TaskInput {
     description: String,
     prompt: String,
+    #[serde(alias = "subagent")]
     subagent_type: String,
     task_id: Option<String>,
     command: Option<String>,

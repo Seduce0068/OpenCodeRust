@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::message_v2::FilePart;
+use crate::session::Session;
 
 fn default_message_created_at() -> DateTime<Utc> {
     DateTime::<Utc>::UNIX_EPOCH
@@ -286,6 +287,31 @@ impl SessionMessage {
     }
 }
 
+impl Session {
+    /// Update the status of pending `Agent` parts that match `name`.
+    ///
+    /// Every `PartType::Agent` whose `name` matches and whose status is still
+    /// `"pending"` is updated in place to `status`. Other parts, and agent parts
+    /// that already left `"pending"`, are left untouched. A name with no
+    /// matching pending agent part is a no-op. Only the existing `status` field
+    /// is rewritten, so the wire shape of the message is unchanged.
+    pub fn set_agent_part_status(&mut self, name: &str, status: &str) {
+        for message in &mut self.messages {
+            for part in &mut message.parts {
+                if let PartType::Agent {
+                    name: part_name,
+                    status: part_status,
+                } = &mut part.part_type
+                {
+                    if part_name.as_str() == name && part_status.as_str() == "pending" {
+                        *part_status = status.to_string();
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +437,98 @@ mod tests {
         msg.add_text("a");
         msg.add_text("b");
         assert_ne!(msg.parts[0].id, msg.parts[1].id);
+    }
+
+    #[test]
+    fn set_agent_part_status_updates_all_matching_pending_parts() {
+        let mut session = Session::new("proj", ".");
+        {
+            let msg = session.add_user_message("go");
+            msg.add_agent("build");
+            msg.add_agent("explore");
+            msg.add_agent("build");
+        }
+
+        session.set_agent_part_status("build", "completed");
+
+        let statuses: Vec<(&str, &str)> = session.messages[0]
+            .parts
+            .iter()
+            .filter_map(|p| match &p.part_type {
+                PartType::Agent { name, status } => Some((name.as_str(), status.as_str())),
+                _ => None,
+            })
+            .collect();
+        // 同名の Agent part は全て更新する（決定論的な全更新ポリシー）。
+        assert_eq!(
+            statuses,
+            vec![
+                ("build", "completed"),
+                ("explore", "pending"),
+                ("build", "completed"),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_agent_part_status_no_match_is_noop() {
+        let mut session = Session::new("proj", ".");
+        {
+            let msg = session.add_user_message("go");
+            msg.add_agent("build");
+        }
+
+        session.set_agent_part_status("explore", "completed");
+
+        assert!(session.messages[0].parts.iter().any(|p| matches!(
+            &p.part_type,
+            PartType::Agent { name, status } if name == "build" && status == "pending"
+        )));
+    }
+
+    #[test]
+    fn set_agent_part_status_does_not_overwrite_non_pending_parts() {
+        let mut session = Session::new("proj", ".");
+        {
+            let msg = session.add_user_message("go");
+            msg.add_agent("build");
+            msg.add_agent("build");
+        }
+        session.set_agent_part_status("build", "completed");
+        session.set_agent_part_status("build", "error");
+
+        // pending を外れた part は二回目の呼び出しで上書きされない（Agent part のみ検査）。
+        assert!(session.messages[0].parts.iter().any(|p| matches!(
+            &p.part_type,
+            PartType::Agent { status, .. } if status == "completed"
+        )));
+        assert!(session.messages[0]
+            .parts
+            .iter()
+            .all(|p| match &p.part_type {
+                PartType::Agent { status, .. } => status == "completed",
+                _ => true,
+            }));
+    }
+
+    #[test]
+    fn set_agent_part_status_keeps_wire_shape() {
+        let mut session = Session::new("proj", ".");
+        {
+            let msg = session.add_user_message("go");
+            msg.add_agent("build");
+        }
+        session.set_agent_part_status("build", "error");
+
+        let value = serde_json::to_value(&session.messages[0]).expect("must serialize");
+        let part = value["parts"]
+            .as_array()
+            .expect("parts array")
+            .iter()
+            .find(|p| p["part_type"]["type"].as_str() == Some("agent"))
+            .expect("agent part exists");
+        assert_eq!(part["part_type"]["type"].as_str(), Some("agent"));
+        assert_eq!(part["part_type"]["status"].as_str(), Some("error"));
+        assert_eq!(part["part_type"]["name"].as_str(), Some("build"));
     }
 }
