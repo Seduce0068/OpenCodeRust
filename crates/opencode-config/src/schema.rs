@@ -972,8 +972,14 @@ pub struct SkillsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WatcherConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignore: Vec<String>,
+    // `ignore: []` is an explicit clear directive; an omitted key must leave
+    // the accumulated value intact. `ExplicitStringList` tracks that presence
+    // bit while its custom serde impl keeps the JSON wire shape as an array.
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub ignore: ExplicitStringList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2262,9 +2268,7 @@ impl DeepMerge for SkillsConfig {
 
 impl DeepMerge for WatcherConfig {
     fn deep_merge(&mut self, other: Self) {
-        if !other.ignore.is_empty() {
-            self.ignore = other.ignore;
-        }
+        merge_explicit_string_list_replace(&mut self.ignore, other.ignore);
     }
 }
 
@@ -2817,6 +2821,81 @@ mod tests {
 
         assert_eq!(base.plugin, vec!["a".to_string()]);
         assert_eq!(base.instructions, vec!["one.md".to_string()]);
+    }
+
+    #[test]
+    fn explicit_empty_watcher_ignore_clears_accumulated_values() {
+        let mut base: Config =
+            serde_json::from_str(r#"{"watcher": {"ignore": ["target"]}}"#).unwrap();
+        let base_watcher = base.watcher.as_ref().expect("base watcher");
+        assert!(base_watcher.ignore.is_explicit());
+        assert_eq!(base_watcher.ignore.as_slice(), &["target".to_string()]);
+
+        let clear: Config = serde_json::from_str(r#"{"watcher": {"ignore": []}}"#).unwrap();
+        let clear_watcher = clear.watcher.as_ref().expect("clear watcher");
+        assert!(clear_watcher.ignore.is_explicit());
+        assert!(clear_watcher.ignore.is_empty());
+
+        base.merge(clear);
+
+        let merged = base.watcher.expect("merged watcher");
+        assert!(
+            merged.ignore.is_empty(),
+            "watcher.ignore: [] must clear lower-precedence values"
+        );
+        assert!(merged.ignore.is_explicit());
+    }
+
+    #[test]
+    fn omitted_watcher_ignore_keeps_accumulated_values() {
+        let mut base: Config =
+            serde_json::from_str(r#"{"watcher": {"ignore": ["target"]}}"#).unwrap();
+
+        // Empty watcher object: the `ignore` key is absent, so it must not clear.
+        let theme_only: Config =
+            serde_json::from_str(r#"{"watcher": {}, "theme": "dark"}"#).unwrap();
+        let overlay_watcher = theme_only.watcher.as_ref().expect("overlay watcher");
+        assert!(!overlay_watcher.ignore.is_explicit());
+
+        base.merge(theme_only);
+        let merged = base.watcher.as_ref().expect("merged watcher");
+        assert_eq!(merged.ignore.as_slice(), &["target".to_string()]);
+
+        // The whole `watcher` key is absent: it must be left untouched too.
+        let no_watcher: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        base.merge(no_watcher);
+        let merged = base.watcher.as_ref().expect("merged watcher");
+        assert_eq!(merged.ignore.as_slice(), &["target".to_string()]);
+    }
+
+    #[test]
+    fn watcher_ignore_serializes_as_array_including_explicit_empty() {
+        let populated: Config =
+            serde_json::from_str(r#"{"watcher": {"ignore": ["target", "dist"]}}"#).unwrap();
+        let json = serde_json::to_value(&populated).unwrap();
+        assert_eq!(
+            json["watcher"]["ignore"],
+            serde_json::json!(["target", "dist"])
+        );
+
+        let explicit: Config = serde_json::from_str(r#"{"watcher": {"ignore": []}}"#).unwrap();
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json["watcher"]["ignore"], serde_json::json!([]));
+
+        let reloaded: Config = serde_json::from_value(json).unwrap();
+        let reloaded_watcher = reloaded.watcher.expect("reloaded watcher");
+        assert!(
+            reloaded_watcher.ignore.is_explicit() && reloaded_watcher.ignore.is_empty(),
+            "watcher.ignore: [] must persist as an explicit clear directive"
+        );
+
+        // An omitted key stays omitted even when the `watcher` object is present.
+        let absent: Config = serde_json::from_str(r#"{"watcher": {}}"#).unwrap();
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json["watcher"].get("ignore").is_none(),
+            "an omitted watcher.ignore key must stay omitted"
+        );
     }
 
     #[test]
