@@ -77,7 +77,11 @@ fn get_parts(input: &str) -> Vec<String> {
 }
 
 fn safe_host(input: &str) -> bool {
-    !input.is_empty() && !input.starts_with('-') && !Regex::new(r"[\s/\\]").unwrap().is_match(input)
+    input != "."
+        && input != ".."
+        && !input.is_empty()
+        && !input.starts_with('-')
+        && !Regex::new(r"[\s/\\]").unwrap().is_match(input)
 }
 
 fn safe_segment(input: &str) -> bool {
@@ -231,11 +235,20 @@ mod tests {
         assert!(!safe_host(""));
         assert!(!safe_host("-evil"));
         assert!(!safe_host("bad host"));
+        assert!(!safe_host("."));
+        assert!(!safe_host(".."));
 
         assert!(safe_segment("repo"));
         assert!(!safe_segment("."));
         assert!(!safe_segment(".."));
         assert!(!safe_segment("a:b"));
+    }
+
+    #[test]
+    fn parse_rejects_dot_and_dot_dot_hosts() {
+        assert!(parse(".:owner/repo").is_none());
+        assert!(parse("..:owner/repo").is_none());
+        assert!(parse("../owner/repo").is_none());
     }
 
     #[test]

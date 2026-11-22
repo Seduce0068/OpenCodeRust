@@ -1460,13 +1460,11 @@ impl ProviderBootstrapState {
                         }
                     }
 
-                    // Apply blacklist
+                    // Apply blacklist (empty/whitespace-only patterns are ignored)
                     if !result.blacklist.is_empty() {
                         if let Some(p) = providers.get_mut(provider_id) {
-                            p.models.retain(|mid, _| {
-                                let lower = mid.to_lowercase();
-                                !result.blacklist.iter().any(|pat| lower.contains(pat))
-                            });
+                            p.models
+                                .retain(|mid, _| !is_model_blacklisted(mid, &result.blacklist));
                         }
                     }
                 }
@@ -2764,6 +2762,19 @@ pub fn bootstrap_config_from_raw(
     }
 }
 
+/// Reports whether a model id matches any blacklist pattern from a custom loader.
+///
+/// Patterns that are empty or whitespace-only are ignored. `str::contains("")`
+/// matches every string, so such a pattern would otherwise remove every model
+/// (and consequently the whole provider). Non-empty patterns are matched
+/// verbatim, preserving the original behavior.
+fn is_model_blacklisted(model_id: &str, blacklist: &[String]) -> bool {
+    let lower = model_id.to_lowercase();
+    blacklist
+        .iter()
+        .any(|pat| !pat.trim().is_empty() && lower.contains(pat))
+}
+
 /// Apply custom loaders to models data, mutating it in place.
 /// This runs each provider's custom loader and applies blacklists, headers,
 /// and option overrides.
@@ -2778,13 +2789,12 @@ pub fn apply_custom_loaders(data: &mut ModelsData) {
             };
             let result = loader.load(&provider_info, None);
 
-            // Apply blacklist: remove models matching any blacklist pattern
+            // Apply blacklist: remove models matching any non-empty pattern
             if !result.blacklist.is_empty() {
                 if let Some(provider) = data.get_mut(provider_id) {
-                    provider.models.retain(|mid, _| {
-                        let lower = mid.to_lowercase();
-                        !result.blacklist.iter().any(|pat| lower.contains(pat))
-                    });
+                    provider
+                        .models
+                        .retain(|mid, _| !is_model_blacklisted(mid, &result.blacklist));
                 }
             }
 
@@ -3811,5 +3821,52 @@ mod tests {
             state.providers.get(fresh_id).and_then(|p| p.key.as_deref()),
             Some("FRESH_DUMMY_TOKEN")
         );
+    }
+
+    #[test]
+    fn blacklist_empty_and_whitespace_patterns_are_ignored() {
+        let models = ["gpt-4", "claude-3", "whisper-1"];
+
+        // `contains("")` is always true and used to erase every model.
+        let empty = vec![String::new()];
+        assert!(models.iter().all(|id| !is_model_blacklisted(id, &empty)));
+
+        let whitespace = vec!["   ".to_string(), "\t".to_string()];
+        assert!(models
+            .iter()
+            .all(|id| !is_model_blacklisted(id, &whitespace)));
+
+        // A real pattern mixed with an empty one must still be applied.
+        let mixed = vec![String::new(), "whisper".to_string()];
+        assert!(!is_model_blacklisted("gpt-4", &mixed));
+        assert!(is_model_blacklisted("whisper-1", &mixed));
+    }
+
+    #[test]
+    fn blacklist_non_empty_patterns_keep_original_matching_behavior() {
+        // 元の挙動どおり、パターンは小文字化せずモデル ID の小文字に対して contains する。
+        let patterns = vec!["whisper".to_string(), "tts".to_string()];
+        assert!(is_model_blacklisted("whisper-1", &patterns));
+        assert!(is_model_blacklisted("gpt-4-tts", &patterns));
+        assert!(!is_model_blacklisted("gpt-4", &patterns));
+
+        // Patterns are never trimmed before matching, so padding stays significant.
+        let padded = vec![" whisper ".to_string()];
+        assert!(!is_model_blacklisted("whisper-1", &padded));
+    }
+
+    #[test]
+    fn apply_custom_loaders_still_removes_models_with_real_blacklist() {
+        let mut provider = provider_info("openai", model_info("gpt-4"));
+        provider
+            .models
+            .insert("whisper-1".to_string(), model_info("whisper-1"));
+        let mut data: ModelsData = HashMap::from([("openai".to_string(), provider)]);
+
+        apply_custom_loaders(&mut data);
+
+        let models = &data["openai"].models;
+        assert!(models.contains_key("gpt-4"));
+        assert!(!models.contains_key("whisper-1"));
     }
 }

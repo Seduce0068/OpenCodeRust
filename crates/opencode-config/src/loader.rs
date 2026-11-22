@@ -2156,8 +2156,14 @@ fn merge_agent_config(target: &mut AgentConfig, source: AgentConfig) {
 /// - For file:// URLs: extracts filename without extension
 /// - For npm packages: extracts package name without version
 pub fn get_plugin_name(plugin: &str) -> String {
-    if plugin.starts_with("file://") {
-        return Path::new(plugin.trim_start_matches("file://"))
+    if let Some(path) = plugin.strip_prefix("file://") {
+        // A traversal or percent-escaped spec is not decoded here, so deriving
+        // a file_stem from it could collide with a legitimate spec's dedup key.
+        let has_dot_component = path.split(['/', '\\']).any(|c| c == "." || c == "..");
+        if has_dot_component || path.contains('%') {
+            return plugin.to_string();
+        }
+        return Path::new(path)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| plugin.to_string());
@@ -5327,11 +5333,27 @@ mod provider_normalization_tests {
     }
 
     #[test]
+    fn get_plugin_name_keeps_traversal_and_escaped_specs_verbatim() {
+        assert_eq!(get_plugin_name("file://../p.js"), "file://../p.js");
+        assert_eq!(get_plugin_name("file://%2e%2e/p.js"), "file://%2e%2e/p.js");
+        assert_eq!(get_plugin_name("file://p%2ejs"), "file://p%2ejs");
+    }
+
+    #[test]
     fn deduplicate_plugins_keeps_last_winning_order() {
         let plugins = vec!["pkg@1".to_owned(), "other@1".to_owned(), "pkg@2".to_owned()];
         assert_eq!(
             deduplicate_plugins(plugins),
             vec!["other@1".to_owned(), "pkg@2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn deduplicate_plugins_does_not_merge_traversal_spec_with_file_spec() {
+        let plugins = vec!["file://../p.js".to_owned(), "file:///tmp/p.js".to_owned()];
+        assert_eq!(
+            deduplicate_plugins(plugins),
+            vec!["file://../p.js".to_owned(), "file:///tmp/p.js".to_owned()]
         );
     }
 

@@ -440,18 +440,21 @@ impl SessionPrompt {
             .unwrap_or("application/octet-stream")
             .to_string();
 
-        if raw_url.starts_with("mcp://") {
+        // RFC 3986 schemes are case-insensitive. Normalise only for dispatch;
+        // downstream parsers accept mixed case and `raw_url` is kept verbatim.
+        let scheme = raw_url.to_ascii_lowercase();
+        if scheme.starts_with("mcp://") {
             self.add_mcp_resource_part(msg, raw_url, &filename, &mime)
                 .await;
             return;
         }
 
-        if raw_url.starts_with("data:") {
+        if scheme.starts_with("data:") {
             self.add_data_url_part(msg, raw_url, &filename, &mime).await;
             return;
         }
 
-        if raw_url.starts_with("file://") {
+        if scheme.starts_with("file://") {
             self.add_file_url_part(msg, raw_url, &filename, &mime, project_root)
                 .await;
             return;
@@ -5344,5 +5347,63 @@ mod tests {
         assert!(summary.starts_with("[Context Compaction Triggered]"));
         assert!(summary.ends_with(&"あ".repeat(166)));
         assert!(!summary.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn add_file_part_dispatches_uppercase_schemes() {
+        let prompt = SessionPrompt::default();
+
+        // DATA: must be decoded as a data URL, not attached as a raw file URL.
+        let mut msg = SessionMessage::user("s", "");
+        prompt
+            .add_file_part(
+                &mut msg,
+                "DATA:text/plain,uppercase-data",
+                Some("note.txt"),
+                Some("text/plain"),
+                "/",
+            )
+            .await;
+        assert!(msg.parts.iter().any(|part| matches!(
+            &part.part_type,
+            PartType::Text { text, .. } if text.as_str() == "uppercase-data"
+        )));
+
+        // MCP:// is parsed by url::Url, which already normalises the scheme.
+        let mut msg = SessionMessage::user("s", "");
+        prompt
+            .add_file_part(
+                &mut msg,
+                "MCP://client/resource",
+                Some("resource.txt"),
+                Some("text/plain"),
+                "/",
+            )
+            .await;
+        assert!(msg.parts.iter().any(|part| matches!(
+            &part.part_type,
+            PartType::Text { text, .. } if text.contains("Reading MCP resource")
+        )));
+
+        // FILE:// must go through add_file_url_part and read the file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("content.txt");
+        std::fs::write(&file, "uppercase-file").unwrap();
+        let url = format!("FILE://{}", file.display());
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut msg = SessionMessage::user("s", "");
+        prompt
+            .add_file_part(
+                &mut msg,
+                &url,
+                Some("content.txt"),
+                Some("text/plain"),
+                &root,
+            )
+            .await;
+        assert!(msg.parts.iter().any(|part| matches!(
+            &part.part_type,
+            PartType::Text { text, .. } if text.as_str() == "uppercase-file"
+        )));
     }
 }

@@ -5448,15 +5448,76 @@ fn normalize_import_payload(payload: SessionImportPayload) -> Vec<SessionExportE
     }
 }
 
-fn parse_share_slug(url: &str) -> Option<String> {
-    let trimmed = url.trim_end_matches('/');
-    if let Some(idx) = trimmed.rfind("/share/") {
-        return Some(trimmed[idx + 7..].to_string());
+/// Extract a share slug from a trusted first-party share URL.
+///
+/// The URL is parsed instead of searched as raw text, so a `/share/` marker in
+/// a query string or fragment can never be mistaken for a path segment. Only
+/// exact first-party hosts are accepted and the slug must be a single safe
+/// path segment. Returns `None` on parse failure or invalid input.
+fn parse_share_slug(input: &str) -> Option<String> {
+    // `opencode.ai` / `www.opencode.ai` are the existing allowed first-party
+    // origins; `share.opencode.ai` is the host used for generated share links.
+    const SHARE_HOSTS: [&str; 3] = ["opencode.ai", "www.opencode.ai", "share.opencode.ai"];
+
+    let parsed = url::Url::parse(input).ok()?;
+    let host = parsed.host_str()?;
+    if !SHARE_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        return None;
     }
-    if let Some(idx) = trimmed.rfind("/s/") {
-        return Some(trimmed[idx + 3..].to_string());
+
+    // A query or fragment is never part of the slug.
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
     }
-    None
+
+    let mut segments: Vec<&str> = parsed.path_segments()?.collect();
+    while segments.last() == Some(&"") {
+        segments.pop();
+    }
+
+    let slug = match segments.as_slice() {
+        [prefix, slug] if *prefix == "share" || *prefix == "s" => *slug,
+        _ => return None,
+    };
+
+    // Reject traversal markers and encoded separators before the slug is
+    // interpolated into the share API URL.
+    if slug.is_empty()
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains('.')
+        || slug.contains('%')
+        || slug.contains('?')
+        || slug.contains('#')
+    {
+        return None;
+    }
+
+    Some(slug.to_string())
+}
+
+/// ユーザー向け文言に埋め込む用の安全な表示名。
+///
+/// URL はクエリ（トークン等）と userinfo を除き host + path のみ、ローカル
+/// パスはファイル名のみにする（完全な入力をログ・エラーへ出さない、R4）。
+fn safe_import_source_label(source: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(source) {
+        let host = parsed.host_str().unwrap_or("<unknown-host>");
+        let path = parsed.path();
+        if path.is_empty() || path == "/" {
+            host.to_string()
+        } else {
+            format!("{host}{path}")
+        }
+    } else {
+        std::path::Path::new(source)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown-source>".to_string())
+    }
 }
 
 async fn import_session_data(file_or_url: String) -> anyhow::Result<()> {
@@ -5478,7 +5539,10 @@ async fn import_session_data(file_or_url: String) -> anyhow::Result<()> {
     let entries = normalize_import_payload(payload);
 
     if entries.is_empty() {
-        anyhow::bail!("No session entries found in {}", file_or_url);
+        anyhow::bail!(
+            "No session entries found in {}",
+            safe_import_source_label(&file_or_url)
+        );
     }
 
     let db = Database::new().await?;
@@ -5504,7 +5568,11 @@ async fn import_session_data(file_or_url: String) -> anyhow::Result<()> {
         imported += 1;
     }
 
-    println!("Imported {} session(s) from {}", imported, file_or_url);
+    println!(
+        "Imported {} session(s) from {}",
+        imported,
+        safe_import_source_label(&file_or_url)
+    );
     Ok(())
 }
 
@@ -8812,5 +8880,63 @@ mod tests {
         assert!(!error.contains("opencode.json"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_share_slug_accepts_legitimate_first_party_share_urls() {
+        assert_eq!(
+            parse_share_slug("https://opencode.ai/share/abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_share_slug("https://opencode.ai/s/abc123").as_deref(),
+            Some("abc123")
+        );
+        // A trailing slash used to be tolerated and must keep working.
+        assert_eq!(
+            parse_share_slug("https://opencode.ai/share/abc/").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_share_slug("https://www.opencode.ai/share/abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_share_slug("https://share.opencode.ai/s/abc").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn parse_share_slug_rejects_foreign_hosts_and_smuggled_markers() {
+        assert_eq!(
+            parse_share_slug("https://attacker.example/?next=/share/abc"),
+            None
+        );
+        assert_eq!(parse_share_slug("https://attacker.example/s/abc"), None);
+        assert_eq!(
+            parse_share_slug("https://opencode.ai.evil.test/share/abc"),
+            None
+        );
+        assert_eq!(
+            parse_share_slug("https://opencode.ai/?next=/share/abc"),
+            None
+        );
+        assert_eq!(parse_share_slug("not a url"), None);
+    }
+
+    #[test]
+    fn parse_share_slug_rejects_unsafe_slug_segments() {
+        assert_eq!(parse_share_slug("https://opencode.ai/share/.."), None);
+        assert_eq!(parse_share_slug("https://opencode.ai/share/a/b"), None);
+        assert_eq!(parse_share_slug("https://opencode.ai/s/a%2Fb"), None);
+        assert_eq!(
+            parse_share_slug("https://opencode.ai/s/abc?next=/share/evil"),
+            None
+        );
+        assert_eq!(
+            parse_share_slug("https://opencode.ai/s/abc#/share/evil"),
+            None
+        );
     }
 }

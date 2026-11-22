@@ -91,7 +91,8 @@ fn find_up(target: &str, start: &Path, stop: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     loop {
         let candidate = current.join(target);
-        if candidate.exists() {
+        // symlink を追従しない（外部ファイルがプロンプトへ注入されるのを防ぐ、R4）。
+        if is_plain_file(&candidate) {
             result.push(candidate);
         }
         if current == stop {
@@ -123,6 +124,36 @@ fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// `Path::is_file()` follows symlinks; `symlink_metadata` does not.
+fn is_plain_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// True when `path` itself or any component from the trusted `root` down to
+/// `path` is a symlink. Missing metadata is treated as unsafe and rejected.
+///
+/// The walk starts at `root` (the worktree/cwd), not at a glob's literal base:
+/// inspecting only components *below* the base would miss a symlink inside the
+/// base itself (e.g. `linked/*.md` where `linked` points outside the worktree).
+fn path_crosses_symlink(path: &Path, root: &Path) -> bool {
+    let relative = match path.strip_prefix(root) {
+        Ok(relative) => relative,
+        Err(_) => return !is_plain_file(path),
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 /// Expand a glob pattern rooted at `cwd`, returning absolute paths.
 fn expand_glob(pattern: &str, cwd: &Path) -> Vec<PathBuf> {
     let full = if Path::new(pattern).is_absolute() {
@@ -133,7 +164,7 @@ fn expand_glob(pattern: &str, cwd: &Path) -> Vec<PathBuf> {
     match glob::glob(&full) {
         Ok(paths) => paths
             .filter_map(|entry| entry.ok())
-            .filter(|p| p.is_file())
+            .filter(|p| is_plain_file(p) && !path_crosses_symlink(p, cwd))
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -179,7 +210,8 @@ fn instruction_source_from_filename(name: &str) -> InstructionSource {
 fn first_matching_file_in_dir(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
     for file in candidates {
         let candidate = dir.join(file);
-        if candidate.exists() && candidate.is_file() {
+        // symlink を追従しない（R4）。
+        if is_plain_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -676,6 +708,29 @@ mod tests {
 
         let matches = expand_glob("*.md", tmp.path());
         assert_eq!(matches.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_glob_expansion_excludes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join(AGENTS_MD), "outside instructions").unwrap();
+        fs::write(tmp.path().join("regular.md"), "regular").unwrap();
+
+        // A symlinked file: is_file() would follow it and read outside content.
+        symlink(outside.path().join(AGENTS_MD), tmp.path().join("linked.md")).unwrap();
+        // glob descends into symlinked directories; their descendants have
+        // plain-file metadata at the leaf and need a component-wise check.
+        symlink(outside.path(), tmp.path().join("linked_dir")).unwrap();
+
+        let matches = expand_glob("*.md", tmp.path());
+        assert_eq!(matches, vec![tmp.path().join("regular.md")]);
+
+        let matches = expand_glob("**/*.md", tmp.path());
+        assert_eq!(matches, vec![tmp.path().join("regular.md")]);
     }
 
     #[test]
