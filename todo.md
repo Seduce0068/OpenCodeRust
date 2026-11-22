@@ -241,6 +241,12 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **global/managed の json/jsonc 優先順と書き戻し選択が逆**
+  — `config/loader.rs:145-153` / CFG-LIFE-02 / 中
+- [ ] **MCP 設定をディスクから削除してもインメモリに残る**
+  — `server/routes.rs:4783-4808` / CFG-LIFE-03 / 中
+- [ ] **キュー投入プロンプトの再試行上限が再起動でリセットされる**
+  — `server/routes.rs:3269-3279` / RETRY-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -266,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定/再試行 2 件]** PATCH 正規化と Retry-After 大小文字対応
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider 添付生成 1 件]** 画像出力から ToolResult attachments を生成
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ToolResult 添付 2 件]** FilePart 保持と本番 prompt/HTTP wire への配線
@@ -729,6 +737,13 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm196、2 担当・8 件、観点: 設定ライフサイクル /
+  再試行バックオフ）: 親が high 1 件（PATCH が transforms を通らない）と
+  medium 1 件（Retry-After 大小文字）を read で事実確認、2 件即座 coding。
+  R4 指摘なし。親が子のテストタイポ（rEtRaY→rEtRy）を直接修正。残存: json
+  優先順と書き戻しの不一致、MCP ディスク同期が追加専用、キュー再試行上限の
+  再起動リセット、PATCH cwd と起動時 cwd の食い違い、inline {file:...}
+  基準と fingerprint、SessionRunStatus::Retry が本番未構築。
 - 2026-11-22 R4 指摘（却下、provider 添付生成の修正時）: 「非画像 MIME が
   伝播する」「大文字拡張子を取りこぼす」の 2 件を指摘されたが、親が read で
   事実確認した結果、前者は match が許容リスト方式で text/html 等は既に
