@@ -287,25 +287,32 @@ mod glob_match {
         let pattern = pattern.trim_start_matches("./");
 
         if pattern.contains('*') {
-            let regex = glob_to_regex(pattern);
-            regex.is_match(&path_str)
+            match glob_to_regex(pattern) {
+                Some(regex) => regex.is_match(&path_str),
+                None => false,
+            }
         } else {
             path_str.ends_with(pattern) || path_str.contains(pattern)
         }
     }
 
-    fn glob_to_regex(pattern: &str) -> regex::Regex {
+    /// glob パターンを正規表現へ変換する。
+    ///
+    /// `*` / `?` / `.` は従来どおり変換し、それ以外の文字は `regex::escape`
+    /// でリテラルとしてエスケープする。コンパイル失敗時は `None` を返し、
+    /// 呼び出し側で「非マッチ」として扱う（全マッチへのフォールバックは行わない）。
+    fn glob_to_regex(pattern: &str) -> Option<regex::Regex> {
         let mut regex_str = String::from("^.*");
         for c in pattern.chars() {
             match c {
                 '*' => regex_str.push_str("[^/]*"),
                 '?' => regex_str.push_str("[^/]"),
                 '.' => regex_str.push_str("\\."),
-                _ => regex_str.push(c),
+                _ => regex_str.push_str(&regex::escape(&c.to_string())),
             }
         }
         regex_str.push('$');
-        regex::Regex::new(&regex_str).unwrap_or_else(|_| regex::Regex::new(".*").unwrap())
+        regex::Regex::new(&regex_str).ok()
     }
 }
 
@@ -392,6 +399,33 @@ mod tests {
         assert!(glob_match::glob_match(
             "./src/main.rs",
             std::path::Path::new("/work/src/main.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_invalid_regex_metacharacter_does_not_match_all() {
+        // ERRPROP-01 回帰: '(' がエスケープされず不正 regex となり、
+        // フォールバックの `.*` で無関係なファイルまでマッチしていた問題。
+        assert!(!glob_match::glob_match(
+            "src/*.rs(",
+            std::path::Path::new("notes.txt")
+        ));
+        assert!(!glob_match::glob_match(
+            "src/*.rs(",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_regex_metacharacters_are_literals() {
+        // regex メタ文字は glob ではリテラル。エスケープ後も字面どおりにマッチする。
+        assert!(glob_match::glob_match(
+            "src/*/[1]+.rs",
+            std::path::Path::new("/work/src/sub/[1]+.rs")
+        ));
+        assert!(!glob_match::glob_match(
+            "src/*/[1]+.rs",
+            std::path::Path::new("/work/src/sub/1.rs")
         ));
     }
 }
