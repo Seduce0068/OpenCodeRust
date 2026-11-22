@@ -241,8 +241,6 @@ status: current
 
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
-- [ ] **PATCH /config の read-modify-write が無ロックでパッチ消失**
-  — `config/loader.rs:2650` / TX-03 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[config 並行更新 1 件]** PATCH の read-modify-write を直列化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[URLSearchParams 1 件]** WHATWG urlencoded 規則（'+' ↔ 空白）
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[トランザクション/エンコーディング 2 件]** cascade 削除・ログ Cf 除去
@@ -761,6 +761,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（config ロックの修正時）: 親が並行回帰テストの
+  ベストエフォート性（Barrier は read 直前の同時解放に過ぎずロック無しでも
+  両キーが残り得る）をコメントに明記。read-modify-write 全体の包絡、
+  poisoned 回収、再帰取得なしは確認済み。
 - 2026-11-23 R4 指摘（URLSearchParams の修正時）: 親が form_encode の
   unreserved 集合を WHATWG 準拠（英数字と `* - . _` のみ、! ~ ' ( ) は %XX）
   へ直接修正。残存 low: 配列初期化子の非 sequence 要素が TypeError に
