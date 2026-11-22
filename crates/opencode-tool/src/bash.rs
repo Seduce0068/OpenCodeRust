@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::LazyLock;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout, Duration};
 
@@ -10,6 +11,14 @@ use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 use opencode_plugin::{HookContext, HookEvent};
 
 const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1000;
+
+/// シェル本体が終了した後も、背景子が stdout / stderr の書込端を保持して
+/// EOF が来ない場合に、パイプへ書き出済みの出力を回収する猶予。
+///
+/// シェルは `exit` 時に stdio を flush してから終了するため、通常この時間は
+/// バッファ済みバイトを読み切るのに十分である。背景子自体は kill せず、
+/// ここでドレインを打ち切って完了扱いにする（timeout 経路とは異なる）。
+const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(75);
 
 /// Parse an optional non-negative `u64` argument. A missing or `null` value
 /// keeps `default`; a negative number or any other JSON type is rejected
@@ -169,6 +178,26 @@ impl Default for BashTool {
     }
 }
 
+/// `read_limited_lines` の保留行を保持し、future がドロップされたときに
+/// 改行なしの末尾行を出力へ flush するガード。
+///
+/// グレース満了でドレイン future がドロップされると EOF を待たずに
+/// `pending` が捨てられ、末尾が改行でない行（例: `printf ok`）が失われる。
+/// EOF 経路で既に flush 済みなら `pending` は `clear()` されているので no-op。
+struct FlushOnDrop<'a> {
+    pending: Vec<u8>,
+    output: &'a mut String,
+    truncated: &'a mut bool,
+}
+
+impl Drop for FlushOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            push_limited_line(&mut self.pending, self.output, self.truncated);
+        }
+    }
+}
+
 /// stdout / stderr を固定サイズのチャンクで読み、1 行を丸ごと確保しない。
 /// 累計が MAX_OUTPUT_BYTES を超えた時点で truncated を立て、以降のバイトは
 /// 破棄する（子プロセスをブロックさせないため EOF まで読み切る）。
@@ -178,30 +207,39 @@ impl Default for BashTool {
 /// それぞれ別の `output` / `truncated` を渡すため、各ストリームが最大
 /// MAX_OUTPUT_BYTES を持ち、結合後の出力は最大 2 * MAX_OUTPUT_BYTES になる。
 /// これは「合計 50KB」ではなく「各ストリーム 50KB」という設計方針である。
+///
+/// 保留行は [`FlushOnDrop`] が保持し、future がドロップされたとき（グレース
+/// 満了によるドレイン打ち切りを含む）に改行なしの末尾行を flush する。
 async fn read_limited_lines<R: AsyncRead + Unpin>(
     mut reader: R,
     output: &mut String,
     truncated: &mut bool,
 ) -> std::io::Result<()> {
-    let mut pending = Vec::new();
+    let mut pending = FlushOnDrop {
+        pending: Vec::new(),
+        output,
+        truncated,
+    };
     let mut buf = [0u8; 8192];
 
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
-            if !pending.is_empty() {
-                push_limited_line(&mut pending, output, truncated);
+            // EOF 経路の flush は従来どおり維持する。push_limited_line が
+            // pending を clear() するため、続く Drop ガードは no-op になる。
+            if !pending.pending.is_empty() {
+                push_limited_line(&mut pending.pending, pending.output, pending.truncated);
             }
             return Ok(());
         }
         for &byte in &buf[..n] {
             if byte == b'\n' {
-                push_limited_line(&mut pending, output, truncated);
-            } else if pending.len() < MAX_OUTPUT_BYTES {
-                pending.push(byte);
+                push_limited_line(&mut pending.pending, pending.output, pending.truncated);
+            } else if pending.pending.len() < MAX_OUTPUT_BYTES {
+                pending.pending.push(byte);
             } else {
                 // 1 行が MAX_OUTPUT_BYTES を超えても行バッファを伸ばさない。
-                *truncated = true;
+                *pending.truncated = true;
             }
         }
     }
@@ -409,48 +447,87 @@ impl Tool for BashTool {
 
         let abort_token = ctx.abort.clone();
 
+        // 両ストリームを同時にドレインする。片方だけを読むと子プロセスが
+        // もう片方のパイプへの書き込みでブロックしデッドロックする。
+        // MAX_OUTPUT_BYTES はストリーム単位の上限: stdout / stderr が
+        // それぞれ最大 50KB を持ち、合計は最大 100KB になる（共有
+        // カウンタではなく per-stream 予算を採用する方針）。
+        //
+        // シェル終了を検知した分岐から同じ future へグレース付きで戻れるよう
+        // Box::pin で所有し、select! の分岐には &mut で渡す。
+        let mut drain = Box::pin(async {
+            let (stdout_result, stderr_result) = tokio::join!(
+                read_limited_lines(stdout, &mut stdout_output, &mut stdout_truncated),
+                read_limited_lines(stderr, &mut stderr_output, &mut stderr_truncated),
+            );
+            if let Err(e) = stdout_result {
+                stdout_output.push_str(&format!("Error reading stdout: {e}\n"));
+            }
+            if let Err(e) = stderr_result {
+                stderr_output.push_str(&format!("Error reading stderr: {e}\n"));
+            }
+        });
+
+        // シェル終了を検知した分岐の ExitStatus を保持し、後段の二重 wait を避ける。
+        let mut shell_status: Option<std::process::ExitStatus> = None;
+        // drain が select! 内で完了したかどうか。完了済み future をグレースで
+        // 再 poll すると "async fn resumed after completion" でパニックするため、
+        // グレース drain は drain が未完了の場合だけ行う。
+        let mut drain_completed = false;
+        // abort 時の kill は select! を抜けた後で行う。wait future が
+        // 保持する child への可変借用と競合しないようにするため。
+        let mut aborted = false;
+
+        // drain 分岐がシェル終了より先に選ばれた場合に timeout の残り時間を
+        // 計算する基準時刻。後段の wait が timeout_ms を超えて
+        // ブロックしないようにするために使う。
+        let start = Instant::now();
+
+        // child.wait() の future はここで一度だけ生成し、select! と後段で同じ
+        // future を poll する。完了後に別の future を作って再 poll すると
+        // Tokio が "async fn resumed after completion" としてパニックするのを避ける。
+        let mut wait = Box::pin(child.wait());
+
         let result = timeout(Duration::from_millis(timeout_ms), async {
             tokio::select! {
+                // ランダム選択だとシェル終了と同時に child.wait() 分岐が選ばれ
+                // aborted=false のまま正常結果を返す取りこぼしがあったため、
+                // abort 分岐を最優先でポールする。
+                biased;
                 _ = abort_token.cancelled() => {
-                    #[cfg(unix)]
-                    {
-                        if let Some(pid) = child_pid {
-                            kill_process_tree(pid).await;
-                        }
-                    }
-                    let _ = child.kill().await;
-                    return Err(ToolError::Cancelled);
+                    aborted = true;
                 }
-                // 両ストリームを同時にドレインする。片方だけを読むと子プロセスが
-                // もう片方のパイプへの書き込みでブロックしデッドロックする。
-                // MAX_OUTPUT_BYTES はストリーム単位の上限: stdout / stderr が
-                // それぞれ最大 50KB を持ち、合計は最大 100KB になる（共有
-                // カウンタではなく per-stream 予算を採用する方針）。
-                _ = async {
-                    let (stdout_result, stderr_result) = tokio::join!(
-                        read_limited_lines(stdout, &mut stdout_output, &mut stdout_truncated),
-                        read_limited_lines(stderr, &mut stderr_output, &mut stderr_truncated),
-                    );
-                    if let Err(e) = stdout_result {
-                        stdout_output.push_str(&format!("Error reading stdout: {e}\n"));
-                    }
-                    if let Err(e) = stderr_result {
-                        stderr_output.push_str(&format!("Error reading stderr: {e}\n"));
-                    }
-                } => {}
+                // 背景子が stdout / stderr の書込端を握って EOF が来なくても、
+                // シェル本体が終了した時点で完了候補にする。残りの出力は
+                // select! を抜けた後の短いグレースで回収する。
+                status = &mut wait => {
+                    shell_status = Some(status.map_err(|e| {
+                        ToolError::execution_with_source(
+                            format!("Failed to wait for process: {}", e),
+                            e,
+                        )
+                    })?);
+                }
+                // 従来どおり、両ストリームが EOF に達したら完了。
+                _ = drain.as_mut() => {
+                    drain_completed = true;
+                }
             }
+            // select! 直後に取りこぼしを確実に拾う（biased の保険）。
+            aborted |= abort_token.is_cancelled();
             Ok::<_, ToolError>(())
         })
         .await;
 
-        let mut output = stdout_output;
-        output.push_str(&stderr_output);
-        let truncated = stdout_truncated || stderr_truncated;
-
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                drop(wait);
+                return Err(e);
+            }
             Err(_) => {
+                // wait の child への可変借用を解放してから kill する。
+                drop(wait);
                 #[cfg(unix)]
                 {
                     if let Some(pid) = child_pid {
@@ -465,9 +542,101 @@ impl Tool for BashTool {
             }
         }
 
-        let status = child.wait().await.map_err(|e| {
-            ToolError::execution_with_source(format!("Failed to wait for process: {}", e), e)
-        })?;
+        if aborted {
+            drop(wait);
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child_pid {
+                    kill_process_tree(pid).await;
+                }
+            }
+            let _ = child.kill().await;
+            return Err(ToolError::Cancelled);
+        }
+
+        // select! が drain 分岐を選んだ場合（stdout / stderr が先に EOF に達し
+        // シェルはまだ終了していない）、shell_status は None のままここへ来る。
+        // この状態で wait を無制限に待つと timeout_ms を超えてハングし、kill
+        // 経路と ToolError::Timeout が走らないため、timeout の残り時間だけ
+        // 同じ future を poll し、超過または Err なら従来の timeout 経路へ入る。
+        if shell_status.is_none() {
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let remaining = timeout_ms.saturating_sub(elapsed_ms);
+            if remaining == 0 {
+                // 残り時間が無い場合は Future を作らず try_wait で即時確認する。
+                drop(wait);
+                match child.try_wait() {
+                    Ok(Some(status)) => shell_status = Some(status),
+                    Ok(None) => {
+                        #[cfg(unix)]
+                        {
+                            if let Some(pid) = child_pid {
+                                kill_process_tree(pid).await;
+                            }
+                        }
+                        let _ = child.kill().await;
+                        return Err(ToolError::Timeout(format!(
+                            "Command timed out after {}ms",
+                            timeout_ms
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(ToolError::execution_with_source(
+                            format!("Failed to wait for process: {}", e),
+                            e,
+                        ))
+                    }
+                }
+            } else {
+                match timeout(Duration::from_millis(remaining), &mut wait).await {
+                    Ok(Ok(status)) => shell_status = Some(status),
+                    Ok(Err(e)) => {
+                        drop(wait);
+                        return Err(ToolError::execution_with_source(
+                            format!("Failed to wait for process: {}", e),
+                            e,
+                        ));
+                    }
+                    Err(_) => {
+                        drop(wait);
+                        #[cfg(unix)]
+                        {
+                            if let Some(pid) = child_pid {
+                                kill_process_tree(pid).await;
+                            }
+                        }
+                        let _ = child.kill().await;
+                        return Err(ToolError::Timeout(format!(
+                            "Command timed out after {}ms",
+                            timeout_ms
+                        )));
+                    }
+                }
+                drop(wait);
+            }
+        } else {
+            drop(wait);
+        }
+
+        // シェルが先に終了し、かつ drain がまだ完了していない場合だけ、
+        // 背景子が書込端を保持していてもグレースの間ドレインを続けて
+        // バッファ済み出力を回収する。drain が select! で完了済みなら再 poll
+        // すると "async fn resumed after completion" でパニックするため行わない。
+        if shell_status.is_some() && !drain_completed {
+            let _ = tokio::time::timeout(EXIT_FLUSH_GRACE, drain.as_mut()).await;
+        }
+        drop(drain); // stdout_output / stderr_output への可変借用を解放する。
+
+        let mut output = stdout_output;
+        output.push_str(&stderr_output);
+        let truncated = stdout_truncated || stderr_truncated;
+
+        let status = match shell_status {
+            Some(status) => status,
+            None => child.wait().await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to wait for process: {}", e), e)
+            })?,
+        };
 
         let exit_code = status.code().unwrap_or(-1);
 
@@ -1628,6 +1797,181 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    // --- SIG-03: 背景子が書込端を保持してもシェル終了で完了すること ---
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_child_holding_stdout_does_not_block_completion() {
+        // シェルは echo の直後に終了するが、背景子が stdout / stderr の
+        // 書込端を保持し続けるため EOF が来ない。旧実装は timeout まで
+        // ドレイン待ちを続け、"ok" を捨てて ToolError::Timeout を返した。
+        let result = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "echo ok; sleep 10 &",
+                    "description": "echo then background sleep",
+                    "timeout": 2000,
+                }),
+                context("/tmp"),
+            )
+            .await
+            .expect("shell exit must complete without timing out");
+
+        assert!(
+            result.output.contains("ok"),
+            "buffered stdout must be captured: {:?}",
+            result.output
+        );
+        assert_eq!(
+            result.metadata.get("exit_code").and_then(|v| v.as_i64()),
+            Some(0),
+            "shell exit code must be preserved"
+        );
+        assert_eq!(
+            result.metadata.get("truncated").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_child_does_not_lose_newline_free_output() {
+        // グレース満了でドレイン future がドロップされると、改行なしの末尾行が
+        // pending に残ったまま失われていた。printf は改行を出さないため、
+        // 既存の `echo ok; sleep 10 &` 回帰では検出できなかったケースを固定する。
+        let result = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "printf ok; sleep 10 &",
+                    "description": "printf then background sleep",
+                    "timeout": 2000,
+                }),
+                context("/tmp"),
+            )
+            .await
+            .expect("shell exit must complete without timing out");
+
+        assert!(
+            result.output.contains("ok\n"),
+            "newline-free buffered stdout must be flushed: {:?}",
+            result.output
+        );
+        assert_eq!(
+            result.metadata.get("exit_code").and_then(|v| v.as_i64()),
+            Some(0),
+            "shell exit code must be preserved"
+        );
+        assert_eq!(
+            result.metadata.get("truncated").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_command_output_and_exit_code_are_unchanged() {
+        // select! に child.wait() 分岐を追加しても、通常コマンドでは
+        // 全出力と exit_code が従来どおり伝播することを固定する。
+        let result = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "echo out; echo err >&2; exit 7",
+                    "description": "stdout, stderr and non-zero exit code",
+                    "timeout": 2000,
+                }),
+                context("/tmp"),
+            )
+            .await
+            .expect("normal command must succeed");
+
+        assert!(
+            result.output.starts_with("out\nerr\n"),
+            "stdout then stderr must be preserved: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Command exited with code: 7"),
+            "non-zero exit must still be appended: {:?}",
+            result.output
+        );
+        assert_eq!(
+            result.metadata.get("exit_code").and_then(|v| v.as_i64()),
+            Some(7)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_running_command_still_times_out() {
+        // シェル本体が終了しない場合は従来どおり kill_process_tree + kill が
+        // 走り ToolError::Timeout になる（完了検知分岐を追加しても不変）。
+        let error = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "sleep 10",
+                    "description": "long running command",
+                    "timeout": 100,
+                }),
+                context("/tmp"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, ToolError::Timeout(_)), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_eof_before_shell_exit_still_times_out() {
+        // stdout / stderr が先に EOF に達してもシェルがまだ終了していない場合、
+        // 後段の child.wait() が timeout_ms を超えてブロックせずに
+        // kill_process_tree + kill + ToolError::Timeout へ入ることを固定する。
+        let started = Instant::now();
+        let error = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "exec >/dev/null 2>&1; sleep 60",
+                    "description": "close stdio then sleep",
+                    "timeout": 200,
+                }),
+                context("/tmp"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, ToolError::Timeout(_)), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drain-wins path must not hang past the timeout budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_is_not_lost_when_child_exit_is_ready() {
+        // abort と child.wait() が同時に ready でも、biased で abort 分岐が
+        // 優先され ToolError::Cancelled が返ることを固定する。
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let ctx = context("/tmp").with_abort(token.clone());
+        token.cancel();
+
+        let error = BashTool::new()
+            .execute(
+                serde_json::json!({
+                    "command": "exit 0",
+                    "description": "fast command with pre-cancelled token",
+                    "timeout": 2000,
+                }),
+                ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, ToolError::Cancelled), "{error:?}");
     }
 
     // --- R2 medium: 行長制限付き出力読取（改行なし巨大出力で OOM しない） ---
