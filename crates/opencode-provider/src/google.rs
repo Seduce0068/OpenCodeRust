@@ -21,7 +21,15 @@ fn google_content_url(base_url: &str, model: &str, stream: bool) -> String {
     } else {
         "generateContent"
     };
-    format!("{base_url}/{model}:{action}")
+    // base_url 末尾の `/` を除いてから連結し、二重スラッシュを防ぐ。
+    // 除去結果が空になる（`"/"` のみの設定）場合は元の base を維持する。
+    let trimmed = base_url.trim_end_matches('/');
+    // 空文字や "https:" のようなスキームのみへ退化した場合は元 base を維持（R4）。
+    let degraded = trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("http:")
+        || trimmed.eq_ignore_ascii_case("https:");
+    let base = if degraded { base_url } else { trimmed };
+    format!("{base}/{model}:{action}")
 }
 
 /// リクエストへ Google API キーをヘッダとして付与する。
@@ -705,5 +713,72 @@ mod tests {
             "usage_metadata/finish_reason は追加イベントを出さない: {events:?}"
         );
         assert!(matches!(&events[0], StreamEvent::TextDelta(delta) if delta == text));
+    }
+
+    /// `http(s)://` のスキーム部分は除き、パスに二重スラッシュが無いことを確認する。
+    fn assert_no_double_slash_in_path(url: &str) {
+        let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+        assert!(!path.contains("//"), "URL path has a double slash: {url}");
+    }
+
+    const EXPECTED_GOOGLE_URL: &str =
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
+    /// 回帰ガード: base_url 末尾に `/` があっても連結部分に二重スラッシュを出さない。
+    #[test]
+    fn google_content_url_trims_trailing_slash_from_base_url() {
+        let url = google_content_url(
+            "https://generativelanguage.googleapis.com/v1beta/models/",
+            "gemini-2.0-flash",
+            false,
+        );
+        assert_eq!(url, EXPECTED_GOOGLE_URL);
+        assert_no_double_slash_in_path(&url);
+
+        let stream_url = google_content_url(
+            "https://generativelanguage.googleapis.com/v1beta/models/",
+            "gemini-2.0-flash",
+            true,
+        );
+        assert_eq!(
+            stream_url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+        );
+        assert_no_double_slash_in_path(&stream_url);
+    }
+
+    /// 回帰ガード: 末尾 `/` なしの設定と既定定数では出力が不変。
+    #[test]
+    fn google_content_url_keeps_existing_output_without_trailing_slash() {
+        let custom = google_content_url(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            "gemini-2.0-flash",
+            false,
+        );
+        assert_eq!(custom, EXPECTED_GOOGLE_URL);
+        assert_no_double_slash_in_path(&custom);
+
+        let default = google_content_url(GOOGLE_API_URL, "gemini-2.0-flash", false);
+        assert_eq!(default, EXPECTED_GOOGLE_URL);
+        assert_no_double_slash_in_path(&default);
+    }
+
+    /// 回帰ガード: 末尾 `/` が複数でも同じ URL になる。
+    #[test]
+    fn google_content_url_trims_multiple_trailing_slashes() {
+        let url = google_content_url(
+            "https://generativelanguage.googleapis.com/v1beta/models///",
+            "gemini-2.0-flash",
+            false,
+        );
+        assert_eq!(url, EXPECTED_GOOGLE_URL);
+        assert_no_double_slash_in_path(&url);
+    }
+
+    /// 回帰ガード: 除去結果が空になる `"/"` のみの base は元の値を維持する（後方互換）。
+    #[test]
+    fn google_content_url_preserves_root_only_base() {
+        let url = google_content_url("/", "gemini-2.0-flash", false);
+        assert_eq!(url, "//gemini-2.0-flash:generateContent");
     }
 }
