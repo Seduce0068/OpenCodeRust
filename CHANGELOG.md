@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T00:27:42+09:00"
+  at: "2026-11-23T00:42:46+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `server`: port=0 起動で state URL / ログに実バインドポートを反映
+  （swarm-coding R1-R6）
 - `cli`: IPv6 hostname の bind/URL 生成と unspecified の接続先正規化
   （swarm-coding R1-R6）
 - `provider`: Vertex / Google の base_url 末尾スラッシュを正規化（スキーム保護）

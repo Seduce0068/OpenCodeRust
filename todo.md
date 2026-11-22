@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **port=0 起動で実際のバインドポートではなく 0 が使われる**
-  — `cli/main.rs:1692` / NET-05 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -266,6 +264,8 @@ status: current
 
 ## 完了
 
+- [x] **[port=0 起動 1 件]** state URL / ログに実バインドポートを反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[IPv6 hostname 1 件]** bind/URL 生成と unspecified 正規化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider URL 1 件]** Vertex/Google base_url の末尾スラッシュ正規化
@@ -741,6 +741,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（port=0 起動の修正時、記録のみ）: 回帰テストがヘルパ
+  のみを検証し配線・ログは未担保、wildcard bind（0.0.0.0/[::]）では state URL
+  に到達不能なホストが入る、local_addr() 取得が副作用の後。親が
+  run_server_with_state の doc comment に port=0 時の契約を明記。
 - 2026-11-23 R4 指摘（IPv6 hostname の修正時）: 親が unspecified（:: / [::]）
   の接続先 loopback 正規化、角括弧付き [::1] の loopback 判定、完全形式 IPv6
   の URL assertion を直接追加。port=0 は CLI が 3000 へ置換する既存挙動で、
