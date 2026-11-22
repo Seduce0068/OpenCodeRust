@@ -473,7 +473,9 @@ pub struct SseTransport {
     /// バックグラウンド SSE リスナが検出した上限超過 등의理由（本文は含まない）。
     violation: Arc<Mutex<Option<String>>>,
     /// 違反検出時に待機中の `receive()` を起こすための通知。
-    violation_notify: Arc<tokio::sync::Notify>,
+    /// 再接続のたびに差し替え、古い Notify に溜まった未消費 permit を破棄する
+    /// （再接続直後の `receive()` が偽の `Ok(None)` を返すのを防ぐ）。
+    violation_notify: Mutex<Arc<tokio::sync::Notify>>,
     /// Handle to the background SSE listener task so we can abort on close.
     sse_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -488,7 +490,7 @@ impl SseTransport {
             response_rx: Mutex::new(rx),
             response_tx: tx,
             violation: Arc::new(Mutex::new(None)),
-            violation_notify: Arc::new(tokio::sync::Notify::new()),
+            violation_notify: Mutex::new(Arc::new(tokio::sync::Notify::new())),
             sse_task: Mutex::new(None),
         }
     }
@@ -508,9 +510,37 @@ impl SseTransport {
             McpClientError::TransportError(format!("Failed to create SSE connection: {}", e))
         })?;
 
+        // LIFE-01: 旧リスナを「上書き」ではなく abort してから状態をリセットする。
+        // `abort()` は次の await 地点で future をドロップするため、ここで
+        // JoinHandle を await して停止完了を待つ。待たずにリセットすると旧
+        // タスクが violation を再設定したりキューへ書き込んだりする恐れがある。
+        // 初回 connect では sse_task が None のため何も起きず既存挙動と同一。
+        let previous_task = {
+            let mut task = self.sse_task.lock().await;
+            task.take()
+        };
+        if let Some(old) = previous_task {
+            old.abort();
+            let _ = old.await;
+        }
+
+        // LIFE-02: 古い violation 理由と未消費メッセージを破棄してから
+        // 新しいストリームを開始する。初回 connect では双方とも空のため
+        // 既存挙動と同一。
+        *self.violation.lock().await = None;
+        // R4: 旧 Notify に溜まった未消費 permit を破棄するため、新しい
+        // リスナを spawn する前に Notify 自体を差し替える。初回 connect でも
+        // 空の Notify を置き直すだけなので既存挙動は不変。
+        *self.violation_notify.lock().await = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut rx = self.response_rx.lock().await;
+            while rx.try_recv().is_ok() {}
+        }
+
         let tx = self.response_tx.clone();
         let violation = Arc::clone(&self.violation);
-        let notify = Arc::clone(&self.violation_notify);
+        // MutexGuard を await 跨ぎで保持しないよう、Arc を clone してから使う。
+        let notify = Arc::clone(&*self.violation_notify.lock().await);
 
         let handle = tokio::spawn(async move {
             while let Some(event) = es.next().await {
@@ -664,6 +694,11 @@ impl McpTransport for SseTransport {
             return Err(McpClientError::ProtocolError(reason.clone()));
         }
 
+        // R4: MutexGuard を await 跨ぎで保持しないよう、先に Arc を clone して
+        // から notified() を待つ。再接続で Notify が差し替えられても、この
+        // 待機は取得時点の Notify に対して行われる。
+        let notify = Arc::clone(&*self.violation_notify.lock().await);
+
         let mut rx = self.response_rx.lock().await;
         tokio::select! {
             result = rx.recv() => {
@@ -672,7 +707,7 @@ impl McpTransport for SseTransport {
                     None => Ok(result),
                 }
             }
-            _ = self.violation_notify.notified() => {
+            _ = notify.notified() => {
                 match self.violation.lock().await.as_ref() {
                     Some(reason) => Err(McpClientError::ProtocolError(reason.clone())),
                     None => Ok(None),
@@ -682,10 +717,19 @@ impl McpTransport for SseTransport {
     }
 
     async fn close(&self) -> Result<(), McpClientError> {
-        let mut task = self.sse_task.lock().await;
-        if let Some(handle) = task.take() {
-            handle.abort();
+        // 既存の handle.abort() は不変。スコープを分けて sse_task のロックを
+        // 解放してから violation をリセットする（LIFE-02）。
+        {
+            let mut task = self.sse_task.lock().await;
+            if let Some(handle) = task.take() {
+                handle.abort();
+            }
         }
+        // 再 connect 時に古い終了理由が残らないようクリアする。
+        *self.violation.lock().await = None;
+        // R4: 旧 Notify の未消費 permit もここで破棄する。close 単体で
+        // 再 connect されない経路でも、古い permit が残らないようにする。
+        *self.violation_notify.lock().await = Arc::new(tokio::sync::Notify::new());
         Ok(())
     }
 }
@@ -1183,5 +1227,200 @@ mod http_sse_limit_tests {
 
         stop.store(true, Ordering::Release);
         server.join().expect("mock thread must not panic");
+    }
+
+    /// タスクの future がドロップされたことを観測するためのガード。
+    struct DropNotifier(Arc<AtomicBool>);
+
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// LIFE-01: 同一インスタンスで 2 回 connect() したとき、古いリスナが
+    /// デタッチ・リークせず abort されることを検証する。
+    /// 旧ハンドルとして pending なタスクを仕込み、future のドロップを
+    /// DropNotifier で観測する。
+    #[tokio::test]
+    async fn reconnect_aborts_previous_listener_task() {
+        ensure_no_proxy();
+        let (url, connected, stop, server) = serve_sse_keep_open();
+
+        let old_dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropNotifier(Arc::clone(&old_dropped));
+        let old_task = tokio::spawn(async move {
+            let _guard = guard;
+            futures::future::pending::<()>().await;
+        });
+
+        let transport = SseTransport::new(url, None);
+        {
+            let mut task = transport.sse_task.lock().await;
+            *task = Some(old_task);
+        }
+
+        transport.connect().await.expect("reconnect must succeed");
+
+        assert!(
+            old_dropped.load(Ordering::SeqCst),
+            "previous listener future must be aborted and dropped on reconnect"
+        );
+        assert!(
+            transport.sse_task.lock().await.is_some(),
+            "new listener handle must be registered"
+        );
+
+        // 新リスナが実際に接続するまで待ってから close し、
+        // モックが accept 待ちでタイムアウトしないようにする。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !connected.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "new listener never connected");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        transport.close().await.expect("close");
+        stop.store(true, Ordering::Release);
+        server.join().expect("mock thread must not panic");
+    }
+
+    /// LIFE-02: violation 発生 → close → 再 connect で古い理由が残らず、
+    /// キューに溜まった古いメッセージも破棄されることを検証する。
+    #[tokio::test]
+    async fn close_and_reconnect_clear_stale_violation_and_messages() {
+        ensure_no_proxy();
+
+        // 1 回目: 空の SSE ストリームでリスナに violation を設定させる。
+        let (url1, server1) = serve_once("text/event-stream", String::new());
+        let mut transport = SseTransport::new(url1, None);
+        transport.connect().await.expect("first connect");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while transport.violation.lock().await.is_none() {
+            assert!(Instant::now() < deadline, "listener never set a violation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            transport.receive().await,
+            Err(McpClientError::ProtocolError(_))
+        ));
+
+        // 古いレスポンスもキューに仕込んでおく（close ではドレインしない）。
+        let stale =
+            JsonRpcMessage::parse_json_str(r#"{"jsonrpc":"2.0","id":42,"result":{"stale":true}}"#)
+                .expect("stale fixture");
+        transport
+            .response_tx
+            .try_send(stale)
+            .expect("stale message must be queued");
+
+        transport.close().await.expect("close");
+        assert!(
+            transport.violation.lock().await.is_none(),
+            "close must clear the stale violation reason"
+        );
+
+        // 2 回目: keep-open の SSE に接続し直す（新たな violation は出ない）。
+        let (url2, connected2, stop, server2) = serve_sse_keep_open();
+        transport.url = url2;
+        transport.connect().await.expect("second connect");
+
+        assert!(
+            transport.violation.lock().await.is_none(),
+            "reconnect must start with no stale violation"
+        );
+        assert!(
+            transport.response_rx.lock().await.try_recv().is_err(),
+            "reconnect must drain stale buffered messages"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !connected2.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "second listener never connected");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        transport.close().await.expect("second close");
+        stop.store(true, Ordering::Release);
+        server1.join().expect("first mock thread must not panic");
+        server2.join().expect("second mock thread must not panic");
+    }
+
+    /// R4 指摘: violation 発生時に待機中の `receive()` が居ないと旧 Notify に
+    /// permit が蓄積され、close → 再 connect 後の最初の `receive()` が
+    /// violation=None のまま偽の `Ok(None)` を返す回帰テスト。
+    #[tokio::test]
+    async fn stale_notify_permit_is_discarded_on_close_and_reconnect() {
+        ensure_no_proxy();
+
+        // 1) 空の SSE で violation を起こさせる。ここでは receive() を呼ばない
+        //    ので notify_one() の permit が旧 Notify に蓄積される。
+        let (url1, server1) = serve_once("text/event-stream", String::new());
+        let mut transport = SseTransport::new(url1, None);
+        transport.connect().await.expect("first connect");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while transport.violation.lock().await.is_none() {
+            assert!(Instant::now() < deadline, "listener never set a violation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // リスナが完了するまで待ち、notify_one() が呼ばれた確定状態にする。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let finished = {
+                let task = transport.sse_task.lock().await;
+                task.as_ref()
+                    .map(|handle| handle.is_finished())
+                    .unwrap_or(false)
+            };
+            if finished {
+                break;
+            }
+            assert!(Instant::now() < deadline, "first listener never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 2) close → keep-open の SSE へ再 connect（新たな violation は出ない）。
+        transport.close().await.expect("close");
+        let (url2, connected2, stop, server2) = serve_sse_keep_open();
+        transport.url = url2;
+        transport.connect().await.expect("second connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !connected2.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "second listener never connected");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 3) 旧 permit が残っていると receive() が即 Ok(None) を返す。
+        //    正常側はキューが空の間は待機し、メッセージ到達で Some を返す。
+        let early = tokio::select! {
+            result = transport.receive() => Some(result),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => None,
+        };
+        assert!(
+            early.is_none(),
+            "stale notify permit must not make receive() return early"
+        );
+
+        let expected =
+            JsonRpcMessage::parse_json_str(r#"{"jsonrpc":"2.0","id":99,"result":{"ok":true}}"#)
+                .expect("fixture");
+        transport
+            .response_tx
+            .try_send(expected)
+            .expect("message must be queued");
+
+        let message = tokio::time::timeout(Duration::from_secs(3), transport.receive())
+            .await
+            .expect("receive must complete after the message arrives")
+            .expect("receive must succeed")
+            .expect("receive must return Some, not Ok(None)");
+        match message {
+            JsonRpcMessage::Response(response) => assert_eq!(response.id, 99),
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        transport.close().await.expect("final close");
+        stop.store(true, Ordering::Release);
+        server1.join().expect("first mock thread must not panic");
+        server2.join().expect("second mock thread must not panic");
     }
 }
