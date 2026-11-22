@@ -1851,8 +1851,14 @@ pub struct ExperimentalConfig {
     pub batch_tool: Option<bool>,
     #[serde(alias = "openTelemetry", skip_serializing_if = "Option::is_none")]
     pub open_telemetry: Option<bool>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub primary_tools: Vec<String>,
+    // `primary_tools: []` is an explicit clear directive; an omitted key must
+    // leave the accumulated value intact. `ExplicitStringList` tracks that
+    // presence bit while its custom serde impl keeps the JSON wire shape as an array.
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub primary_tools: ExplicitStringList,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continue_loop_on_deny: Option<bool>,
     /// Deprecated millisecond MCP timeout. The post-load transform in
@@ -2058,12 +2064,14 @@ fn merge_explicit_string_list(target: &mut ExplicitStringList, source: ExplicitS
 
 /// Merge a config layer's string list using replacement semantics.
 ///
-/// Unlike [`merge_explicit_string_list`], the provider lists are defined by the
-/// upstream schema as a replacement rather than a union: a higher-precedence
-/// non-empty array replaces the accumulated value wholesale (see the existing
-/// `provider_lists_follow_replace_semantics_instead_of_union` test). Presence
-/// tracking is still required so that an omitted key leaves the accumulated
-/// value untouched while an explicit empty array clears it.
+/// Unlike [`merge_explicit_string_list`], fields using this helper keep
+/// replacement semantics rather than a union: a higher-precedence non-empty
+/// array replaces the accumulated value wholesale. This applies to the provider
+/// lists (upstream schema, see `provider_lists_follow_replace_semantics_instead_of_union`),
+/// `watcher.ignore`, and `experimental.primary_tools` (the latter inherits the
+/// old `self.field = other.field` behaviour). Presence tracking is still required
+/// so that an omitted key leaves the accumulated value untouched while an
+/// explicit empty array clears it.
 fn merge_explicit_string_list_replace(target: &mut ExplicitStringList, source: ExplicitStringList) {
     if source.is_explicit() {
         *target = source;
@@ -2526,9 +2534,7 @@ impl DeepMerge for ExperimentalConfig {
         merge_option_replace(&mut self.disable_paste_summary, other.disable_paste_summary);
         merge_option_replace(&mut self.batch_tool, other.batch_tool);
         merge_option_replace(&mut self.open_telemetry, other.open_telemetry);
-        if !other.primary_tools.is_empty() {
-            self.primary_tools = other.primary_tools;
-        }
+        merge_explicit_string_list_replace(&mut self.primary_tools, other.primary_tools);
         merge_option_replace(&mut self.continue_loop_on_deny, other.continue_loop_on_deny);
         merge_option_replace(&mut self.mcp_timeout, other.mcp_timeout);
     }
@@ -2895,6 +2901,92 @@ mod tests {
         assert!(
             json["watcher"].get("ignore").is_none(),
             "an omitted watcher.ignore key must stay omitted"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_primary_tools_clears_accumulated_values() {
+        let mut base: Config =
+            serde_json::from_str(r#"{"experimental": {"primary_tools": ["bash", "edit"]}}"#)
+                .unwrap();
+        let base_experimental = base.experimental.as_ref().expect("base experimental");
+        assert!(base_experimental.primary_tools.is_explicit());
+        assert_eq!(
+            base_experimental.primary_tools.as_slice(),
+            &["bash".to_string(), "edit".to_string()]
+        );
+
+        let clear: Config =
+            serde_json::from_str(r#"{"experimental": {"primary_tools": []}}"#).unwrap();
+        let clear_experimental = clear.experimental.as_ref().expect("clear experimental");
+        assert!(clear_experimental.primary_tools.is_explicit());
+        assert!(clear_experimental.primary_tools.is_empty());
+
+        base.merge(clear);
+
+        let merged = base.experimental.expect("merged experimental");
+        assert!(
+            merged.primary_tools.is_empty(),
+            "experimental.primary_tools: [] must clear lower-precedence values"
+        );
+        assert!(merged.primary_tools.is_explicit());
+    }
+
+    #[test]
+    fn omitted_primary_tools_keeps_accumulated_values() {
+        let mut base: Config =
+            serde_json::from_str(r#"{"experimental": {"primary_tools": ["bash"]}}"#).unwrap();
+
+        // Empty experimental object: the `primary_tools` key is absent, so it must not clear.
+        let theme_only: Config =
+            serde_json::from_str(r#"{"experimental": {}, "theme": "dark"}"#).unwrap();
+        let overlay_experimental = theme_only
+            .experimental
+            .as_ref()
+            .expect("overlay experimental");
+        assert!(!overlay_experimental.primary_tools.is_explicit());
+
+        base.merge(theme_only);
+        let merged = base.experimental.as_ref().expect("merged experimental");
+        assert_eq!(merged.primary_tools.as_slice(), &["bash".to_string()]);
+
+        // The whole `experimental` key is absent: it must be left untouched too.
+        let no_experimental: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        base.merge(no_experimental);
+        let merged = base.experimental.as_ref().expect("merged experimental");
+        assert_eq!(merged.primary_tools.as_slice(), &["bash".to_string()]);
+    }
+
+    #[test]
+    fn primary_tools_serializes_as_array_including_explicit_empty() {
+        let populated: Config =
+            serde_json::from_str(r#"{"experimental": {"primary_tools": ["bash", "edit"]}}"#)
+                .unwrap();
+        let json = serde_json::to_value(&populated).unwrap();
+        assert_eq!(
+            json["experimental"]["primary_tools"],
+            serde_json::json!(["bash", "edit"])
+        );
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"experimental": {"primary_tools": []}}"#).unwrap();
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json["experimental"]["primary_tools"], serde_json::json!([]));
+
+        let reloaded: Config = serde_json::from_value(json).unwrap();
+        let reloaded_experimental = reloaded.experimental.expect("reloaded experimental");
+        assert!(
+            reloaded_experimental.primary_tools.is_explicit()
+                && reloaded_experimental.primary_tools.is_empty(),
+            "experimental.primary_tools: [] must persist as an explicit clear directive"
+        );
+
+        // An omitted key stays omitted even when the `experimental` object is present.
+        let absent: Config = serde_json::from_str(r#"{"experimental": {}}"#).unwrap();
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json["experimental"].get("primary_tools").is_none(),
+            "an omitted experimental.primary_tools key must stay omitted"
         );
     }
 
