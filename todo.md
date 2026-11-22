@@ -266,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[パス/URL 安全性 7 件]** symlink・共有 URL・blacklist・スキーム等
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[serde/後始末 5 件]** old-key alias・round-trip・busy リーク・楽観 msg
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ページネーション引数露出 1 件]** directory/roots/start を API に追加
@@ -707,6 +709,12 @@ status: current
 
 ## メモ
 
+- 2026-11-22 cross-skill 集約（swarm178、2 担当・7 件、観点: パス/URL 安全性
+  / コレクション境界）: 親が medium 3 件を read で事実確認、7 件すべて即座
+  coding 完了。R4 が symlink 走査の不完全さ（glob literal base / find_up）を
+  指摘し親が cwd 起点の全 component 検査へ修正。Low も親が import_session_data
+  の完全 URL（トークン query を含む可能性）をユーザー向けエラーへ出す経路を
+  safe_import_source_label（host+path / ファイル名のみ）へ修正。
 - 2026-11-22 技術判断（現状維持、設計判断のため未変更）: コマンド timeout は
   bash 2 分（opencode-tool の `DEFAULT_TIMEOUT_MS`、呼び出し側で上書き可）と
   local-llm 5 分（`OPENCODE_LOCAL_LLM_TIMEOUT_SECS` で上書き可）で用途が異なり
