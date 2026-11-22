@@ -239,6 +239,12 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
+- [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
+  — `server/server.rs:1037` / TX-02 / 中
+- [ ] **PATCH /config の read-modify-write が無ロックでパッチ消失**
+  — `config/loader.rs:2650` / TX-03 / 中
+- [ ] **URLSearchParams が '+' ↔ 空白変換を欠落（WHATWG 非準拠）**
+  — `codemode/interpreter.rs:5885` / ENC-01 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -264,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[トランザクション/エンコーディング 2 件]** cascade 削除・ログ Cf 除去
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[agent 解決 1 件]** 未知名を build へ黙って化けさせない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI 引数検証 4 件]** attach URL / mcp 排他 / session ID / upgrade
@@ -753,6 +761,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm214、2 担当・7 件、観点: トランザクション /
+  エンコーディング）: 親が medium 2 件を read で事実確認し即座 coding（session
+  削除の FK cascade 一本化、ログ Cf 除去）。R4 がツリー横断の原子性 limits を
+  指摘（設計判断のため記録のみ）。残存 medium 3 件（sync トランザクション、
+  PATCH 無ロック、URLSearchParams '+'）と low 2 件（data URL percent decode、
+  import 原子的性）を triage。
 - 2026-11-23 R4 指摘（agent 解決の修正時）: 親が unknown agent エラーを
   固定文言化（CLI 引数をエコーしない方針へ他ヘルパと統一）。
 - 2026-11-23 R4 指摘（CLI 引数検証の修正時）: 親が validate_attach_url の
