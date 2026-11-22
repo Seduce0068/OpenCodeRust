@@ -7452,14 +7452,35 @@ fn random_uuid_v4() -> String {
     )
 }
 
-fn math_random() -> f64 {
-    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let mut value = STATE.load(Ordering::Relaxed);
+// xorshift64 の 1 ステップ。状態更新と出力算出で同じ遷移を再利用するため純関数にする。
+fn xorshift_next(value: u64) -> u64 {
+    let mut value = value;
     value ^= value << 13;
     value ^= value >> 7;
     value ^= value << 17;
-    STATE.store(value, Ordering::Relaxed);
+    value
+}
+
+// 直前の状態から Math.random() の出力を求める（従来の計算式を維持）。
+fn math_random_from_state(previous: u64) -> f64 {
+    let value = xorshift_next(previous);
     ((value >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+fn math_random() -> f64 {
+    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    // load → store では並行呼び出しが同じ old を読み、同一乱数（同一 UUID）を返し得る。
+    // try_update は CAS 成功ごとに異なる old を返すため、その old から更新後の
+    // 値を再計算して出力に使う。シングルスレッドでは従来と同じ出力列になる。
+    let previous = STATE
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            Some(xorshift_next(old))
+        })
+        // 更新クロージャは常に Some を返すため失敗しない。将来 None を返す
+        // 変更が入ったら旧 load/store と同じ重複乱数へ退化するため、ここで
+        // 気づけるように panic させる（R4）。
+        .expect("xorshift update is infallible");
+    math_random_from_state(previous)
 }
 
 fn math_hypot(values: &[f64]) -> f64 {
@@ -12231,6 +12252,97 @@ mod tests {
         assert_eq!(
             run_value("return crypto.randomUUID() !== crypto.randomUUID();"),
             Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn math_random_matches_legacy_sequence_from_seed() {
+        // 初期状態から 3 回生成したときの (更新後状態, 出力の上位 53 bit) を固定する。
+        // 出力は (state >> 11) / 2^53 なので、2^53 を掛けると整数値になる。
+        const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+        let expected = [
+            (0xDC1B_77AE_0BF3_4DADu64, 0x001B_836E_F5C1_7E69u64),
+            (0x64F0_EEB9_026E_6076u64, 0x000C_9E1D_D720_4DCCu64),
+            (0x7B07_CE91_E590_6136u64, 0x000F_60F9_D23C_B20Cu64),
+        ];
+        let mut state = SEED;
+        for (next_state, output_bits) in expected {
+            assert_eq!(super::xorshift_next(state), next_state);
+            assert_eq!(
+                (super::math_random_from_state(state) * 9_007_199_254_740_992.0) as u64,
+                output_bits
+            );
+            state = next_state;
+        }
+    }
+
+    #[test]
+    fn math_random_is_distinct_under_concurrent_calls() {
+        use std::collections::HashSet;
+        use std::sync::mpsc;
+
+        const THREADS: usize = 4;
+        const CALLS_PER_THREAD: usize = 32;
+        let (sender, receiver) = mpsc::channel();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    let values: Vec<u64> = (0..CALLS_PER_THREAD)
+                        .map(|_| super::math_random().to_bits())
+                        .collect();
+                    sender.send(values).expect("receiver should be alive");
+                })
+            })
+            .collect();
+        drop(sender);
+        for handle in handles {
+            handle.join().expect("worker thread should not panic");
+        }
+
+        let mut seen = HashSet::new();
+        for values in receiver {
+            for bits in values {
+                assert!(
+                    seen.insert(bits),
+                    "concurrent calls must not repeat a value"
+                );
+            }
+        }
+        assert_eq!(seen.len(), THREADS * CALLS_PER_THREAD);
+    }
+
+    /// CAS が競合を解決することを決定的に検証する（R4）。
+    ///
+    /// 全スレッドが同じ初期値から `try_update` を呼ぶと、成功した回数だけ
+    /// 状態が進む。load/store なら全スレッドが同じ値を書き込んで 1 回しか
+    /// 進まないため、このアサーションで回帰を検出できる。
+    #[test]
+    fn atomic_try_update_resolves_contention_deterministically() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Barrier;
+
+        const THREADS: usize = 4;
+        static SHARED: AtomicU64 = AtomicU64::new(0);
+        let barrier = std::sync::Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SHARED
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old + 1))
+                        .expect("increment is infallible");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("worker thread should not panic");
+        }
+        assert_eq!(
+            SHARED.load(Ordering::Relaxed),
+            THREADS as u64,
+            "every contending CAS must advance the state"
         );
     }
 
