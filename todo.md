@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **default_agent の下流経路が回帰テストで直接検証されていない**
-  — `server/routes.rs:2926` / CFGAPPLY-04-R4 / 中（high）
 - [ ] **StreamProcessor の compaction_config が本番配線されない**
   — `session/llm.rs:474` / CFGAPPLY-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
@@ -277,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[default_agent 下流検証 1 件]** PromptInput/metadata を直接検証
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[default_agent 配線 1 件]** エージェント選択/downstream へ反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[404/405 JSON 契約 1 件]** fallback envelope を追加
@@ -862,6 +862,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（下流直接検証の修正時）: 親が low（前後空白のある agent
+  名が trim されず build に落ちる）を直接修正し回帰テストを追加。残存 low
+  （PromptInput 全フィールドのアサーション不足、未知名 task_agent が
+  config.default_agent より優先される挙動）はテスト品質／設計意図として
+  記録のみ。clippy too_many_arguments は PromptInputParts 構造体で解消。
 - 2026-11-23 R4 残存（default_agent 配線の修正時）: 下流経路の回帰ガードが
   実際の PromptInput/metadata 構築を通していない（medium、テスト品質）、
   hidden エージェントが解決候補として受理され得る、設定値の前後空白が
