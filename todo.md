@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **todo SSE の update→読戻しが writer lock 外で非アトミック**
-  — `server/routes.rs:3333` / TODO-SSE-ID-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
@@ -269,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[todo SSE 原子化 1 件]** 更新と ID 読戻しを同一ロックで実行
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[todo SSE id 1 件]** GET と同じ安定 id を配信
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[StreamProcessor 1 件]** 本番未使用を明記して現状確定
@@ -864,6 +864,13 @@ status: current
 
 ## メモ
 
+- 2026-11-24 R4 残存（todo SSE 原子化の修正時）: update_and_get_with_ids を
+  追加し writer_lock 内で update_locked → get_with_ids_locked を連続実行。
+  公開 update/get_with_ids の挙動（DB 失敗時 early return 含む）は不変。
+  R4 が並行回帰テストの原子性ガードの弱さ（テスト用遅延フックが必要）と
+  DB 失敗時 early return の専用テスト欠落を指摘したが、テスト専用フックの
+  本番混入を伴うため設計判断として記録のみ。実装の原子性はコードレビュー
+  で確認済み。
 - 2026-11-24 R4 残存（todo SSE id の修正時）: update → get_with_ids が
   writer lock 外で非アトミック（並行更新時に後勝ちスナップショットが
   配信され得る）、回帰テストが実コールバック/broadcast 経路を通らず
