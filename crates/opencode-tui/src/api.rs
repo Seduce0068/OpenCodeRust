@@ -1257,7 +1257,12 @@ impl ApiClient {
         let body = serde_json::json!({
             "reply": reply,
         });
-        let response = self.client.post(&url).json(&body).send()?;
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send permission reply"))?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             // 既に回答済み。ボディは内容を見ずに読み捨てる（Keep-Alive の
@@ -1280,7 +1285,12 @@ impl ApiClient {
         let body = serde_json::json!({
             "answers": answers,
         });
-        let response = self.client.post(&url).json(&body).send()?;
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send question reply"))?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();
@@ -1294,7 +1304,11 @@ impl ApiClient {
 
     pub fn reject_question(&self, request_id: &str) -> anyhow::Result<()> {
         let url = format!("{}/question/{}/reject", self.base_url, request_id);
-        let response = self.client.post(&url).send()?;
+        let response = self
+            .client
+            .post(&url)
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send question rejection"))?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().unwrap_or_default();

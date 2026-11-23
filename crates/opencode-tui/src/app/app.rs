@@ -499,6 +499,10 @@ impl App {
             return;
         }
 
+        // 送信成功時のみ ID を忘却する。失敗時は上の early return でキーが残り、
+        // 同じ要求を再試行しても二重 enqueue としてスキップされない。
+        forget_request_seen(&self.context, "permission", &id);
+
         // 送信成功時のみ要求を削除してプロンプトを閉じる。
         match action {
             PermissionAction::Approve | PermissionAction::ApproveAlways => {
@@ -2658,6 +2662,10 @@ impl App {
             return;
         }
 
+        // 送信成功時のみ ID を忘却する。失敗時は restore_question_for_retry が
+        // 呼ばれ、キーが残ることで同じ要求の再送が抑止されない。
+        forget_request_seen(&self.context, "question", &request_id);
+
         // 送信成功時のみ要求を削除してダイアログを閉じ、次の要求へ進む。
         self.active_question_request.take();
         self.question_prompt.close();
@@ -2704,6 +2712,9 @@ impl App {
             // 要求もダイアログも残して再試行可能にする。
             return;
         }
+
+        // 送信成功時のみ ID を忘却する。失敗時は要求とダイアログを残して再試行する。
+        forget_request_seen(&self.context, "question", &request_id);
 
         // 送信成功時のみ要求を削除してダイアログを閉じ、次の要求へ進む。
         self.active_question_request.take();
@@ -4261,13 +4272,24 @@ fn resync_todos_from_server(context: &Arc<AppContext>) {
 /// 共有するため、どちらが先に要求を受け取っても二重 enqueue を抑止できる。
 /// キーと要求 ID はログ・エラーへ出力しない。
 ///
-/// 残存リスク: 回答済みで要求が消えても ID は集合に残る。サーバ側で要求 ID が
-/// 再利用されないことを前提としており、再利用された場合は誤スキップされ得る。
+/// 回答／拒否が送信成功した時点で `forget_request_seen` が対になるキーを削除するため、
+/// 集合は要求のライフサイクルに追従する（送信失敗時は再送のため残す）。
 fn mark_request_seen(context: &Arc<AppContext>, kind: &str, id: &str) -> bool {
     context
         .seen_request_ids
         .write()
         .insert(format!("{kind}:{id}"))
+}
+
+/// `mark_request_seen` の対。回答／拒否がサーバへ届いた場合にだけ `kind:{id}` を
+/// 集合から削除し、要求 ID が再利用されたときに新規要求が誤スキップされるのを防ぐ。
+/// 送信失敗時に呼ぶと再送が抑止されるため、成功経路からのみ呼び出す。
+/// キーと要求 ID はログ・エラーへ出力しない。
+fn forget_request_seen(context: &Arc<AppContext>, kind: &str, id: &str) {
+    context
+        .seen_request_ids
+        .write()
+        .remove(&format!("{kind}:{id}"));
 }
 
 /// サーバの保留中 permission / question を取得し、`CustomEvent` として enqueue する。
@@ -6925,5 +6947,166 @@ mod tests {
         let seen = context.seen_request_ids.read();
         assert!(seen.contains("permission:perm_resync_1"));
         assert!(seen.contains("question:q_resync_1"));
+    }
+
+    /// 回答成功後に要求 ID が忘却され、同じ ID の新規イベントが再 enqueue されること。
+    #[test]
+    fn answered_permission_id_can_be_enqueued_again() {
+        let (base_url, reply_hits, recorded) = spawn_permission_reply_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(Arc::clone(&context));
+        let permissions = [pending_request_sse_payloads()[0].clone()];
+
+        // 1) SSE 経由で enqueue し、アプリへ届ける。
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        forward_sse_payloads(&permissions, &event_tx, &context);
+        for event in event_rx.try_iter() {
+            app.handle_event(&event)
+                .expect("permission event must be handled");
+        }
+        assert!(app.permission_prompt.current_request().is_some());
+        assert!(
+            context
+                .seen_request_ids
+                .read()
+                .contains("permission:perm_resync_1"),
+            "SSE enqueue must register the id"
+        );
+
+        // 2) 回答成功 → 要求が消え、ID も忘却される。
+        app.apply_permission_action(PermissionAction::Approve);
+        assert!(app.permission_prompt.is_empty());
+        assert_eq!(reply_hits.load(Ordering::SeqCst), 1);
+        assert!(recorded.lock().expect("record lock")[0]
+            .0
+            .contains("/permission/perm_resync_1/reply"));
+        assert!(
+            !context
+                .seen_request_ids
+                .read()
+                .contains("permission:perm_resync_1"),
+            "successful reply must forget the id"
+        );
+
+        // 3) 同じ ID の新規イベントが再 enqueue される。
+        let (retry_tx, retry_rx) = mpsc::channel::<Event>();
+        forward_sse_payloads(&permissions, &retry_tx, &context);
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Ok(Event::Custom(CustomEvent::PermissionRequested { id, .. }))
+                if id == "perm_resync_1"
+        ));
+    }
+
+    #[test]
+    fn answered_question_id_can_be_enqueued_again() {
+        let base_url = spawn_pending_requests_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(Arc::clone(&context));
+        let questions = [pending_request_sse_payloads()[1].clone()];
+
+        // 1) SSE 経由で enqueue し、アプリへ届ける。
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        forward_sse_payloads(&questions, &event_tx, &context);
+        for event in event_rx.try_iter() {
+            app.handle_event(&event)
+                .expect("question event must be handled");
+        }
+        assert!(app.active_question_request.is_some());
+        assert!(
+            context
+                .seen_request_ids
+                .read()
+                .contains("question:q_resync_1"),
+            "SSE enqueue must register the id"
+        );
+
+        // 2) 回答成功 → 要求が消え、ID も忘却される。
+        app.submit_question_answer(vec!["Yes".to_string()]);
+        assert!(
+            app.active_question_request.is_none(),
+            "successful reply must take the request"
+        );
+        assert!(
+            !context
+                .seen_request_ids
+                .read()
+                .contains("question:q_resync_1"),
+            "successful reply must forget the id"
+        );
+
+        // 3) 同じ ID の新規イベントが再 enqueue される。
+        let (retry_tx, retry_rx) = mpsc::channel::<Event>();
+        forward_sse_payloads(&questions, &retry_tx, &context);
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Ok(Event::Custom(CustomEvent::QuestionAsked(request)))
+                if request.id == "q_resync_1"
+        ));
+    }
+
+    #[test]
+    fn failed_replies_keep_request_id_seen() {
+        // API クライアント未設定 = 送信失敗。キーを残して再送可能にする。
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(Arc::clone(&context));
+
+        mark_request_seen(&app.context, "permission", "perm_failed_1");
+        app.permission_prompt.add_request(PermissionRequest {
+            id: "perm_failed_1".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: "ls".to_string(),
+            tool_name: "bash".to_string(),
+        });
+        app.apply_permission_action(PermissionAction::Approve);
+        assert!(
+            context
+                .seen_request_ids
+                .read()
+                .contains("permission:perm_failed_1"),
+            "failed permission reply must keep the id for retry"
+        );
+
+        let payloads = pending_request_sse_payloads();
+        let request: QuestionRequestInfo =
+            serde_json::from_value(payloads[1]["request"].clone()).expect("valid question payload");
+        mark_request_seen(&app.context, "question", &request.id);
+        app.enqueue_question_request(request);
+        app.submit_question_answer(vec!["Yes".to_string()]);
+        assert!(
+            context
+                .seen_request_ids
+                .read()
+                .contains("question:q_resync_1"),
+            "failed question reply must keep the id for retry"
+        );
+    }
+
+    #[test]
+    fn failed_reject_keeps_question_id_seen() {
+        // API クライアント未設定 = reject 送信失敗。キーを残して再試行可能にする（R4）。
+        let context = Arc::new(AppContext::new());
+        let mut app = headless_app(Arc::clone(&context));
+
+        let payloads = pending_request_sse_payloads();
+        let request: QuestionRequestInfo =
+            serde_json::from_value(payloads[1]["request"].clone()).expect("valid question payload");
+        let id = request.id.clone();
+        mark_request_seen(&app.context, "question", &id);
+        app.enqueue_question_request(request);
+        app.reject_active_question();
+        assert!(
+            context
+                .seen_request_ids
+                .read()
+                .contains(&format!("question:{id}")),
+            "failed question reject must keep the id for retry"
+        );
+        assert!(
+            app.active_question_request.is_some(),
+            "failed reject must keep the request for retry"
+        );
     }
 }
