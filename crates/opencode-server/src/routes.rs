@@ -721,18 +721,23 @@ fn normalize_todo_wire_values(status: &str, priority: &str) -> (String, String) 
 
 /// `todo.updated` SSE のペイロードを生成する。
 ///
+/// `todos` は `TodoManager::get_with_ids` の戻り値 (`TodoWithId`) を想定する。
+/// `id` をそのまま JSON へ載せることで、`GET /session/{id}/todo` と同じ
+/// 安定 ID をクライアントへ配信する（位置インデックスには依存しない）。
 /// `status` / `priority` は `normalize_todo_wire_values` で canonical 化してから
 /// JSON に載せる。これにより `GET /session/{id}/todo` と同じ wire 値が流れる。
-/// イベント名・JSON キー・`sessionID` は従来どおりで、呼び出し元が
-/// `TodoManager` へ渡す `TodoItemData` は生値のまま変更しない。
-fn todo_updated_payload(session_id: &str, todos: &[opencode_tool::TodoItemData]) -> String {
+/// イベント名・JSON キー・`sessionID` は従来どおりで、後方互換のため
+/// 既存フィールド (`content` / `status` / `priority`) は変更しない。
+fn todo_updated_payload(session_id: &str, todos: &[opencode_session::todo::TodoWithId]) -> String {
     serde_json::json!({
         "type": "todo.updated",
         "sessionID": session_id,
-        "todos": todos.iter().map(|todo| {
-            let (status, priority) = normalize_todo_wire_values(&todo.status, &todo.priority);
+        "todos": todos.iter().map(|entry| {
+            let (status, priority) =
+                normalize_todo_wire_values(&entry.todo.status, &entry.todo.priority);
             serde_json::json!({
-                "content": todo.content,
+                "id": entry.id,
+                "content": entry.todo.content,
                 "status": status,
                 "priority": priority,
             })
@@ -3326,7 +3331,11 @@ fn spawn_prompt_execution(
                 // TodoManager へは従来どおり生値を渡す（GET 側が正規化する）。
                 // SSE 側だけ canonical 値を流し、GET と wire 値を一致させる。
                 state.todo_manager.update(&session_id, items).await;
-                state.broadcast(&todo_updated_payload(&session_id, &todos));
+                // SSE にも GET /session/{id}/todo と同じ安定 ID を載せるため、
+                // 更新直後の TodoManager から ID 付きの値を読み戻す。
+                // update がリストを置き換えた直後なので両者の ID は一致する。
+                let todos_with_ids = state.todo_manager.get_with_ids(&session_id).await;
+                state.broadcast(&todo_updated_payload(&session_id, &todos_with_ids));
                 Ok(())
             })
         });
@@ -7994,24 +8003,33 @@ mod mapping_tests {
 
     /// R2: `todo.updated` SSE ペイロードの status/priority が
     /// `GET /session/{id}/todo` と同じ canonical 値になること。
-    /// イベント名・JSON キー・sessionID が不変なことも併せて検証する。
+    /// イベント名・JSON キー・sessionID が不変で、id が追加されることも検証する。
     #[test]
     fn todo_updated_sse_payload_uses_canonical_values() {
         let todos = vec![
-            opencode_tool::TodoItemData {
-                content: "legacy".to_string(),
-                status: "InProgress".to_string(),
-                priority: "High".to_string(),
+            opencode_session::todo::TodoWithId {
+                id: "sess-test_a".to_string(),
+                todo: opencode_session::TodoInfo {
+                    content: "legacy".to_string(),
+                    status: "InProgress".to_string(),
+                    priority: "High".to_string(),
+                },
             },
-            opencode_tool::TodoItemData {
-                content: "hyphen".to_string(),
-                status: "in-progress".to_string(),
-                priority: "MEDIUM".to_string(),
+            opencode_session::todo::TodoWithId {
+                id: "sess-test_b".to_string(),
+                todo: opencode_session::TodoInfo {
+                    content: "hyphen".to_string(),
+                    status: "in-progress".to_string(),
+                    priority: "MEDIUM".to_string(),
+                },
             },
-            opencode_tool::TodoItemData {
-                content: "canonical".to_string(),
-                status: "completed".to_string(),
-                priority: "low".to_string(),
+            opencode_session::todo::TodoWithId {
+                id: "sess-test_c".to_string(),
+                todo: opencode_session::TodoInfo {
+                    content: "canonical".to_string(),
+                    status: "completed".to_string(),
+                    priority: "low".to_string(),
+                },
             },
         ];
 
@@ -8024,17 +8042,86 @@ mod mapping_tests {
 
         let wire = value["todos"].as_array().expect("todos must be an array");
         assert_eq!(wire.len(), 3);
+        assert_eq!(wire[0]["id"], "sess-test_a");
         assert_eq!(wire[0]["content"], "legacy");
         assert_eq!(wire[0]["status"], "in_progress");
         assert_eq!(wire[0]["priority"], "high");
+        assert_eq!(wire[1]["id"], "sess-test_b");
         assert_eq!(wire[1]["status"], "in_progress");
         assert_eq!(wire[1]["priority"], "medium");
+        assert_eq!(wire[2]["id"], "sess-test_c");
         assert_eq!(wire[2]["status"], "completed");
         assert_eq!(wire[2]["priority"], "low");
 
-        // TodoManager へ渡す元データ（生値）は不変。
-        assert_eq!(todos[0].status, "InProgress");
-        assert_eq!(todos[0].priority, "High");
+        // 入力の生値は不変（正規化はペイロード生成時のみ行う）。
+        assert_eq!(todos[0].todo.status, "InProgress");
+        assert_eq!(todos[0].todo.priority, "High");
+    }
+
+    /// TODO-SSE-ID-01: `todo.updated` の id が
+    /// `GET /session/{id}/todo` の id と同じ安定値であることを検証する。
+    #[tokio::test]
+    async fn todo_updated_sse_payload_ids_match_get_todo_ids() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id
+        };
+        state
+            .todo_manager
+            .update(
+                &session_id,
+                vec![
+                    opencode_session::TodoInfo {
+                        content: "A".to_string(),
+                        status: "InProgress".to_string(),
+                        priority: "High".to_string(),
+                    },
+                    opencode_session::TodoInfo {
+                        content: "B".to_string(),
+                        status: "in-progress".to_string(),
+                        priority: "MEDIUM".to_string(),
+                    },
+                ],
+            )
+            .await;
+
+        // コールバックと同じ順序で get_with_ids を呼び、ペイロードを生成する。
+        let with_ids = state.todo_manager.get_with_ids(&session_id).await;
+        let Json(get_items) = get_session_todos(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("GET /session/{id}/todo must succeed");
+        assert_eq!(get_items.len(), 2);
+
+        let payload = todo_updated_payload(&session_id, &with_ids);
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload must be valid JSON");
+        assert_eq!(value["type"], "todo.updated");
+        assert_eq!(value["sessionID"], session_id.as_str());
+
+        let wire = value["todos"].as_array().expect("todos must be an array");
+        assert_eq!(wire.len(), get_items.len());
+        for (index, item) in wire.iter().enumerate() {
+            assert_eq!(
+                item["id"].as_str(),
+                Some(get_items[index].id.as_str()),
+                "SSE id must match the id returned by GET /session/{{id}}/todo"
+            );
+            assert_eq!(
+                item["status"].as_str(),
+                Some(get_items[index].status.as_str())
+            );
+            assert_eq!(
+                item["priority"].as_str(),
+                Some(get_items[index].priority.as_str())
+            );
+        }
+        assert_ne!(wire[0]["id"].as_str(), wire[1]["id"].as_str());
+        // 正規化が維持されていること（GET 側も同じ canonical 値）。
+        assert_eq!(wire[0]["status"].as_str(), Some("in_progress"));
+        assert_eq!(wire[0]["priority"].as_str(), Some("high"));
+        assert_eq!(wire[1]["status"].as_str(), Some("in_progress"));
+        assert_eq!(wire[1]["priority"].as_str(), Some("medium"));
     }
 
     /// serde ベースへ置換しても `/session/status` の status 値は従来と同一。
