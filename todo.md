@@ -67,8 +67,8 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **回答済み要求 ID が共有集合に残り再利用時に誤スキップ**
-  — `tui/app.rs:4269` / RETRY-04-R4 / 中（high）
+- [ ] **要求 ID の forget と SSE enqueue が競合し誤スキップ**
+  — `tui/app.rs:504` / RETRY-04-R4 / 中（medium）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[要求 ID 削除 1 件]** 回答/拒否成功時に共有集合から削除
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[要求 ID 去重 1 件]** SSE/resync の双方向去重を共有状態へ集約
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[SSE 保留要求再同期 1 件]** 再接続時に permission/question を復元
@@ -833,6 +835,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（ID 削除経路の修正時）: 親が low 2 件（reply/reject の
+  send() エラーに reqwest URL が混入する問題の固定文言化、reject 失敗時の
+  キー保持テスト）を直接修正。残存 medium（古い要求の forget と新規要求の
+  mark がスレッド間で競合し誤スキップ／誤削除され得る）は世代情報付きキー
+  等の設計を伴うため中優先 TODO へ。未回答要求がサーバ側で消えた場合の
+  キー残存も同根として記録。
 - 2026-11-23 R4 残存（双方向去重の修正時）: 親が low 2 件（既存 warn の
   要求 ID 露出、parse_question_asked の空 ID 検証欠落）を直接修正。残存
   medium（回答/拒否時に共有集合から ID を削除する経路が無く、ID 再利用時に
