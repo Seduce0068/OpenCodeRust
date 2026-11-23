@@ -67,8 +67,10 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **MCP OAuth の期限切れトークンが並行 get_token で二重 refresh**
-  — `mcp/oauth.rs:715` / RETRY-03 / 中
+- [ ] **OAuth refresh がプロセス共有ロックで直列化されていない**
+  — `mcp/oauth.rs:138` / RETRY-03-R4 / 中（high）
+- [ ] **公開 refresh_token() が 401 再試行経路でロック外**
+  — `mcp/client.rs:420` / RETRY-03-R4 / 中（high）
 - [ ] **SSE 再接続で permission/question 保留要求が再同期されない**
   — `tui/app.rs:4162` / RETRY-04 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -270,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[OAuth refresh 1 件]** 同一インスタンスの並行 refresh を抑制
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CodeMode 空白 2 件]** ECMAScript 準拠の trim / 日付区切り
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[パス区切り 2 件]** ls ignore / grep glob の Windows 区切り対応
@@ -827,6 +831,16 @@ status: current
 
 ## メモ
 
+- 2026-11-23 Betterleaks 全履歴スキャン: 2 件検出（discovery.rs のマスキング
+  対象例示 `https://user:pass@host/...?api_key=...` と api.rs テストの
+  ダミー JWT `{"sub":"dummy"}` + `dummysignaturebase64url_123`）。いずれも
+  実際の機微情報ではないため、履歴書き換え（force push を伴う破壊的操作）は
+  ユーザー確認なしには行わず、検出事実と判断を記録。pre-commit 未設定。
+- 2026-11-23 R4 残存（OAuth refresh の修正時）: refresh_lock がインスタンス
+  単位で、公開 refresh_token()（401 再試行）がロック外。プロセス共有ロック
+  と client.rs の再設計を伴うため中優先 TODO へ。本次は同一インスタンス内の
+  二重 refresh 防止として確定。他の low（ネットワーク I/O 全体でロック保持、
+  回帰テストの経路不足、refresh 後の再期限チェック欠落）も記録のみ。
 - 2026-11-23 R4 指摘（CORS 正規化の修正時）: 親が「Url::parse は scheme を
   小文字化するが host は保持する」をデバッグ確認し、判定側と whitelist 側
   双方で host を to_ascii_lowercase して比較するよう直接修正。残存 low

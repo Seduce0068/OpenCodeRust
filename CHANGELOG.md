@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T14:25:17+09:00"
+  at: "2026-11-23T14:49:53+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3302 件（all-features は 3301 件）
+  テスト総数 594 → 3303 件（all-features は 3302 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mcp`: 期限切れ OAuth トークンの並行 refresh を二重チェックで抑制
+  （swarm-coding R1-R6）
 - `codemode`: Date.parse の空白規範を ECMAScript 準拠へ（NEL 除外・区切り拡張）
   （swarm-coding R1-R6）
 - `tool` / `grep`: ignore / glob の Windows 区切りを POSIX と同等に扱う
