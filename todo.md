@@ -166,8 +166,6 @@ status: current
 
 - [ ] **task ツールが任意 task_id を検証せず渡す**
   — `tool/task.rs:56` / AV-04 / 低
-- [ ] **plugin auth.fetch の不正チャンクが通知を捨てる**
-  — `plugin/subprocess/client.rs:538` / PARSE-04 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
   — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -265,6 +263,8 @@ status: current
 
 ## 完了
 
+- [x] **[plugin チャンク検証 1 件]** 不正 chunk を Protocol エラー化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[search query 検証 1 件]** 空拒否・trim・上限 4096 char
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[mcp.timeout 検証 1 件]** 不正値を設定エラー化
@@ -888,6 +888,9 @@ status: current
 
 ## メモ
 
+- 2026-11-24 plugin チャンク: auth.fetch.stream.chunk の非文字列値を固定文言
+  Protocol エラー化（stream.end が正常完了に見えないように）。status の
+  unwrap_or(200) は旧ホスト互換のため据え置き（子の判断）。R4 指摘なし。
 - 2026-11-24 search query: WebSearch/CodeSearch に validated_query（空拒否、
   trim、4096 char 上限）を追加し External API・permission・title で検証済み値
   を共有。CodeSearch の PermissionRequest は metadata を持たず ToolResult 側
