@@ -73,10 +73,6 @@ status: current
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **未登録ルート/405 が空ボディで JSON 契約と不整合**
   — `server/routes.rs:122` / ERR-ENVELOPE-02 / 中
-- [ ] **mcp.servers.*.oauth.clientId が OAuth 設定へ変換されない**
-  — `server/routes.rs:4656` / CFGAPPLY-02 / 中
-- [ ] **`lsp.<server>.env` がサブプロセスへ渡されない**
-  — `cli/main.rs:5112` / CFGAPPLY-03 / 中
 - [ ] **default_agent 設定がエージェント選択へ反映されない**
   — `server/routes.rs:3010` / CFGAPPLY-04 / 中
 - [ ] **skills.urls がスキル探索ルートに使われない**
@@ -283,6 +279,8 @@ status: current
 
 ## 完了
 
+- [x] **[設定配線 2 件]** LSP env と MCP OAuth clientId
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[wire/doc 2 件]** JSON-RPC 要求分類と 401 ドキュメント整合
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[server wire 2 件]** todo SSE 正規化と 401 Bearer ヘッダ
@@ -862,6 +860,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 設定配線 2 件: opencode_lsp::LspServerConfig に env を追加し
+  build_server_command で envs 適用（未指定時は親環境継承）、CLI が
+  server.env を配線。MCP は oauth.clientId を RemoteOAuthSettings へ取り込み
+  RemoteMcpConfig.client_id のフォールバックに使用（legacy トップレベル
+  が優先、REST API 経路は対象外で不変）。R4 指摘なし。
 - 2026-11-23 wire/doc 2 件: parse_json_str が method キーを最優先で検査し
   id+method 要求を Notification へ分類（旧実装は空 Response に誤分類）。
   Unauthorized の doc を実装（legacy 形式のみ）に合わせ到達不能分岐を削除、
