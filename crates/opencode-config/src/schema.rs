@@ -1467,10 +1467,19 @@ impl<'de> Deserialize<'de> for McpConfig {
         // `mcp.timeout` is a global default object in the current schema, but
         // a legacy config may legitimately define a server named `timeout`.
         // Only treat the value as the global timeout when it is not a server.
-        let timeout = object
-            .get("timeout")
-            .filter(|value| !looks_like_mcp_server(value))
-            .and_then(|timeout| serde_json::from_value::<McpTimeoutConfig>(timeout.clone()).ok());
+        // Once it is clearly the timeout object, a deserialization failure must
+        // surface as a config error: silently dropping it leaves `timeout` in
+        // the legacy map, where it is parsed as a phantom MCP server (all
+        // fields optional, unknown keys ignored) and the load "succeeds".
+        let timeout = match object.get("timeout") {
+            Some(value) if !looks_like_mcp_server(value) => {
+                let parsed = serde_json::from_value::<McpTimeoutConfig>(value.clone());
+                Some(parsed.map_err(|_| {
+                    <D::Error as serde::de::Error>::custom("invalid mcp.timeout value")
+                })?)
+            }
+            _ => None,
+        };
 
         if is_mcp_servers_wrapper(object) {
             let servers = object.get("servers").cloned().unwrap_or_default();
@@ -3842,6 +3851,53 @@ mod tests {
             serde_json::from_str(r#"{"mcp":{"timeout":{"startup":45000}}}"#).unwrap();
         let section = config.mcp.expect("mcp");
         assert_eq!(section.timeout.expect("timeout").per_operation().0, 45000);
+    }
+
+    /// 不正な `mcp.timeout` は設定エラーにする。握りつぶすと legacy 分岐で
+    /// `timeout` という名前の空の MCP サーバーが作られ、ロードが成功してしまう。
+    /// エラー文言は固定で、設定値は一切含めない。
+    #[test]
+    fn invalid_global_timeout_is_an_error_without_echoing_value() {
+        for raw in [
+            r#"{"mcp":{"timeout":{"startup":-1}}}"#,
+            r#"{"mcp":{"timeout":{"catalog":-9}}}"#,
+            r#"{"mcp":{"timeout":"-1"}}"#,
+            r#"{"mcp":{"timeout":{"startup":-1},"servers":{"a":{"command":["x"]}}}}"#,
+        ] {
+            let err = serde_json::from_str::<Config>(raw)
+                .expect_err("invalid global mcp.timeout must fail to load");
+            let message = err.to_string();
+            assert!(
+                message.contains("mcp.timeout"),
+                "error should name the field: {message}"
+            );
+            assert!(
+                !message.contains("-1") && !message.contains("-9"),
+                "error must not echo the configured value: {message}"
+            );
+        }
+
+        // 正しい timeout は従来どおり反映される。
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"timeout":{"startup":45000}}}"#).unwrap();
+        assert_eq!(
+            config
+                .mcp
+                .expect("mcp")
+                .timeout
+                .expect("timeout")
+                .per_operation()
+                .0,
+            45000
+        );
+
+        // レガシーな `timeout` サーバーは従来どおりサーバーとして扱われる。
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"timeout":{"command":["run-timeout-server"]}}}"#)
+                .unwrap();
+        let section = config.mcp.expect("mcp");
+        assert!(section.timeout.is_none());
+        assert!(section.servers.expect("servers").contains_key("timeout"));
     }
 
     #[test]
