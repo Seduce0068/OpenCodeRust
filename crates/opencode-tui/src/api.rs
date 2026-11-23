@@ -1302,6 +1302,60 @@ impl ApiClient {
         }
         Ok(())
     }
+
+    /// 保留中の権限要求を `GET /permission` で取得する（SSE 切断中の取りこぼし回復用）。
+    ///
+    /// サーバがエンドポイントを持たない場合は 404 を空一覧として扱う。
+    /// 要求 ID / トークン / パスはエラーへ含めないため、レスポンス本文は
+    /// ログにもエラーにも渡さず、HTTP ステータスだけを通知する。
+    pub fn get_pending_permissions(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let url = format!("{}/permission", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send pending permissions request"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 未対応サーバ。ボディは見ずに読み捨てる（コネクションをプールへ戻す）。
+            let _ = response.bytes();
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            anyhow::bail!(
+                "Failed to get pending permissions (HTTP {})",
+                status.as_u16()
+            );
+        }
+        response
+            .json::<Vec<serde_json::Value>>()
+            .map_err(|_| anyhow::anyhow!("Failed to parse pending permissions response"))
+    }
+
+    /// 保留中の質問要求を `GET /question` で取得する（SSE 切断中の取りこぼし回復用）。
+    ///
+    /// サーバがエンドポイントを持たない場合は 404 を空一覧として扱う。
+    /// 要求 ID / トークン / パスはエラーへ含めないため、レスポンス本文は
+    /// ログにもエラーにも渡さず、HTTP ステータスだけを通知する。
+    pub fn get_pending_questions(&self) -> anyhow::Result<Vec<QuestionRequestInfo>> {
+        let url = format!("{}/question", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|_| anyhow::anyhow!("Failed to send pending questions request"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let _ = response.bytes();
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            anyhow::bail!("Failed to get pending questions (HTTP {})", status.as_u16());
+        }
+        response
+            .json::<Vec<QuestionRequestInfo>>()
+            .map_err(|_| anyhow::anyhow!("Failed to parse pending questions response"))
+    }
 }
 
 #[cfg(test)]
@@ -2974,5 +3028,112 @@ mod tests {
             "query must not leak into error: {message}"
         );
         let _ = mock.request();
+    }
+
+    // --- R2 (RETRY-04): 保留要求の再同期用 GET /permission, GET /question ---
+
+    #[test]
+    fn get_pending_permissions_returns_server_pending_list() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn(
+            r#"[{"id":"perm_resync_1","session_id":"ses_1","tool":"bash","input":{},"message":"allow","permission_type":"edit","patterns":["pat-a","pat-b"],"metadata":{},"always":[]}]"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let pending = client
+            .get_pending_permissions()
+            .expect("GET /permission must parse the pending list");
+        assert_eq!(pending.len(), 1, "one pending permission expected");
+        assert_eq!(pending[0]["id"], json!("perm_resync_1"));
+        assert_eq!(pending[0]["permission_type"], json!("edit"));
+
+        let request = mock.request();
+        assert!(
+            request.request_line.starts_with("GET /permission "),
+            "must GET /permission: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn get_pending_questions_returns_server_pending_list() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn(
+            r#"[{"id":"q_resync_1","session_id":"ses_1","questions":[{"question":"Proceed?","header":null,"options":[{"label":"Yes","description":null}],"multiple":false}]}]"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let pending = client
+            .get_pending_questions()
+            .expect("GET /question must parse the pending list");
+        assert_eq!(pending.len(), 1, "one pending question expected");
+        assert_eq!(pending[0].id, "q_resync_1");
+        assert_eq!(pending[0].questions[0].question, "Proceed?");
+
+        let request = mock.request();
+        assert!(
+            request.request_line.starts_with("GET /question "),
+            "must GET /question: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn pending_list_gets_treat_404_as_empty() {
+        ensure_no_proxy();
+        let permissions_mock = RecordingMock::spawn_with_status("404 Not Found", r#"{}"#);
+        let permissions_client = ApiClient::new(permissions_mock.base_url.clone());
+        assert!(
+            permissions_client
+                .get_pending_permissions()
+                .expect("404 must map to an empty list")
+                .is_empty(),
+            "unsupported /permission must yield no pending requests"
+        );
+        let _ = permissions_mock.request();
+
+        ensure_no_proxy();
+        let questions_mock = RecordingMock::spawn_with_status("404 Not Found", r#"{}"#);
+        let questions_client = ApiClient::new(questions_mock.base_url.clone());
+        assert!(
+            questions_client
+                .get_pending_questions()
+                .expect("404 must map to an empty list")
+                .is_empty(),
+            "unsupported /question must yield no pending requests"
+        );
+        let _ = questions_mock.request();
+    }
+
+    #[test]
+    fn pending_list_gets_error_without_leaking_body_or_path() {
+        let body = r#"{"error":{"type":"internal","message":"failed at /home/secret value LEAK_MARKER_9f3a"}}"#;
+        ensure_no_proxy();
+        let permissions_mock = RecordingMock::spawn_with_status("500 Internal Server Error", body);
+        let permissions_client = ApiClient::new(permissions_mock.base_url.clone());
+        let permissions_err = permissions_client
+            .get_pending_permissions()
+            .expect_err("500 must remain an error");
+        let _ = permissions_mock.request();
+
+        ensure_no_proxy();
+        let questions_mock = RecordingMock::spawn_with_status("500 Internal Server Error", body);
+        let questions_client = ApiClient::new(questions_mock.base_url.clone());
+        let questions_err = questions_client
+            .get_pending_questions()
+            .expect_err("500 must remain an error");
+        let _ = questions_mock.request();
+
+        for err in [permissions_err, questions_err] {
+            let message = err.to_string();
+            assert!(
+                message.contains("500"),
+                "status must be reported: {message}"
+            );
+            assert!(
+                !message.contains("/home/secret") && !message.contains("LEAK_MARKER_9f3a"),
+                "response body must not leak into error: {message}"
+            );
+        }
     }
 }

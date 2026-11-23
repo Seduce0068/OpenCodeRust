@@ -4257,6 +4257,93 @@ fn resync_todos_from_server(context: &Arc<AppContext>) {
     }
 }
 
+thread_local! {
+    /// この SSE リスナスレッドが resync で enqueue した要求 ID。
+    /// 再接続のたびに同じ保留要求を二重に enqueue しないための冪等化。
+    /// SSE イベント経由の enqueue は変更せず、resync 由来の重複だけを排除する。
+    static RESYNCED_REQUEST_IDS: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// 既に resync で enqueue した ID かどうかを判定する。
+fn resync_id_seen(kind: &str, id: &str) -> bool {
+    RESYNCED_REQUEST_IDS.with(|seen| seen.borrow().contains(&format!("{kind}:{id}")))
+}
+
+/// resync で enqueue した ID を記録する。
+fn remember_resync_id(kind: &str, id: &str) {
+    RESYNCED_REQUEST_IDS.with(|seen| {
+        seen.borrow_mut().insert(format!("{kind}:{id}"));
+    });
+}
+
+/// サーバの保留中 permission / question を取得し、`CustomEvent` として enqueue する。
+///
+/// SSE の `permission.requested` / `question.asked` は切断中に発生した要求を
+/// 取りこぼすため、接続確立時に GET で再同期する。失敗時は固定文言の debug
+/// ログだけを残し、要求 ID / トークン / パスを一切出力しない。
+fn resync_pending_requests_from_server(context: &Arc<AppContext>, event_tx: &Sender<CustomEvent>) {
+    let Some(client) = context.get_api_client() else {
+        return;
+    };
+
+    match client.get_pending_permissions() {
+        Ok(permissions) => {
+            for value in permissions {
+                // SSE の `permission.requested` は `{"request": ...}` で届くため、
+                // 既存のパースヘルパへ同じ形に包んで渡し、変換ロジックを共有する。
+                let wrapper = serde_json::json!({ "request": value });
+                let Some(event) = parse_permission_requested(&wrapper) else {
+                    continue;
+                };
+                let CustomEvent::PermissionRequested { id, .. } = &event else {
+                    continue;
+                };
+                if resync_id_seen("permission", id) {
+                    continue;
+                }
+                let id = String::clone(id);
+                if event_tx.send(event).is_err() {
+                    return;
+                }
+                remember_resync_id("permission", &id);
+            }
+        }
+        Err(_) => tracing::debug!("failed to resync pending permissions from server"),
+    }
+
+    match client.get_pending_questions() {
+        Ok(questions) => {
+            for request in questions {
+                if resync_id_seen("question", &request.id) {
+                    continue;
+                }
+                let id = request.id.clone();
+                if event_tx.send(CustomEvent::QuestionAsked(request)).is_err() {
+                    return;
+                }
+                remember_resync_id("question", &id);
+            }
+        }
+        Err(_) => tracing::debug!("failed to resync pending questions from server"),
+    }
+}
+
+/// SSE リスナが保持する `Sender<Event>` 用の薄いアダプタ。
+///
+/// `resync_pending_requests_from_server` は `CustomEvent` のみを扱い、ここで
+/// 既存の `Event::Custom` チャネルへ橋渡しする（SSE 側の送信経路は不変）。
+fn resync_pending_requests_for_listener(context: &Arc<AppContext>, event_tx: &Sender<Event>) {
+    let (custom_tx, custom_rx) = mpsc::channel();
+    resync_pending_requests_from_server(context, &custom_tx);
+    drop(custom_tx);
+    for custom in custom_rx {
+        if event_tx.send(Event::Custom(custom)).is_err() {
+            break;
+        }
+    }
+}
+
 /// SSE 初回再接続待機（従来の 400ms を維持）。
 const SSE_INITIAL_RETRY_MS: u64 = 400;
 /// 指数バックオフの上限。
@@ -4419,6 +4506,8 @@ fn spawn_server_event_listener(
         let event_url = format!("{}/event", base_url.trim_end_matches('/'));
         // 起動時にもサーバ側の状態で上書きし、過去の更新の取りこぼしを回復する。
         resync_todos_from_server(&context);
+        // 切断中に発生した permission / question も GET で取り戻す。
+        resync_pending_requests_for_listener(&context, &event_tx);
         let mut retry_attempt: u32 = 0;
         loop {
             if shutdown.load(Ordering::Relaxed) {
@@ -4437,6 +4526,8 @@ fn spawn_server_event_listener(
                     // 再接続中に届いた todo.updated を取りこぼす場合があるため、
                     // ストリームの消費前に GET で再同期する。
                     resync_todos_from_server(&context);
+                    // 切断中にサーバへ積まれた permission / question も同様に再同期する。
+                    resync_pending_requests_for_listener(&context, &event_tx);
                     let stream_started = Instant::now();
                     // 受信側が消えた (send が Err) 場合は再接続せず終了する。
                     if !consume_server_event_stream(response, &event_tx, &context, &shutdown) {
@@ -6614,6 +6705,97 @@ mod tests {
             status_hits.load(Ordering::SeqCst),
             2,
             "each refresh must reach the /session/status stub exactly once"
+        );
+    }
+
+    /// GET /permission と GET /question に保留要求を返す loopback スタブ。
+    /// 外部送信は行わず、トークンや実ファイルパスはレスポンスへ含めない。
+    fn spawn_pending_requests_api() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = if first_line.contains("/permission") {
+                    r#"[{"id":"perm_resync_1","session_id":"ses_1","tool":"bash","input":{},"message":"allow","permission_type":"edit","patterns":["tool/read","tool/write"],"metadata":{},"always":[]}]"#
+                } else if first_line.contains("/question") {
+                    r#"[{"id":"q_resync_1","session_id":"ses_1","questions":[{"question":"Proceed?","header":null,"options":[{"label":"Yes","description":null}],"multiple":false}]}]"#
+                } else {
+                    "[]"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn resync_pending_requests_delivers_permission_and_question_events() {
+        let base_url = spawn_pending_requests_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        resync_pending_requests_from_server(&context, &event_tx);
+
+        let mut permissions = Vec::new();
+        let mut questions = Vec::new();
+        for event in event_rx.try_iter() {
+            match event {
+                CustomEvent::PermissionRequested {
+                    id,
+                    permission_type,
+                    resource,
+                    tool_name,
+                } => permissions.push((id, permission_type, resource, tool_name)),
+                CustomEvent::QuestionAsked(request) => questions.push(request),
+                other => panic!("unexpected custom event: {other:?}"),
+            }
+        }
+
+        assert_eq!(permissions.len(), 1, "one permission must be re-enqueued");
+        assert_eq!(permissions[0].0, "perm_resync_1");
+        assert_eq!(permissions[0].1, "edit");
+        assert_eq!(permissions[0].2, "tool/read, tool/write");
+        assert_eq!(permissions[0].3, "bash");
+        assert_eq!(questions.len(), 1, "one question must be re-enqueued");
+        assert_eq!(questions[0].id, "q_resync_1");
+        assert_eq!(questions[0].questions[0].question, "Proceed?");
+
+        // 同一 ID の再送は抑止される（再接続時の二重 enqueue 防止）。
+        resync_pending_requests_from_server(&context, &event_tx);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "duplicate pending requests must not be re-enqueued"
         );
     }
 }
