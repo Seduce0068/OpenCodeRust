@@ -24,6 +24,11 @@ const MIN_CONTEXT_MAX_CHARACTERS: usize = 1_000;
 const MAX_CONTEXT_MAX_CHARACTERS: usize = 10_000;
 /// WebFetch と同じ 5MB 上限を Exa レスポンス本文にも適用する。
 const MAX_RESPONSE_SIZE: usize = 5 * 1024 * 1024;
+/// 検索クエリの上限（char 数）。External API と `PermissionRequest` へ渡る値を
+/// 有界にし、過大な入力がそのまま外部送信・権限 metadata へ流れるのを防ぐ。
+const MAX_QUERY_CHARS: usize = 4096;
+/// 空クエリを拒否する際の固定エラー文言。クエリ値・パス・トークンを含めない。
+const INVALID_QUERY_MESSAGE: &str = "Web search query must not be empty";
 
 pub struct WebSearchTool {
     client: Client,
@@ -113,11 +118,29 @@ fn clamp_context_max_characters(value: usize) -> usize {
     value.clamp(MIN_CONTEXT_MAX_CHARACTERS, MAX_CONTEXT_MAX_CHARACTERS)
 }
 
-/// Exa へ送信する引数を組み立てる。全ての数値をここで clamp し、
-/// `execute()` とテストが同じ経路を通るようにする。
-fn clamped_search_arguments(input: &WebSearchInput) -> McpSearchArguments {
-    McpSearchArguments {
-        query: input.query.clone(),
+/// Exa へ渡す検索クエリを検証・正規化する。
+///
+/// - 前後の空白を除去し、空になった場合は固定文言の `InvalidArguments` を返す。
+/// - `MAX_QUERY_CHARS` を超える場合は char 単位で打ち切り、外部 API と
+///   `PermissionRequest` の metadata へ渡る値の上限を保証する。
+/// - エラー文言にはクエリ値・パス・トークンを一切含めない。
+fn validated_query(query: &str) -> Result<String, ToolError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            INVALID_QUERY_MESSAGE.to_string(),
+        ));
+    }
+
+    Ok(trimmed.chars().take(MAX_QUERY_CHARS).collect())
+}
+
+/// Exa へ送信する引数を組み立てる。全ての数値をここで clamp し、クエリは
+/// `validated_query()` で検証・正規化する。`execute()` とテストが同じ経路を
+/// 通るようにする。
+fn clamped_search_arguments(input: &WebSearchInput) -> Result<McpSearchArguments, ToolError> {
+    Ok(McpSearchArguments {
+        query: validated_query(&input.query)?,
         search_type: Some(
             input
                 .search_type
@@ -134,7 +157,7 @@ fn clamped_search_arguments(input: &WebSearchInput) -> McpSearchArguments {
         context_max_characters: input
             .context_max_characters
             .map(clamp_context_max_characters),
-    }
+    })
 }
 
 /// Exa レスポンス本文を `bytes_stream()` の累計で 5MB に制限して読む。
@@ -240,15 +263,17 @@ impl Tool for WebSearchTool {
         let input: WebSearchInput =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        // Exa へ渡す前に範囲を強制する。CodeSearch の clamp と同じく、
-        // 不正値はエラーにせず境界へ丸め、入力値をログ・エラーに出さない。
-        let arguments = clamped_search_arguments(&input);
+        // Exa へ渡す前に範囲を強制し、クエリを検証・正規化する。CodeSearch の
+        // clamp と同じく数値は境界へ丸め、入力値をログ・エラーに出さない。
+        // 検証済みクエリは Exa 引数・permission pattern/metadata・タイトルで共有する。
+        let arguments = clamped_search_arguments(&input)?;
+        let query = arguments.query.clone();
         let num_results = arguments.num_results.unwrap_or(DEFAULT_NUM_RESULTS);
 
         ctx.ask_permission(
             crate::PermissionRequest::new("websearch")
-                .with_pattern(&input.query)
-                .with_metadata("query", serde_json::Value::String(input.query.clone()))
+                .with_pattern(&query)
+                .with_metadata("query", serde_json::Value::String(query.clone()))
                 .with_metadata("numResults", serde_json::Value::Number(num_results.into()))
                 .always_allow(),
         )
@@ -297,7 +322,7 @@ impl Tool for WebSearchTool {
         });
 
         Ok(ToolResult {
-            title: format!("Web search: {}", input.query),
+            title: format!("Web search: {}", query),
             output,
             metadata: std::collections::HashMap::new(),
             truncated: false,
@@ -425,7 +450,7 @@ mod tests {
             "numResults": usize::MAX
         }))
         .expect("usize::MAX must deserialize into usize");
-        let arguments = clamped_search_arguments(&input);
+        let arguments = clamped_search_arguments(&input).expect("query must be valid");
         assert_eq!(arguments.num_results, Some(20));
 
         let serialized = serde_json::to_value(&arguments).expect("serialize arguments");
@@ -454,7 +479,7 @@ mod tests {
             "contextMaxCharacters": usize::MAX
         }))
         .expect("usize::MAX must deserialize");
-        let arguments = clamped_search_arguments(&input);
+        let arguments = clamped_search_arguments(&input).expect("query must be valid");
         let serialized = serde_json::to_value(&arguments).expect("serialize arguments");
         let raw_max = usize::MAX.to_string();
         assert_eq!(serialized["contextMaxCharacters"], 10_000);
@@ -470,7 +495,7 @@ mod tests {
     fn omitted_context_max_characters_stays_none() {
         let input: WebSearchInput =
             serde_json::from_value(serde_json::json!({ "query": "rust" })).unwrap();
-        let arguments = clamped_search_arguments(&input);
+        let arguments = clamped_search_arguments(&input).expect("query must be valid");
         assert_eq!(arguments.num_results, Some(DEFAULT_NUM_RESULTS));
         assert!(arguments.context_max_characters.is_none());
         assert_eq!(arguments.search_type.as_deref(), Some("auto"));
@@ -547,5 +572,85 @@ mod tests {
         assert!(matches!(error, ToolError::ExecutionError(_)));
 
         server.await.expect("server task");
+    }
+
+    /// 回帰テスト（R2 AV-05）: 空・空白のみの query は固定文言の
+    /// `InvalidArguments` になり、通常 query は trim 済みで不変であること。
+    #[test]
+    fn validated_query_rejects_blank_and_trims_normal_values() {
+        let cases = [
+            ("", false, ""),
+            ("   ", false, ""),
+            ("\t\n  \r", false, ""),
+            ("rust", true, "rust"),
+            ("  rust  ", true, "rust"),
+            ("\trust\n", true, "rust"),
+            (
+                "rust programming language",
+                true,
+                "rust programming language",
+            ),
+        ];
+
+        for (raw, is_valid, expected) in cases {
+            match validated_query(raw) {
+                Ok(actual) => {
+                    assert!(is_valid, "raw={raw:?} must be rejected");
+                    assert_eq!(actual, expected, "raw={raw:?}");
+                }
+                Err(err) => {
+                    assert!(!is_valid, "raw={raw:?} must be valid: {err}");
+                    assert!(
+                        matches!(&err, ToolError::InvalidArguments(_)),
+                        "raw={raw:?}, err={err:?}"
+                    );
+                    // 固定文言のみで、クエリ値・パス・トークンを含まないこと。
+                    assert_eq!(
+                        err.to_string(),
+                        format!("Invalid arguments: {INVALID_QUERY_MESSAGE}")
+                    );
+                }
+            }
+        }
+    }
+
+    /// 回帰テスト（R2 AV-05）: 上限超えの query は char 数（バイト数ではない）で
+    /// `MAX_QUERY_CHARS` に打ち切られ、外部 API / metadata へ渡る値が有界になること。
+    #[test]
+    fn validated_query_truncates_over_long_input_by_char_count() {
+        let multibyte = "あ".repeat(MAX_QUERY_CHARS + 10);
+        let truncated = validated_query(&multibyte).expect("over-long query is truncated");
+        assert_eq!(truncated.chars().count(), MAX_QUERY_CHARS);
+        assert_eq!(truncated, "あ".repeat(MAX_QUERY_CHARS));
+
+        let padded = format!("  {}  ", "x".repeat(MAX_QUERY_CHARS + 5));
+        let truncated = validated_query(&padded).expect("over-long padded query is truncated");
+        assert_eq!(truncated.chars().count(), MAX_QUERY_CHARS);
+        assert_eq!(truncated, "x".repeat(MAX_QUERY_CHARS));
+    }
+
+    /// 回帰テスト（R2 AV-05）: `clamped_search_arguments` が検証済みクエリを
+    /// `McpSearchArguments.query` にも反映し、空クエリを拒否すること。
+    /// permission pattern/metadata と同じ値が Exa 引数にも渡ることを固定する。
+    #[test]
+    fn clamped_arguments_use_validated_query() {
+        let input: WebSearchInput = serde_json::from_value(serde_json::json!({
+            "query": "  rust  "
+        }))
+        .unwrap();
+        let arguments = clamped_search_arguments(&input).expect("query must be valid");
+        assert_eq!(arguments.query, validated_query(&input.query).unwrap());
+        let serialized = serde_json::to_value(&arguments).expect("serialize arguments");
+        assert_eq!(serialized["query"], serde_json::json!("rust"));
+        assert!(!serialized.to_string().contains("  rust  "));
+
+        let blank: WebSearchInput = serde_json::from_value(serde_json::json!({
+            "query": "   "
+        }))
+        .unwrap();
+        assert!(matches!(
+            clamped_search_arguments(&blank),
+            Err(ToolError::InvalidArguments(_))
+        ));
     }
 }

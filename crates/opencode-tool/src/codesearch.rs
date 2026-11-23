@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::{Metadata, PermissionRequest, Tool, ToolContext, ToolError, ToolResult};
 
 const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
+/// 検索クエリの上限（char 数）。External API と `PermissionRequest` の pattern、
+/// および `ToolResult` の metadata/title へ渡る値を有界にし、過大な入力がそのまま
+/// 外部送信・権限情報へ流れるのを防ぐ。WebSearch の `MAX_QUERY_CHARS` と揃える。
+const MAX_QUERY_CHARS: usize = 4096;
+/// 空クエリを拒否する際の固定エラー文言。クエリ値・パス・トークンを含めない。
+const INVALID_QUERY_MESSAGE: &str = "Code search query must not be empty";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +22,23 @@ pub struct CodeSearchParams {
 
 fn default_tokens() -> u32 {
     5000
+}
+
+/// Exa Code API へ渡す検索クエリを検証・正規化する。
+///
+/// - 前後の空白を除去し、空になった場合は固定文言の `InvalidArguments` を返す。
+/// - `MAX_QUERY_CHARS` を超える場合は char 単位で打ち切り、外部 API と
+///   `PermissionRequest` / `ToolResult` へ渡る値の上限を保証する。
+/// - エラー文言にはクエリ値・パス・トークンを一切含めない。
+fn validated_query(query: &str) -> Result<String, ToolError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            INVALID_QUERY_MESSAGE.to_string(),
+        ));
+    }
+
+    Ok(trimmed.chars().take(MAX_QUERY_CHARS).collect())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,15 +93,18 @@ impl CodeSearchTool {
         let params: CodeSearchParams = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid parameters: {}", e)))?;
 
+        // 権限確認より前にクエリを検証・正規化し、以降の経路（MCP 引数、
+        // permission pattern、metadata、title）で検証済み値を共有する。
+        let query = validated_query(&params.query)?;
+
         ctx.ask_permission(
             PermissionRequest::new("codesearch")
-                .with_pattern(&params.query)
+                .with_pattern(&query)
                 .always_allow(),
         )
         .await?;
 
         let tokens_num = params.tokens_num.clamp(1000, 50000);
-        let query = params.query.clone();
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -133,12 +159,15 @@ impl CodeSearchTool {
                     });
 
                 let mut metadata = Metadata::new();
-                metadata.insert("query".to_string(), serde_json::json!(query));
+                metadata.insert(
+                    "query".to_string(),
+                    serde_json::Value::String(query.clone()),
+                );
                 metadata.insert("tokens_num".to_string(), serde_json::json!(tokens_num));
 
                 Ok(ToolResult {
                     output,
-                    title: format!("Code search: {}", params.query),
+                    title: format!("Code search: {}", query),
                     metadata,
                     truncated: false,
                 })
@@ -256,6 +285,160 @@ mod tests {
         let serialized = serde_json::to_value(&params).unwrap();
         assert_eq!(serialized["tokensNum"], 1000);
         assert!(serialized.get("tokens_num").is_none());
+    }
+
+    /// 回帰テスト（AV-05）: 空／空白のみの query は固定文言の `InvalidArguments`
+    /// になり、権限確認や HTTP リクエストより前に拒否されること。
+    #[tokio::test]
+    async fn empty_query_is_rejected_before_permission_and_http() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let permission_called = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&permission_called);
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned()).with_ask(
+            move |_| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        for raw in ["", "   \t\n ", "\u{3000}"] {
+            let args = serde_json::json!({ "query": raw });
+            // 到達不能なエンドポイントを指定しても、検証が先に走るため即座に失敗する。
+            let error =
+                CodeSearchTool::execute_with_endpoint(args, ctx.clone(), "http://127.0.0.1:1/mcp")
+                    .await
+                    .expect_err("empty query must be rejected");
+            let message = error.to_string();
+
+            assert!(
+                matches!(&error, ToolError::InvalidArguments(_)),
+                "error type must remain InvalidArguments: {error}"
+            );
+            assert_eq!(
+                message,
+                format!("Invalid arguments: {INVALID_QUERY_MESSAGE}"),
+                "fixed error wording must not carry the query value, path or token"
+            );
+            assert_eq!(validated_query(raw).unwrap_err().to_string(), message);
+            assert!(
+                !permission_called.load(Ordering::SeqCst),
+                "permission must not be requested for an empty query"
+            );
+        }
+    }
+
+    /// 回帰テスト（AV-05）: 前後の空白は trim され、内部の空白は保持される。
+    #[test]
+    fn query_surrounding_whitespace_is_trimmed() {
+        assert_eq!(
+            validated_query("  react hooks \n\t").expect("valid query"),
+            "react hooks"
+        );
+        assert_eq!(
+            validated_query("\u{3000}React useState\u{3000}").expect("valid query"),
+            "React useState"
+        );
+        assert_eq!(validated_query("a b  c").expect("valid query"), "a b  c");
+    }
+
+    /// 回帰テスト（AV-05）: 上限超えは char 単位で打ち切られる（バイト単位ではない）。
+    #[test]
+    fn oversized_query_is_truncated_by_char_count() {
+        let ascii = "a".repeat(MAX_QUERY_CHARS + 100);
+        let out = validated_query(&ascii).expect("valid query");
+        assert_eq!(out.chars().count(), MAX_QUERY_CHARS);
+        assert_eq!(out, "a".repeat(MAX_QUERY_CHARS));
+
+        let multibyte = "あ".repeat(MAX_QUERY_CHARS + 100);
+        let out = validated_query(&multibyte).expect("valid query");
+        assert_eq!(out.chars().count(), MAX_QUERY_CHARS);
+        assert_eq!(out, "あ".repeat(MAX_QUERY_CHARS));
+        assert_eq!(
+            out.len(),
+            MAX_QUERY_CHARS * "あ".len(),
+            "limit must count chars, not UTF-8 bytes"
+        );
+    }
+
+    /// 回帰テスト（AV-05）: 通常の query は不変。
+    #[test]
+    fn normal_query_is_unchanged() {
+        for query in ["react hooks", "Express.js middleware", "Rust tokio select!"] {
+            assert_eq!(validated_query(query).expect("valid query"), query);
+        }
+    }
+
+    /// 回帰テスト（AV-05）: 検証済みクエリが MCP リクエスト、permission pattern、
+    /// および `ToolResult` の metadata/title で共有されること。
+    #[tokio::test]
+    async fn sanitized_query_is_used_by_permission_and_result() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                // JSON ボディの末尾（`"}}"`）が揃った時点で検証に必要な情報は得られる。
+                if request.windows(2).any(|window| window == b"}}") {
+                    break;
+                }
+            }
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes()).await;
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let patterns = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&patterns);
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned()).with_ask(
+            move |request| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.lock().expect("lock").extend(request.patterns);
+                    Ok(())
+                }
+            },
+        );
+
+        let args = serde_json::json!({ "query": "  react hooks  " });
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let result = CodeSearchTool::execute_with_endpoint(args, ctx, &endpoint)
+            .await
+            .expect("request must succeed");
+
+        assert_eq!(result.metadata["query"], serde_json::json!("react hooks"));
+        assert_eq!(result.title, "Code search: react hooks");
+        assert_eq!(
+            *patterns.lock().expect("lock"),
+            vec!["react hooks".to_owned()]
+        );
+
+        let wire = server.await.expect("server task");
+        assert!(
+            wire.contains("\"query\":\"react hooks\""),
+            "MCP request must carry sanitized query: {wire}"
+        );
+        assert!(
+            !wire.contains("  react hooks  "),
+            "raw query leaked into MCP request: {wire}"
+        );
     }
 
     #[test]
