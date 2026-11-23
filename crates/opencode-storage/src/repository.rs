@@ -183,7 +183,23 @@ impl SessionRepository {
         Self { pool }
     }
 
+    /// 同一 DB を指す高位リポジトリを組み立てるための接続ハンドル。
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub async fn create(&self, session: &Session) -> Result<(), DatabaseError> {
+        Self::create_on(&self.pool, session).await
+    }
+
+    /// 指定した executor 上でセッションを挿入する内部ヘルパー。
+    ///
+    /// `create` と `SessionPersistence::upsert_session_with_messages` が同じ
+    /// INSERT 文を共有し、片方だけが修正されることによる不整合を防ぐ。
+    async fn create_on<'e, E>(executor: E, session: &Session) -> Result<(), DatabaseError>
+    where
+        E: Executor<'e, Database = sqlx::Sqlite>,
+    {
         let summary_diffs = session
             .summary
             .as_ref()
@@ -236,7 +252,7 @@ impl SessionRepository {
         .bind(session.updated_at.timestamp_millis())
         .bind(session.time.compacting.map(|t| t as i64))
         .bind(session.time.archived.map(|t| t as i64))
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
@@ -346,6 +362,17 @@ impl SessionRepository {
     }
 
     pub async fn update(&self, session: &Session) -> Result<(), DatabaseError> {
+        Self::update_on(&self.pool, session).await
+    }
+
+    /// 指定した executor 上でセッションを更新する内部ヘルパー。
+    ///
+    /// `update` と `SessionPersistence::upsert_session_with_messages` が同じ
+    /// UPDATE 文を共有する。`create_on` と異なり immutable な列は更新しない。
+    async fn update_on<'e, E>(executor: E, session: &Session) -> Result<(), DatabaseError>
+    where
+        E: Executor<'e, Database = sqlx::Sqlite>,
+    {
         let summary_diffs = session
             .summary
             .as_ref()
@@ -396,7 +423,7 @@ impl SessionRepository {
         .bind(session.time.compacting.map(|t| t as i64))
         .bind(session.time.archived.map(|t| t as i64))
         .bind(&session.id.0)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
@@ -532,16 +559,21 @@ fn decode_message_row(row: &MessageRow) -> Result<SessionMessage, DatabaseError>
 }
 
 /// セッション内の破損行数を数える（`replace_for_session` の事前検証用）。
-async fn count_corrupt_messages(
-    pool: &SqlitePool,
+///
+/// プールでもトランザクションでも同じ検証ができるよう executor を受け取る。
+async fn count_corrupt_messages<'e, E>(
+    executor: E,
     session_id: &str,
-) -> Result<usize, DatabaseError> {
+) -> Result<usize, DatabaseError>
+where
+    E: Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as::<_, MessageRow>(
         r#"SELECT id, session_id, role, created_at, data, metadata, usage
            FROM messages WHERE session_id = ?"#,
     )
     .bind(session_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
@@ -731,7 +763,32 @@ impl MessageRepository {
         session_id: &str,
         messages: &[SessionMessage],
     ) -> Result<(), DatabaseError> {
-        let corrupt = count_corrupt_messages(&self.pool, session_id).await?;
+        Self::ensure_no_corrupt_messages(&self.pool, session_id).await?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DatabaseError::TransactionError(e.to_string()))?;
+
+        Self::replace_messages_on(&mut tx, session_id, messages).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::TransactionError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 破損行が残っていれば置換を拒否する（従来の事前検証を共有する）。
+    async fn ensure_no_corrupt_messages<'e, E>(
+        executor: E,
+        session_id: &str,
+    ) -> Result<(), DatabaseError>
+    where
+        E: Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let corrupt = count_corrupt_messages(executor, session_id).await?;
         if corrupt > 0 {
             tracing::warn!(
                 session_id = %session_id,
@@ -742,22 +799,80 @@ impl MessageRepository {
                 "session '{session_id}' has {corrupt} corrupted message row(s); refusing replace to avoid data loss"
             )));
         }
+        Ok(())
+    }
 
+    /// DELETE + INSERT を呼び出し側の接続上で実行する。
+    /// トランザクションの開始・コミットは呼び出し側の責務とし、既存の
+    /// `replace_for_session` と新 API の双方から同じ SQL が使われる。
+    async fn replace_messages_on(
+        conn: &mut sqlx::SqliteConnection,
+        session_id: &str,
+        messages: &[SessionMessage],
+    ) -> Result<(), DatabaseError> {
+        sqlx::query("DELETE FROM messages WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        for message in messages {
+            Self::insert_message(&mut *conn, message).await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// セッションとそのメッセージを単一トランザクションで永続化する高位リポジトリ。
+///
+/// `SessionRepository` / `MessageRepository` と同じ `SqlitePool` を共有し、
+/// 個別リポジトリの公開 API（既存 SQL・挙動）は変更せずに原子性だけを追加する。
+pub struct SessionPersistence {
+    pool: SqlitePool,
+}
+
+impl SessionPersistence {
+    /// 既存リポジトリと同一のプールから組み立てる。
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// セッションの存在確認 → update/create → メッセージ置換を 1 トランザクションで行う。
+    ///
+    /// 途中で失敗した場合は未コミットのトランザクションがドロップされ、
+    /// セッション更新とメッセージ置換の両方がロールバックされる。
+    /// 破損行が残っている場合は `MessageRepository::replace_for_session` と同じく
+    /// `DatabaseError::CorruptData` を返し、既存行を削除しない。
+    /// トークン値・パスをログやエラー本文に含めない方針は既存リポジトリと同じ。
+    pub async fn upsert_session_with_messages(
+        &self,
+        session: &Session,
+        messages: &[SessionMessage],
+    ) -> Result<(), DatabaseError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| DatabaseError::TransactionError(e.to_string()))?;
 
-        sqlx::query("DELETE FROM messages WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        // 既存の replace_for_session と同じ事前検証をトランザクション内で行う。
+        MessageRepository::ensure_no_corrupt_messages(&mut *tx, &session.id.0).await?;
 
-        for message in messages {
-            Self::insert_message(&mut *tx, message).await?;
+        let exists = sqlx::query("SELECT 1 FROM sessions WHERE id = ?")
+            .bind(&session.id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?
+            .is_some();
+
+        if exists {
+            SessionRepository::update_on(&mut *tx, session).await?;
+        } else {
+            SessionRepository::create_on(&mut *tx, session).await?;
         }
+
+        MessageRepository::replace_messages_on(&mut tx, &session.id.0, messages).await?;
 
         tx.commit()
             .await
@@ -2884,6 +2999,150 @@ mod session_repository_restore_tests {
         assert!(
             !combined.contains(SENTINEL_COST),
             "f64 列の保存値を error / warn に出さないこと"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_persistence_tests {
+    use super::{MessageRepository, SessionPersistence, SessionRepository};
+    use crate::Database;
+    use chrono::Utc;
+    use opencode_types::{ProjectID, Session, SessionID, SessionMessage, SessionStatus, TimeInfo};
+    use std::collections::HashMap;
+
+    fn sample_session(id: &str, title: &str) -> Session {
+        let now = Utc::now();
+        Session {
+            id: SessionID(id.to_string()),
+            slug: "slug".to_string(),
+            project_id: ProjectID("project-1".to_string()),
+            directory: ".".to_string(),
+            parent_id: None,
+            title: title.to_string(),
+            version: "1".to_string(),
+            time: TimeInfo {
+                created: 1,
+                updated: 2,
+                compacting: None,
+                archived: None,
+            },
+            messages: Vec::new(),
+            summary: None,
+            share: None,
+            revert: None,
+            permission: None,
+            usage: None,
+            status: SessionStatus::Active,
+            metadata: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn seed_session_with_original_message(database: &Database) {
+        sqlx::query(
+            "INSERT INTO sessions (id, project_id, slug, directory, title, created_at, updated_at) \
+             VALUES ('session-1', 'project-1', 'slug', '.', 'old-title', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .expect("seed session");
+        let messages = MessageRepository::new(database.pool().clone());
+        messages
+            .create(&SessionMessage::user("session-1", "original"))
+            .await
+            .expect("seed original message");
+    }
+
+    async fn message_texts(database: &Database) -> Vec<String> {
+        MessageRepository::new(database.pool().clone())
+            .list_for_session("session-1")
+            .await
+            .expect("list messages")
+            .iter()
+            .map(|m| m.get_text())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn upsert_creates_new_session_and_messages_together() {
+        let database = Database::in_memory().await.expect("database initializes");
+        let persistence = SessionPersistence::new(database.pool().clone());
+
+        persistence
+            .upsert_session_with_messages(
+                &sample_session("session-1", "created-title"),
+                &[SessionMessage::user("session-1", "hello")],
+            )
+            .await
+            .expect("upsert creates session and messages");
+
+        let stored = SessionRepository::new(database.pool().clone())
+            .get("session-1")
+            .await
+            .expect("get works")
+            .expect("session created");
+        assert_eq!(stored.title, "created-title");
+        assert_eq!(message_texts(&database).await, ["hello"]);
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_existing_session_and_replaces_messages() {
+        let database = Database::in_memory().await.expect("database initializes");
+        seed_session_with_original_message(&database).await;
+        let persistence = SessionPersistence::new(database.pool().clone());
+
+        persistence
+            .upsert_session_with_messages(
+                &sample_session("session-1", "updated-title"),
+                &[SessionMessage::user("session-1", "new")],
+            )
+            .await
+            .expect("upsert updates session and replaces messages");
+
+        let stored = SessionRepository::new(database.pool().clone())
+            .get("session-1")
+            .await
+            .expect("get works")
+            .expect("session exists");
+        assert_eq!(stored.title, "updated-title");
+        assert_eq!(message_texts(&database).await, ["new"]);
+    }
+
+    /// メッセージ INSERT が途中で失敗した場合、セッション更新も巻き戻ること。
+    #[tokio::test]
+    async fn upsert_rolls_back_session_and_messages_on_insert_failure() {
+        let database = Database::in_memory().await.expect("database initializes");
+        seed_session_with_original_message(&database).await;
+        let persistence = SessionPersistence::new(database.pool().clone());
+
+        // 2 件目の id を衝突させ、DELETE 後の INSERT を PK 違反で失敗させる。
+        let mut first = SessionMessage::user("session-1", "replacement-1");
+        first.id = "duplicate-id".to_string();
+        let mut second = SessionMessage::user("session-1", "replacement-2");
+        second.id = first.id.clone();
+
+        assert!(
+            persistence
+                .upsert_session_with_messages(
+                    &sample_session("session-1", "should-not-be-committed"),
+                    &[first, second],
+                )
+                .await
+                .is_err(),
+            "duplicate message id must fail the transaction"
+        );
+
+        let title: String = sqlx::query_scalar("SELECT title FROM sessions WHERE id = 'session-1'")
+            .fetch_one(database.pool())
+            .await
+            .expect("read session title");
+        assert_eq!(title, "old-title", "session update must roll back too");
+        assert_eq!(
+            message_texts(&database).await,
+            ["original"],
+            "message DELETE and INSERT must both roll back"
         );
     }
 }

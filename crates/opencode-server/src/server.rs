@@ -36,6 +36,7 @@ use opencode_provider::{
     RotationReason,
 };
 use opencode_session::SessionManager;
+use opencode_storage::repository::SessionPersistence;
 use opencode_storage::InputRepository;
 use opencode_storage::{Database, MessageRepository, SessionRepository};
 
@@ -549,6 +550,9 @@ pub struct ServerState {
     pub(crate) pty_manager: PtyManager,
     session_repo: Option<SessionRepository>,
     message_repo: Option<MessageRepository>,
+    /// セッション更新とメッセージ置換を単一トランザクションで行う高位リポジトリ。
+    /// 上記リポジトリと同一の `SqlitePool` を共有する。
+    session_persistence: Option<SessionPersistence>,
     pub(crate) input_repo: Option<InputRepository>,
 
     /// このインスタンス専用の CORS 追加許可オリジン。
@@ -596,6 +600,7 @@ impl ServerState {
             pty_manager: PtyManager::new(),
             session_repo: None,
             message_repo: None,
+            session_persistence: None,
             input_repo: None,
             // CLI の起動時設定は legacy シードから 1 度だけコピーする。
             // 以降の変更はこのインスタンス内に閉じる。
@@ -794,6 +799,7 @@ impl ServerState {
         let pool = db.pool().clone();
         state.session_repo = Some(SessionRepository::new(pool.clone()));
         state.message_repo = Some(MessageRepository::new(pool.clone()));
+        state.session_persistence = Some(SessionPersistence::new(pool.clone()));
         state.input_repo = Some(InputRepository::new(pool));
         state.load_sessions_from_storage().await?;
         if let Some(input_repo) = &state.input_repo {
@@ -1011,8 +1017,7 @@ impl ServerState {
     /// インスタンスが未ロードのセッションまで消していた。sync は削除を行わず、
     /// 物理削除は明示的な `delete_session_from_storage` に委譲する。
     pub async fn sync_sessions_to_storage(&self) -> anyhow::Result<()> {
-        let (Some(session_repo), Some(message_repo)) = (&self.session_repo, &self.message_repo)
-        else {
+        let Some(persistence) = &self.session_persistence else {
             return Ok(());
         };
 
@@ -1034,16 +1039,11 @@ impl ServerState {
                 .map(stored_message_from_session)
                 .collect();
 
-            if session_repo.get(&stored_session.id.0).await?.is_some() {
-                session_repo.update(&stored_session).await?;
-            } else {
-                session_repo.create(&stored_session).await?;
-            }
-
-            // delete + create を単一トランザクションで実行し、途中失敗で
-            // メッセージが欠損しないようにする (H-10)。
-            message_repo
-                .replace_for_session(&stored_session.id.0, &messages)
+            // セッションの存在確認・update/create・メッセージの DELETE+INSERT を
+            // 単一トランザクションで実行する。途中失敗でセッションだけ更新され、
+            // メッセージが欠損する不整合を防ぐ (H-10 / 本タスク)。
+            persistence
+                .upsert_session_with_messages(&stored_session, &messages)
                 .await?;
         }
 
@@ -2845,6 +2845,8 @@ mod tests {
         message_repo: MessageRepository,
     ) -> ServerState {
         let mut state = ServerState::new();
+        // 個別リポジトリと同じプールを共有するトランザクション writer も差し込む。
+        state.session_persistence = Some(SessionPersistence::new(session_repo.pool().clone()));
         state.session_repo = Some(session_repo);
         state.message_repo = Some(message_repo);
         state
