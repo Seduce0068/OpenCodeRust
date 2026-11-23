@@ -863,12 +863,15 @@ fn parse_model_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError> {
             if let Some(ref mut hunk) = current_hunk {
                 // 先頭の 1 文字だけが PatchLine の種別を表す。
                 // `__pycache__/foo.pyc` のような接頭辞の無いノイズ行は無視する。
+                // `--- foo` は内容 `-- foo` の削除、`+++bar` は内容 `++bar` の
+                // 追加である。モデル patch 形式には `--- `/`+++` のファイル
+                // ヘッダ解析が無いため、hunk 内の同名行はすべて実データとして扱う。
                 if let Some(rest) = line.strip_prefix(' ') {
                     hunk.lines.push(PatchLine::Context(rest.to_string()));
-                } else if line.starts_with('-') && !line.starts_with("--- ") {
-                    hunk.lines.push(PatchLine::Remove(line[1..].to_string()));
-                } else if line.starts_with('+') && !line.starts_with("+++") {
-                    hunk.lines.push(PatchLine::Add(line[1..].to_string()));
+                } else if let Some(rest) = line.strip_prefix('-') {
+                    hunk.lines.push(PatchLine::Remove(rest.to_string()));
+                } else if let Some(rest) = line.strip_prefix('+') {
+                    hunk.lines.push(PatchLine::Add(rest.to_string()));
                 }
             }
             continue;
@@ -1765,6 +1768,46 @@ mod tests {
         assert_eq!(hunk.lines.len(), 2);
         assert_eq!(hunk.old_count, 1);
         assert_eq!(hunk.new_count, 1);
+    }
+
+    #[tokio::test]
+    async fn model_patch_applies_data_lines_starting_with_three_dashes_or_pluses() {
+        // `--- keep` は内容 `-- keep` の削除、`+++bar` は内容 `++bar` の追加。
+        // 行数省略 hunk なので declared_counts は None のまま本文から 1/1 と算出され、
+        // 行が黙って捨てられるとエラーなく「正しい」行数として通ってしまう。
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: file.txt\n",
+            "@@ -1 +1 @@\n",
+            "--- keep\n",
+            "+++bar\n",
+            "*** End Patch"
+        );
+
+        let parsed = parse_model_patch(patch).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let hunk = &parsed[0].hunks[0];
+        assert_eq!(hunk.declared_counts, None);
+        assert_eq!(hunk.old_count, 1);
+        assert_eq!(hunk.new_count, 1);
+        assert_eq!(hunk.lines.len(), 2);
+        assert!(matches!(&hunk.lines[0], PatchLine::Remove(s) if s == "-- keep"));
+        assert!(matches!(&hunk.lines[1], PatchLine::Add(s) if s == "++bar"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "-- keep\n").unwrap();
+        let (ctx, _asks) = recording_context(&root);
+        ApplyPatchTool
+            .execute(serde_json::json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "++bar"
+        );
     }
 
     #[test]
