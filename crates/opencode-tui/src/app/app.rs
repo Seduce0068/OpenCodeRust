@@ -923,6 +923,17 @@ impl App {
                     }
                     self.sync_prompt_spinner_state();
                 }
+                CustomEvent::StateChanged(StateChange::SessionDeleted(session_id)) => {
+                    // サーバ側 SSE 経由の削除通知でも同じ cleanup を通す（R1-RES-01）。
+                    self.remove_session_from_context(session_id);
+                    if self.active_session_id.as_deref() == Some(session_id.as_str()) {
+                        self.active_session_id = None;
+                        self.session_view = None;
+                        self.context.navigate(Route::Home);
+                    }
+                    // TUI 削除経路と同じく一覧を即時更新する（R4）。
+                    self.refresh_session_list_dialog();
+                }
                 CustomEvent::StateChanged(StateChange::SessionStatusBusy(session_id)) => {
                     self.set_session_status(session_id, SessionStatus::Running);
                     self.sync_prompt_spinner_state();
@@ -1697,24 +1708,7 @@ impl App {
                         match state {
                             SessionDeleteState::Armed(_) => {}
                             SessionDeleteState::Confirmed(session_id) => {
-                                if let Some(client) = self.context.get_api_client() {
-                                    if let Err(err) = client.delete_session(&session_id) {
-                                        self.alert_dialog.set_message(&format!(
-                                            "Failed to delete session `{}`:\n{}",
-                                            session_id, err
-                                        ));
-                                        self.alert_dialog.open();
-                                    } else {
-                                        if self.active_session_id.as_deref()
-                                            == Some(session_id.as_str())
-                                        {
-                                            self.context.navigate(Route::Home);
-                                            self.active_session_id = None;
-                                            self.session_view = None;
-                                        }
-                                        self.refresh_session_list_dialog();
-                                    }
-                                }
+                                self.delete_session_confirmed(&session_id);
                             }
                         }
                     }
@@ -2765,7 +2759,7 @@ impl App {
                 let session = match client.create_session(None) {
                     Ok(session) => session,
                     Err(err) => {
-                        self.remove_optimistic_session(&optimistic_session_id);
+                        self.remove_session_from_context(&optimistic_session_id);
                         self.context.navigate(Route::Home);
                         self.active_session_id = None;
                         self.session_view = None;
@@ -2872,7 +2866,7 @@ impl App {
                 let session = match client.create_session(None) {
                     Ok(session) => session,
                     Err(err) => {
-                        self.remove_optimistic_session(&optimistic_session_id);
+                        self.remove_session_from_context(&optimistic_session_id);
                         self.context.navigate(Route::Home);
                         self.active_session_id = None;
                         self.session_view = None;
@@ -3471,7 +3465,7 @@ impl App {
         session_id
     }
 
-    fn remove_optimistic_session(&mut self, session_id: &str) {
+    fn remove_session_from_context(&mut self, session_id: &str) {
         let mut session_ctx = self.context.session.write();
         session_ctx.sessions.remove(session_id);
         session_ctx.messages.remove(session_id);
@@ -3481,6 +3475,31 @@ impl App {
         session_ctx.revert.remove(session_id);
         if session_ctx.current_session_id.as_deref() == Some(session_id) {
             session_ctx.current_session_id = None;
+        }
+    }
+
+    /// 削除確定後の共通処理。本番のキー操作と回帰テストの両方から呼ぶ実経路。
+    ///
+    /// API 側の削除 → アクティブセッションの後始末 → per-session context の
+    /// cleanup → 一覧の再読み込みを一箇所にまとめる。
+    fn delete_session_confirmed(&mut self, session_id: &str) {
+        if let Some(client) = self.context.get_api_client() {
+            if let Err(err) = client.delete_session(session_id) {
+                // API 層が ID を除去した契約を TUI 側で再挿入しない（R4）。
+                self.alert_dialog
+                    .set_message(&format!("Failed to delete session:\n{err}"));
+                self.alert_dialog.open();
+            } else {
+                if self.active_session_id.as_deref() == Some(session_id) {
+                    self.context.navigate(Route::Home);
+                    self.active_session_id = None;
+                    self.session_view = None;
+                }
+                // セッション本体だけでなく SessionContext の
+                // per-session コレクションも破棄する（R1-RES-01）。
+                self.remove_session_from_context(session_id);
+                self.refresh_session_list_dialog();
+            }
         }
     }
 
@@ -4701,6 +4720,17 @@ fn forward_server_event(
                 return false;
             }
         }
+        Some("session.deleted") => {
+            let Some(session_id) = session_id else {
+                return true;
+            };
+            // 値はログへ出さず、既存の StateChange バリアントで通知するだけ。
+            if !send(Event::Custom(CustomEvent::StateChanged(
+                StateChange::SessionDeleted(session_id.to_string()),
+            ))) {
+                return false;
+            }
+        }
         Some("session.status") => {
             let Some(session_id) = session_id else {
                 return true;
@@ -5505,6 +5535,190 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         assert!(!forward_server_event(&payload, &tx, &context, &shutdown));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// `DELETE /session/{id}` を成功させるローカル HTTP スタブ。
+    /// 一覧/ステータスも空で返し、外部サービスへは送信しない。
+    fn spawn_delete_ok_api() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        let delete_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub_hits = Arc::clone(&delete_hits);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let (status, body) = if first_line.starts_with("DELETE /session/") {
+                    stub_hits.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", r#"{"deleted":true}"#)
+                } else if first_line.starts_with("GET /session/status") {
+                    ("200 OK", "{}")
+                } else if first_line.starts_with("GET /session ") {
+                    ("200 OK", "[]")
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), delete_hits)
+    }
+
+    /// 6 マップへ投入した per-session エントリが削除ハンドラで一掃されることを検証する。
+    #[test]
+    fn session_delete_handler_removes_all_per_session_context_collections() {
+        let (base_url, delete_hits) = spawn_delete_ok_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let session_id = context
+            .session
+            .write()
+            .create_session(Some("delete target".to_string()));
+
+        {
+            let mut session_ctx = context.session.write();
+            session_ctx.messages.insert(session_id.clone(), Vec::new());
+            session_ctx.set_status(&session_id, SessionStatus::Idle);
+            session_ctx
+                .session_diff
+                .insert(session_id.clone(), Vec::new());
+            session_ctx.todos.insert(session_id.clone(), Vec::new());
+            session_ctx.revert.insert(
+                session_id.clone(),
+                RevertInfo {
+                    message_id: "msg_probe".to_string(),
+                    part_id: None,
+                    snapshot: None,
+                    diff: None,
+                },
+            );
+        }
+
+        let mut app = headless_app(context.clone());
+        app.session_list_dialog.set_sessions(vec![SessionItem {
+            is_busy: false,
+            id: session_id.clone(),
+            title: "delete target".to_string(),
+            directory: String::new(),
+            parent_id: None,
+            updated_at: Utc::now().timestamp_millis(),
+        }]);
+        app.session_list_dialog.open(Some(&session_id));
+
+        // ヘッドレス環境ではキーバインドの初期状態に依存せず、削除ステートの
+        // 遷移を直接進めて本番と同じ確定後処理へ渡す。
+        let armed = app
+            .session_list_dialog
+            .trigger_delete_selected()
+            .expect("delete selection must arm");
+        assert!(
+            matches!(armed, SessionDeleteState::Armed(_)),
+            "first delete trigger must arm deletion"
+        );
+        let confirmed = app
+            .session_list_dialog
+            .trigger_delete_selected()
+            .expect("delete selection must confirm");
+        let confirmed_id = match confirmed {
+            SessionDeleteState::Confirmed(id) => id,
+            SessionDeleteState::Armed(_) => panic!("second delete trigger must confirm deletion"),
+        };
+        assert!(
+            confirmed_id == session_id,
+            "confirmed deletion must target the selected session"
+        );
+        app.delete_session_confirmed(&confirmed_id);
+
+        assert!(
+            delete_hits.load(Ordering::SeqCst) >= 1,
+            "DELETE /session endpoint must actually be reached"
+        );
+        let session_ctx = context.session.read();
+        assert!(!session_ctx.sessions.contains_key(&session_id));
+        assert!(!session_ctx.messages.contains_key(&session_id));
+        assert!(!session_ctx.session_status.contains_key(&session_id));
+        assert!(!session_ctx.session_diff.contains_key(&session_id));
+        assert!(!session_ctx.todos.contains_key(&session_id));
+        assert!(!session_ctx.revert.contains_key(&session_id));
+        assert!(session_ctx.current_session_id.is_none());
+    }
+
+    /// `session.deleted` SSE を forwarding し、App 側の cleanup まで検証する。
+    #[test]
+    fn session_deleted_event_removes_all_per_session_context_collections() {
+        let context = Arc::new(AppContext::new());
+        let session_id = context
+            .session
+            .write()
+            .create_session(Some("remote delete".to_string()));
+        {
+            let mut session_ctx = context.session.write();
+            session_ctx.messages.insert(session_id.clone(), Vec::new());
+            session_ctx.set_status(&session_id, SessionStatus::Idle);
+            session_ctx
+                .session_diff
+                .insert(session_id.clone(), Vec::new());
+            session_ctx.todos.insert(session_id.clone(), Vec::new());
+            session_ctx.revert.insert(
+                session_id.clone(),
+                RevertInfo {
+                    message_id: "msg_probe".to_string(),
+                    part_id: None,
+                    snapshot: None,
+                    diff: None,
+                },
+            );
+        }
+
+        let mut app = headless_app(context.clone());
+        let (tx, rx) = mpsc::channel();
+        let shutdown = AtomicBool::new(false);
+        let payload = vec![format!(
+            r#"{{"type":"session.deleted","sessionID":"{session_id}"}}"#
+        )];
+        assert!(forward_server_event(&payload, &tx, &context, &shutdown));
+        let event = rx
+            .try_recv()
+            .expect("session.deleted must produce a custom event");
+        app.handle_event(&event)
+            .expect("SessionDeleted handler must not fail");
+
+        let session_ctx = context.session.read();
+        assert!(!session_ctx.sessions.contains_key(&session_id));
+        assert!(!session_ctx.messages.contains_key(&session_id));
+        assert!(!session_ctx.session_status.contains_key(&session_id));
+        assert!(!session_ctx.session_diff.contains_key(&session_id));
+        assert!(!session_ctx.todos.contains_key(&session_id));
+        assert!(!session_ctx.revert.contains_key(&session_id));
+        assert!(session_ctx.current_session_id.is_none());
     }
 
     #[test]
