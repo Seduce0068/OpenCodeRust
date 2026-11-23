@@ -43,6 +43,10 @@ use crate::ui::{Clipboard, Selection};
 const TICK_RATE_MS: u64 = 16;
 const MAX_EVENTS_PER_FRAME: usize = 256;
 
+/// Drop 時のリスナ join 待機上限。SSE の blocking `read_line` は reqwest の
+/// タイムアウト（最大 120 秒）でブロックし得るため、無制限に待たない。
+const JOIN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// メッセージ時刻をローカルタイムゾーンの `HH:MM:SS` で表示する。
 /// wire/DB 上の値は UTC のまま保持し、描画時のみ変換する。
 fn format_message_timestamp(created_at: &chrono::DateTime<Utc>) -> String {
@@ -3899,16 +3903,58 @@ impl Drop for App {
     fn drop(&mut self) {
         // event_rx は Drop::drop の後にフィールドが破棄されるため、SSE / 入力の
         // 両スレッドとも send 失敗だけでは停止を検知できない。
-        // 先に両方のフラグを立て、それから各ハンドルを join して残留を防ぐ。
+        // 先に両方のフラグを立て、各ハンドルを待機スレッドへ移してから、
+        // 期限付きの待ちを 1 回だけ行う。待ちを直列にすると 2 スレッドとも
+        // ブロック中に最悪 2 * JOIN_WAIT_TIMEOUT 秒かかるため、notifier を
+        // 先に全て生成してから並行して待つ。
         self.sse_shutdown.store(true, Ordering::Relaxed);
         self.input_shutdown.store(true, Ordering::Relaxed);
+        let mut notifiers = Vec::with_capacity(2);
         if let Some(handle) = self.sse_listener.take() {
-            let _ = handle.join();
+            notifiers.push(spawn_join_notifier(handle));
         }
         if let Some(handle) = self.input_listener.take() {
-            let _ = handle.join();
+            notifiers.push(spawn_join_notifier(handle));
         }
+        wait_join_notifiers(&notifiers, JOIN_WAIT_TIMEOUT);
         let _ = terminal::restore();
+    }
+}
+
+/// `JoinHandle` を待機スレッドへ移し、完了通知用の `Receiver` を返す。
+///
+/// スレッド本体の `join()` は待機スレッドが所有する `handle` に対して行うため、
+/// `JoinHandle` が未 join のまま放置されることはない。返された `Receiver` は
+/// [`wait_join_notifiers`] に渡して期限付きで待つ。
+fn spawn_join_notifier(handle: thread::JoinHandle<()>) -> mpsc::Receiver<()> {
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+}
+
+/// 各 notifier の完了を、最初の呼び出し時点から `timeout` 秒を上限として待つ。
+///
+/// receiver 毎に `timeout` を渡すと待ちが直列に足し算されるため、期限
+/// (`Instant::now() + timeout`) を 1 つだけ作り、各 `recv_timeout` には
+/// その時点の残り時間を渡す。これで receiver が何個あっても全体の待ちは
+/// 高々 `timeout` 秒に収まる。SSE の `read_line` が blocking reqwest の
+/// タイムアウト（最大 120 秒）でブロック中でも、Drop は高々 `timeout` 秒で
+/// 返るため終了がハングしない。
+///
+/// `recv_timeout` が成功してもタイムアウトしても receiver は呼び出し側で
+/// ドロップされる。その結果、待機スレッドの `done_tx.send(())` は失敗するが、
+/// 待機スレッドは `join()` が完了するまで残る（参加待ちの `handle` が
+/// blocking read 中なら最大 120 秒かかることがある）。待機スレッドの
+/// `JoinHandle` は生成時に破棄されているため detach されており、残った
+/// スレッドはプロセス終了時に OS が回収する。
+fn wait_join_notifiers(receivers: &[mpsc::Receiver<()>], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    for receiver in receivers {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = receiver.recv_timeout(remaining);
     }
 }
 
@@ -5500,6 +5546,81 @@ mod tests {
         // App の Drop と同じ手順で通知して join できれば、リスナが残留しない。
         shutdown.store(true, Ordering::Relaxed);
         assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn wait_join_notifiers_returns_promptly_for_finished_thread() {
+        let handle = thread::spawn(|| {});
+        let notifier = spawn_join_notifier(handle);
+        let started = Instant::now();
+        // timeout を十分長く取ることで、下限側の余裕を広げて flaky を避ける。
+        wait_join_notifiers(&[notifier], Duration::from_secs(10));
+        // 完了済み（ほぼ即終了）のスレッドではタイムアウトまで待たないこと。
+        // flaky 回避のため上限は緩めに取る。
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "finished thread must not wait for the full timeout"
+        );
+    }
+
+    #[test]
+    fn wait_join_notifiers_does_not_wait_past_timeout_for_blocked_thread() {
+        // recv でブロックする worker。テスト末尾で sender を drop して解放する。
+        // 万一解放を忘れても 5 秒で自終了し、回帰時に永久ハングしない。
+        let (never_tx, never_rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _ = never_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let notifier = spawn_join_notifier(handle);
+
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        wait_join_notifiers(&[notifier], timeout);
+        let elapsed = started.elapsed();
+        drop(never_tx);
+
+        assert!(
+            elapsed >= timeout,
+            "must wait at least the requested timeout"
+        );
+        // ブロック中のスレッド（最大 5 秒）を待ち切らないこと。
+        // flaky 回避のため上限は緩めに取る。
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must give up waiting for a blocked thread within a loose upper bound"
+        );
+    }
+
+    #[test]
+    fn wait_join_notifiers_does_not_sum_timeouts_for_multiple_blocked_threads() {
+        // 2 つのブロック中ハンドルを渡しても、全体の待ちが timeout の合計
+        // (2 * 200ms) に達せず、1 回分の timeout で収まることを検証する。
+        // 旧 API を直列に呼んでいた回帰ではここが ~400ms 以上に伸びていた。
+        let (tx_a, rx_a) = mpsc::channel::<()>();
+        let (tx_b, rx_b) = mpsc::channel::<()>();
+        let handle_a = thread::spawn(move || {
+            let _ = rx_a.recv_timeout(Duration::from_secs(5));
+        });
+        let handle_b = thread::spawn(move || {
+            let _ = rx_b.recv_timeout(Duration::from_secs(5));
+        });
+        let notifiers = vec![spawn_join_notifier(handle_a), spawn_join_notifier(handle_b)];
+
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        wait_join_notifiers(&notifiers, timeout);
+        let elapsed = started.elapsed();
+        drop(tx_a);
+        drop(tx_b);
+
+        assert!(
+            elapsed >= timeout,
+            "must wait at least the requested timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "parallel wait must finish within one timeout, not the sum of them"
+        );
     }
 
     #[test]
