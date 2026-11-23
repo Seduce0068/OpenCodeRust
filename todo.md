@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **ファイルロックが権限確認 await を跨ぐ Head-of-line ブロック**
-  — `tool/write.rs:118` / IOORDER-01-R4 / 中（EditTool も同構造）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[権限 await ロック外 1 件]** Head-of-line ブロックを解消
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[file_time 配線 1 件]** 本番 ToolContext で stale 検出を有効化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[WriteTool ロック 1 件]** Write/Edit 間の lost update を防止
@@ -811,6 +811,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（2 フェーズロックの修正時、2 回目のレビューで停止）:
+  Edit の第2フェーズに create_dir_all が無い（Write と非対称）、セッション
+  未 read ファイルでは stale 検出が no-op（内容ハッシュが必要）、並行
+  Write/Edit テストが stale 検出を無効化して期待を緩めている。
+  2 件目（新規作成中に他操作が作成した場合の上書き）は親が try_exists
+  再検証で直接修正。親が子のテスト型エラー 2 件も直接修正。
 - 2026-11-23 R4 残存（file_time 配線の修正時、2 回目のレビューで停止）:
   mtime 単独変動の誤検出（内容ハッシュ必要）、本番注入 site の回帰テスト欠落、
   metadata 一時エラーの種別区別、file_times のライフタイム（終了時のクリア
