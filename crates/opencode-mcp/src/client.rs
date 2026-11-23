@@ -1170,6 +1170,8 @@ impl McpClientRegistry {
                 self.set_status(&name, status).await;
                 self.log_event(&name, format!("Connect failed: {}", e))
                     .await;
+                // R1-RES-01: 試行前に挿入した接続設定を失敗時に残さない。
+                self.connection_configs.write().await.remove(&name);
                 Err(e)
             }
         }
@@ -1247,6 +1249,8 @@ impl McpClientRegistry {
                 self.set_status(&name, status).await;
                 self.log_event(&name, format!("Connect failed: {}", e))
                     .await;
+                // R1-RES-01: 試行前に挿入した接続設定を失敗時に残さない。
+                self.connection_configs.write().await.remove(&name);
                 Err(e)
             }
         }
@@ -1293,6 +1297,8 @@ impl McpClientRegistry {
                 self.set_status(&name, status).await;
                 self.log_event(&name, format!("Connect failed: {}", e))
                     .await;
+                // R1-RES-01: 試行前に挿入した接続設定を失敗時に残さない。
+                self.connection_configs.write().await.remove(&name);
                 Err(e)
             }
         }
@@ -1315,7 +1321,14 @@ impl McpClientRegistry {
         self.logs.write().await.remove(name);
     }
 
-    pub async fn remove(&self, name: &str) -> Result<(), McpClientError> {
+    /// remove / purge の共通後始末。
+    /// `drop_connection_config` が true のときだけ接続設定も破棄する
+    /// （remove は restart 契約のため残す）。
+    async fn drop_client(
+        &self,
+        name: &str,
+        drop_connection_config: bool,
+    ) -> Result<(), McpClientError> {
         let client = self.clients.write().await.remove(name);
         // close が失敗してもクライアントは既に map から削除済みのため、
         // ステータスとログの整合性を先に回復してからエラーを返す。
@@ -1326,7 +1339,22 @@ impl McpClientRegistry {
         self.set_status(name, McpStatus::Disabled).await;
         // 切断ログを残す意味はないため、消去してから状態を完了させる。
         self.drop_server_log(name).await;
+        if drop_connection_config {
+            self.connection_configs.write().await.remove(name);
+        }
         close_result
+    }
+
+    /// クライアントを切断し、status / log を後始末する。
+    /// restart に備えて connection_configs は保持する（既存契約）。
+    pub async fn remove(&self, name: &str) -> Result<(), McpClientError> {
+        self.drop_client(name, false).await
+    }
+
+    /// remove と同じ後始末を行った上で、restart 用の接続設定も破棄する。
+    /// サーバーを完全に削除し、再追加まで restart できないようにする場合に使う。
+    pub async fn purge(&self, name: &str) -> Result<(), McpClientError> {
+        self.drop_client(name, true).await
     }
 
     pub async fn list(&self) -> Vec<(String, Arc<McpClient>)> {
@@ -2566,5 +2594,123 @@ mod tests {
 
         assert!(registry.get_logs("alpha").await.is_empty());
         assert!(!registry.logs.read().await.contains_key("alpha"));
+    }
+
+    /// add 成功後の状態を実サーバなしで再現するスタブ。
+    async fn seed_connected_client(registry: &McpClientRegistry, name: &str) {
+        let client = Arc::new(McpClient::new(name.to_string(), registry.tool_registry()));
+        {
+            let mut guard = client.transport.lock().await;
+            *guard = Some(Arc::new(MockTransport::new(vec![])));
+        }
+        registry
+            .clients
+            .write()
+            .await
+            .insert(name.to_string(), client);
+    }
+
+    /// R1-RES-01: remove は restart 契約を維持するため connection_configs を残す。
+    #[tokio::test]
+    async fn remove_keeps_connection_config_for_restart() {
+        let registry = McpClientRegistry::new();
+        seed_connected_client(&registry, "alpha").await;
+        registry.connection_configs.write().await.insert(
+            "alpha".to_string(),
+            RegistryConnectionConfig::Http {
+                url: "https://alpha.invalid/mcp".to_string(),
+                headers: None,
+                timeouts: McpTimeouts::default(),
+            },
+        );
+
+        registry.remove("alpha").await.expect("remove must succeed");
+
+        assert!(registry.get("alpha").await.is_none());
+        assert_eq!(
+            registry.get_status("alpha").await,
+            Some(McpStatus::Disabled)
+        );
+        assert!(
+            registry
+                .connection_configs
+                .read()
+                .await
+                .contains_key("alpha"),
+            "remove must keep the connection config so restart can reconnect"
+        );
+    }
+
+    /// R1-RES-01: purge は remove と同じ後始末 (close/status/log) を行い、
+    /// さらに connection_configs からもエントリを削除する。
+    #[tokio::test]
+    async fn purge_drops_connection_config_and_client_state() {
+        let registry = McpClientRegistry::new();
+        seed_connected_client(&registry, "alpha").await;
+        registry.connection_configs.write().await.insert(
+            "alpha".to_string(),
+            RegistryConnectionConfig::Stdio(McpServerConfig {
+                name: "alpha".to_string(),
+                command: "unused".to_string(),
+                args: Vec::new(),
+                env: None,
+                cwd: None,
+                timeouts: McpTimeouts::default(),
+                protocol: None,
+            }),
+        );
+        registry.set_status("alpha", McpStatus::Connected).await;
+        registry.log_event("alpha", "before purge").await;
+        assert_eq!(registry.get_logs("alpha").await.len(), 1);
+
+        registry.purge("alpha").await.expect("purge must succeed");
+
+        assert!(registry.get("alpha").await.is_none());
+        assert_eq!(
+            registry.get_status("alpha").await,
+            Some(McpStatus::Disabled)
+        );
+        assert!(registry.get_logs("alpha").await.is_empty());
+        assert!(
+            !registry
+                .connection_configs
+                .read()
+                .await
+                .contains_key("alpha"),
+            "purge must drop the connection config"
+        );
+    }
+
+    /// R1-RES-01: 接続失敗時に add_* が挿入した connection_configs が残存しない。
+    /// 削除・再追加の繰り返しでエントリが単調増加しないことも確認する。
+    #[tokio::test]
+    async fn failed_add_leaves_no_connection_config() {
+        let registry = McpClientRegistry::new();
+        let failing_config = || McpServerConfig {
+            name: "alpha".to_string(),
+            command: "__opencode_mcp_missing_command__".to_string(),
+            args: Vec::new(),
+            env: None,
+            cwd: None,
+            timeouts: McpTimeouts::uniform(50),
+            protocol: None,
+        };
+
+        for _ in 0..3 {
+            let result = registry.add_stdio(failing_config()).await;
+            assert!(result.is_err(), "nonexistent command must fail to connect");
+            assert!(
+                !registry
+                    .connection_configs
+                    .read()
+                    .await
+                    .contains_key("alpha"),
+                "failed add must not leave a stale connection config"
+            );
+        }
+        assert!(
+            registry.connection_configs.read().await.is_empty(),
+            "repeated failed adds must not grow connection_configs"
+        );
     }
 }

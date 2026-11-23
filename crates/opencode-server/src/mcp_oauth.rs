@@ -345,7 +345,7 @@ impl McpOAuthManager {
         self.oauth_states.write().await.remove(server_name);
         self.oauth_clients.write().await.remove(server_name);
         self.clients.remove_oauth_manager(server_name).await;
-        if self.clients.remove(server_name).await.is_err() {
+        if self.clients.purge(server_name).await.is_err() {
             // Log only a fixed message: client errors may embed URLs or paths.
             tracing::warn!(
                 server = server_name,
@@ -1049,12 +1049,35 @@ mod tests {
             )
             .await;
 
+        // Seed a real registry connection config through the mock MCP endpoint.
+        // A successful add_http keeps it for restart; only purge drops it.
+        let (url, _) = spawn_mock_mcp(axum::http::StatusCode::OK).await;
+        manager
+            .clients
+            .add_http(
+                "to-remove".to_string(),
+                url,
+                None,
+                McpTimeouts::default(),
+                None,
+            )
+            .await
+            .expect("mock MCP connect must succeed");
+
         let removed = manager.remove_server("to-remove").await;
         assert_eq!(removed.map(|info| info.name), Some("to-remove".to_string()));
         assert!(!manager.has_server("to-remove").await);
         assert!(manager.get_server("to-remove").await.is_none());
         assert!(manager.list_servers().await.is_empty());
         assert!(manager.remove_server("to-remove").await.is_none());
+        // remove_server uses purge (not remove), so the registry must have
+        // dropped the restart/connection config too. `McpClientRegistry::restart`
+        // is the public proxy for that private state: without a config it fails
+        // with "No restart config found", so a resurrected server is impossible.
+        assert!(
+            manager.clients.restart("to-remove").await.is_err(),
+            "purge must drop the registry connection config so restart cannot resurrect the server"
+        );
     }
 
     #[tokio::test]
