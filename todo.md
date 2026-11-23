@@ -67,6 +67,14 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **質問の回答が HTTP 送信前にローカル要求を破棄**
+  — `tui/app.rs:2631` / RETRY-02 / 中
+- [ ] **MCP OAuth の期限切れトークンが並行 get_token で二重 refresh**
+  — `mcp/oauth.rs:715` / RETRY-03 / 中
+- [ ] **SSE 再接続で permission/question 保留要求が再同期されない**
+  — `tui/app.rs:4162` / RETRY-04 / 中
+- [ ] **CORS whitelist の URL scheme/host 大小文字非対称**
+  — `server/server.rs:1823` / NORM-01 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -164,6 +172,20 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **ビルトイン許可リストの URL 大小文字非対称**
+  — `server/server.rs:1876` / NORM-02 / 低
+- [ ] **CodeMode trim が NEL を除去し JS 非準拠**
+  — `codemode/date.rs:122` / NORM-03 / 低
+- [ ] **日付と時刻の区切りが ASCII 半角スペースのみ**
+  — `codemode/date.rs:118` / NORM-04 / 低
+- [ ] **ls の ignore がバックスラッシュ区切りを正規化しない**
+  — `tool/ls.rs:139` / NORM-05 / 低
+- [ ] **grep の glob がバックスラッシュ区切りを正規化しない**
+  — `grep/search.rs:289` / NORM-06 / 低
+- [ ] **Edit の改行正規化が CR 単独を扱わない**
+  — `tool/edit/tool.rs:511` / NORM-07 / 低
+- [ ] **skill frontmatter の改行正規化が CR 単独を扱わない**
+  — `tool/skill.rs:120` / NORM-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -266,6 +288,8 @@ status: current
 
 ## 完了
 
+- [x] **[権限 reply 冪等化 1 件]** 再送 404 でプロンプトを閉じる
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[権限 await ロック外 1 件]** Head-of-line ブロックを解消
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[file_time 配線 1 件]** 本番 ToolContext で stale 検出を有効化
@@ -811,6 +835,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm249、2 担当・12 件、観点: リトライ冪等性 /
+  文字列正規化）: retry から high の RETRY-01（権限 reply 再送 404）を coding、
+  他 3 件を triage。norm 8 件すべて triage（NORM-01 中、他低）。
+  R4 指摘なし。reply_permission の 404 を delete_session と同じ冪等化方式で
+  Ok(()) へ変換し、既存テストの失敗ケースを 500/503 へ整合。
 - 2026-11-23 R4 残存（2 フェーズロックの修正時、2 回目のレビューで停止）:
   Edit の第2フェーズに create_dir_all が無い（Write と非対称）、セッション
   未 read ファイルでは stale 検出が no-op（内容ハッシュが必要）、並行
