@@ -394,6 +394,9 @@ pub struct SessionPrompt {
     todo_get: Option<opencode_tool::TodoGetCallback>,
     /// read が記録したファイル stamp（mtime, size）。IOORDER-03 の stale 検出用。
     file_times: FileTimeMap,
+    /// Compaction execution policy supplied by the server config. `new()`
+    /// keeps the historical defaults so existing callers are unaffected.
+    compaction_config: CompactionConfig,
 }
 
 impl SessionPrompt {
@@ -406,7 +409,16 @@ impl SessionPrompt {
             todo_update: None,
             todo_get: None,
             file_times: Arc::new(Mutex::new(HashMap::new())),
+            compaction_config: CompactionConfig::default(),
         }
+    }
+
+    /// Override the compaction policy (`auto` / `prune` / `reserved`) used by
+    /// the prompt loop. Unset options are already resolved by the caller, so
+    /// passing the executor-side config here is sufficient.
+    pub fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
+        self.compaction_config = config;
+        self
     }
 
     pub fn with_mcp_clients(mut self, clients: Arc<opencode_mcp::McpClientRegistry>) -> Self {
@@ -1168,6 +1180,7 @@ impl SessionPrompt {
             self.todo_update.clone(),
             self.todo_get.clone(),
             self.file_times.clone(),
+            self.compaction_config.clone(),
         )
         .await;
 
@@ -1253,6 +1266,7 @@ impl SessionPrompt {
             self.todo_update.clone(),
             self.todo_get.clone(),
             self.file_times.clone(),
+            self.compaction_config.clone(),
         )
         .await;
 
@@ -1283,6 +1297,7 @@ impl SessionPrompt {
         todo_update: Option<opencode_tool::TodoUpdateCallback>,
         todo_get: Option<opencode_tool::TodoGetCallback>,
         file_times: FileTimeMap,
+        compaction_config: CompactionConfig,
     ) -> anyhow::Result<()> {
         let mut step = 0u32;
         let provider_type = ProviderType::from_provider_id(&provider_id);
@@ -1337,6 +1352,7 @@ impl SessionPrompt {
             }
 
             if Self::should_compact(
+                &compaction_config,
                 &filtered_messages,
                 provider.as_ref(),
                 &model_id,
@@ -1768,7 +1784,7 @@ impl SessionPrompt {
             Self::abort_pending_tool_calls(session);
         }
 
-        Self::prune_after_loop(session);
+        Self::prune_after_loop(session, &compaction_config);
         session.touch();
         Self::emit_session_update(update_hook.as_ref(), session);
 
@@ -2600,11 +2616,18 @@ impl SessionPrompt {
     }
 
     fn should_compact(
+        config: &CompactionConfig,
         messages: &[SessionMessage],
         provider: &dyn Provider,
         model_id: &str,
         max_output_tokens: Option<u64>,
     ) -> bool {
+        // `auto = false` must skip every compaction trigger, including the
+        // character-count fallback below (the engine only gates the overflow
+        // check, not the fallback).
+        if !config.auto {
+            return false;
+        }
         let usage = Self::token_usage_from_messages(messages);
         let model = provider.get_model(model_id);
         let limits = ModelLimits {
@@ -2616,7 +2639,7 @@ impl SessionPrompt {
                 .or_else(|| model.map(|info| info.max_output_tokens))
                 .unwrap_or(OUTPUT_TOKEN_MAX),
         };
-        let engine = CompactionEngine::new(CompactionConfig::default());
+        let engine = CompactionEngine::new(config.clone());
         if engine.is_overflow(&usage, &limits) {
             return true;
         }
@@ -2925,7 +2948,12 @@ impl SessionPrompt {
         Ok(())
     }
 
-    fn prune_after_loop(session: &mut Session) {
+    fn prune_after_loop(session: &mut Session, config: &CompactionConfig) {
+        // `prune = false` must skip the whole pruning path, not just the
+        // engine's return value (the engine already gates it as well).
+        if !config.prune {
+            return;
+        }
         let mut tool_name_by_call: HashMap<String, String> = HashMap::new();
         for msg in &session.messages {
             for part in &msg.parts {
@@ -2976,7 +3004,7 @@ impl SessionPrompt {
             })
             .collect();
 
-        let engine = CompactionEngine::new(CompactionConfig::default());
+        let engine = CompactionEngine::new(config.clone());
         let pruned_ids = engine.prune(&mut prune_messages);
         if pruned_ids.is_empty() {
             return;
@@ -5316,7 +5344,7 @@ mod tests {
             .push(SessionMessage::user(session_id.clone(), "new user two"));
         session.messages.push(SessionMessage::assistant(session_id));
 
-        SessionPrompt::prune_after_loop(&mut session);
+        SessionPrompt::prune_after_loop(&mut session, &CompactionConfig::default());
 
         let compacted_count = session
             .messages
@@ -5342,8 +5370,101 @@ mod tests {
         msg.metadata
             .insert("tokens_input".to_string(), serde_json::json!(950_u64));
 
-        let compact = SessionPrompt::should_compact(&[msg], &provider, "tiny-model", None);
+        let compact = SessionPrompt::should_compact(
+            &CompactionConfig::default(),
+            &[msg],
+            &provider,
+            "tiny-model",
+            None,
+        );
         assert!(compact);
+    }
+
+    #[test]
+    fn should_compact_auto_disabled_skips_all_triggers() {
+        // Overflow path: same message as the provider-limit test above.
+        let overflow_provider = StaticModelProvider::with_model("tiny-model", 1000, 100);
+        let mut overflow_msg = SessionMessage::user("ses_test", "hello");
+        overflow_msg
+            .metadata
+            .insert("tokens_input".to_string(), serde_json::json!(950_u64));
+        assert!(SessionPrompt::should_compact(
+            &CompactionConfig::default(),
+            &[overflow_msg.clone()],
+            &overflow_provider,
+            "tiny-model",
+            None,
+        ));
+        assert!(!SessionPrompt::should_compact(
+            &CompactionConfig {
+                auto: false,
+                ..Default::default()
+            },
+            &[overflow_msg],
+            &overflow_provider,
+            "tiny-model",
+            None,
+        ));
+
+        // Character-count fallback: the engine's `auto` gate does not cover
+        // it, so `should_compact` must short-circuit on `auto = false`.
+        let large_provider = StaticModelProvider::with_model("large-model", 1_000_000, 100);
+        let large_msg = SessionMessage::user("ses_test", "x".repeat(200_001));
+        assert!(SessionPrompt::should_compact(
+            &CompactionConfig::default(),
+            std::slice::from_ref(&large_msg),
+            &large_provider,
+            "large-model",
+            None,
+        ));
+        assert!(!SessionPrompt::should_compact(
+            &CompactionConfig {
+                auto: false,
+                ..Default::default()
+            },
+            &[large_msg],
+            &large_provider,
+            "large-model",
+            None,
+        ));
+    }
+
+    #[test]
+    fn prune_after_loop_prune_disabled_keeps_tool_results() {
+        let mut session = Session::new("proj", ".");
+        let session_id = session.id.clone();
+        session
+            .messages
+            .push(SessionMessage::user(session_id.clone(), "old user message"));
+
+        let mut old_assistant = SessionMessage::assistant(session_id.clone());
+        old_assistant.add_tool_call("call_a", "bash", serde_json::json!({"command": "echo a"}));
+        old_assistant.add_tool_result("call_a", "A".repeat(140_000), false);
+        session.messages.push(old_assistant);
+        session
+            .messages
+            .push(SessionMessage::user(session_id.clone(), "new user one"));
+        session.messages.push(SessionMessage::assistant(session_id));
+
+        SessionPrompt::prune_after_loop(
+            &mut session,
+            &CompactionConfig {
+                prune: false,
+                ..Default::default()
+            },
+        );
+
+        let compacted_count = session
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match &p.part_type {
+                PartType::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .filter(|c| c.starts_with("[tool result compacted]"))
+            .count();
+        assert_eq!(compacted_count, 0, "prune = false must not compact parts");
     }
 
     // ── COMPACT-STATUS-STUCK regression tests ──

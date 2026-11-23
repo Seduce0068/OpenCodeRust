@@ -510,6 +510,9 @@ pub struct StreamProcessor {
     pending_events: Vec<ProcessorEvent>,
     /// Compaction policy engine (uses model-specific limits).
     compaction_engine: CompactionEngine,
+    /// Compaction policy supplied by the caller; kept so retries can rebuild
+    /// the engine with the same config.
+    compaction_config: CompactionConfig,
     /// Resolved model limits for the active stream.
     model_limits: Option<ModelLimits>,
 }
@@ -526,6 +529,7 @@ pub struct LlmProcessor;
 impl StreamProcessor {
     /// Create a new stream processor for a given assistant message.
     pub fn new(session_id: String, assistant_message_id: String) -> Self {
+        let compaction_config = CompactionConfig::default();
         Self {
             reasoning_map: HashMap::new(),
             tool_calls: HashMap::new(),
@@ -545,9 +549,26 @@ impl StreamProcessor {
             completed_tool_parts: Vec::new(),
             pending_patches: Vec::new(),
             pending_events: Vec::new(),
-            compaction_engine: CompactionEngine::new(CompactionConfig::default()),
+            compaction_engine: CompactionEngine::new(compaction_config.clone()),
+            compaction_config,
             model_limits: None,
         }
+    }
+
+    /// Override the compaction policy used by this processor.
+    ///
+    /// The engine is rebuilt so `auto = false` suppresses `is_overflow` and
+    /// `prune = false` suppresses prune handling on the next step.
+    pub fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
+        self.compaction_engine = CompactionEngine::new(config.clone());
+        self.compaction_config = config;
+        self
+    }
+
+    /// Accessor used by tests and callers that need to inspect the resolved
+    /// policy without exposing the engine itself.
+    pub fn compaction_config(&self) -> &CompactionConfig {
+        &self.compaction_config
     }
 
     /// Clear every piece of state that belongs to a single streaming attempt.
@@ -2157,6 +2178,40 @@ pub(crate) fn tool_attachments_to_file_parts(
 mod tests {
     use super::*;
     use opencode_provider::ToolDefinition;
+
+    #[test]
+    fn test_stream_processor_compaction_config_default_and_override() {
+        let default_processor = StreamProcessor::new("ses_test".into(), "msg_assistant".into());
+        assert_eq!(
+            default_processor.compaction_config().auto,
+            CompactionConfig::default().auto
+        );
+        assert_eq!(
+            default_processor.compaction_config().prune,
+            CompactionConfig::default().prune
+        );
+
+        let config = CompactionConfig {
+            auto: false,
+            prune: false,
+            reserved: Some(500),
+        };
+        let processor = StreamProcessor::new("ses_test".into(), "msg_assistant".into())
+            .with_compaction_config(config.clone());
+        assert!(!processor.compaction_config().auto);
+        assert!(!processor.compaction_config().prune);
+        assert_eq!(processor.compaction_config().reserved, Some(500));
+
+        // The engine is rebuilt from the same policy, so overflow detection
+        // is disabled when `auto = false`.
+        let usage = TokenUsage::new(100_000, 5_000);
+        let limits = ModelLimits {
+            context: 128_000,
+            max_input: None,
+            max_output: 8_192,
+        };
+        assert!(!processor.compaction_engine.is_overflow(&usage, &limits));
+    }
 
     // -----------------------------------------------------------------------
     // R2: OUTPUT_TOKEN_MAX の単一情報源化（session == provider）回帰テスト

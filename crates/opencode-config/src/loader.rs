@@ -2292,6 +2292,22 @@ fn apply_env_overrides(config: &mut Config) {
     }
 }
 
+/// Applies all `OPENCODE_*` environment overrides to a config.
+///
+/// Public entry point for callers that fall back to a default `Config` when
+/// [`load_config`] fails: without it, kill switches such as
+/// `OPENCODE_DISABLE_AUTOCOMPACT` and `OPENCODE_DISABLE_PRUNE` would be lost
+/// and compaction would silently run with its fail-open defaults.
+///
+/// Applying it twice is idempotent — each flag only sets a fixed value and
+/// never toggles or accumulates. This delegates to the existing private
+/// `apply_env_overrides`, so the `ConfigLoader::load_all` merge order and
+/// precedence are unchanged.
+/// Only variable names are ever logged; values are not.
+pub fn apply_environment_overrides(config: &mut Config) {
+    apply_env_overrides(config);
+}
+
 /// Resolve legacy `tools` entries into permission actions.
 ///
 /// Several legacy names (`write`, `edit`, `patch`, `multiedit`) collapse onto
@@ -4029,6 +4045,56 @@ mod tests {
             Some(true),
             "managed config must win over OPENCODE_DISABLE_AUTOCOMPACT"
         );
+    }
+
+    /// 回帰 (swarm263-r4): `load_config` が失敗しても compaction の kill switch
+    /// が fail-open にならないこと。routes.rs の `unwrap_or_default()` 経路と
+    /// 同じく、失敗後の既定 Config へ環境オーバーライドを適用すると
+    /// auto / prune が Some(false) になる。値やパスは assertion に出さない。
+    #[test]
+    fn failed_load_config_default_keeps_disable_flags() {
+        let _guard = ENV_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const EXPLICIT: &str = "OPENCODE_CONFIG";
+        const AUTO: &str = "OPENCODE_DISABLE_AUTOCOMPACT";
+        const PRUNE: &str = "OPENCODE_DISABLE_PRUNE";
+
+        let temp = TestDir::new("opencode_failed_load_disable_flags");
+        // 明示指定された不正な設定ファイルは load_config を失敗させる。
+        let broken = temp.path.join("opencode.json");
+        fs::write(&broken, "{ not valid json").unwrap();
+
+        let previous_explicit = env::var_os(EXPLICIT);
+        let previous_auto = env::var_os(AUTO);
+        let previous_prune = env::var_os(PRUNE);
+        std::env::set_var(EXPLICIT, &broken);
+        std::env::set_var(AUTO, "true");
+        std::env::set_var(PRUNE, "1");
+
+        let load_result = load_config(&temp.path);
+        let failed = load_result.is_err();
+        let mut config = load_result.unwrap_or_default();
+        apply_environment_overrides(&mut config);
+
+        // assertion の前に後始末し、panic しても環境を汚さない。
+        match previous_explicit {
+            Some(value) => std::env::set_var(EXPLICIT, value),
+            None => std::env::remove_var(EXPLICIT),
+        }
+        match previous_auto {
+            Some(value) => std::env::set_var(AUTO, value),
+            None => std::env::remove_var(AUTO),
+        }
+        match previous_prune {
+            Some(value) => std::env::set_var(PRUNE, value),
+            None => std::env::remove_var(PRUNE),
+        }
+
+        assert!(failed, "malformed explicit config must fail to load");
+        let compaction = config
+            .compaction
+            .expect("disable flags must set compaction");
+        assert_eq!(compaction.auto, Some(false));
+        assert_eq!(compaction.prune, Some(false));
     }
 
     // ── YAML frontmatter parsing tests ──────────────────────────────

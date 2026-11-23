@@ -38,6 +38,24 @@ impl Default for CompactionConfig {
     }
 }
 
+impl CompactionConfig {
+    /// Build the executor-side config from optional overrides.
+    ///
+    /// `None` keeps the current defaults (`auto = true`, `prune = true`,
+    /// `reserved = None`), so callers with no configuration stay backward
+    /// compatible. Keeping the mapping here avoids adding an `opencode-config`
+    /// dependency to `opencode-session`; the server converts its schema values
+    /// and passes the result into the session prompt.
+    pub fn from_options(auto: Option<bool>, prune: Option<bool>, reserved: Option<u64>) -> Self {
+        let defaults = Self::default();
+        Self {
+            auto: auto.unwrap_or(defaults.auto),
+            prune: prune.unwrap_or(defaults.prune),
+            reserved: reserved.or(defaults.reserved),
+        }
+    }
+}
+
 /// Input for the compaction process.
 #[derive(Debug, Clone)]
 pub struct CompactionInput {
@@ -1176,6 +1194,22 @@ mod tests {
         assert!(config.auto);
         assert!(config.prune);
         assert!(config.reserved.is_none());
+    }
+
+    #[test]
+    fn test_compaction_config_from_options_none_keeps_defaults() {
+        let config = CompactionConfig::from_options(None, None, None);
+        assert_eq!(config.auto, CompactionConfig::default().auto);
+        assert_eq!(config.prune, CompactionConfig::default().prune);
+        assert_eq!(config.reserved, CompactionConfig::default().reserved);
+    }
+
+    #[test]
+    fn test_compaction_config_from_options_explicit_values() {
+        let config = CompactionConfig::from_options(Some(false), Some(false), Some(1234));
+        assert!(!config.auto);
+        assert!(!config.prune);
+        assert_eq!(config.reserved, Some(1234));
     }
 
     #[test]

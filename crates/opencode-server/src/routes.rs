@@ -34,7 +34,7 @@ use crate::worktree::{self, WorktreeError, WorktreeInfo as WorktreeInfoStruct};
 use crate::{ApiError, Result, ServerState, MAX_TUI_RESPONSE_QUEUE};
 use opencode_agent::{AgentInfo as AgentConfigInfo, AgentMode, AgentRegistry, BuiltinAgent};
 use opencode_config::{
-    apply_post_load_transforms, load_config, Config as AppConfig,
+    apply_environment_overrides, apply_post_load_transforms, load_config, Config as AppConfig,
     McpServerConfig as LoadedMcpServerConfig, McpTimeoutConfig,
 };
 use opencode_mcp::client::McpTimeouts;
@@ -111,6 +111,31 @@ mod prompt_failure_redaction_tests {
         assert_eq!(message_a, "Internal server error");
         assert_eq!(message_b, message_a);
         assert_ne!(id_a, id_b, "each failure needs its own correlation id");
+    }
+}
+
+#[cfg(test)]
+mod compaction_kill_switch_tests {
+    /// 回帰ガード (swarm263-r4): load_config 失敗時の既定 Config へ環境
+    /// オーバーライドを適用してから compaction を組み立てること。
+    /// 設定値・パスの内容は検査せず、呼び出し順だけを確認する。
+    #[test]
+    fn task_route_applies_environment_overrides_before_compaction() {
+        let source = include_str!("routes.rs");
+        let anchor = source
+            .find("let config = match load_config(&cwd) {")
+            .expect("task route must fall back to a default config");
+        let tail = &source[anchor..];
+        let apply_at = tail
+            .find("apply_environment_overrides(&mut config);")
+            .expect("environment overrides must run on the default config");
+        let compaction_at = tail
+            .find("let compaction_config = config")
+            .expect("compaction config must be built afterwards");
+        assert!(
+            apply_at < compaction_at,
+            "kill switches must be applied before compaction is derived"
+        );
     }
 }
 
@@ -3009,7 +3034,18 @@ fn spawn_prompt_execution(
 
         // Build AgentRegistry from config
         let cwd = std::env::current_dir().unwrap_or_default();
-        let config = load_config(&cwd).unwrap_or_default();
+        // load_config が失敗して既定 Config へフォールバックした場合のみ env
+        // override を適用し、compaction の kill switch (OPENCODE_DISABLE_*) を
+        // 失わないようにする。成功時に再適用すると managed config の優先順位が
+        // 壊れるため、失敗経路だけに限定する（R4）。
+        let config = match load_config(&cwd) {
+            Ok(config) => config,
+            Err(_) => {
+                let mut config = AppConfig::default();
+                apply_environment_overrides(&mut config);
+                config
+            }
+        };
         let agent_registry = AgentRegistry::from_config(&config);
 
         // Determine agent name (default to "build")
@@ -3057,10 +3093,20 @@ fn spawn_prompt_execution(
             top_p: agent_info.top_p,
         };
 
+        // CFGAPPLY-01: config.compaction を実行系へ渡す。未設定（None）の
+        // フィールドは session 側 default（auto=true, prune=true）を維持する。
+        // 設定値やパスはログ・エラーに出さない。
+        let compaction_config = config
+            .compaction
+            .as_ref()
+            .map_or_else(opencode_session::CompactionConfig::default, |c| {
+                opencode_session::CompactionConfig::from_options(c.auto, c.prune, c.reserved)
+            });
         let prompt_runner = opencode_session::SessionPrompt::new(Arc::new(RwLock::new(
             opencode_session::SessionStateManager::new(),
         )))
-        .with_todo_hooks(todo_update, todo_get);
+        .with_todo_hooks(todo_update, todo_get)
+        .with_compaction_config(compaction_config);
         let input = opencode_session::PromptInput {
             session_id: session_id.clone(),
             message_id,
