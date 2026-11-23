@@ -10,6 +10,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# Workspace crates
+opencode-config = { path = "../opencode-config" }
+
 # Workspace dependencies
 tokio = { workspace = true }
 serde = { workspace = true }

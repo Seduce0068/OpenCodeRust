@@ -68,9 +68,22 @@ fn setup_panic_hook() {
 }
 
 /// TUI を起動し、ユーザーが終了するまでイベントループを実行する。
+///
+/// UI 関連の Config（`theme` / `tui.sidebar`）は起動経路ここでのみ cwd から
+/// 読み込み、[`App::new_with_config`] へ渡して反映する。
+/// 既定コンストラクタ（`App::new` / `AppContext::new`）は設定ファイルを
+/// 読み込まないため、ライブラリ利用側に副作用を及ぼさない。
 pub fn run_tui() -> anyhow::Result<()> {
     setup_panic_hook();
 
-    let mut app = App::new()?;
+    let config = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| opencode_config::load_config(&cwd).ok())
+        .unwrap_or_else(|| {
+            // パス・設定値・エラー詳細は出さない固定文言（R4）。
+            tracing::warn!("failed to load config; using TUI defaults");
+            opencode_config::Config::default()
+        });
+    let mut app = App::new_with_config(&config)?;
     app.run()
 }

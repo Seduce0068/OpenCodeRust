@@ -129,6 +129,11 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    /// 既定値のみで `AppContext` を構築する。
+    ///
+    /// `opencode-config` の設定ファイルは読み込まない。ただし UI 状態
+    /// (`kv.json`) の読み込みと、破損時の `.bak` 退避は行う。
+    /// UI 関連 Config を反映したい場合は [`Self::new_with_config`] を使う。
     pub fn new() -> Self {
         let ui_kv = UiKv::load();
         let default_theme_name = format!("opencode@{}", detect_terminal_theme_mode());
@@ -168,6 +173,15 @@ impl AppContext {
             auth_token: RwLock::new(None),
             api_client: RwLock::new(None),
         }
+    }
+
+    /// 既定値の上に UI 関連 Config（`theme` / `tui.sidebar`）を反映する。
+    ///
+    /// 設定ファイルの読み込みは行わず、反映する値は引数のみに依存する。
+    pub fn new_with_config(config: &opencode_config::Config) -> Self {
+        let context = Self::new();
+        context.apply_ui_config(config);
+        context
     }
 
     pub fn navigate(&self, route: crate::router::Route) {
@@ -288,6 +302,31 @@ impl AppContext {
             return true;
         }
         false
+    }
+
+    /// opencode-config の UI 関連設定を既存状態へ反映する（後方互換）。
+    ///
+    /// 未設定の項目は `detect_terminal_theme_mode()` 由来の既定値を維持する。
+    /// `theme` と `tui.sidebar` のみをマッピングし、それ以外は既存フィールドが
+    /// 無いため反映しない（詳細は各ブロックのコメントを参照）。
+    pub fn apply_ui_config(&self, config: &opencode_config::Config) {
+        if let Some(name) = config
+            .theme
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            // 未知名は set_theme_by_name の既存挙動（状態を変えず false）に委譲する。
+            let _ = self.set_theme_by_name(name);
+        }
+
+        if let Some(sidebar) = config.tui.as_ref().and_then(|tui| tui.sidebar) {
+            *self.show_sidebar.write() = sidebar;
+        }
+        // tui.mode / scroll_speed / scroll_acceleration / diff_style は
+        // AppContext に対応フィールドが無いためマッピングしない。
+
+        // config.layout (opencode_config::LayoutMode::Auto / Stretch) は
+        // AppContext に対応フィールドが無いためスキップする。
     }
 
     pub fn current_theme_name(&self) -> String {
@@ -559,6 +598,7 @@ fn ui_kv_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // --- ProviderInfo / ModelInfo: データ保持 ---
@@ -913,5 +953,149 @@ mod tests {
         let reloaded = UiKv::load_from(&dir.path());
         assert!(!reloaded.get_bool("header_visible", true));
         assert_eq!(reloaded.get_string("message_density", "compact"), "cozy");
+    }
+
+    // --- CFGAPPLY-06: Config の theme / tui.sidebar 反映と後方互換 ---
+
+    #[test]
+    fn apply_ui_config_applies_theme_and_sidebar() {
+        let context = AppContext::new();
+        let config = opencode_config::Config {
+            theme: Some("opencode@light".to_string()),
+            tui: Some(opencode_config::TuiConfig {
+                sidebar: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        context.apply_ui_config(&config);
+
+        assert_eq!(context.current_theme_name(), "opencode@light");
+        assert!(!*context.show_sidebar.read());
+    }
+
+    #[test]
+    fn apply_ui_config_keeps_defaults_when_unset() {
+        let context = AppContext::new();
+        let initial_theme = context.current_theme_name();
+        let initial_sidebar = *context.show_sidebar.read();
+
+        context.apply_ui_config(&opencode_config::Config::default());
+        assert_eq!(context.current_theme_name(), initial_theme);
+        assert_eq!(*context.show_sidebar.read(), initial_sidebar);
+
+        let blank = opencode_config::Config {
+            theme: Some("   ".to_string()),
+            tui: Some(opencode_config::TuiConfig::default()),
+            ..Default::default()
+        };
+        context.apply_ui_config(&blank);
+        assert_eq!(context.current_theme_name(), initial_theme);
+        assert_eq!(*context.show_sidebar.read(), initial_sidebar);
+    }
+
+    #[test]
+    fn apply_ui_config_delegates_unknown_theme_to_setter() {
+        let context = AppContext::new();
+        let initial_theme = context.current_theme_name();
+        let config = opencode_config::Config {
+            theme: Some("definitely-unknown-theme".to_string()),
+            ..Default::default()
+        };
+
+        context.apply_ui_config(&config);
+
+        // set_theme_by_name は未知名で false を返し、状態を変えない。
+        assert_eq!(context.current_theme_name(), initial_theme);
+        assert!(!context.set_theme_by_name("definitely-unknown-theme"));
+    }
+
+    // --- R4: new() の副作用除去と new_with_config の追加 ---
+
+    #[test]
+    fn new_with_config_applies_theme_and_sidebar() {
+        let context = AppContext::new_with_config(&opencode_config::Config {
+            theme: Some("dracula@dark".to_string()),
+            tui: Some(opencode_config::TuiConfig {
+                sidebar: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(context.current_theme_name(), "dracula@dark");
+        assert!(!*context.show_sidebar.read());
+    }
+
+    #[test]
+    fn new_with_config_default_matches_new() {
+        let baseline = AppContext::new();
+        let configured = AppContext::new_with_config(&opencode_config::Config::default());
+
+        assert_eq!(
+            configured.current_theme_name(),
+            baseline.current_theme_name()
+        );
+        assert_eq!(
+            *configured.show_sidebar.read(),
+            *baseline.show_sidebar.read()
+        );
+    }
+
+    /// cwd を一時変更し、Drop で必ず元に戻すガード。
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn switch_to(path: &Path) -> Self {
+            let original = std::env::current_dir().expect("read original cwd");
+            std::env::set_current_dir(path).expect("switch to temporary cwd");
+            Self(original)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn new_ignores_config_file_in_current_directory() {
+        // cwd はプロセス全体の状態なので、変更するテストどうしを直列化する。
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _cwd_lock = CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 一時ディレクトリ生成と自動削除は既存ヘルパーを再利用する。
+        let dir = TempKvDir::new("cfg-ignore");
+        fs::write(
+            dir.0.join("opencode.json"),
+            r#"{"theme":"dracula@dark","tui":{"sidebar":false}}"#,
+        )
+        .expect("write opencode.json in temporary cwd");
+
+        let baseline = AppContext::new();
+        let baseline_theme = baseline.current_theme_name();
+        let baseline_sidebar = *baseline.show_sidebar.read();
+        // 配置した値が既定値と異なることを確認し、検証が空振りしないようにする。
+        assert_ne!(
+            baseline_theme, "dracula@dark",
+            "fixture theme must differ from the default"
+        );
+
+        let original_cwd = std::env::current_dir().expect("read original cwd");
+        {
+            let _cwd_guard = CwdGuard::switch_to(&dir.0);
+            let context = AppContext::new();
+            assert_eq!(context.current_theme_name(), baseline_theme);
+            assert_eq!(*context.show_sidebar.read(), baseline_sidebar);
+        }
+        assert_eq!(
+            std::env::current_dir().expect("read restored cwd"),
+            original_cwd,
+            "cwd must be restored after the test"
+        );
     }
 }

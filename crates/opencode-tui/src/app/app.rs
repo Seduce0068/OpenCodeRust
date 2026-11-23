@@ -197,10 +197,18 @@ pub struct App {
 }
 
 impl App {
+    /// 既定 Config で `App` を構築する（設定ファイルは読み込まない）。
     pub fn new() -> anyhow::Result<Self> {
+        Self::new_with_config(&opencode_config::Config::default())
+    }
+
+    /// 呼び出し元が読み込んだ Config の UI 設定を反映して `App` を構築する。
+    ///
+    /// 設定ファイルの I/O は行わず、反映内容は引数のみに依存する。
+    pub fn new_with_config(config: &opencode_config::Config) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
         let event_tx_input = event_tx.clone();
-        let context = Arc::new(AppContext::new());
+        let context = Arc::new(AppContext::new_with_config(config));
         let terminal = terminal::init()?;
         let mut prompt = Prompt::new(context.clone())
             .with_placeholder("Ask anything... \"Fix a TODO in the codebase\"");

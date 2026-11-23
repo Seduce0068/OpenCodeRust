@@ -2275,6 +2275,7 @@ dependencies = [
  "futures",
  "nucleo-matcher",
  "once_cell",
+ "opencode-config",
  "parking_lot 0.13.0",
  "pulldown-cmark",
  "ratatui",
