@@ -170,10 +170,6 @@ status: current
 
 - [ ] **差分表示の折返しが表示幅ではなく scalar 数を使用**
   — `tui/components/diff.rs:249` / NUM-04 / 低
-- [ ] **LSP ドキュメントバージョンが i32 へ非チェックキャスト**
-  — `lsp/lib.rs:468` / NUM-05 / 低
-- [ ] **CodeMode 診断 column が UTF-16 ではなく scalar 数**
-  — `codemode/api.rs:304` / NUM-06 / 低
 - [ ] **ツール名の TaskKind 分類が部分文字列一致で誤分類**
   — `tui/app.rs:4018` / STRING-01 / 低
 - [ ] **空ファイル名のパスで候補が全マッチ**
@@ -282,6 +278,8 @@ status: current
 
 ## 完了
 
+- [x] **[column/version 2 件]** UTF-16 column・LSP version checked
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[util 文字数 2 件]** バイト数ではなく文字数で算出
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[tool_calls index 1 件]** u64→u32 切詰による衝突を防止
@@ -809,6 +807,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（column/version の修正時）: file_versions カウンタの
+  u32::MAX overflow（約43億回編集で到達、子も記録済み）、open_document の
+  version 読取と更新が別ロックで非アトミック（変更非起因の既存構造）、
+  LspClientRegistry::touch_file の既存エラーログが絶対パスを出力（今回の
+  差分では新規露出なし）。いずれも既存残存として記録のみ。
 - 2026-11-23 util 文字数修正: ansi_length と token::estimate を chars().count()
   基準へ（日本語/絵文字の見積もり過大を解消）。ASCII/空文字は不変、R4 指摘なし。
 - 2026-11-23 R4 指摘（tool_calls index の修正時）: 親が warn-once テストを
