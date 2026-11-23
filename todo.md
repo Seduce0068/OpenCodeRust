@@ -71,8 +71,6 @@ status: current
   — `session/llm.rs:474` / CFGAPPLY-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
-- [ ] **未登録ルート/405 が空ボディで JSON 契約と不整合**
-  — `server/routes.rs:122` / ERR-ENVELOPE-02 / 中
 - [ ] **default_agent 設定がエージェント選択へ反映されない**
   — `server/routes.rs:3010` / CFGAPPLY-04 / 中
 - [ ] **skills.urls がスキル探索ルートに使われない**
@@ -279,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[404/405 JSON 契約 1 件]** fallback envelope を追加
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定配線 2 件]** LSP env と MCP OAuth clientId
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[wire/doc 2 件]** JSON-RPC 要求分類と 401 ドキュメント整合
@@ -860,6 +860,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（404/405 fallback の修正時）: 子が記録した
+  「ネスト内サブルーターには fallback が効かない」は axum 0.8.9 の実装と
+  矛盾。親が一時テストで実挙動を確認（GET /session/no-such は JSON
+  session_not_found、POST /api/health は 405 + JSON）し、正式テストを追加
+  して正しい範囲を固定。子の誤記録は撤回。
 - 2026-11-23 設定配線 2 件: opencode_lsp::LspServerConfig に env を追加し
   build_server_command で envs 適用（未指定時は親環境継承）、CLI が
   server.env を配線。MCP は oauth.clientId を RemoteOAuthSettings へ取り込み

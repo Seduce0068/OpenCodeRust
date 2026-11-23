@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T20:22:50+09:00"
+  at: "2026-11-23T21:11:39+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3340 件（all-features は 3339 件）
+  テスト総数 594 → 3343 件（all-features は 3342 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `server`: 未登録ルート/405 に JSON エラー envelope を追加
+  （swarm-coding R1-R6）
 - `lsp` / `server`: LSP env の子プロセス反映と MCP OAuth clientId の変換
   （swarm-coding R1-R6）
 - `mcp` / `server`: JSON-RPC 要求の誤分類と 401 ドキュメント不一致を修正
