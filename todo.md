@@ -67,10 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **空配列クリアが残り 2 フィールドで未対応**
-  — provider.whitelist/blacklist /
-  watcher.ignore と同パターンで ExplicitStringList 化
-  （primary_tools / skills.paths/urls は 2026-11-21 対応済み）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -270,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[provider 空配列 1 件]** whitelist / blacklist を明示クリア可能へ
+  （2026-11-21、swarm-coding R1-R6、空配列クリア残存を完結）
 - [x] **[skills 空配列 1 件]** paths / urls を明示クリア可能へ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[grep エラー伝播 1 件]** 一部ファイル失敗を握りつぶさない
@@ -807,6 +805,9 @@ status: current
 
 ## メモ
 
+- 2026-11-23 provider 空配列修正: whitelist/blacklist も ExplicitStringList 化、
+  cli/server の 4 箇所を as_slice().to_vec() へ。R4 指摘なし。これで
+  watcher/primary_tools/skills/provider の空配列クリア残存はすべて解消。
 - 2026-11-23 R4 指摘（skills 空配列の修正時）: 親が
   merge_explicit_string_list_replace の doc comment 対象一覧へ
   skills.paths / skills.urls を追記。残り provider.whitelist/blacklist
