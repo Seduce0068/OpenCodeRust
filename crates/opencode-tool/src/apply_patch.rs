@@ -454,58 +454,66 @@ fn parse_multi_file_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError>
             continue;
         }
 
-        if let Some(caps) = file_header.captures(line) {
-            if let Some(ref mut file) = current_file {
-                if let Some(hunk) = current_hunk.take() {
-                    file.hunks.push(hunk);
+        // `---` / `+++` は hunk 内では実データ（内容 `--` / `++` の Remove / Add）
+        // であるため、ファイルヘッダ判定は hunk 外でのみ行う。
+        // 通常の unified diff は `@@` より前にヘッダが現れるため従来どおり動作する。
+        // `diff --git` 区切りなしで複数ファイルが連続する形式は、元々 current_file が
+        // file_patches へ push されず未対応（R4）。hunk 直後のヘッダをデータ行として
+        // 扱うのは回帰ではなく、この形式は今後も標準 git diff とは区別して扱う。
+        if !in_hunk {
+            if let Some(caps) = file_header.captures(line) {
+                if let Some(ref mut file) = current_file {
+                    if let Some(hunk) = current_hunk.take() {
+                        file.hunks.push(hunk);
+                    }
                 }
+                old_path = Some(caps[1].to_string());
+                in_hunk = false;
+                continue;
             }
-            old_path = Some(caps[1].to_string());
-            in_hunk = false;
-            continue;
-        }
 
-        if let Some(caps) = new_file_header.captures(line) {
-            let new_path = caps[1].to_string();
+            if let Some(caps) = new_file_header.captures(line) {
+                let new_path = caps[1].to_string();
 
-            // Determine operation based on old/new paths
-            let operation = if let (Some(ref rf), Some(ref rt)) = (&rename_from, &rename_to) {
-                // Git rename detected
-                let op = PatchOperation::Move {
-                    move_path: rt.clone(),
+                // Determine operation based on old/new paths
+                let operation = if let (Some(ref rf), Some(ref rt)) = (&rename_from, &rename_to) {
+                    // Git rename detected
+                    let op = PatchOperation::Move {
+                        move_path: rt.clone(),
+                    };
+                    current_file = Some(FilePatch {
+                        path: rf.clone(),
+                        operation: op,
+                        hunks: Vec::new(),
+                    });
+                    continue;
+                } else if old_path.as_deref() == Some("/dev/null") {
+                    // New file: --- /dev/null, +++ b/file
+                    PatchOperation::Add
+                } else if new_path == "/dev/null" {
+                    // Deleted file: --- a/file, +++ /dev/null
+                    PatchOperation::Delete
+                } else {
+                    PatchOperation::Update
                 };
+
+                let path = if operation.is_add() {
+                    new_path.clone()
+                } else {
+                    old_path.clone().unwrap_or_else(|| new_path.clone())
+                };
+
+                if path == "/dev/null" || path.is_empty() {
+                    continue;
+                }
+
                 current_file = Some(FilePatch {
-                    path: rf.clone(),
-                    operation: op,
+                    path,
+                    operation,
                     hunks: Vec::new(),
                 });
                 continue;
-            } else if old_path.as_deref() == Some("/dev/null") {
-                // New file: --- /dev/null, +++ b/file
-                PatchOperation::Add
-            } else if new_path == "/dev/null" {
-                // Deleted file: --- a/file, +++ /dev/null
-                PatchOperation::Delete
-            } else {
-                PatchOperation::Update
-            };
-
-            let path = if operation.is_add() {
-                new_path.clone()
-            } else {
-                old_path.clone().unwrap_or_else(|| new_path.clone())
-            };
-
-            if path == "/dev/null" || path.is_empty() {
-                continue;
             }
-
-            current_file = Some(FilePatch {
-                path,
-                operation,
-                hunks: Vec::new(),
-            });
-            continue;
         }
 
         if let Some(caps) = hunk_header.captures(line) {
@@ -550,10 +558,13 @@ fn parse_multi_file_patch(patch_text: &str) -> Result<Vec<FilePatch>, ToolError>
                 if line.starts_with(' ') || line.starts_with('\t') {
                     hunk.lines
                         .push(PatchLine::Context(line.chars().skip(1).collect()));
-                } else if line.starts_with('-') && !line.starts_with("--- ") {
+                } else if line.starts_with('-') {
+                    // 先頭 1 文字が種別。`--- foo` は内容 `-- foo` の削除として扱う
+                    // （モデル patch 側の hunk 解釈と統一）。
                     hunk.lines
                         .push(PatchLine::Remove(line.chars().skip(1).collect()));
-                } else if line.starts_with('+') && !line.starts_with("+++") {
+                } else if line.starts_with('+') {
+                    // 同様に `+++bar` は内容 `++bar` の追加として扱う。
                     hunk.lines
                         .push(PatchLine::Add(line.chars().skip(1).collect()));
                 } else if line.starts_with('\\') {
@@ -1317,6 +1328,79 @@ mod tests {
     }
 
     #[test]
+    fn parse_multi_file_patch_keeps_data_lines_starting_with_three_dashes_or_pluses() {
+        // hunk 内の `--- keep` は内容 `-- keep` の削除、`+++bar` は内容 `++bar` の
+        // 追加であり、ファイルヘッダとして誤認してはならない。
+        let patch = concat!(
+            "diff --git a/file.txt b/file.txt\n",
+            "--- a/file.txt\n",
+            "+++ b/file.txt\n",
+            "@@ -1 +1 @@\n",
+            "--- keep\n",
+            "+++bar\n"
+        );
+        let parsed = parse_multi_file_patch(patch).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "file.txt");
+        assert!(matches!(parsed[0].operation, PatchOperation::Update));
+        assert_eq!(parsed[0].hunks.len(), 1);
+        let hunk = &parsed[0].hunks[0];
+        assert_eq!(hunk.old_start, 1);
+        assert_eq!(hunk.new_start, 1);
+        assert_eq!(hunk.old_count, 1);
+        assert_eq!(hunk.new_count, 1);
+        assert_eq!(hunk.lines.len(), 2);
+        assert!(matches!(&hunk.lines[0], PatchLine::Remove(s) if s == "-- keep"));
+        assert!(matches!(&hunk.lines[1], PatchLine::Add(s) if s == "++bar"));
+    }
+
+    #[test]
+    fn parse_multi_file_patch_recognizes_diff_git_header_and_hunk() {
+        // 標準 git diff（diff --git + a/ b/ ヘッダ）が不変であることを直接検証（R4）。
+        let patch = concat!(
+            "diff --git a/x.txt b/x.txt\n",
+            "--- a/x.txt\n",
+            "+++ b/x.txt\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n"
+        );
+        let parsed = parse_multi_file_patch(patch).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "x.txt");
+        assert!(matches!(parsed[0].operation, PatchOperation::Update));
+        assert_eq!(parsed[0].hunks.len(), 1);
+        let hunk = &parsed[0].hunks[0];
+        assert_eq!(hunk.lines.len(), 2);
+        assert!(matches!(&hunk.lines[0], PatchLine::Remove(s) if s == "old"));
+        assert!(matches!(&hunk.lines[1], PatchLine::Add(s) if s == "new"));
+    }
+
+    #[test]
+    fn parse_multi_file_patch_recognizes_standard_unified_diff_headers() {
+        // `@@` より前の通常ヘッダは in_hunk=false で従来どおり認識されること。
+        let patch = concat!(
+            "--- a/foo.txt\n",
+            "+++ b/foo.txt\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n"
+        );
+        let parsed = parse_multi_file_patch(patch).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "foo.txt");
+        assert!(matches!(parsed[0].operation, PatchOperation::Update));
+        assert_eq!(parsed[0].hunks.len(), 1);
+        let hunk = &parsed[0].hunks[0];
+        assert_eq!(hunk.lines.len(), 2);
+        assert!(matches!(&hunk.lines[0], PatchLine::Remove(s) if s == "old"));
+        assert!(matches!(&hunk.lines[1], PatchLine::Add(s) if s == "new"));
+    }
+
+    #[test]
     fn patch_operation_is_add_only_for_add() {
         assert!(PatchOperation::Add.is_add());
         assert!(!PatchOperation::Update.is_add());
@@ -1793,6 +1877,33 @@ mod tests {
         assert_eq!(hunk.lines.len(), 2);
         assert!(matches!(&hunk.lines[0], PatchLine::Remove(s) if s == "-- keep"));
         assert!(matches!(&hunk.lines[1], PatchLine::Add(s) if s == "++bar"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "-- keep\n").unwrap();
+        let (ctx, _asks) = recording_context(&root);
+        ApplyPatchTool
+            .execute(serde_json::json!({ "patchText": patch }), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "++bar"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_diff_patch_applies_data_lines_starting_with_three_dashes_or_pluses() {
+        // モデル patch 側と同じデータを unified diff 側でも Remove/Add として適用する。
+        let patch = concat!(
+            "--- a/file.txt\n",
+            "+++ b/file.txt\n",
+            "@@ -1 +1 @@\n",
+            "--- keep\n",
+            "+++bar\n"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
