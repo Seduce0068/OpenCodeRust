@@ -69,8 +69,6 @@ status: current
 
 - [ ] **ファイルロックが権限確認 await を跨ぐ Head-of-line ブロック**
   — `tool/write.rs:118` / IOORDER-01-R4 / 中（EditTool も同構造）
-- [ ] **file_time_assert / file_time_read が本番未配線で no-op**
-  — `session/prompt.rs:1575` / IOORDER-03 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -270,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[file_time 配線 1 件]** 本番 ToolContext で stale 検出を有効化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[WriteTool ロック 1 件]** Write/Edit 間の lost update を防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider 空配列 1 件]** whitelist / blacklist を明示クリア可能へ
@@ -811,6 +811,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（file_time 配線の修正時、2 回目のレビューで停止）:
+  mtime 単独変動の誤検出（内容ハッシュ必要）、本番注入 site の回帰テスト欠落、
+  metadata 一時エラーの種別区別、file_times のライフタイム（終了時のクリア
+  無し）— いずれも設計判断として記録のみ。R2 が medium 2 件（mtime+size
+  比較、パス正規化）を修正し R4 最終指摘なし。
 - 2026-11-23 cross-skill 集約（swarm245、2 担当・4 件、観点: 初期化 / I/O順序）:
   init は 0 件。ioorder から IOORDER-01（WriteTool 無ロック）を coding、
   他 3 件を triage。R4 が 4 件指摘（権限確認 await を跨ぐロック保持、
