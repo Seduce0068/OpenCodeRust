@@ -67,10 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **OAuth refresh がプロセス共有ロックで直列化されていない**
-  — `mcp/oauth.rs:138` / RETRY-03-R4 / 中（high）
-- [ ] **公開 refresh_token() が 401 再試行経路でロック外**
-  — `mcp/client.rs:420` / RETRY-03-R4 / 中（high）
 - [ ] **SSE 再接続で permission/question 保留要求が再同期されない**
   — `tui/app.rs:4162` / RETRY-04 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -272,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[OAuth 共有ロック 2 件]** プロセス共有化と 401 経路の直列化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth refresh 1 件]** 同一インスタンスの並行 refresh を抑制
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CodeMode 空白 2 件]** ECMAScript 準拠の trim / 日付区切り
@@ -831,6 +829,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（OAuth 共有ロックの修正時）: 親が REFRESH_LOCKS の
+  エントリを remove_auth で回収（forget_refresh_lock、PREPARE_SLOTS と
+  同ライフサイクル）。残存 low（TokenMock の peak 計測が write 後に
+  active 減算で flaky 可能性）は confidence low のため記録のみ。
 - 2026-11-23 Betterleaks 全履歴スキャン: 2 件検出（discovery.rs のマスキング
   対象例示 `https://user:pass@host/...?api_key=...` と api.rs テストの
   ダミー JWT `{"sub":"dummy"}` + `dummysignaturebase64url_123`）。いずれも
