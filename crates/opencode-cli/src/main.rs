@@ -5128,6 +5128,9 @@ async fn create_lsp_client(file_hint: Option<&Path>) -> anyhow::Result<LspClient
         .initialization
         .map(serde_json::to_value)
         .transpose()?;
+    // Pass the config-side `lsp.<server>.env` to the spawned server process.
+    // `None` keeps the inherited parent environment.
+    let env = server.env;
 
     LspClient::start(
         LspServerConfig {
@@ -5135,6 +5138,7 @@ async fn create_lsp_client(file_hint: Option<&Path>) -> anyhow::Result<LspClient
             command,
             args,
             initialization_options,
+            env,
         },
         cwd,
     )

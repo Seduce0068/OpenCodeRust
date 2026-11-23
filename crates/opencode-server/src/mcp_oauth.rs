@@ -35,6 +35,11 @@ pub struct RemoteMcpConfig {
 /// OAuth client settings declared in the MCP server configuration.
 #[derive(Debug, Clone, Default)]
 pub struct RemoteOAuthSettings {
+    /// Client id from `mcp.servers.<name>.oauth.clientId`.
+    ///
+    /// The legacy top-level `client_id` is kept separately on
+    /// [`RemoteMcpConfig`] and takes priority when both are present.
+    pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub scope: Option<String>,
     pub callback_port: Option<u16>,
@@ -175,7 +180,13 @@ impl McpOAuthManager {
             .unwrap_or_else(|| DEFAULT_MCP_OAUTH_REDIRECT.to_string());
 
         let config = RealOAuthConfig {
-            client_id: remote.client_id.clone(),
+            // The legacy top-level `client_id` wins; `oauth.clientId` is only a
+            // fallback for callers that build the runtime config directly
+            // (the config-file path already folds it into `remote.client_id`).
+            client_id: remote
+                .client_id
+                .clone()
+                .or_else(|| settings.client_id.clone()),
             client_secret: settings.client_secret.clone(),
             auth_url: remote.authorization_url.clone().unwrap_or_default(),
             token_url: String::new(),

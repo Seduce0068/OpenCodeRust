@@ -4717,6 +4717,7 @@ fn remote_oauth_settings(
 ) -> Option<RemoteOAuthSettings> {
     match oauth {
         Some(opencode_config::McpOAuthConfig::Config(config)) => Some(RemoteOAuthSettings {
+            client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
             scope: config.scope.clone(),
             callback_port: config.callback_port,
@@ -4834,15 +4835,23 @@ fn parse_runtime_from_loaded_config(
                     server.oauth.as_ref(),
                     Some(opencode_config::McpOAuthConfig::Disabled(false))
                 );
+                let oauth = remote_oauth_settings(server.oauth.as_ref());
+                // The legacy top-level `client_id` keeps priority; the OAuth
+                // object's `clientId` is only used when that field is absent.
+                let client_id = server.client_id.or_else(|| {
+                    oauth
+                        .as_ref()
+                        .and_then(|settings| settings.client_id.clone())
+                });
                 return Ok(Some((
                     McpRuntimeConfig::Remote(RemoteMcpConfig {
                         url,
                         oauth_enabled,
-                        client_id: server.client_id,
+                        client_id,
                         authorization_url: server.authorization_url,
                         headers: server.headers,
                         timeouts,
-                        oauth: remote_oauth_settings(server.oauth.as_ref()),
+                        oauth,
                         protocol: server.protocol.map(|p| p.revision().to_string()),
                     }),
                     enabled,
@@ -7165,7 +7174,8 @@ mod plugin_auth_flow_id_tests {
 mod mcp_loaded_config_tests {
     use super::*;
     use opencode_config::{
-        McpOAuthConfig, McpPerOperationTimeout, McpServer, McpServerConfig, McpTimeoutConfig,
+        McpOAuth, McpOAuthConfig, McpPerOperationTimeout, McpServer, McpServerConfig,
+        McpTimeoutConfig,
     };
 
     fn full(server: McpServer) -> McpServerConfig {
@@ -7222,6 +7232,72 @@ mod mcp_loaded_config_tests {
             McpRuntimeConfig::Remote(remote) => {
                 assert!(!remote.oauth_enabled);
                 assert_eq!(remote.url, "https://example.com/mcp");
+            }
+            McpRuntimeConfig::Local(_) => panic!("expected remote config"),
+        }
+    }
+
+    /// `oauth.clientId` alone must reach the runtime client_id used by the
+    /// OAuth flow; otherwise the value is silently dropped and dynamic client
+    /// registration is attempted instead.
+    #[test]
+    fn loaded_remote_config_uses_oauth_client_id_without_legacy_field() {
+        let config = full(McpServer {
+            url: Some("https://example.com/mcp".to_string()),
+            oauth: Some(McpOAuthConfig::Config(McpOAuth {
+                client_id: Some("oauth-client".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+
+        let (runtime, _) = parse_runtime_from_loaded_config(config, None)
+            .unwrap()
+            .unwrap();
+        match runtime {
+            McpRuntimeConfig::Remote(remote) => {
+                assert_eq!(remote.client_id.as_deref(), Some("oauth-client"));
+                assert_eq!(
+                    remote
+                        .oauth
+                        .as_ref()
+                        .and_then(|settings| settings.client_id.as_deref()),
+                    Some("oauth-client")
+                );
+            }
+            McpRuntimeConfig::Local(_) => panic!("expected remote config"),
+        }
+    }
+
+    /// Existing configs that set the top-level `client_id` must be unaffected:
+    /// it still wins over `oauth.clientId`.
+    #[test]
+    fn loaded_remote_config_prefers_legacy_client_id_over_oauth_client_id() {
+        let config = full(McpServer {
+            url: Some("https://example.com/mcp".to_string()),
+            client_id: Some("legacy-client".to_string()),
+            oauth: Some(McpOAuthConfig::Config(McpOAuth {
+                client_id: Some("oauth-client".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+
+        let (runtime, _) = parse_runtime_from_loaded_config(config, None)
+            .unwrap()
+            .unwrap();
+        match runtime {
+            McpRuntimeConfig::Remote(remote) => {
+                assert_eq!(remote.client_id.as_deref(), Some("legacy-client"));
+                // Both values are retained for diagnostics/debugging; only the
+                // legacy one is selected for the OAuth flow.
+                assert_eq!(
+                    remote
+                        .oauth
+                        .as_ref()
+                        .and_then(|settings| settings.client_id.as_deref()),
+                    Some("oauth-client")
+                );
             }
             McpRuntimeConfig::Local(_) => panic!("expected remote config"),
         }

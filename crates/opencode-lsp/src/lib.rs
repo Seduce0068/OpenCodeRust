@@ -159,6 +159,11 @@ pub struct LspServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub initialization_options: Option<Value>,
+    /// Per-server environment variables passed to the spawned process.
+    ///
+    /// `None` preserves the previous behavior: the child inherits the parent
+    /// environment. Values are applied to the child only and are never logged.
+    pub env: Option<HashMap<String, String>>,
 }
 
 /// Upper bound for a single JSON-RPC request/response round-trip.
@@ -266,10 +271,23 @@ fn wire_document_version(version: u32) -> i32 {
     i32::try_from(version).unwrap_or(i32::MAX)
 }
 
+/// Builds the child-process command for an LSP server.
+///
+/// Configured `env` entries are added as process environment variables; when
+/// absent, no env overrides are applied and the child inherits the parent
+/// environment. Keys and values are never included in logs or error messages.
+fn build_server_command(config: &LspServerConfig) -> Command {
+    let mut command = Command::new(&config.command);
+    command.args(&config.args);
+    if let Some(ref env) = config.env {
+        command.envs(env);
+    }
+    command
+}
+
 impl LspClient {
     pub async fn start(config: LspServerConfig, root: PathBuf) -> Result<Self, LspError> {
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
+        let mut child = build_server_command(&config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1115,6 +1133,81 @@ pub fn detect_language(path: &Path) -> &'static str {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Regression test for CFGAPPLY-03: config env must reach the server child.
+    /// A Command spy checks the exact key/value without logging their contents.
+    #[test]
+    fn server_command_applies_configured_env() {
+        let mut env = HashMap::new();
+        env.insert(
+            "CFGAPPLY03_ENV_PROBE".to_string(),
+            "cfgapply03-sentinel".to_string(),
+        );
+        let config = LspServerConfig {
+            id: "probe".to_string(),
+            command: "probe-lsp".to_string(),
+            args: vec!["--stdio".to_string()],
+            initialization_options: None,
+            env: Some(env),
+        };
+
+        let command = build_server_command(&config);
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key.to_str() == Some("CFGAPPLY03_ENV_PROBE")
+                && value.and_then(|v| v.to_str()) == Some("cfgapply03-sentinel")
+        }));
+    }
+
+    /// `None` must leave the inherited parent environment untouched.
+    #[test]
+    fn server_command_leaves_env_unset_when_not_configured() {
+        let config = LspServerConfig {
+            id: "probe".to_string(),
+            command: "probe-lsp".to_string(),
+            args: Vec::new(),
+            initialization_options: None,
+            env: None,
+        };
+
+        let command = build_server_command(&config);
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| key.to_str() != Some("CFGAPPLY03_ENV_PROBE")),
+            "env overrides must not be set when none are configured"
+        );
+    }
+
+    /// End-to-end check that the configured value is visible inside the child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_command_env_is_visible_in_spawned_child() {
+        let mut env = HashMap::new();
+        env.insert(
+            "CFGAPPLY03_ENV_PROBE".to_string(),
+            "cfgapply03-sentinel".to_string(),
+        );
+        let config = LspServerConfig {
+            id: "probe".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "[ \"$CFGAPPLY03_ENV_PROBE\" = 'cfgapply03-sentinel' ]".to_string(),
+            ],
+            initialization_options: None,
+            env: Some(env),
+        };
+
+        let output = build_server_command(&config)
+            .output()
+            .await
+            .expect("failed to spawn env probe");
+        assert!(
+            output.status.success(),
+            "configured env value was not visible in the child process"
+        );
+    }
 
     #[test]
     fn test_detect_language() {
