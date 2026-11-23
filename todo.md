@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **OpenAI tool_calls index の u64→u32 切詰で衝突**
-  — `provider/openai.rs:433` / NUM-03 / 中
 - [ ] **空配列クリアが他 3 フィールドで未対応**
   — skills.paths/urls, provider.whitelist/blacklist /
   watcher.ignore と同パターンで ExplicitStringList 化
@@ -288,6 +286,8 @@ status: current
 
 ## 完了
 
+- [x] **[tool_calls index 1 件]** u64→u32 切詰による衝突を防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[数値境界 2 件]** 使用率 100% クランプ・選択肢キー境界
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[空配列クリア 1 件]** primary_tools を ExplicitStringList 化
@@ -811,6 +811,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（tool_calls index の修正時）: 親が warn-once テストを
+  範囲外 index 2 件で強化。残存 low（u64 超過 index が as_u64 None 経由で
+  0 にフォールバックする可能性）は旧コードと同挙動で新規回帰ではないため
+  記録のみ。
 - 2026-11-23 cross-skill 集約（swarm235、2 担当・10 件、観点: 文字列 / 数値）:
   親が NUM-01/02 を read で事実確認し即座 coding（使用率 100% クランプ、
   選択肢 27 個目以降の番号キー）。親が子のテスト期待（160 件ではヒント行が
