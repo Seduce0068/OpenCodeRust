@@ -7747,7 +7747,8 @@ fn own_keys(value: &Value) -> Vec<String> {
 /// Whitespace trimmed by `String.prototype.trim` and numeric parsers: the
 /// ECMAScript WhiteSpace + LineTerminator set. Rust's `is_whitespace` also
 /// includes U+0085 (NEL), which JavaScript does not treat as whitespace.
-fn is_js_whitespace(character: char) -> bool {
+/// Shared with `crate::date::parse_iso` so date parsing uses the same set.
+pub(crate) fn is_js_whitespace(character: char) -> bool {
     matches!(
         character,
         '\u{0009}' | '\u{000B}' | '\u{000C}' | '\u{0020}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
@@ -12602,6 +12603,27 @@ mod tests {
             Value::Boolean(true)
         );
         assert_eq!(run_value("return +new Date(42);"), number(42.0));
+    }
+
+    #[test]
+    fn date_parse_matches_string_trim_whitespace_set() {
+        // `String.prototype.trim` keeps NEL (U+0085); Date.parse must reject it.
+        assert_eq!(
+            run_value(r#"return "\u00852024-01-02\u0085".trim().length;"#),
+            number(12.0)
+        );
+        assert!(matches!(
+            run_value(r#"return Date.parse("\u00852024-01-02T03:04:05Z\u0085");"#),
+            Value::Number(value) if value.is_nan()
+        ));
+        assert_eq!(
+            run_value(r#"return Date.parse("2024-01-02\u000903:04:05Z");"#),
+            number(1_704_164_645_000.0)
+        );
+        assert_eq!(
+            run_value(r#"return Date.parse("2024-01-02\u300003:04:05Z");"#),
+            number(1_704_164_645_000.0)
+        );
     }
 
     #[test]

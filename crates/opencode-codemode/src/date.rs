@@ -6,6 +6,8 @@
 //! the host timezone. String coercion and boundary serialization both use the
 //! ISO form, matching upstream `SandboxDate`.
 
+use crate::interpreter::is_js_whitespace;
+
 /// Maximum absolute time value accepted by JavaScript `Date`.
 const MAX_TIME_MS: f64 = 8.64e15;
 
@@ -109,29 +111,42 @@ fn format_year(year: i64) -> String {
     }
 }
 
+/// Removes leading and trailing ECMAScript whitespace, matching
+/// `String.prototype.trim`. Unlike `str::trim`, this keeps U+0085 (NEL).
+fn trim_js_whitespace(text: &str) -> &str {
+    text.trim_matches(is_js_whitespace)
+}
+
 /// Parses an ISO 8601 date or date-time string, returning `NaN` when invalid.
 ///
 /// Accepted forms:
 ///
 /// - `YYYY`, `YYYY-MM`, `YYYY-MM-DD` (UTC midnight).
 /// - `YYYY-MM-DDTHH:mm[:ss[.fff]]` with `Z`, `±HH:MM`, `±HHMM`, or no zone.
-/// - The date and time may be separated by `T` or a space.
+/// - The date and time may be separated by `T`, `t`, or a run of one or more
+///   ECMAScript whitespace characters (tab, U+00A0, U+3000, and so on).
+/// - U+0085 (NEL) is not ECMAScript whitespace: it is neither trimmed at the
+///   edges nor accepted as a separator, matching `String.prototype.trim`.
 ///
 /// A missing zone is treated as UTC. Native JavaScript treats it as local time;
 /// CodeMode chooses determinism over host timezone dependence.
 pub fn parse_iso(text: &str) -> f64 {
-    let text = text.trim();
+    let text = trim_js_whitespace(text);
     if text.is_empty() {
         return f64::NAN;
     }
 
-    let (date_text, time_text, iso_time) = match text.find(['T', 't', ' ']) {
-        Some(index) => (
-            &text[..index],
-            Some(&text[index + 1..]),
-            matches!(text.as_bytes()[index], b'T' | b't'),
-        ),
-        None => (text, None, false),
+    // `T`/`t` stays the ISO separator. Otherwise a run of ECMAScript whitespace
+    // separates the parts; consume the whole run so multi-byte and repeated
+    // whitespace acts as a single separator.
+    let (date_text, time_text, iso_time) = if let Some(index) = text.find(['T', 't']) {
+        (&text[..index], Some(&text[index + 1..]), true)
+    } else if let Some(index) = text.find(is_js_whitespace) {
+        let rest = &text[index..];
+        let separator_len = rest.len() - rest.trim_start_matches(is_js_whitespace).len();
+        (&text[..index], Some(&text[index + separator_len..]), false)
+    } else {
+        (text, None, false)
     };
     if iso_time && !iso_date_width(date_text) {
         return f64::NAN;
@@ -147,7 +162,7 @@ pub fn parse_iso(text: &str) -> f64 {
             let time_text = if iso_time {
                 time_text
             } else {
-                time_text.trim_start_matches(char::is_whitespace)
+                time_text.trim_start_matches(is_js_whitespace)
             };
             let Some(parsed) = parse_time_part(time_text) else {
                 return f64::NAN;
@@ -438,6 +453,26 @@ mod tests {
         assert!(parse_iso("garbage").is_nan());
         assert!(parse_iso("2024-13-01").is_nan());
         assert!(parse_iso("2024-01-02T24:00:01Z").is_nan());
+    }
+
+    #[test]
+    fn uses_ecmascript_whitespace_in_parse_iso() {
+        let expected = 1_704_164_645_000.0;
+        // Existing separators stay unchanged.
+        assert_eq!(parse_iso("2024-01-02 03:04:05Z"), expected);
+        assert_eq!(parse_iso("2024-01-02T03:04:05Z"), expected);
+        assert_eq!(parse_iso("2024-01-02t03:04:05Z"), expected);
+        // Other ECMAScript whitespace, including multi-byte and repeated runs.
+        assert_eq!(parse_iso("2024-01-02\t03:04:05Z"), expected);
+        assert_eq!(parse_iso("2024-01-02\u{00A0}03:04:05Z"), expected);
+        assert_eq!(parse_iso("2024-01-02\u{3000}03:04:05Z"), expected);
+        assert_eq!(parse_iso("2024-01-02 \t\u{3000}03:04:05Z"), expected);
+        // ECMAScript whitespace is still trimmed at both edges.
+        assert_eq!(parse_iso("\u{3000}2024-01-02\u{3000}"), 1_704_153_600_000.0);
+        // NEL is not ECMAScript whitespace: not trimmed, not a separator.
+        assert!(parse_iso("\u{85}2024-01-02T03:04:05Z\u{85}").is_nan());
+        assert!(parse_iso("2024-01-02\u{85}03:04:05Z").is_nan());
+        assert!(parse_iso("\u{85}2024-01-02").is_nan());
     }
 
     #[test]
