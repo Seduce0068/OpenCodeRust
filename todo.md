@@ -251,8 +251,6 @@ status: current
   — `openai.rs:1026-1083` / ERR2-07 / 中（speculation）
 - [ ] **POST /prompt に冪等キーが無く再送で二重実行**
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
-- [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
-  — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
 - [ ] **reset_processing が DB 全体の processing を書き換え**
@@ -265,6 +263,8 @@ status: current
 
 ## 完了
 
+- [x] **[SSE join 1 件]** 終了時の待ちを 2 秒の期限付き並列待ちへ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[extractor rejection 1 件]** 400 を JSON エラー envelope へ統一
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP config 回収 1 件]** 完全削除時に connection_config も破棄
@@ -868,6 +868,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 SSE join: Drop の直接 join を期限付き（2秒）待ちへ変更。
+  R4 が直列待ちで最悪 4 秒になる点を指摘したため、spawn_join_notifier +
+  wait_join_notifiers の 2 段 API へ分割し deadline 基準で並列待ちに。
+  待機スレッドは join() 完了まで残るが JoinHandle は消費され、プロセス
+  終了時に OS が回収。R4 最終指摘なし。
 - 2026-11-24 extractor rejection: JsonBody/QueryParams を追加し 58 引数を
   置換、rejection を ApiError::BadRequest の JSON envelope へ変換。
   R4 が回帰テストの実ルータ経路不足を指摘したため実 HTTP 経由テストを
