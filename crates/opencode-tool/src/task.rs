@@ -10,6 +10,87 @@ pub const MAX_SUBAGENT_DEPTH: u32 = 3;
 /// `ToolContext::extra` に現在の深さを格納するキー。
 pub const SUBAGENT_DEPTH_KEY: &str = "subagent_depth";
 
+/// 形式不正な `task_id` に対する固定エラー文言。入力値を一切含めない。
+const INVALID_TASK_ID_MESSAGE: &str = "invalid task_id format";
+
+/// `task_id` が生成側の形式に一致するかを検証する。
+///
+/// 受理する形式は次の 2 種類。
+/// - `task_{agent}_{uuid}`: `do_create_subsession` が実際に生成する ID。
+///   uuid は simple（32 桁小文字 16 進、ハイフンなし）と standard
+///   （8-4-4-4-12 ハイフン付き）の両方を `Uuid::parse_str` で検証して受理する。
+///   agent は非空で、空白やパス区切りを含まない `[A-Za-z0-9_-]+`。
+/// - `sub_{uuid}`: 後方互換のため維持。standard の v4 UUID のみ受理する。
+///
+/// `Uuid::parse_str` は urn / braced / 大文字も受理するため、
+/// 生成側と同じ形であることを先に確認してから解釈する。
+fn is_valid_subagent_task_id(task_id: &str) -> bool {
+    if let Some(uuid_part) = task_id.strip_prefix("sub_") {
+        // 後方互換: `sub_{Uuid::new_v4()}` の standard v4 のみ受理する。
+        let bytes = uuid_part.as_bytes();
+        if bytes.len() != 36
+            || bytes[8] != b'-'
+            || bytes[13] != b'-'
+            || bytes[18] != b'-'
+            || bytes[23] != b'-'
+        {
+            return false;
+        }
+
+        // バージョン nibble は 4、variant nibble は 8/9/a/b（生成側は小文字）。
+        if bytes[14] != b'4' || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
+            return false;
+        }
+
+        let all_hex = bytes.iter().enumerate().all(|(i, b)| {
+            matches!(i, 8 | 13 | 18 | 23) || b.is_ascii_digit() || (b'a'..=b'f').contains(b)
+        });
+
+        return all_hex && uuid::Uuid::parse_str(uuid_part).is_ok();
+    }
+
+    // 実際の生成 ID は `task_{agent}_{Uuid::new_v4().simple()}`（simple）、
+    // デフォルト実装は `task_{agent}_{Uuid::new_v4()}`（standard）。
+    let Some(rest) = task_id.strip_prefix("task_") else {
+        return false;
+    };
+
+    // agent 名にも '_' を含み得るため、最後の '_' を区切りとして uuid を取り出す。
+    let Some(split_at) = rest.rfind('_') else {
+        return false;
+    };
+    let (agent, tail) = rest.split_at(split_at);
+    let uuid_part = &tail[1..];
+
+    if agent.is_empty()
+        || !agent
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return false;
+    }
+
+    let bytes = uuid_part.as_bytes();
+    let shape_ok = if bytes.len() == 32 {
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    } else if bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+    {
+        bytes.iter().enumerate().all(|(i, b)| {
+            matches!(i, 8 | 13 | 18 | 23) || b.is_ascii_digit() || (b'a'..=b'f').contains(b)
+        })
+    } else {
+        false
+    };
+
+    shape_ok && uuid::Uuid::parse_str(uuid_part).is_ok()
+}
+
 /// コンテキストに記録された現在のサブエージェント深さを返す。
 ///
 /// キーが無い場合はルート（0）として扱う。値が不正な場合も推測せず 0 とみなす
@@ -115,6 +196,20 @@ impl Tool for TaskTool {
     ) -> Result<ToolResult, ToolError> {
         let input: TaskInput =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // 再開指定は生成側が作った `task_{agent}_{uuid}` / `sub_{uuid}` 形式だけを受理する。
+        // 権限確認・モデル解決などの副作用より前に形式だけを検証する。
+        // 所有権チェック（指定 task_id が呼び出し元セッションに属するか）は
+        // session 側に既存機構が無く（未実装）、現状は形式検証のみ行う。
+        if input
+            .task_id
+            .as_deref()
+            .is_some_and(|task_id| !is_valid_subagent_task_id(task_id))
+        {
+            return Err(ToolError::InvalidArguments(
+                INVALID_TASK_ID_MESSAGE.to_string(),
+            ));
+        }
 
         // `bypassAgentCheck` の有無にかかわらず、深さ上限は常に適用する。
         // エラー文言には深さの値・トークン値・パスを一切含めない。
@@ -407,7 +502,7 @@ mod tests {
             "description": "Continue task",
             "prompt": "Continue where you left off",
             "subagent_type": "build",
-            "task_id": "task_existing_42"
+            "task_id": "sub_550e8400-e29b-41d4-a716-446655440000"
         });
 
         let result = TaskTool::new().execute(args, ctx).await.unwrap();
@@ -415,11 +510,227 @@ mod tests {
         assert!(!(*created.lock().await));
         let prompted = prompted.lock().await.clone();
         assert_eq!(prompted.len(), 1);
-        assert_eq!(prompted[0].0, "task_existing_42");
+        assert_eq!(prompted[0].0, "sub_550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(prompted[0].1, "Continue where you left off");
-        assert!(result
-            .output
-            .contains("task_id: task_existing_42 (for resuming to continue this task if needed)"));
+        assert!(result.output.contains(concat!(
+            "task_id: sub_550e8400-e29b-41d4-a716-446655440000 ",
+            "(for resuming to continue this task if needed)"
+        )));
+    }
+
+    #[tokio::test]
+    async fn task_resumes_with_do_create_subsession_generated_task_id_shapes() {
+        // do_create_subsession が実際に生成する `task_{agent}_{uuid}` を task_id に
+        // 渡しても拒否されず、do_prompt_subsession まで到達すること（往復テスト）。
+        let generated_ids = [
+            "task_build_550e8400e29b41d4a716446655440000", // simple: Uuid::new_v4().simple()
+            "task_build_550e8400-e29b-41d4-a716-446655440000", // standard: Uuid::new_v4()
+        ];
+
+        for task_id in generated_ids {
+            let created = Arc::new(Mutex::new(false));
+            let prompted = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+
+            let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+                .with_get_last_model(
+                    |_session_id| async move { Ok(Some("provider-x:model-y".into())) },
+                )
+                .with_create_subsession({
+                    let created = created.clone();
+                    move |_agent, _title, _model, _disabled_tools| {
+                        let created = created.clone();
+                        async move {
+                            *created.lock().await = true;
+                            Ok("should_not_be_used".to_string())
+                        }
+                    }
+                })
+                .with_prompt_subsession({
+                    let prompted = prompted.clone();
+                    move |session_id, prompt| {
+                        let prompted = prompted.clone();
+                        async move {
+                            prompted.lock().await.push((session_id, prompt));
+                            Ok("resumed output".to_string())
+                        }
+                    }
+                });
+
+            let args = serde_json::json!({
+                "description": "Resume generated task",
+                "prompt": "Continue",
+                "subagent_type": "build",
+                "task_id": task_id,
+            });
+
+            let result = TaskTool::new().execute(args, ctx).await.unwrap();
+
+            assert!(
+                !*created.lock().await,
+                "create_subsession must not be called on resume"
+            );
+            let prompted = prompted.lock().await.clone();
+            assert_eq!(prompted.len(), 1);
+            assert_eq!(prompted[0].0, task_id);
+            assert_eq!(prompted[0].1, "Continue");
+            assert!(result.output.contains(&format!("task_id: {}", task_id)));
+        }
+    }
+
+    #[test]
+    fn is_valid_subagent_task_id_accepts_generated_shapes() {
+        // sub_ は後方互換の standard v4。
+        assert!(is_valid_subagent_task_id(
+            "sub_550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(is_valid_subagent_task_id(
+            "sub_550e8400-e29b-41d4-a716-446655440001"
+        ));
+        // task_ は do_create_subsession の生成形式（simple / standard）。
+        assert!(is_valid_subagent_task_id(
+            "task_build_550e8400e29b41d4a716446655440000"
+        ));
+        assert!(is_valid_subagent_task_id(
+            "task_build_550e8400-e29b-41d4-a716-446655440000"
+        ));
+        // agent 名に '_' / '-' を含んでもよい。
+        assert!(is_valid_subagent_task_id(
+            "task_my-agent_2_550e8400e29b41d4a716446655440000"
+        ));
+        for invalid in [
+            "",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "/etc/passwd",
+            "task_xxx",
+            "sub_xxx",
+            "sub_550e8400e29b41d4a716446655440000",
+            "sub_550e8400-e29b-11d4-a716-446655440000",
+            "sub_550e8400-e29b-41d4-7716-446655440000",
+            "SUB_550e8400-e29b-41d4-a716-446655440000",
+            "sub_550E8400-E29B-41D4-A716-446655440000",
+            "task_",
+            "task_build_",
+            "task_build_550e8400e29b41d4a71644665544000g",
+            "task_build_550E8400E29B41D4A716446655440000",
+            "task_/etc/passwd_550e8400-e29b-41d4-a716-446655440000",
+            "task_bu ild_550e8400-e29b-41d4-a716-446655440000",
+            "task_build_urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            assert!(
+                !is_valid_subagent_task_id(invalid),
+                "invalid shape must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_rejects_invalid_task_id_without_side_effects() {
+        let invalid_ids = [
+            "",
+            "/etc/passwd",
+            "task_xxx",
+            "sub_xxx",
+            "sub_550e8400e29b41d4a716446655440000",
+            "sub_550e8400-e29b-11d4-a716-446655440000",
+            "sub_550e8400-e29b-41d4-7716-446655440000",
+            "task_build_",
+            "task_build_550e8400e29b41d4a71644665544000g",
+            "task_/etc/passwd_550e8400-e29b-41d4-a716-446655440000",
+        ];
+
+        for invalid_id in invalid_ids {
+            let created = Arc::new(Mutex::new(false));
+            let prompted = Arc::new(Mutex::new(false));
+
+            let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+                .with_create_subsession({
+                    let created = created.clone();
+                    move |_agent, _title, _model, _disabled_tools| {
+                        let created = created.clone();
+                        async move {
+                            *created.lock().await = true;
+                            Ok("should_not_be_used".to_string())
+                        }
+                    }
+                })
+                .with_prompt_subsession({
+                    let prompted = prompted.clone();
+                    move |_session_id, _prompt| {
+                        let prompted = prompted.clone();
+                        async move {
+                            *prompted.lock().await = true;
+                            Ok("should_not_be_used".to_string())
+                        }
+                    }
+                });
+
+            let args = serde_json::json!({
+                "description": "Invalid resume",
+                "prompt": "Should not run",
+                "subagent_type": "build",
+                "task_id": invalid_id,
+            });
+
+            let err = TaskTool::new().execute(args, ctx).await.unwrap_err();
+            let message = match &err {
+                ToolError::InvalidArguments(message) => message,
+                _ => panic!("expected InvalidArguments"),
+            };
+            assert_eq!(message.as_str(), INVALID_TASK_ID_MESSAGE);
+            if !invalid_id.is_empty() {
+                assert!(!message.contains(invalid_id));
+            }
+            assert!(
+                !*created.lock().await,
+                "create_subsession must not be called"
+            );
+            assert!(
+                !*prompted.lock().await,
+                "prompt_subsession must not be called"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_with_null_task_id_still_creates_subsession() {
+        let created = Arc::new(Mutex::new(false));
+        let prompted = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_create_subsession({
+                let created = created.clone();
+                move |_agent, _title, _model, _disabled_tools| {
+                    let created = created.clone();
+                    async move {
+                        *created.lock().await = true;
+                        Ok("sub_550e8400-e29b-41d4-a716-446655440001".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession({
+                let prompted = prompted.clone();
+                move |session_id, _prompt| {
+                    let prompted = prompted.clone();
+                    async move {
+                        prompted.lock().await.push(session_id);
+                        Ok("new output".to_string())
+                    }
+                }
+            });
+
+        let args = serde_json::json!({
+            "description": "New task",
+            "prompt": "Run",
+            "subagent_type": "build",
+            "task_id": null,
+        });
+
+        TaskTool::new().execute(args, ctx).await.unwrap();
+
+        assert!(*created.lock().await);
+        let prompted = prompted.lock().await;
+        assert_eq!(prompted.len(), 1);
+        assert_eq!(prompted[0], "sub_550e8400-e29b-41d4-a716-446655440001");
     }
 
     fn recording_ctx(
