@@ -80,10 +80,14 @@ impl Ripgrep {
                     errors.push(e);
                 }
             }
-            if matches.is_empty() {
-                if let Some(e) = errors.into_iter().next() {
-                    return Err(Box::new(e));
-                }
+            // ERRPROP-02: ディレクトリ検索では一部ファイルの読み取り失敗を握りつぶさず、
+            // 一致が存在しても最初のエラーを返す。全成功時は errors が空のため
+            // 従来どおり Ok(matches) を返し、後方互換性は維持される。
+            // limit 到達で break した場合は「最初の limit 件の一致が確定した時点で
+            // 打ち切り、その時点までに集めた errors のみを伝播する」仕様（R4）。
+            // 未走査ファイルの読み取り失敗は検索範囲外のため報告しない。
+            if let Some(e) = errors.into_iter().next() {
+                return Err(Box::new(e));
             }
         }
 
@@ -427,5 +431,63 @@ mod tests {
             "src/*/[1]+.rs",
             std::path::Path::new("/work/src/sub/1.rs")
         ));
+    }
+
+    /// テスト専用の一意な一時ディレクトリを作成する（外部クレート依存なし）。
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "opencode-grep-{}-{}-{}",
+            label,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        dir
+    }
+
+    #[test]
+    fn directory_search_returns_error_when_partial_file_is_invalid_utf8() {
+        // ERRPROP-02 回帰: 一致する正常ファイルと不正 UTF-8 バイトを含むファイルが
+        // 混在する場合、後者の読み取りエラーが握りつぶされ不完全な Ok が返っていた。
+        let dir = unique_temp_dir("errprop02-partial");
+
+        let good = dir.join("good.txt");
+        std::fs::write(&good, b"needle in a haystack\n").expect("write good file");
+
+        // 不正 UTF-8 バイト (0xff) を含む行は BufRead::lines() が InvalidData を返す。
+        let bad = dir.join("bad.txt");
+        std::fs::write(&bad, b"\xff\xfe\n").expect("write bad file");
+
+        let result = Ripgrep::search_with_limit(&dir, "needle", 100);
+        assert!(
+            result.is_err(),
+            "a partial read failure must not be swallowed when other files matched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_search_all_success_remains_ok() {
+        // 全ファイルが正常な既存ケースが不変であることを確認する。
+        let dir = unique_temp_dir("errprop02-ok");
+
+        let first = dir.join("first.txt");
+        std::fs::write(&first, b"needle one\n").expect("write first file");
+        let second = dir.join("second.txt");
+        std::fs::write(&second, b"needle two\nplain line\n").expect("write second file");
+
+        let result = Ripgrep::search_with_limit(&dir, "needle", 100);
+        assert!(
+            result.is_ok(),
+            "all-success directory search must return Ok"
+        );
+        assert_eq!(result.expect("ok result").len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
