@@ -177,6 +177,12 @@ impl TodoManager {
         let lock = self.writer_lock(session_id).await;
         let _guard = lock.lock().await;
 
+        self.update_locked(session_id, todos).await;
+    }
+
+    /// 呼び出し側がセッション単位の writer ロックを保持している前提で実行する
+    /// 更新本体。`update` と `update_and_get_with_ids` が共有する。
+    async fn update_locked(&self, session_id: &str, todos: Vec<TodoInfo>) {
         let entries: Vec<TodoEntry> = todos
             .into_iter()
             .map(|todo| TodoEntry {
@@ -210,6 +216,30 @@ impl TodoManager {
         }
     }
 
+    /// Replace the todo list and read it back with stable IDs atomically.
+    ///
+    /// `update` と同じセッション単位の writer ロックを取得したまま、DB 置換〜
+    /// メモリ更新〜ID 付き読み戻しまでを同一クリティカルセクションで実行する。
+    /// これにより SSE の `todo_update` コールバックのように「更新直後の
+    /// スナップショット」を必要とする呼び出しが、別の writer の割り込みで
+    /// 他人のリストを読むことを防ぐ (TODO-SSE-ID-01-R4)。
+    ///
+    /// 公開 API (`update` / `get_with_ids`) の挙動は不変。DB 置換失敗時は
+    /// `update` と同様にメモリ更新をスキップし、ロールバック済みの DB（また
+    /// は既存メモリ）から読み戻すため、従来の `update` + `get_with_ids` の
+    /// 2 呼び出しと同じ値を返す（後方互換）。
+    pub async fn update_and_get_with_ids(
+        &self,
+        session_id: &str,
+        todos: Vec<TodoInfo>,
+    ) -> Vec<TodoWithId> {
+        let lock = self.writer_lock(session_id).await;
+        let _guard = lock.lock().await;
+
+        self.update_locked(session_id, todos).await;
+        self.get_with_ids_locked(session_id).await
+    }
+
     /// Return the stored todo list for a session together with each stable ID.
     ///
     /// A configured database is read first; the persisted `TodoItem.id` is
@@ -219,6 +249,14 @@ impl TodoManager {
     /// IDs never depend on list position, so removing an item does not change
     /// the IDs of the survivors.
     pub async fn get_with_ids(&self, session_id: &str) -> Vec<TodoWithId> {
+        self.get_with_ids_locked(session_id).await
+    }
+
+    /// 読み戻し本体。`update_and_get_with_ids` は writer ロックを保持したまま
+    /// これを呼び、置換〜読み戻しを同一クリティカルセクションに収める。
+    /// `get_with_ids` からはロック無しで呼ばれるが読み取り専用のため、
+    /// 従来の非ブロック挙動は変わらない。
+    async fn get_with_ids_locked(&self, session_id: &str) -> Vec<TodoWithId> {
         if let Some(ref db) = self.db {
             match db.list_for_session(session_id).await {
                 Ok(items) => {
@@ -1194,6 +1232,105 @@ mod tests {
         assert_eq!(
             memory_manager.get(SESSION).await,
             vec![todo("B", "pending", "medium"), todo("C", "pending", "low")]
+        );
+    }
+
+    /// 同一セッションに並行して update_and_get_with_ids を呼んだとき、各戻り値が
+    /// 自分の入力に対応する ID を持ち、別呼び出しのスナップショットが混ざらない
+    /// ことを検証する (TODO-SSE-ID-01-R4)。
+    #[tokio::test]
+    async fn concurrent_update_and_get_with_ids_do_not_mix_snapshots() {
+        let database = test_database().await;
+        let mut manager = TodoManager::with_database(database.pool().clone());
+        manager.db_delay = Duration::from_millis(300);
+        let manager = Arc::new(manager);
+        let started = Arc::clone(&manager.db_started);
+
+        // A を開始し、writer ロックを保持したまま DB 置換フェーズに入らせる。
+        let a_manager = Arc::clone(&manager);
+        let a_task = tokio::spawn(async move {
+            a_manager
+                .update_and_get_with_ids(SESSION, vec![todo("A", "pending", "high")])
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(1000), started.notified())
+            .await
+            .expect("A reached its DB phase");
+
+        // A がクリティカルセクションに居る間に B を開始する。
+        let b_manager = Arc::clone(&manager);
+        let mut b_task = tokio::spawn(async move {
+            b_manager
+                .update_and_get_with_ids(SESSION, vec![todo("B", "pending", "low")])
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut b_task)
+                .await
+                .is_err(),
+            "B must wait for A to finish its update-and-read critical section"
+        );
+
+        let a_result = a_task.await.expect("A task");
+        let b_result = b_task.await.expect("B task");
+
+        assert_eq!(
+            a_result
+                .iter()
+                .map(|entry| entry.todo.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A"],
+            "A must read back its own snapshot"
+        );
+        assert_eq!(
+            b_result
+                .iter()
+                .map(|entry| entry.todo.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B"],
+            "B must read back its own snapshot"
+        );
+
+        let a_ids: HashSet<&str> = a_result.iter().map(|entry| entry.id.as_str()).collect();
+        let b_ids: HashSet<&str> = b_result.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(a_ids.len(), 1, "A must return exactly one stable id");
+        assert_eq!(b_ids.len(), 1, "B must return exactly one stable id");
+        assert!(
+            a_ids.is_disjoint(&b_ids),
+            "each call must return its own stable id, not the other call's"
+        );
+    }
+
+    /// 遅延なしの並行呼び出しでも、各戻り値の ID 集合が入力に対応することを
+    /// 検証する (TODO-SSE-ID-01-R4)。
+    #[tokio::test]
+    async fn parallel_update_and_get_with_ids_keep_own_id_sets() {
+        let manager = Arc::new(TodoManager::new());
+
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let worker = Arc::clone(&manager);
+            let content = format!("todo-{index}");
+            tasks.push(tokio::spawn(async move {
+                let result = worker
+                    .update_and_get_with_ids(SESSION, vec![todo(&content, "pending", "medium")])
+                    .await;
+                (content, result)
+            }));
+        }
+
+        let mut all_ids = Vec::new();
+        for task in tasks {
+            let (content, result) = task.await.expect("parallel task");
+            assert_eq!(result.len(), 1, "each call reads back its own single item");
+            assert_eq!(result[0].todo.content, content);
+            all_ids.push(result[0].id.clone());
+        }
+        let unique: HashSet<&str> = all_ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            all_ids.len(),
+            "ids must be unique across calls"
         );
     }
 }

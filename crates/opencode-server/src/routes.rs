@@ -3330,12 +3330,14 @@ fn spawn_prompt_execution(
                     .collect();
                 // TodoManager へは従来どおり生値を渡す（GET 側が正規化する）。
                 // SSE 側だけ canonical 値を流し、GET と wire 値を一致させる。
-                state.todo_manager.update(&session_id, items).await;
-                // SSE にも GET /session/{id}/todo と同じ安定 ID を載せるため、
-                // 更新直後の TodoManager から ID 付きの値を読み戻す。
-                // update がリストを置き換えた直後なので両者の ID は一致する。
-                let todos_with_ids = state.todo_manager.get_with_ids(&session_id).await;
-                state.broadcast(&todo_updated_payload(&session_id, &todos_with_ids));
+                // 置換〜ID 付き読み戻しを writer lock 下でアトミックに実行し、
+                // 並行する別 update のスナップショットが混ざらないようにする
+                // (TODO-SSE-ID-01-R4)。
+                let with_ids = state
+                    .todo_manager
+                    .update_and_get_with_ids(&session_id, items)
+                    .await;
+                state.broadcast(&todo_updated_payload(&session_id, &with_ids));
                 Ok(())
             })
         });
