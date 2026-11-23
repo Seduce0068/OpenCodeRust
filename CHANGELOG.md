@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T10:52:49+09:00"
+  at: "2026-11-23T11:18:13+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3273 件（all-features は 3272 件）
+  テスト総数 594 → 3274 件（all-features は 3273 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tool`: WriteTool にファイルロックを追加し Write/Edit 間の lost update を防止
+  （swarm-coding R1-R6）
 - `config`: 明示的空配列で provider.whitelist / blacklist をクリア
   （空配列クリア残存をすべて解消）
   （swarm-coding R1-R6）

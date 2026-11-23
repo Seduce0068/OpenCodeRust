@@ -67,6 +67,10 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **ファイルロックが権限確認 await を跨ぐ Head-of-line ブロック**
+  — `tool/write.rs:118` / IOORDER-01-R4 / 中（EditTool も同構造）
+- [ ] **file_time_assert / file_time_read が本番未配線で no-op**
+  — `session/prompt.rs:1575` / IOORDER-03 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -266,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[WriteTool ロック 1 件]** Write/Edit 間の lost update を防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[provider 空配列 1 件]** whitelist / blacklist を明示クリア可能へ
   （2026-11-21、swarm-coding R1-R6、空配列クリア残存を完結）
 - [x] **[skills 空配列 1 件]** paths / urls を明示クリア可能へ
@@ -805,6 +811,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm245、2 担当・4 件、観点: 初期化 / I/O順序）:
+  init は 0 件。ioorder から IOORDER-01（WriteTool 無ロック）を coding、
+  他 3 件を triage。R4 が 4 件指摘（権限確認 await を跨ぐロック保持、
+  ロックキー未正規化、LSP 診断がロック内、非 UTF-8 回帰テスト欠落）したが、
+  いずれも EditTool の既存パターンを拡張したもので新規回帰ではないため記録のみ。
 - 2026-11-23 provider 空配列修正: whitelist/blacklist も ExplicitStringList 化、
   cli/server の 4 箇所を as_slice().to_vec() へ。R4 指摘なし。これで
   watcher/primary_tools/skills/provider の空配列クリア残存はすべて解消。
