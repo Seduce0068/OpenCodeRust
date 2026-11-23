@@ -287,7 +287,10 @@ mod glob_match {
     use std::path::Path;
 
     pub fn glob_match(pattern: &str, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
+        // NORM-06: Windows パス区切りを正規化する。POSIX パスでは不変のため後方互換。
+        // パターンは正規化後に "./" を除去し、".\src" 形式も受け付ける。
+        let path_str = path.to_string_lossy().replace('\\', "/");
+        let pattern = pattern.replace('\\', "/");
         let pattern = pattern.trim_start_matches("./");
 
         if pattern.contains('*') {
@@ -403,6 +406,61 @@ mod tests {
         assert!(glob_match::glob_match(
             "./src/main.rs",
             std::path::Path::new("/work/src/main.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_normalizes_windows_separators_in_path() {
+        // NORM-06 回帰: Windows パス "src\\file.rs" を POSIX 区切りへ正規化し照合する。
+        assert!(glob_match::glob_match(
+            "src/file.rs",
+            std::path::Path::new("src\\file.rs")
+        ));
+        assert!(glob_match::glob_match(
+            "*.rs",
+            std::path::Path::new("src\\file.rs")
+        ));
+        assert!(glob_match::glob_match(
+            "src/*.rs",
+            std::path::Path::new("src\\file.rs")
+        ));
+        assert!(!glob_match::glob_match(
+            "src/*.rs",
+            std::path::Path::new("src\\nested\\file.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_normalizes_windows_separators_in_pattern() {
+        // Windows スタイルのパターン指定も受け付ける。
+        assert!(glob_match::glob_match(
+            "src\\file.rs",
+            std::path::Path::new("src/file.rs")
+        ));
+        assert!(glob_match::glob_match(
+            "src\\*.rs",
+            std::path::Path::new("src/file.rs")
+        ));
+        assert!(glob_match::glob_match(
+            ".\\src\\*.rs",
+            std::path::Path::new("src\\file.rs")
+        ));
+    }
+
+    #[test]
+    fn glob_match_posix_paths_remain_unchanged() {
+        // 既存 POSIX ケースが不変であることを確認する。
+        assert!(glob_match::glob_match(
+            "src/main.rs",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+        assert!(glob_match::glob_match(
+            "*.rs",
+            std::path::Path::new("/work/src/main.rs")
+        ));
+        assert!(!glob_match::glob_match(
+            "src/main.rs",
+            std::path::Path::new("/work/src/lib.rs")
         ));
     }
 

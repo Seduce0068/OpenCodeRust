@@ -138,7 +138,12 @@ impl Tool for LsTool {
 
         if let Some(custom_ignore) = input.ignore {
             for pattern in custom_ignore {
-                let normalized = pattern.trim_start_matches('!').trim();
+                // 走査側の rel_str と同じ区切り正規化を先に適用する。Windows 形式の
+                // バックスラッシュ区切り指定（例: "dir\\"）をスラッシュ区切りへ
+                // 変換することで、ignore_set / ignore_globs の両分岐が同じ比較
+                // 基準を持つ。 POSIX パス（'\\' 不含）では文字列は不変。
+                let replaced = pattern.replace('\\', "/");
+                let normalized = replaced.trim_start_matches('!').trim();
                 if normalized.is_empty() {
                     continue;
                 }
@@ -374,6 +379,47 @@ mod tests {
         assert_eq!(result.metadata["count"], 1);
         assert!(result.output.contains("keep.rs"));
         assert!(!result.output.contains("skip.log"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// バックスラッシュ区切りの ignore 指定（例: "dir\\"）がスラッシュ区切りと
+    /// 同じくディレクトリを除外できることを検証する（NORM-05 回帰テスト）。
+    #[tokio::test]
+    async fn execute_ignore_backslash_separator_excludes_dir() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("dir")).unwrap();
+        std::fs::write(dir.join("dir").join("a.txt"), "nested").unwrap();
+        std::fs::write(dir.join("keep.txt"), "keep").unwrap();
+
+        let result = LsTool::new()
+            .execute(serde_json::json!({ "ignore": ["dir\\"] }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["count"], 1);
+        assert!(result.output.contains("keep.txt"));
+        assert!(!result.output.contains("a.txt"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 既存のスラッシュ区切り指定（例: "dir/"）の挙動が不変であることを検証する。
+    #[tokio::test]
+    async fn execute_ignore_forward_slash_separator_unchanged() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("dir")).unwrap();
+        std::fs::write(dir.join("dir").join("a.txt"), "nested").unwrap();
+        std::fs::write(dir.join("keep.txt"), "keep").unwrap();
+
+        let result = LsTool::new()
+            .execute(serde_json::json!({ "ignore": ["dir/"] }), context(&dir))
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata["count"], 1);
+        assert!(result.output.contains("keep.txt"));
+        assert!(!result.output.contains("a.txt"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
