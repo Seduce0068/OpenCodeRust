@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-24T05:33:42+09:00"
+  at: "2026-11-24T05:56:56+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3396 件（all-features は 3395 件）
+  テスト総数 594 → 3399 件（all-features は 3398 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `codemode`: JSON.parse の Infinity センチネルを呼び出しごとに一意化
+  （swarm-coding R1-R6）
 - `tool`: CLI 質問の空 Enter による暗黙 Yes 選択を防止
   （swarm-coding R1-R6）
 - `tool`: unified diff の hunk 内データ行をヘッダと誤認しないように修正

@@ -170,8 +170,6 @@ status: current
   — `tool/websearch.rs:43` / AV-05 / 低
 - [ ] **LspTool の位置・rename 名がスキーマ制約をすり抜ける**
   — `tool/lsp_tool.rs:63` / AV-06 / 低
-- [ ] **CodeMode JSON.parse がセンチネル文字列を Infinity に誤変換**
-  — `codemode/interpreter.rs:7869` / PARSE-02 / 低
 - [ ] **不正な mcp.timeout がゴースト MCP サーバーとして読まれる**
   — `config/schema.rs:1470` / PARSE-03 / 低
 - [ ] **plugin auth.fetch の不正チャンクが通知を捨てる**
@@ -273,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[CodeMode センチネル 1 件]** Infinity トークンを一意化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI 空入力 1 件]** 暗黙 Yes 選択を防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[unified diff 行解析 1 件]** hunk 内ヘッダ誤認を修正
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 CodeMode センチネル: 固定 Infinity センチネルを呼び出しごとの
+  一意トークン（SystemTime ナノ秒＋AtomicU64）へ変更し、ユーザー文字列の
+  誤変換を防止。R4 が 2 件（不正 JSON 数値 `01e400` / `1.e400` の誤受理、
+  生成トークンがオブジェクトキーへ漏洩）を指摘、R2 が RFC 8259 number 文法
+  検証と object キーのセンチネル拒否を追加。最大2回で停止。
 - 2026-11-24 CLI 空入力: Yes を含む選択肢では空入力の先頭選択肢フォールバックを
   無効化し空回答を返す（Plan 側 require_approval が fail-closed で拒否）。
   stdin 読み取りと回答パースを分離し純粋関数化、回帰4件。R4 が低（テストが
