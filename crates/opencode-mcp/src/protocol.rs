@@ -60,15 +60,31 @@ pub enum JsonRpcMessage {
 
 impl JsonRpcMessage {
     /// Try to parse a raw JSON string as either a Response or a Notification.
-    /// Responses have an `id` field; notifications have a `method` field but no `id`.
+    ///
+    /// A frame carrying a `method` field is always treated as a Notification
+    /// (a server request/notification), regardless of whether an `id` is also
+    /// present. A frame with an `id` but no `method` is a Response. Frames with
+    /// neither field are rejected.
     pub fn parse_json_str(s: &str) -> Result<Self, serde_json::Error> {
-        // Try response first (has `id`)
-        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(s) {
+        let value: serde_json::Value = serde_json::from_str(s)?;
+
+        // `method` first: `JsonRpcResponse` makes `result`/`error` optional, so an
+        // id-bearing request would otherwise deserialize into an empty Response
+        // and silently lose its method. `JsonRpcNotification` has no `id` field,
+        // so an accompanying `id` is intentionally not preserved here.
+        if value.get("method").is_some() {
+            let notif = serde_json::from_value::<JsonRpcNotification>(value)?;
+            return Ok(JsonRpcMessage::Notification(notif));
+        }
+
+        if value.get("id").is_some() {
+            let resp = serde_json::from_value::<JsonRpcResponse>(value)?;
             return Ok(JsonRpcMessage::Response(resp));
         }
-        // Fall back to notification (has `method`, no `id`)
-        let notif = serde_json::from_str::<JsonRpcNotification>(s)?;
-        Ok(JsonRpcMessage::Notification(notif))
+
+        Err(<serde_json::Error as serde::de::Error>::custom(
+            "JSON-RPC message requires a 'method' or 'id' field",
+        ))
     }
 }
 
@@ -324,6 +340,52 @@ mod tests {
     fn parse_json_str_returns_error_for_invalid_input() {
         let error =
             JsonRpcMessage::parse_json_str("not-json").expect_err("invalid input must fail");
+        assert!(!error.to_string().is_empty());
+    }
+
+    // Regression (MCP-JSONRPC-CLASSIFY-01): a frame with both `id` and `method`
+    // is a request and must be classified as Notification, not an empty Response.
+    #[test]
+    fn parse_json_str_classifies_id_and_method_as_notification() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}"#;
+        match JsonRpcMessage::parse_json_str(raw).expect("parse notification") {
+            JsonRpcMessage::Notification(notification) => {
+                assert_eq!(notification.method, "sampling/createMessage");
+                assert!(notification.params.is_none());
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_str_keeps_id_only_frame_as_response() {
+        let raw = r#"{"jsonrpc":"2.0","id":1}"#;
+        match JsonRpcMessage::parse_json_str(raw).expect("parse response") {
+            JsonRpcMessage::Response(response) => {
+                assert_eq!(response.id, 1);
+                assert!(response.result.is_none());
+                assert!(response.error.is_none());
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_str_classifies_method_only_as_notification() {
+        let raw = r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#;
+        match JsonRpcMessage::parse_json_str(raw).expect("parse notification") {
+            JsonRpcMessage::Notification(notification) => {
+                assert_eq!(notification.method, "notifications/cancelled");
+                assert!(notification.params.is_none());
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_str_rejects_frame_without_method_or_id() {
+        let error = JsonRpcMessage::parse_json_str(r#"{"jsonrpc":"2.0"}"#)
+            .expect_err("frame without method or id must fail");
         assert!(!error.to_string().is_empty());
     }
 

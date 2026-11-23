@@ -158,21 +158,26 @@ pub enum ApiError {
 
     /// 認証失敗（401）。
     ///
-    /// `auth_middleware` の 401 レスポンスを `ApiError` の共通スキーマへ
-    /// 集約するために追加したバリアント。共通スキーマに加え、既存クライアント
-    /// 互換のためトップレベル `message` も保持する（詳細は `IntoResponse`）。
+    /// `auth_middleware` の 401 レスポンスを `ApiError` へ集約するために追加した
+    /// バリアント。後方互換のため旧 401 形式
+    /// `{"error":"unauthorized","message":"..."}` のみを返す。共通スキーマの
+    /// `error.type` に相当する値はトップレベル `error` の文字列値として保持され、
+    /// ネストした `error` オブジェクト（`error.type` / `error.message`）は出力しない
+    /// （詳細は `IntoResponse`）。
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // 4 要素目は「レガシーなトップレベル `message` を残すか」のフラグ、
+        // 4 要素目は旧 401 形式（レガシーなトップレベル `message`）を選ぶフラグで、
+        // `Unauthorized` バリアントのみ true。
         // 5 要素目は InternalError / ProviderError の相関 ID（他バリアントは None）。
         // 共通スキーマは `{"error":{"message","type"}}` だが、旧 401 レスポンスは
-        // `{"error":"unauthorized","message":"..."}` を返していた。互換性のため
-        // `Unauthorized` のみトップレベル `message` も併記する。旧 `error` の文字列値
-        // "unauthorized" は `error.type` へ移行して保持する（詳細は report 参照）。
+        // `{"error":"unauthorized","message":"..."}` を返していた。後方互換のため
+        // `Unauthorized` は旧形式のみを返し、共通スキーマの `error.type` に相当する値は
+        // トップレベル `error` の文字列値として保持する。ネストした `error` オブジェクト
+        // （`error.type` / `error.message`）は出力しない（wire 形式は不変）。
         let (status, message, error_type, include_legacy_message, correlation_id) = match self {
             ApiError::SessionNotFound(id) => (
                 StatusCode::NOT_FOUND,
@@ -236,20 +241,14 @@ impl IntoResponse for ApiError {
             ),
         };
 
-        let body = if error_type == "unauthorized" {
+        let body = if include_legacy_message {
             // 旧 401 契約 `{"error":"unauthorized","message":"..."}` を維持する。
-            // 新スキーマの `error.type` と同等の値をトップレベル `error` にも載せる。
+            // 共通スキーマの `error.type` と同等の値をトップレベル `error` の文字列値
+            // として載せる。ネストした `error` オブジェクトは出力しない。
+            // `include_legacy_message` は Unauthorized バリアントのときだけ true
+            // なので、この分岐は Unauthorized 専用かつ到達可能。
             json!({
                 "error": error_type,
-                "message": message
-            })
-        } else if include_legacy_message {
-            let legacy_message = message.clone();
-            json!({
-                "error": {
-                    "message": legacy_message,
-                    "type": error_type
-                },
                 "message": message
             })
         } else if let Some(correlation_id) = correlation_id {
@@ -601,9 +600,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_maps_to_401_with_common_schema_and_legacy_message() {
-        // 回帰ガード: 共通スキーマ `error.{message,type}` に加え、
-        // 旧クライアントが読むトップレベル `message` が残ること。
+    async fn unauthorized_maps_to_401_with_legacy_body_format() {
+        // 回帰ガード (AUTH-401-SCHEMA-01): 401 ボディはドキュメント通り旧形式
+        // `{"error":"unauthorized","message":"..."}` のみ。共通スキーマのネストした
+        // `error` オブジェクト（`error.type` / `error.message`）は出力しない。
         let response = ApiError::Unauthorized("Invalid or missing authentication token".to_owned())
             .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -620,11 +620,17 @@ mod tests {
             body["message"], "Invalid or missing authentication token",
             "legacy top-level message must be preserved for older clients"
         );
+        // `error` は文字列であり、ネストした error.type / error.message は存在しない。
+        assert!(
+            body.get("error").and_then(|v| v.get("type")).is_none(),
+            "401 must stay in legacy format without nested error.type: {body}"
+        );
     }
 
     #[tokio::test]
     async fn unauthorized_empty_message_uses_safe_default() {
-        // 空文字でも TypeError 名称だけは安全に返し、トークン値を露出しない。
+        // 空文字でも旧形式の error 値 "unauthorized" だけを安全に返し、
+        // トークン値を露出しない。
         let response = ApiError::Unauthorized(String::new()).into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
