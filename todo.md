@@ -243,8 +243,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **grep ディレクトリ検索の一部ファイル失敗が握りつぶされる**
-  — `grep/search.rs:74` / ERRPROP-02 / 中
 - [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
   — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
@@ -272,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[grep エラー伝播 1 件]** 一部ファイル失敗を握りつぶさない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[差分表示幅 1 件]** Unicode 表示幅基準・Split モード対応
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[文字列境界 2 件]** TaskKind 誤分類・空ファイル名候補
@@ -805,6 +805,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（grep エラー伝播の修正時）: 親が limit 到達時の
+  「最初の limit 件の一致が確定した時点で打ち切り、その時点までの errors
+  のみ伝播」という仕様をコメントへ明記。残存 low（既存の cwd 走査テストが
+  環境依存で壊れやすい）は記録のみ。
 - 2026-11-23 R4 残存（差分表示幅の修正時）: タブ等を 0 幅として扱うため
   実描画（タブストップ 8 列）では枠を超過し得る、折返し判定 threshold
   (width-12) と切詰め上限 (width-15) の非対称で全角行が不要に短縮される
