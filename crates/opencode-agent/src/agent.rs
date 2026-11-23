@@ -751,6 +751,11 @@ impl AgentRegistry {
         agents
     }
 
+    /// レジストリ自身の既定エージェント（`general` または先頭 primary）を返す。
+    ///
+    /// このレジストリは `Config` を保持しないため `Config.default_agent` は参照しない。
+    /// `Config.default_agent` の解決は `opencode-server` の prompt ルート側で行う
+    /// （CFGAPPLY-04）。
     pub fn default_agent(&self) -> &AgentInfo {
         if let Some(general) = self.get(BuiltinAgent::General.as_str()) {
             return general;

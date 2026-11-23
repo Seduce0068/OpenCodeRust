@@ -2805,6 +2805,141 @@ mod session_update_coalescing_tests {
     }
 }
 
+/// CFGAPPLY-04: prompt 実行で使う agent 名を解決する。
+///
+/// 優先順位は `task_agent`（リクエスト明示指定） > `config.default_agent` >
+/// `build` の順。空文字・空白のみの指定は未設定として扱う。解決した名前が
+/// `registry` に未登録なら `build` へ正規化する（graceful fallback）。
+/// これで未知名／空文字が `PromptInput.agent` や assistant metadata へ
+/// そのまま流出し、実実行エージェント（build）と不一致になることを防ぐ。
+/// 設定値そのものはログ・エラーへ出さない。
+fn resolve_prompt_agent_name<'a>(
+    task_agent: Option<&'a str>,
+    config_default_agent: Option<&'a str>,
+    registry: &AgentRegistry,
+) -> &'a str {
+    let candidate = task_agent
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| config_default_agent.filter(|name| !name.trim().is_empty()));
+
+    match candidate {
+        Some(name) if registry.get(name).is_some() => name,
+        // 未知名と未設定はどちらも build に正規化する（例外は投げない）。
+        _ => BuiltinAgent::Build.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod default_agent_resolution_tests {
+    use super::*;
+
+    /// 既定レジストリ（config 未指定）を構築するヘルパ。
+    fn default_registry() -> AgentRegistry {
+        AgentRegistry::from_config(&AppConfig::default())
+    }
+
+    /// 既定レジストリ（config 未指定）から agent 情報を解決するヘルパ。
+    fn resolved_info(agent_name: &str) -> AgentConfigInfo {
+        default_registry()
+            .get(agent_name)
+            .cloned()
+            .unwrap_or_else(|| AgentConfigInfo::from_builtin(BuiltinAgent::Build))
+    }
+
+    #[test]
+    fn task_agent_takes_precedence_over_config_default_agent() {
+        let config = AppConfig {
+            default_agent: Some("general".to_string()),
+            ..Default::default()
+        };
+        let name = resolve_prompt_agent_name(
+            Some("plan"),
+            config.default_agent.as_deref(),
+            &default_registry(),
+        );
+        assert_eq!(name, "plan");
+    }
+
+    #[test]
+    fn config_default_agent_is_used_without_task_agent() {
+        let config = AppConfig {
+            default_agent: Some("general".to_string()),
+            ..Default::default()
+        };
+        let name =
+            resolve_prompt_agent_name(None, config.default_agent.as_deref(), &default_registry());
+        assert_eq!(name, "general");
+        assert_eq!(resolved_info(name).name, "general");
+    }
+
+    #[test]
+    fn build_is_kept_when_no_agent_is_configured() {
+        let config = AppConfig::default();
+        let name =
+            resolve_prompt_agent_name(None, config.default_agent.as_deref(), &default_registry());
+        assert_eq!(name, BuiltinAgent::Build.as_str());
+    }
+
+    #[test]
+    fn unknown_config_default_agent_gracefully_falls_back_to_build() {
+        let config = AppConfig {
+            default_agent: Some("unknown-agent".to_string()),
+            ..Default::default()
+        };
+        let name =
+            resolve_prompt_agent_name(None, config.default_agent.as_deref(), &default_registry());
+        assert_eq!(
+            name,
+            BuiltinAgent::Build.as_str(),
+            "unknown names must be normalized, not forwarded downstream"
+        );
+        assert_eq!(resolved_info(name).name, BuiltinAgent::Build.as_str());
+    }
+
+    #[test]
+    fn unknown_task_agent_is_normalized_to_build() {
+        let registry = default_registry();
+        let name = resolve_prompt_agent_name(Some("not-registered"), Some("general"), &registry);
+        assert_eq!(name, BuiltinAgent::Build.as_str());
+        assert!(registry.get(name).is_some());
+    }
+
+    #[test]
+    fn empty_task_agent_falls_back_to_config_default_agent() {
+        let registry = default_registry();
+        for empty in ["", "   ", " \t\n"] {
+            let name = resolve_prompt_agent_name(Some(empty), Some("general"), &registry);
+            assert_eq!(name, "general", "empty task agent must be treated as unset");
+        }
+    }
+
+    #[test]
+    fn whitespace_only_values_are_treated_as_unset_and_fall_back_to_build() {
+        let registry = default_registry();
+        let name = resolve_prompt_agent_name(Some("  \t"), Some("   "), &registry);
+        assert_eq!(name, BuiltinAgent::Build.as_str());
+        let name = resolve_prompt_agent_name(None, Some("   "), &registry);
+        assert_eq!(name, BuiltinAgent::Build.as_str());
+    }
+
+    #[test]
+    fn downstream_agent_name_is_normalized_to_build_for_unknown_task_agent() {
+        let registry = default_registry();
+        let name = resolve_prompt_agent_name(Some("missing-agent"), None, &registry);
+        // PromptInput.agent / assistant metadata と同じ形で下流へ渡す値を検証する。
+        let prompt_input_agent = Some(name.to_string());
+        let metadata_agent = serde_json::json!(name);
+        assert_eq!(
+            prompt_input_agent.as_deref(),
+            Some(BuiltinAgent::Build.as_str())
+        );
+        assert_eq!(
+            metadata_agent,
+            serde_json::json!(BuiltinAgent::Build.as_str())
+        );
+    }
+}
+
 fn spawn_prompt_execution(
     task_state: Arc<ServerState>,
     session_id: String,
@@ -2967,6 +3102,8 @@ fn spawn_prompt_execution(
         session
             .metadata
             .insert("model_id".to_string(), serde_json::json!(&task_model));
+        // この時点では config 未ロード。config.default_agent の反映は下流の
+        // agent_name 解決（resolve_prompt_agent_name）と PromptInput.agent が担う。
         if let Some(agent) = task_agent.as_deref() {
             session
                 .metadata
@@ -3094,10 +3231,14 @@ fn spawn_prompt_execution(
         };
         let agent_registry = AgentRegistry::from_config(&config);
 
-        // Determine agent name (default to "build")
-        let agent_name = task_agent
-            .as_deref()
-            .unwrap_or(BuiltinAgent::Build.as_str());
+        // Determine agent name: task_agent > config.default_agent > "build" (CFGAPPLY-04)
+        // registry を渡して未知名／空文字を build へ正規化し、下流の PromptInput.agent と
+        // assistant metadata が実実行エージェントと一致するようにする。
+        let agent_name = resolve_prompt_agent_name(
+            task_agent.as_deref(),
+            config.default_agent.as_deref(),
+            &agent_registry,
+        );
 
         let agent_info = agent_registry
             .get(agent_name)
@@ -3160,7 +3301,7 @@ fn spawn_prompt_execution(
                 provider_id: task_provider.clone(),
                 model_id: task_model.clone(),
             }),
-            agent: task_agent.clone(),
+            agent: Some(agent_name.to_string()),
             no_reply: false,
             system: Some(system_prompt.clone()),
             variant: task_variant.clone(),
@@ -3214,11 +3355,9 @@ fn spawn_prompt_execution(
             assistant
                 .metadata
                 .insert("model_id".to_string(), serde_json::json!(&task_model));
-            if let Some(agent) = task_agent.as_deref() {
-                assistant
-                    .metadata
-                    .insert("agent".to_string(), serde_json::json!(agent));
-            }
+            assistant
+                .metadata
+                .insert("agent".to_string(), serde_json::json!(agent_name));
             assistant.add_text(format!("{client_message} (reference: {correlation_id})"));
             if let (Some(queue_id), Some(input_repo)) =
                 (queue_id.as_deref(), task_state.input_repo.as_ref())
