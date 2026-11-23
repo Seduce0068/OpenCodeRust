@@ -174,10 +174,6 @@ status: current
   — `lsp/lib.rs:468` / NUM-05 / 低
 - [ ] **CodeMode 診断 column が UTF-16 ではなく scalar 数**
   — `codemode/api.rs:304` / NUM-06 / 低
-- [ ] **token::estimate がバイト数を文字数として扱う**
-  — `util/util.rs:91` / NUM-07 / 低
-- [ ] **color::ansi_length がバイト数を返す**
-  — `util/util.rs:31` / NUM-08 / 低
 - [ ] **ツール名の TaskKind 分類が部分文字列一致で誤分類**
   — `tui/app.rs:4018` / STRING-01 / 低
 - [ ] **空ファイル名のパスで候補が全マッチ**
@@ -286,6 +282,8 @@ status: current
 
 ## 完了
 
+- [x] **[util 文字数 2 件]** バイト数ではなく文字数で算出
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[tool_calls index 1 件]** u64→u32 切詰による衝突を防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[数値境界 2 件]** 使用率 100% クランプ・選択肢キー境界
@@ -811,6 +809,8 @@ status: current
 
 ## メモ
 
+- 2026-11-23 util 文字数修正: ansi_length と token::estimate を chars().count()
+  基準へ（日本語/絵文字の見積もり過大を解消）。ASCII/空文字は不変、R4 指摘なし。
 - 2026-11-23 R4 指摘（tool_calls index の修正時）: 親が warn-once テストを
   範囲外 index 2 件で強化。残存 low（u64 超過 index が as_u64 None 経由で
   0 にフォールバックする可能性）は旧コードと同挙動で新規回帰ではないため
