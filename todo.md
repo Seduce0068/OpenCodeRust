@@ -239,8 +239,6 @@ status: current
 
 ### 優先度: 中（swarm review+discovery 2026-11-20）
 
-- [ ] **sync_sessions_to_storage が session/message を別トランザクションで更新**
-  — `server/server.rs:1037` / TX-02 / 中
 - [ ] **リトライでプラグインフックの外部副作用が二重発火**
   — `session/llm.rs:737-744` / ERR2-06 / 中（speculation）
 - [ ] **OpenAI Responses→legacy フォールバックが session リトライと掛け算**
@@ -259,6 +257,8 @@ status: current
 
 ## 完了
 
+- [x] **[永続化トランザクション 1 件]** session/message を原子保存
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[command subtask 1 件]** 未配線として MAPPING.md へ明記
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[task_id 検証 1 件]** 生成形式を受理し再開を維持
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 永続化トランザクション: SessionPersistence::upsert_session_with_messages
+  を追加し session upsert + message 置換を同一プール上で単一トランザクション化。
+  既存 SessionRepository / MessageRepository の API・SQL・破損行拒否は共有
+  ヘルパー化で不変。途中失敗 rollback 回帰 3 件。親が clippy 2 件を直接修正、
+  R4 指摘なし。
 - 2026-11-24 command subtask: Config.command は loader が parse／DeepMerge
   するが runtime 消費 0 件、/command 一覧は 501。機能全体が未実装という
   過剰一般化を R4 が指摘したため親が表現を修正（POST /{id}/command の
