@@ -247,15 +247,10 @@ status: current
   — `openai.rs:1026-1083` / ERR2-07 / 中（speculation）
 - [ ] **POST /prompt に冪等キーが無く再送で二重実行**
   — `routes.rs:1991-1999` / API-05 / 中（speculation）
-- [ ] **[残り]** limit=0 の意味論が TUI（未指定扱い）とサーバ（空結果）で不一致
-  （引数の露出は完了）
-  — `tui/api.rs:681-693` / API-08 / 中
 - [ ] **TUI SSE リスナー join が終了まで最大 120 秒ハング**
   — `tui/app.rs:3776-3784` / SHUTDOWN-04 / 中
 - [ ] **Snapshot::revert が一部失敗で中途半端な復元状態を残す**
   — `session/snapshot.rs:65-137` / ERRPATH-06 / 中（設計判断）
-- [ ] **コマンド timeout 既定が bash 2 分・local-llm 5 分で不一致**
-  — `tool/bash.rs:11` / CONSTANTS-05 / 中（設計判断）
 - [ ] **reset_processing が DB 全体の processing を書き換え**
   — `server.rs:672-674` / STATE-06
 - [ ] **[残り]** custom fetch proxy が opencode-provider の process-global
@@ -266,6 +261,8 @@ status: current
 
 ## 完了
 
+- [x] **[設計判断 2 件]** timeout 既定 / limit=0 を現状維持で確定
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[要求 ID 競合 1 件]** 調査の結果・修正不要（到達不能）と判断
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[要求 ID 削除 1 件]** 回答/拒否成功時に共有集合から削除
@@ -835,6 +832,15 @@ status: current
 
 ## メモ
 
+- 2026-11-23 設計判断 2 件の確定: timeout 既定（bash 2 分 / local-llm 5 分）
+  は用途差（一般シェル vs モデルダウンロードを伴う推論）による意図的な
+  不一致、limit=0 はサーバが Some(0)=空結果と明記し TUI は 0 を送らない
+  ため実害なし — いずれも 2026-11-22 の技術判断を再確認し現状維持で確定。
+  API 契約変更が必要な統一は行わない。
+- 2026-11-23 TUI SSE join / Snapshot::revert / reset_processing の調査:
+  いずれも設計判断を伴う（blocking read の外からの中断機構、原子的復元の
+  トランザクション設計、全 processing の復旧意図）ため今回は未着手として
+  維持。コード変更なし。
 - 2026-11-23 要求 ID 競合の事実確認: サーバ側の要求 ID は
   `routes.rs:2503` / `:2944` で `uuid::Uuid::new_v4()` により生成されており、
   R4 が想定した「ID 再利用による forget/mark 競合」は実質到達不能
