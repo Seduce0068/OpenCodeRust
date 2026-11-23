@@ -471,6 +471,12 @@ struct TextState {
 
 /// Full stream processor with state management, retry, doom-loop detection,
 /// and abort handling — matching the TS `SessionProcessor.create()`.
+///
+/// 注: `StreamProcessor::new` の呼び出しは `llm.rs` のテストモジュールのみで
+/// 本番配線は 0 件。本番のプロンプトループは `SessionPrompt` を使用する。本番の compaction
+/// 設定 (auto / prune / reserved) は `SessionPrompt::with_compaction_config`
+/// 経由で反映される。将来 `StreamProcessor` を本番へ接続する際は、
+/// `with_compaction_config` で config を渡す必要がある。
 pub struct StreamProcessor {
     /// Map of reasoning block id -> state.
     reasoning_map: HashMap<String, ReasoningState>,
@@ -559,6 +565,12 @@ impl StreamProcessor {
     ///
     /// The engine is rebuilt so `auto = false` suppresses `is_overflow` and
     /// `prune = false` suppresses prune handling on the next step.
+    ///
+    /// 注: `StreamProcessor::new` の呼び出しは `llm.rs` のテストモジュールのみで
+    /// 本番配線は 0 件。本番のプロンプトループは `SessionPrompt` を使用する。本番の compaction
+    /// 設定 (auto / prune / reserved) は `SessionPrompt::with_compaction_config`
+    /// 経由で反映される。将来 `StreamProcessor` を本番へ接続する際は、この
+    /// メソッドで config を渡す必要がある。
     pub fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
         self.compaction_engine = CompactionEngine::new(config.clone());
         self.compaction_config = config;
