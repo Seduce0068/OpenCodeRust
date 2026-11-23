@@ -82,7 +82,7 @@ fn collect_skill_roots(base: &Path) -> Vec<PathBuf> {
 
     if let Ok(config) = load_config(base) {
         if let Some(skills) = config.skills {
-            for raw in skills.paths {
+            for raw in skills.paths.into_inner() {
                 roots.push(resolve_skill_path(base, &raw));
             }
         }

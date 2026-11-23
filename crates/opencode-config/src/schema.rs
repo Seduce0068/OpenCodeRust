@@ -964,10 +964,20 @@ pub struct CommandConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillsConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub urls: Vec<String>,
+    // `paths: []` / `urls: []` are explicit clear directives; an omitted key
+    // must leave the accumulated value intact. `ExplicitStringList` tracks
+    // that presence bit while its custom serde impl keeps the JSON wire shape
+    // as an array.
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub paths: ExplicitStringList,
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub urls: ExplicitStringList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2068,8 +2078,9 @@ fn merge_explicit_string_list(target: &mut ExplicitStringList, source: ExplicitS
 /// replacement semantics rather than a union: a higher-precedence non-empty
 /// array replaces the accumulated value wholesale. This applies to the provider
 /// lists (upstream schema, see `provider_lists_follow_replace_semantics_instead_of_union`),
-/// `watcher.ignore`, and `experimental.primary_tools` (the latter inherits the
-/// old `self.field = other.field` behaviour). Presence tracking is still required
+/// `watcher.ignore`, `experimental.primary_tools`, and `skills.paths` / `skills.urls`
+/// (the latter three inherit the old `self.field = other.field` behaviour).
+/// Presence tracking is still required
 /// so that an omitted key leaves the accumulated value untouched while an
 /// explicit empty array clears it.
 fn merge_explicit_string_list_replace(target: &mut ExplicitStringList, source: ExplicitStringList) {
@@ -2265,12 +2276,10 @@ impl DeepMerge for CommandConfig {
 
 impl DeepMerge for SkillsConfig {
     fn deep_merge(&mut self, other: Self) {
-        if !other.paths.is_empty() {
-            self.paths = other.paths;
-        }
-        if !other.urls.is_empty() {
-            self.urls = other.urls;
-        }
+        // Old behavior replaced non-empty arrays wholesale; replace semantics
+        // preserve that while honoring an explicit empty array as a clear.
+        merge_explicit_string_list_replace(&mut self.paths, other.paths);
+        merge_explicit_string_list_replace(&mut self.urls, other.urls);
     }
 }
 
@@ -2987,6 +2996,123 @@ mod tests {
         assert!(
             json["experimental"].get("primary_tools").is_none(),
             "an omitted experimental.primary_tools key must stay omitted"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_skills_lists_clear_accumulated_values() {
+        let mut base: Config = serde_json::from_str(
+            r#"{"skills": {"paths": ["/skills/a"], "urls": ["https://example.com/skills"]}}"#,
+        )
+        .unwrap();
+        let base_skills = base.skills.as_ref().expect("base skills");
+        assert!(base_skills.paths.is_explicit());
+        assert_eq!(base_skills.paths.as_slice(), &["/skills/a".to_string()]);
+        assert!(base_skills.urls.is_explicit());
+        assert_eq!(
+            base_skills.urls.as_slice(),
+            &["https://example.com/skills".to_string()]
+        );
+
+        let clear: Config =
+            serde_json::from_str(r#"{"skills": {"paths": [], "urls": []}}"#).unwrap();
+        let clear_skills = clear.skills.as_ref().expect("clear skills");
+        assert!(clear_skills.paths.is_explicit());
+        assert!(clear_skills.paths.is_empty());
+        assert!(clear_skills.urls.is_explicit());
+        assert!(clear_skills.urls.is_empty());
+
+        base.merge(clear);
+
+        let merged = base.skills.expect("merged skills");
+        assert!(
+            merged.paths.is_empty(),
+            "skills.paths: [] must clear lower-precedence values"
+        );
+        assert!(
+            merged.urls.is_empty(),
+            "skills.urls: [] must clear lower-precedence values"
+        );
+        assert!(merged.paths.is_explicit());
+        assert!(merged.urls.is_explicit());
+    }
+
+    #[test]
+    fn omitted_skills_lists_keep_accumulated_values() {
+        let mut base: Config = serde_json::from_str(
+            r#"{"skills": {"paths": ["/skills/a"], "urls": ["https://example.com/skills"]}}"#,
+        )
+        .unwrap();
+
+        // Empty skills object: both keys are absent, so neither must clear.
+        let theme_only: Config =
+            serde_json::from_str(r#"{"skills": {}, "theme": "dark"}"#).unwrap();
+        let overlay_skills = theme_only.skills.as_ref().expect("overlay skills");
+        assert!(!overlay_skills.paths.is_explicit());
+        assert!(!overlay_skills.urls.is_explicit());
+
+        base.merge(theme_only);
+        let merged = base.skills.as_ref().expect("merged skills");
+        assert_eq!(merged.paths.as_slice(), &["/skills/a".to_string()]);
+        assert_eq!(
+            merged.urls.as_slice(),
+            &["https://example.com/skills".to_string()]
+        );
+
+        // The whole `skills` key is absent: it must be left untouched too.
+        let no_skills: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        base.merge(no_skills);
+        let merged = base.skills.as_ref().expect("merged skills");
+        assert_eq!(merged.paths.as_slice(), &["/skills/a".to_string()]);
+        assert_eq!(
+            merged.urls.as_slice(),
+            &["https://example.com/skills".to_string()]
+        );
+    }
+
+    #[test]
+    fn skills_lists_serialize_as_arrays_including_explicit_empty() {
+        let populated: Config = serde_json::from_str(
+            r#"{"skills": {"paths": ["/skills/a", "/skills/b"], "urls": ["https://example.com/skills"]}}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&populated).unwrap();
+        assert_eq!(
+            json["skills"]["paths"],
+            serde_json::json!(["/skills/a", "/skills/b"])
+        );
+        assert_eq!(
+            json["skills"]["urls"],
+            serde_json::json!(["https://example.com/skills"])
+        );
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"skills": {"paths": [], "urls": []}}"#).unwrap();
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json["skills"]["paths"], serde_json::json!([]));
+        assert_eq!(json["skills"]["urls"], serde_json::json!([]));
+
+        let reloaded: Config = serde_json::from_value(json).unwrap();
+        let reloaded_skills = reloaded.skills.expect("reloaded skills");
+        assert!(
+            reloaded_skills.paths.is_explicit() && reloaded_skills.paths.is_empty(),
+            "skills.paths: [] must persist as an explicit clear directive"
+        );
+        assert!(
+            reloaded_skills.urls.is_explicit() && reloaded_skills.urls.is_empty(),
+            "skills.urls: [] must persist as an explicit clear directive"
+        );
+
+        // Omitted keys stay omitted even when the `skills` object is present.
+        let absent: Config = serde_json::from_str(r#"{"skills": {}}"#).unwrap();
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json["skills"].get("paths").is_none(),
+            "an omitted skills.paths key must stay omitted"
+        );
+        assert!(
+            json["skills"].get("urls").is_none(),
+            "an omitted skills.urls key must stay omitted"
         );
     }
 
