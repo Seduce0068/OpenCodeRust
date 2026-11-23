@@ -67,6 +67,22 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **compaction 設定が実行系へ一切届かない**
+  — `session/prompt.rs:1339` / CFGAPPLY-01 / 高
+- [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
+  — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
+- [ ] **未登録ルート/405 が空ボディで JSON 契約と不整合**
+  — `server/routes.rs:122` / ERR-ENVELOPE-02 / 中
+- [ ] **mcp.servers.*.oauth.clientId が OAuth 設定へ変換されない**
+  — `server/routes.rs:4656` / CFGAPPLY-02 / 中
+- [ ] **`lsp.<server>.env` がサブプロセスへ渡されない**
+  — `cli/main.rs:5112` / CFGAPPLY-03 / 中
+- [ ] **default_agent 設定がエージェント選択へ反映されない**
+  — `server/routes.rs:3010` / CFGAPPLY-04 / 中
+- [ ] **skills.urls がスキル探索ルートに使われない**
+  — `tool/skill.rs:83` / CFGAPPLY-05 / 中
+- [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
+  — `tui/context/app_context.rs:132` / CFGAPPLY-06 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -82,7 +98,7 @@ status: current
     `network_error_with_source` へ置換（メッセージ不変・非対象は据え置き、旧パターン残存 0）。
     残存 `ExecutionError` 17 箇所は下位エラーが無い固定文字列／StatusCode／別バリアント。
     未対応: StreamError(e.to_string()) と InvalidArguments(e.to_string())（serde_json）。
-    新バリアントは _enum 非 non_exhaustive_ のため下流列挙には破壊的変更になりうる
+    新バリアントは *enum 非 non_exhaustive* のため下流列挙には破壊的変更になりうる
 - [x] **[M-05]** Todo 状態を最小配線（2026-11-19、swarm-coding R1-R6）
   - SessionPrompt に with_todo_manager / with_todo_hooks を追加し ToolContext へ
     with_todo_update / with_todo_get を注入（false success を解消）。server 側で
@@ -164,6 +180,20 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **401 に WWW-Authenticate ヘッダが無い**
+  — `server/server.rs:2369` / AUTH-401-HEADER-01 / 低
+- [ ] **Unauthorized のドキュメントと実装が不一致**
+  — `server/error.rs:159` / AUTH-401-SCHEMA-01 / 低
+- [ ] **todo.updated SSE が GET の正規化を通らない**
+  — `server/routes.rs:2977` / TODO-SSE-NORMALIZE-01 / 低
+- [ ] **todo.updated SSE 項目に安定 id が無い**
+  — `server/routes.rs:2981` / TODO-SSE-ID-01 / 低
+- [ ] **JsonRpcMessage が id+method 要求を空レスポンスと誤分類**
+  — `mcp/protocol.rs:28` / MCP-JSONRPC-CLASSIFY-01 / 低
+- [ ] **Config.username に consumer が無い**
+  — `config/loader.rs:2391` / CFGAPPLY-07 / 低
+- [ ] **command の subtask フラグが実行へ渡されない**
+  — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -261,6 +291,8 @@ status: current
 
 ## 完了
 
+- [x] **[CLI SSE UTF-8 1 件]** チャンク境界のマルチバイト破壊を防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[設計判断 2 件]** timeout 既定 / limit=0 を現状維持で確定
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[要求 ID 競合 1 件]** 調査の結果・修正不要（到達不能）と判断
@@ -832,6 +864,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 cross-skill 集約（swarm261、2 担当・16 件、観点: 設定適用漏れ /
+  レスポンス契約）: response の high（CLI SSE の per-chunk UTF-8 破壊）を
+  coding、他 15 件を triage。compaction 設定未配線（CFGAPPLY-01）は high だが
+  session 側への配線が必要なため次ラウンド以降。R4 が low 2 件を指摘、親が
+  行契約テストを直接追加。残存 low（loopback の単一 read 前提）は
+  confidence low のため記録のみ。
 - 2026-11-23 設計判断 2 件の確定: timeout 既定（bash 2 分 / local-llm 5 分）
   は用途差（一般シェル vs モデルダウンロードを伴う推論）による意図的な
   不一致、limit=0 はサーバが Some(0)=空結果と明記し TUI は 0 を送らない
