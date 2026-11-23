@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **要求 ID の forget と SSE enqueue が競合し誤スキップ**
-  — `tui/app.rs:504` / RETRY-04-R4 / 中（medium）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -268,6 +266,8 @@ status: current
 
 ## 完了
 
+- [x] **[要求 ID 競合 1 件]** 調査の結果・修正不要（到達不能）と判断
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[要求 ID 削除 1 件]** 回答/拒否成功時に共有集合から削除
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[要求 ID 去重 1 件]** SSE/resync の双方向去重を共有状態へ集約
@@ -835,6 +835,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 要求 ID 競合の事実確認: サーバ側の要求 ID は
+  `routes.rs:2503` / `:2944` で `uuid::Uuid::new_v4()` により生成されており、
+  R4 が想定した「ID 再利用による forget/mark 競合」は実質到達不能
+  （UUID v4 は 122 ビット乱数）。根拠を記録し修正不要として完了。
+  将来 ID 生成方式が可変 ID 等へ変更された場合は再評価が必要。
 - 2026-11-23 R4 残存（ID 削除経路の修正時）: 親が low 2 件（reply/reject の
   send() エラーに reqwest URL が混入する問題の固定文言化、reject 失敗時の
   キー保持テスト）を直接修正。残存 medium（古い要求の forget と新規要求の
