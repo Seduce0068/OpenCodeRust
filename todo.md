@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
-  — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
   — `tui/context/app_context.rs:132` / CFGAPPLY-06 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -267,6 +265,8 @@ status: current
 
 ## 完了
 
+- [x] **[extractor rejection 1 件]** 400 を JSON エラー envelope へ統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP config 回収 1 件]** 完全削除時に connection_config も破棄
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[session cleanup 1 件]** 削除時に per-session コレクションを回収
@@ -868,6 +868,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 extractor rejection: JsonBody/QueryParams を追加し 58 引数を
+  置換、rejection を ApiError::BadRequest の JSON envelope へ変換。
+  R4 が回帰テストの実ルータ経路不足を指摘したため実 HTTP 経由テストを
+  追加。親が独自 `Result<T>` alias との E0107 衝突を `std::result::Result` へ
+  直接修正。R4 最終指摘なし。
 - 2026-11-24 MCP config 回収: remove は restart 契約のため connection_config
   を残す挙動を維持し、新規 purge を追加。完全削除経路（remove_server）を
   purge へ接続し、接続失敗時の config 残留も修正。R4 が purge の本番接続
