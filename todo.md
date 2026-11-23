@@ -67,10 +67,10 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **空配列クリアが他 3 フィールドで未対応**
-  — skills.paths/urls, provider.whitelist/blacklist /
+- [ ] **空配列クリアが残り 2 フィールドで未対応**
+  — provider.whitelist/blacklist /
   watcher.ignore と同パターンで ExplicitStringList 化
-  （primary_tools は 2026-11-21 対応済み）
+  （primary_tools / skills.paths/urls は 2026-11-21 対応済み）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -270,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[skills 空配列 1 件]** paths / urls を明示クリア可能へ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[grep エラー伝播 1 件]** 一部ファイル失敗を握りつぶさない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[差分表示幅 1 件]** Unicode 表示幅基準・Split モード対応
@@ -805,6 +807,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（skills 空配列の修正時）: 親が
+  merge_explicit_string_list_replace の doc comment 対象一覧へ
+  skills.paths / skills.urls を追記。残り provider.whitelist/blacklist
+  は他クレート参照が多いため別タスクとして残存。
 - 2026-11-23 R4 指摘（grep エラー伝播の修正時）: 親が limit 到達時の
   「最初の limit 件の一致が確定した時点で打ち切り、その時点までの errors
   のみ伝播」という仕様をコメントへ明記。残存 low（既存の cwd 走査テストが
