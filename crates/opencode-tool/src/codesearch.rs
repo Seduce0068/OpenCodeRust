@@ -58,40 +58,14 @@ struct McpContent {
 
 pub struct CodeSearchTool;
 
-#[async_trait]
-impl Tool for CodeSearchTool {
-    fn id(&self) -> &str {
-        "codesearch"
-    }
-
-    fn description(&self) -> &str {
-        "Search for relevant context for APIs, Libraries, and SDKs using Exa Code API. Find code examples, documentation, and best practices for any programming library or framework."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query to find relevant context for APIs, Libraries, and SDKs. For example, 'React useState hook examples', 'Python pandas dataframe filtering', 'Express.js middleware', 'Next.js partial prerendering configuration'"
-                },
-                "tokensNum": {
-                    "type": "integer",
-                    "minimum": 1000,
-                    "maximum": 50000,
-                    "default": 5000,
-                    "description": "Number of tokens to return (1000-50000). Default is 5000 tokens. Adjust based on how much context you need."
-                }
-            },
-            "required": ["query"]
-        })
-    }
-
-    async fn execute(
-        &self,
+impl CodeSearchTool {
+    /// `execute` の本体。公開 API（`CodeSearchTool` と `Tool` トレイト）および
+    /// 成功系の wire 形式は変えず、HTTP モックによる回帰テストを可能にするため
+    /// だけにエンドポイントを引数で受け取る。
+    async fn execute_with_endpoint(
         args: serde_json::Value,
         ctx: ToolContext,
+        endpoint: &str,
     ) -> Result<ToolResult, ToolError> {
         let params: CodeSearchParams = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid parameters: {}", e)))?;
@@ -128,7 +102,7 @@ impl Tool for CodeSearchTool {
 
         let request_future = async {
             client
-                .post(EXA_MCP_URL)
+                .post(endpoint)
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
                 .json(&request)
@@ -141,10 +115,13 @@ impl Tool for CodeSearchTool {
             result = request_future => {
                 let response = result?;
 
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let error_text = response.text().await.unwrap_or_default();
-                    return Err(ToolError::ExecutionError(format!("Code search error ({}): {}", status, error_text)));
+                let status = response.status();
+                if !status.is_success() {
+                    // サーバのエラー本文にはリクエストのクエリが反復される可能性があるため、
+                    // 本文を読まずステータスコードのみを返す（websearch と同方針）。
+                    return Err(ToolError::ExecutionError(format!(
+                        "Code search error ({status})"
+                    )));
                 }
 
                 let response_text = response.text().await
@@ -170,6 +147,45 @@ impl Tool for CodeSearchTool {
                 Err(ToolError::Cancelled)
             }
         }
+    }
+}
+
+#[async_trait]
+impl Tool for CodeSearchTool {
+    fn id(&self) -> &str {
+        "codesearch"
+    }
+
+    fn description(&self) -> &str {
+        "Search for relevant context for APIs, Libraries, and SDKs using Exa Code API. Find code examples, documentation, and best practices for any programming library or framework."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query to find relevant context for APIs, Libraries, and SDKs. For example, 'React useState hook examples', 'Python pandas dataframe filtering', 'Express.js middleware', 'Next.js partial prerendering configuration'"
+                },
+                "tokensNum": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 50000,
+                    "default": 5000,
+                    "description": "Number of tokens to return (1000-50000). Default is 5000 tokens. Adjust based on how much context you need."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        Self::execute_with_endpoint(args, ctx, EXA_MCP_URL).await
     }
 }
 
@@ -268,5 +284,56 @@ mod tests {
     fn parse_sse_ignores_empty_content() {
         let text = "data: {\"result\":{\"content\":[]}}";
         assert!(parse_sse_response(text).is_none());
+    }
+
+    /// 回帰テスト（AV-01）: 500 レスポンスの本文に SENTINEL が含まれても、
+    /// `execute` は本文を読まずエラーへ埋め込まない。HTTP status のみが伝わる。
+    #[tokio::test]
+    async fn error_response_does_not_leak_body_but_keeps_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SENTINEL: &str = "SENTINEL_BODY_MARKER_9d3a";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            // サーバ側がクエリを反復した生本文を返す状況を模擬する。
+            let body = format!("error: {SENTINEL} (query echoed back)");
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let ctx = ToolContext::new("s".to_owned(), "m".to_owned(), "/work".to_owned());
+        let args = serde_json::json!({ "query": "react hooks" });
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+
+        let error = CodeSearchTool::execute_with_endpoint(args, ctx, &endpoint)
+            .await
+            .expect_err("500 response must produce an error");
+        let message = error.to_string();
+
+        assert!(
+            matches!(&error, ToolError::ExecutionError(_)),
+            "error type must remain ExecutionError: {error}"
+        );
+        assert!(
+            !message.contains(SENTINEL),
+            "raw server body leaked into ToolError: {message}"
+        );
+        assert!(
+            message.contains("500"),
+            "HTTP status was not propagated: {message}"
+        );
+
+        server.await.expect("server task");
     }
 }
