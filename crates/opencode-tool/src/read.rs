@@ -54,6 +54,14 @@ async fn map_metadata_error(err: std::io::Error, path: &Path) -> ToolError {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    // file_name() が None となるパス（"/" や ".." 等）では base が空文字列になり、
+    // `name.contains("")` が全エントリで真となって無関係な候補が返ってしまう。
+    // read_dir より前に空候補で早期 return し、候補を一切出さないようにする。
+    // 通常のファイル名ではこの分岐に入らず、従来の挙動は不変。
+    if base.is_empty() {
+        return ToolError::with_suggestions(format!("File not found: {}", path.display()), &[]);
+    }
+
     // 候補パスの列挙は tokio::fs::read_dir に変更し、同期 read_dir で
     // tokio ワーカーをブロックしないようにする。
     let mut suggestions: Vec<String> = Vec::new();
@@ -870,6 +878,57 @@ mod tests {
             matches!(&mapped, ToolError::FileNotFound(_)),
             "NotFound は従来どおり FileNotFound であること: {mapped}"
         );
+    }
+
+    /// file_name() が None となるパス（"/" や ".."）では base が空文字列になり、
+    /// `name.contains("")` が全エントリで真となって無関係な候補が返る回帰テスト。
+    /// 親ディレクトリにエントリが存在しても候補を出してはならない。
+    #[tokio::test]
+    async fn map_metadata_error_with_empty_file_name_has_no_suggestions() {
+        for path in [Path::new("/"), Path::new("..")] {
+            let mapped = map_metadata_error(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+                path,
+            )
+            .await;
+            let message = mapped.to_string();
+
+            assert!(
+                !message.contains("Did you mean one of these?"),
+                "file_name が None のパスでは候補を出さないこと"
+            );
+        }
+    }
+
+    /// 通常のファイル名では従来どおり候補が返ること（挙動不変の確認）。
+    #[tokio::test]
+    async fn map_metadata_error_with_normal_file_name_keeps_suggestions() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-read-suggest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.txt"), "alpha").unwrap();
+
+        let mapped = map_metadata_error(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            &dir.join("alpha.txt"),
+        )
+        .await;
+        let message = mapped.to_string();
+
+        assert!(
+            message.contains("Did you mean one of these?"),
+            "通常のファイル名では候補が返ること"
+        );
+        let suggestions_part = message
+            .split("Did you mean one of these?")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            suggestions_part.contains("alpha.txt"),
+            "既存の一致ファイルが候補に含まれること"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 読み取り上限は `truncation::MAX_BYTES` を import して使うため

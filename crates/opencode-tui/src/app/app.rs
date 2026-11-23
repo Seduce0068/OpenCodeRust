@@ -4021,29 +4021,40 @@ fn task_kind_from_tool_name(name: &str) -> TaskKind {
         return TaskKind::ToolCall;
     }
 
-    if normalized.contains("read")
-        || normalized.contains("grep")
-        || normalized.contains("glob")
-        || normalized.contains("list")
-    {
-        return TaskKind::FileRead;
-    }
-    if normalized.contains("write")
-        || normalized.contains("edit")
-        || normalized.contains("patch")
-        || normalized.contains("todo")
-    {
-        return TaskKind::FileWrite;
-    }
-    if normalized.contains("bash")
-        || normalized.contains("shell")
-        || normalized.contains("exec")
-        || normalized.contains("command")
-    {
-        return TaskKind::CommandExec;
+    // 区切りなしのビルトイン連結名（todowrite / todoread / multiedit）は
+    // トークン分割では既知キーワードと一致しないため、完全一致で先に判定する
+    // （旧 contains 実装の分類を維持、R4）。
+    match normalized.as_str() {
+        "todowrite" | "multiedit" => return TaskKind::FileWrite,
+        "todoread" => return TaskKind::FileRead,
+        _ => {}
     }
 
-    TaskKind::ToolCall
+    // ビルトイン名は trimmed 全体、MCP 名は '_' / '-' 区切りの各トークンを
+    // キーワードと完全一致で比較する。部分一致は "thread" / "readme" 等を
+    // 誤分類するため行わない。名前・トークン値はログやエラーに出さない。
+    let tokens = normalized.split(['_', '-']);
+    let mut is_read = false;
+    let mut is_write = false;
+    let mut is_exec = false;
+    for token in tokens {
+        match token {
+            "read" | "grep" | "glob" | "list" => is_read = true,
+            "write" | "edit" | "patch" | "todo" => is_write = true,
+            "bash" | "shell" | "exec" | "command" => is_exec = true,
+            _ => {}
+        }
+    }
+
+    if is_read {
+        TaskKind::FileRead
+    } else if is_write {
+        TaskKind::FileWrite
+    } else if is_exec {
+        TaskKind::CommandExec
+    } else {
+        TaskKind::ToolCall
+    }
 }
 
 fn map_mcp_status(server: &McpStatusInfo) -> McpConnectionStatus {
@@ -5004,8 +5015,44 @@ mod tests {
         assert_eq!(task_kind_from_tool_name("write"), TaskKind::FileWrite);
         assert_eq!(task_kind_from_tool_name("apply_patch"), TaskKind::FileWrite);
         assert_eq!(task_kind_from_tool_name("Bash"), TaskKind::CommandExec);
+        // 区切りなしのビルトイン連結名（旧 contains 実装の分類を維持、R4）。
+        assert_eq!(task_kind_from_tool_name("todowrite"), TaskKind::FileWrite);
+        assert_eq!(task_kind_from_tool_name("todoread"), TaskKind::FileRead);
+        assert_eq!(task_kind_from_tool_name("multiedit"), TaskKind::FileWrite);
         assert_eq!(task_kind_from_tool_name("custom"), TaskKind::ToolCall);
         assert_eq!(task_kind_from_tool_name(""), TaskKind::ToolCall);
+    }
+
+    #[test]
+    fn task_kind_from_tool_name_rejects_substring_matches() {
+        // キーワードが部分一致するだけの任意 / MCP ツール名は誤分類しない。
+        assert_eq!(task_kind_from_tool_name("thread"), TaskKind::ToolCall);
+        assert_eq!(task_kind_from_tool_name("readme"), TaskKind::ToolCall);
+        assert_eq!(task_kind_from_tool_name("listening"), TaskKind::ToolCall);
+        assert_eq!(task_kind_from_tool_name("editor"), TaskKind::ToolCall);
+        assert_eq!(task_kind_from_tool_name("execution"), TaskKind::ToolCall);
+        assert_eq!(
+            task_kind_from_tool_name("mcp__thread_pool"),
+            TaskKind::ToolCall
+        );
+    }
+
+    #[test]
+    fn task_kind_from_tool_name_splits_mcp_delimiters() {
+        // '_' / '-' で分割した各トークンの完全一致で分類する。
+        assert_eq!(
+            task_kind_from_tool_name("mcp__read_file"),
+            TaskKind::FileRead
+        );
+        assert_eq!(
+            task_kind_from_tool_name("mcp__write-file"),
+            TaskKind::FileWrite
+        );
+        assert_eq!(
+            task_kind_from_tool_name("mcp-server__bash"),
+            TaskKind::CommandExec
+        );
+        assert_eq!(task_kind_from_tool_name("custom-tool"), TaskKind::ToolCall);
     }
 
     #[test]
