@@ -166,8 +166,6 @@ status: current
 
 - [ ] **task ツールが任意 task_id を検証せず渡す**
   — `tool/task.rs:56` / AV-04 / 低
-- [ ] **WebSearch/CodeSearch の query に空/過大の検証が無い**
-  — `tool/websearch.rs:43` / AV-05 / 低
 - [ ] **plugin auth.fetch の不正チャンクが通知を捨てる**
   — `plugin/subprocess/client.rs:538` / PARSE-04 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
@@ -267,6 +265,8 @@ status: current
 
 ## 完了
 
+- [x] **[search query 検証 1 件]** 空拒否・trim・上限 4096 char
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[mcp.timeout 検証 1 件]** 不正値を設定エラー化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[LSP 入力検証 1 件]** 座標 0・空 rename 名を拒否
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 search query: WebSearch/CodeSearch に validated_query（空拒否、
+  trim、4096 char 上限）を追加し External API・permission・title で検証済み値
+  を共有。CodeSearch の PermissionRequest は metadata を持たず ToolResult 側
+  のみ（子の事実報告、新規 metadata は追加せず）。R4 が WebSearch 側の
+  経路テスト不足を指摘したが実装は条件を満たすため残存記録のみ。
 - 2026-11-24 mcp.timeout: デシリアライズ失敗を '?' で伝播し固定文言エラーへ。
   R4 が 3 件指摘（サーバー風キー混在時のゴースト残存、servers 解析エラーの
   値露出、明示 null のハードエラー化）— looks_like_mcp_server の設計変更を
