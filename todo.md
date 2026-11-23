@@ -168,8 +168,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **差分表示の折返しが表示幅ではなく scalar 数を使用**
-  — `tui/components/diff.rs:249` / NUM-04 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -274,6 +272,8 @@ status: current
 
 ## 完了
 
+- [x] **[差分表示幅 1 件]** Unicode 表示幅基準・Split モード対応
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[文字列境界 2 件]** TaskKind 誤分類・空ファイル名候補
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[column/version 2 件]** UTF-16 column・LSP version checked
@@ -805,6 +805,12 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（差分表示幅の修正時）: タブ等を 0 幅として扱うため
+  実描画（タブストップ 8 列）では枠を超過し得る、折返し判定 threshold
+  (width-12) と切詰め上限 (width-15) の非対称で全角行が不要に短縮される
+  — いずれも設計判断として記録のみ。R4 high（Split 未適用）は親が
+  fit_content を全分岐へ適用して修正。子が一度だけ read-only bash を
+  実行しており制約違反を申告済み。R4 最終指摘なし。
 - 2026-11-23 R4 指摘（TaskKind の修正時）: トークン完全一致化で区切りなし
   ビルトイン名（todowrite / todoread / multiedit）が ToolCall へ回帰したため、
   親が完全一致分岐と回帰テストを直接追加。clippy manual_pattern_char_comparison
