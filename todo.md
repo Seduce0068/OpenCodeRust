@@ -67,8 +67,8 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **apply_patch が diff ヘッダ形式の行を黙って捨てる**
-  — `tool/apply_patch.rs:868` / PARSE-01 / 中
+- [ ] **unified diff 側も diff ヘッダ形式の行を誤認し得る**
+  — `tool/apply_patch.rs:553` / PARSE-01-R4 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -277,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[apply_patch 行解析 1 件]** `--` / `++` 始まりデータ行を保持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[入力検証 2 件]** Plan 誤承認と CodeSearch エラー露出を修正
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI theme 1 件]** 起動時に config.theme / tui.sidebar を反映
@@ -886,6 +888,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 apply_patch 行解析: モデル patch 側（parse_model_patch）の
+  in_hunk で diff ヘッダ形式のスキップ条件を削除し、`-` / `+` 始まりのデータ行を
+  すべて Remove/Add へ。行数省略 hunk でエラーなく無変更になる問題を修正。
+  子の finding: unified diff 側 parse_multi_file_patch:553-556 にも同一条件が
+  残るが、file_header 正規表現が先に評価されるためスキップ条件の削除だけでは
+  修正にならず、本次は未変更として triage。R4 指摘なし。
 - 2026-11-24 cross-skill 集約（swarm289、2 担当・10 件、観点: パース境界 /
   入力検証と権限）: 入力検証から medium 2 件（PlanEnter/Exit の誤承認、
   CodeSearch の生エラー露出）を coding、計 8 件を triage。R4 指摘なし。
