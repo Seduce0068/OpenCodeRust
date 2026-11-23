@@ -180,12 +180,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **401 に WWW-Authenticate ヘッダが無い**
-  — `server/server.rs:2369` / AUTH-401-HEADER-01 / 低
 - [ ] **Unauthorized のドキュメントと実装が不一致**
   — `server/error.rs:159` / AUTH-401-SCHEMA-01 / 低
-- [ ] **todo.updated SSE が GET の正規化を通らない**
-  — `server/routes.rs:2977` / TODO-SSE-NORMALIZE-01 / 低
 - [ ] **todo.updated SSE 項目に安定 id が無い**
   — `server/routes.rs:2981` / TODO-SSE-ID-01 / 低
 - [ ] **JsonRpcMessage が id+method 要求を空レスポンスと誤分類**
@@ -291,6 +287,8 @@ status: current
 
 ## 完了
 
+- [x] **[server wire 2 件]** todo SSE 正規化と 401 Bearer ヘッダ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[compaction 設定配線 1 件]** auto/prune/reserved を実行系へ反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI SSE UTF-8 1 件]** チャンク境界のマルチバイト破壊を防止
@@ -866,6 +864,9 @@ status: current
 
 ## メモ
 
+- 2026-11-23 server wire 2 件: todo.updated ペイロードをヘルパへ抽出し GET と
+  同じ canonical 値へ（todo_manager の保存値は生値のまま）、Unauthorized に
+  WWW-Authenticate: Bearer 固定値を追加。R4 指摘なし。
 - 2026-11-23 R4 残存（compaction 配線の修正時）: 親が low（load_config 失敗時に
   env kill switch が fail-open になる問題）を、失敗経路のみ env override を
   適用する match 方式へ直接修正（成功時に再適用すると managed config の
