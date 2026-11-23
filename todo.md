@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **McpClientRegistry::remove が connection_configs を残存**
-  — `mcp/client.rs:1318` / R1-RES-02 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
@@ -269,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP config 回収 1 件]** 完全削除時に connection_config も破棄
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[session cleanup 1 件]** 削除時に per-session コレクションを回収
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[todo SSE 原子化 1 件]** 更新と ID 読戻しを同一ロックで実行
@@ -868,6 +868,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 MCP config 回収: remove は restart 契約のため connection_config
+  を残す挙動を維持し、新規 purge を追加。完全削除経路（remove_server）を
+  purge へ接続し、接続失敗時の config 残留も修正。R4 が purge の本番接続
+  漏れを指摘したため親が直接修正。残存 low（restart 経由失敗時の契約変更
+  記録不足、並行 add の所有権取り違え、接続失敗ログの URL 露出）は記録のみ。
 - 2026-11-24 cross-skill 集約（swarm278、2 担当・2 件、観点: 境界値 /
   Resource リーク）: boundary 0 件。resource から TUI セッション削除時の
   per-session コレクション残留（medium）を coding、MCP connection_configs
