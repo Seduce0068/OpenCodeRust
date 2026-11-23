@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 #[cfg(feature = "lsp")]
@@ -36,6 +37,33 @@ pub enum LspOperation {
 }
 
 pub struct LspTool;
+
+/// 1-based の位置を 0-based に変換する。
+///
+/// スキーマの `minimum: 1` は serde 側では検証されないため、`Some(0)` は
+/// `checked_sub(1)` で明示的に拒否する。省略 (`None`) は従来どおり 0 を返す。
+fn zero_based_position(value: Option<u32>) -> Result<u32, ToolError> {
+    match value {
+        Some(v) => v.checked_sub(1).ok_or_else(|| {
+            ToolError::InvalidArguments("line and character must be >= 1".to_string())
+        }),
+        None => Ok(0),
+    }
+}
+
+/// rename の新しい名前を解決する。
+///
+/// 省略時は従来どおり "new_name" を使う。空文字・空白のみは受け付けない。
+/// 前後空白付きの入力は trim して LSP へ渡す (借用は入力文字列のまま)。
+fn resolve_new_name(params: &LspParams) -> Result<Cow<'_, str>, ToolError> {
+    match params.new_name.as_deref() {
+        Some(name) if name.trim().is_empty() => Err(ToolError::InvalidArguments(
+            "newName must not be empty".to_string(),
+        )),
+        Some(name) => Ok(Cow::Borrowed(name.trim())),
+        None => Ok(Cow::Borrowed("new_name")),
+    }
+}
 
 #[async_trait]
 impl Tool for LspTool {
@@ -91,6 +119,13 @@ impl Tool for LspTool {
         let params: LspParams = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid parameters: {}", e)))?;
 
+        // パス確認や権限確認より前に、1-based 座標の 0 と空の rename 名を弾く。
+        let line = zero_based_position(params.line)?;
+        let character = zero_based_position(params.character)?;
+        if matches!(&params.operation, LspOperation::Rename) {
+            let _ = resolve_new_name(&params)?;
+        }
+
         let path = PathBuf::from(&params.file_path);
         let path_str = path.to_string_lossy().to_string();
 
@@ -116,9 +151,6 @@ impl Tool for LspTool {
                 .always_allow(),
         )
         .await?;
-
-        let line = params.line.map(|l| l.saturating_sub(1)).unwrap_or(0);
-        let character = params.character.map(|c| c.saturating_sub(1)).unwrap_or(0);
 
         #[cfg(feature = "lsp")]
         {
@@ -247,8 +279,8 @@ async fn execute_with_lsp(
                         }
                     }
                     LspOperation::Rename => {
-                        let new_name = params.new_name.as_deref().unwrap_or("new_name");
-                        match client.rename(path, line, character, new_name).await {
+                        let new_name = resolve_new_name(params)?;
+                        match client.rename(path, line, character, &new_name).await {
                             Ok(Some(_edit)) => format!(
                                 "Rename preview available. Workspace edit ready for: {}",
                                 new_name
@@ -538,6 +570,105 @@ mod tests {
 
         assert!(result.output.contains("LSP hover"));
         assert!(result.output.contains("Enable 'lsp' feature"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zero_based_position_converts_and_rejects_zero() {
+        assert_eq!(zero_based_position(Some(1)).unwrap(), 0);
+        assert_eq!(zero_based_position(Some(10)).unwrap(), 9);
+        assert_eq!(zero_based_position(None).unwrap(), 0);
+        assert!(matches!(
+            zero_based_position(Some(0)),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_zero_line_before_file_check() {
+        let args = serde_json::json!({
+            "operation": "hover",
+            "filePath": "/nonexistent/lsp-file.rs",
+            "line": 0
+        });
+        let error = LspTool.execute(args, context()).await.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_zero_character_before_file_check() {
+        let args = serde_json::json!({
+            "operation": "hover",
+            "filePath": "/nonexistent/lsp-file.rs",
+            "character": 0
+        });
+        let error = LspTool.execute(args, context()).await.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn resolve_new_name_defaults_and_rejects_blank() {
+        let parse = |new_name: Option<&str>| {
+            let mut value = serde_json::json!({
+                "operation": "rename",
+                "filePath": "a.rs"
+            });
+            if let Some(name) = new_name {
+                value["newName"] = serde_json::json!(name);
+            }
+            let params: LspParams = serde_json::from_value(value).unwrap();
+            resolve_new_name(&params).map(|cow| cow.into_owned())
+        };
+
+        assert_eq!(parse(None).unwrap(), "new_name");
+        assert_eq!(parse(Some("renamed")).unwrap(), "renamed");
+        assert_eq!(parse(Some("  foo  ")).unwrap(), "foo");
+        assert!(matches!(
+            parse(Some("")),
+            Err(ToolError::InvalidArguments(_))
+        ));
+        assert!(matches!(
+            parse(Some("   ")),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_blank_rename_name() {
+        let args = serde_json::json!({
+            "operation": "rename",
+            "filePath": "/nonexistent/lsp-file.rs",
+            "newName": "   "
+        });
+        let error = LspTool.execute(args, context()).await.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_accepts_rename_without_new_name() {
+        let dir =
+            std::env::temp_dir().join(format!("opencode-lsp-rename-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let ctx = ToolContext::new(
+            "session".to_owned(),
+            "message".to_owned(),
+            dir.to_string_lossy().to_string(),
+        );
+
+        let result = LspTool
+            .execute(
+                serde_json::json!({
+                    "operation": "rename",
+                    "filePath": file.to_string_lossy(),
+                    "line": 1,
+                    "character": 1
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
