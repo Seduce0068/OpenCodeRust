@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -111,6 +111,10 @@ pub struct AppContext {
     pub sidebar_mode: RwLock<SidebarMode>,
     pub animations_enabled: RwLock<bool>,
     pub pending_permissions: RwLock<usize>,
+    /// SSE と resync の両経路で共有する要求 ID 集合。
+    /// キーは `permission:{id}` / `question:{id}` 形式で、
+    /// 同じ保留要求が二重に enqueue されるのを防ぐ（リスレッド共有）。
+    pub seen_request_ids: RwLock<HashSet<String>>,
     pub show_timestamps: RwLock<bool>,
     pub show_thinking: RwLock<bool>,
     pub show_tool_details: RwLock<bool>,
@@ -151,6 +155,7 @@ impl AppContext {
             sidebar_mode: RwLock::new(SidebarMode::Auto),
             animations_enabled: RwLock::new(true),
             pending_permissions: RwLock::new(0),
+            seen_request_ids: RwLock::new(HashSet::new()),
             show_timestamps: RwLock::new(ui_kv.get_timestamps()),
             show_thinking: RwLock::new(ui_kv.get_bool("thinking_visibility", true)),
             show_tool_details: RwLock::new(ui_kv.get_bool("tool_details_visibility", true)),

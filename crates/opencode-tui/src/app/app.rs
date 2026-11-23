@@ -2555,10 +2555,7 @@ impl App {
         if request.questions.is_empty() {
             // Nothing to ask: reject the request so the server-side broker does
             // not keep the tool waiting for an answer that can never arrive.
-            tracing::warn!(
-                question_id = %request.id,
-                "received question request without questions; rejecting"
-            );
+            tracing::warn!("received question request without questions; rejecting");
             if let Some(client) = self.context.get_api_client() {
                 let _ = client.reject_question(&request.id);
             }
@@ -4257,24 +4254,20 @@ fn resync_todos_from_server(context: &Arc<AppContext>) {
     }
 }
 
-thread_local! {
-    /// この SSE リスナスレッドが resync で enqueue した要求 ID。
-    /// 再接続のたびに同じ保留要求を二重に enqueue しないための冪等化。
-    /// SSE イベント経由の enqueue は変更せず、resync 由来の重複だけを排除する。
-    static RESYNCED_REQUEST_IDS: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
-}
-
-/// 既に resync で enqueue した ID かどうかを判定する。
-fn resync_id_seen(kind: &str, id: &str) -> bool {
-    RESYNCED_REQUEST_IDS.with(|seen| seen.borrow().contains(&format!("{kind}:{id}")))
-}
-
-/// resync で enqueue した ID を記録する。
-fn remember_resync_id(kind: &str, id: &str) {
-    RESYNCED_REQUEST_IDS.with(|seen| {
-        seen.borrow_mut().insert(format!("{kind}:{id}"));
-    });
+/// SSE と resync の両経路で共有する要求 ID の登録ヘルパ。
+///
+/// `context.seen_request_ids` に `{kind}:{id}` を挿入し、新規登録（= enqueue してよい）
+/// の場合のみ `true` を返す。SSE リスナスレッドと resync が同じ `AppContext` を
+/// 共有するため、どちらが先に要求を受け取っても二重 enqueue を抑止できる。
+/// キーと要求 ID はログ・エラーへ出力しない。
+///
+/// 残存リスク: 回答済みで要求が消えても ID は集合に残る。サーバ側で要求 ID が
+/// 再利用されないことを前提としており、再利用された場合は誤スキップされ得る。
+fn mark_request_seen(context: &Arc<AppContext>, kind: &str, id: &str) -> bool {
+    context
+        .seen_request_ids
+        .write()
+        .insert(format!("{kind}:{id}"))
 }
 
 /// サーバの保留中 permission / question を取得し、`CustomEvent` として enqueue する。
@@ -4299,14 +4292,12 @@ fn resync_pending_requests_from_server(context: &Arc<AppContext>, event_tx: &Sen
                 let CustomEvent::PermissionRequested { id, .. } = &event else {
                     continue;
                 };
-                if resync_id_seen("permission", id) {
+                if !mark_request_seen(context, "permission", id) {
                     continue;
                 }
-                let id = String::clone(id);
                 if event_tx.send(event).is_err() {
                     return;
                 }
-                remember_resync_id("permission", &id);
             }
         }
         Err(_) => tracing::debug!("failed to resync pending permissions from server"),
@@ -4315,14 +4306,12 @@ fn resync_pending_requests_from_server(context: &Arc<AppContext>, event_tx: &Sen
     match client.get_pending_questions() {
         Ok(questions) => {
             for request in questions {
-                if resync_id_seen("question", &request.id) {
+                if !mark_request_seen(context, "question", &request.id) {
                     continue;
                 }
-                let id = request.id.clone();
                 if event_tx.send(CustomEvent::QuestionAsked(request)).is_err() {
                     return;
                 }
-                remember_resync_id("question", &id);
             }
         }
         Err(_) => tracing::debug!("failed to resync pending questions from server"),
@@ -4748,6 +4737,13 @@ fn forward_server_event(
         }
         Some("question.asked") => {
             if let Some(event) = parse_question_asked(&value) {
+                let CustomEvent::QuestionAsked(request) = &event else {
+                    return true;
+                };
+                // resync と同じ ID 集合を参照し、二重 enqueue を防ぐ。
+                if !mark_request_seen(context, "question", &request.id) {
+                    return true;
+                }
                 if !send(Event::Custom(event)) {
                     return false;
                 }
@@ -4755,6 +4751,13 @@ fn forward_server_event(
         }
         Some("permission.requested") => {
             if let Some(event) = parse_permission_requested(&value) {
+                let CustomEvent::PermissionRequested { id, .. } = &event else {
+                    return true;
+                };
+                // resync と同じ ID 集合を参照し、二重 enqueue を防ぐ。
+                if !mark_request_seen(context, "permission", id) {
+                    return true;
+                }
                 if !send(Event::Custom(event)) {
                     return false;
                 }
@@ -4768,6 +4771,11 @@ fn forward_server_event(
 /// Parse a `question.asked` server event into a TUI custom event.
 fn parse_question_asked(value: &serde_json::Value) -> Option<CustomEvent> {
     let request = value.get("request")?;
+    // 空 ID は共有集合の "question:" キーを汚染し、後続の要求を誤スキップ
+    // するため parse 段階で破棄する（permission 側と同基準、R4）。
+    if request.get("id").and_then(|item| item.as_str())?.is_empty() {
+        return None;
+    }
     let request = serde_json::from_value::<QuestionRequestInfo>(request.clone()).ok()?;
     Some(CustomEvent::QuestionAsked(request))
 }
@@ -6797,5 +6805,125 @@ mod tests {
             event_rx.try_recv().is_err(),
             "duplicate pending requests must not be re-enqueued"
         );
+    }
+
+    /// SSE と resync で共通の要求 ID を使うためのペイロード。
+    /// ID は loopback スタブ (`spawn_pending_requests_api`) と同じ値を使い、
+    /// トークンや実パスは一切含めない。
+    fn pending_request_sse_payloads() -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({
+                "type": "permission.requested",
+                "request": {
+                    "id": "perm_resync_1",
+                    "session_id": "ses_1",
+                    "tool": "bash",
+                    "input": {},
+                    "message": "allow",
+                    "permission_type": "edit",
+                    "patterns": ["tool/read", "tool/write"],
+                    "metadata": {},
+                    "always": []
+                }
+            }),
+            serde_json::json!({
+                "type": "question.asked",
+                "request": {
+                    "id": "q_resync_1",
+                    "session_id": "ses_1",
+                    "questions": [{
+                        "question": "Proceed?",
+                        "header": null,
+                        "options": [{"label": "Yes", "description": null}],
+                        "multiple": false
+                    }]
+                }
+            }),
+        ]
+    }
+
+    fn forward_sse_payloads(
+        payloads: &[serde_json::Value],
+        event_tx: &Sender<Event>,
+        context: &Arc<AppContext>,
+    ) {
+        let shutdown = AtomicBool::new(false);
+        for payload in payloads {
+            let lines = vec![payload.to_string()];
+            assert!(
+                forward_server_event(&lines, event_tx, context, &shutdown),
+                "SSE forwarding must keep the listener alive"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_events_then_resync_do_not_enqueue_twice() {
+        let base_url = spawn_pending_requests_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+
+        // 1) SSE 経由で先に enqueue する。
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        forward_sse_payloads(&pending_request_sse_payloads(), &event_tx, &context);
+        let sse_events: Vec<_> = event_rx.try_iter().collect();
+        assert_eq!(sse_events.len(), 2, "SSE must deliver both requests");
+        assert!(
+            sse_events.iter().any(|event| matches!(
+                event,
+                Event::Custom(CustomEvent::PermissionRequested { id, .. })
+                    if id == "perm_resync_1"
+            )),
+            "SSE permission event must be delivered"
+        );
+        assert!(
+            sse_events.iter().any(|event| matches!(
+                event,
+                Event::Custom(CustomEvent::QuestionAsked(request))
+                    if request.id == "q_resync_1"
+            )),
+            "SSE question event must be delivered"
+        );
+
+        // 2) 同じ保留要求を resync が取得しても再 enqueue されない。
+        let (custom_tx, custom_rx) = mpsc::channel::<CustomEvent>();
+        resync_pending_requests_from_server(&context, &custom_tx);
+        assert!(
+            custom_rx.try_recv().is_err(),
+            "resync must skip requests already enqueued via SSE"
+        );
+
+        // 共有集合に両方のキーが登録されていることを確認する。
+        let seen = context.seen_request_ids.read();
+        assert!(seen.contains("permission:perm_resync_1"));
+        assert!(seen.contains("question:q_resync_1"));
+    }
+
+    #[test]
+    fn resync_then_sse_events_do_not_enqueue_twice() {
+        let base_url = spawn_pending_requests_api();
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+
+        // 1) resync で先に enqueue する。
+        let (custom_tx, custom_rx) = mpsc::channel::<CustomEvent>();
+        resync_pending_requests_from_server(&context, &custom_tx);
+        assert_eq!(
+            custom_rx.try_iter().count(),
+            2,
+            "resync must deliver both requests"
+        );
+
+        // 2) 同じ ID の SSE イベントは二重 enqueue されない。
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        forward_sse_payloads(&pending_request_sse_payloads(), &event_tx, &context);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "SSE must skip requests already enqueued via resync"
+        );
+
+        let seen = context.seen_request_ids.read();
+        assert!(seen.contains("permission:perm_resync_1"));
+        assert!(seen.contains("question:q_resync_1"));
     }
 }
