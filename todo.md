@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **unified diff 側も diff ヘッダ形式の行を誤認し得る**
-  — `tool/apply_patch.rs:553` / PARSE-01-R4 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -277,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[unified diff 行解析 1 件]** hunk 内ヘッダ誤認を修正
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[apply_patch 行解析 1 件]** `--` / `++` 始まりデータ行を保持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[入力検証 2 件]** Plan 誤承認と CodeSearch エラー露出を修正
@@ -888,6 +888,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 unified diff 行解析: file_header/new_file_header 判定を !in_hunk
+  ゲート内へ移動し、hunk 内のスキップ条件も削除。子が `diff --git` なし
+  複数ファイル連続形式は元々未対応と指摘、親がコードコメントへ明記し
+  標準 git diff の直接テストを追加。R4 low 2 件を直接修正。
 - 2026-11-24 apply_patch 行解析: モデル patch 側（parse_model_patch）の
   in_hunk で diff ヘッダ形式のスキップ条件を削除し、`-` / `+` 始まりのデータ行を
   すべて Remove/Add へ。行数省略 hunk でエラーなく無変更になる問題を修正。
