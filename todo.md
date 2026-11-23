@@ -71,8 +71,6 @@ status: current
   — `session/llm.rs:474` / CFGAPPLY-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
-- [ ] **skills.urls がスキル探索ルートに使われない**
-  — `tool/skill.rs:83` / CFGAPPLY-05 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
   — `tui/context/app_context.rs:132` / CFGAPPLY-06 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -275,6 +273,8 @@ status: current
 
 ## 完了
 
+- [x] **[skills.urls 配線 1 件]** ローカル URL を探索ルートへ反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[default_agent 下流検証 1 件]** PromptInput/metadata を直接検証
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[default_agent 配線 1 件]** エージェント選択/downstream へ反映
@@ -862,6 +862,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（skills.urls の修正時）: 親が medium（file:// の
+  スキーム除去）と low（大文字スキーム判定）を直接修正し回帰テストを追加。
+  残存 low（paths と urls の同名スキル衝突時の後勝ち優先順）は設計判断
+  として記録のみ。http(s) URL は固定文言 debug でスキップ（値・URL 非露出）。
 - 2026-11-23 R4 残存（下流直接検証の修正時）: 親が low（前後空白のある agent
   名が trim されず build に落ちる）を直接修正し回帰テストを追加。残存 low
   （PromptInput 全フィールドのアサーション不足、未知名 task_agent が
