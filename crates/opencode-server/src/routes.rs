@@ -686,6 +686,28 @@ fn normalize_todo_wire_values(status: &str, priority: &str) -> (String, String) 
     )
 }
 
+/// `todo.updated` SSE のペイロードを生成する。
+///
+/// `status` / `priority` は `normalize_todo_wire_values` で canonical 化してから
+/// JSON に載せる。これにより `GET /session/{id}/todo` と同じ wire 値が流れる。
+/// イベント名・JSON キー・`sessionID` は従来どおりで、呼び出し元が
+/// `TodoManager` へ渡す `TodoItemData` は生値のまま変更しない。
+fn todo_updated_payload(session_id: &str, todos: &[opencode_tool::TodoItemData]) -> String {
+    serde_json::json!({
+        "type": "todo.updated",
+        "sessionID": session_id,
+        "todos": todos.iter().map(|todo| {
+            let (status, priority) = normalize_todo_wire_values(&todo.status, &todo.priority);
+            serde_json::json!({
+                "content": todo.content,
+                "status": status,
+                "priority": priority,
+            })
+        }).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 async fn get_session_todos(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -2998,19 +3020,10 @@ fn spawn_prompt_execution(
                         priority: todo.priority.clone(),
                     })
                     .collect();
+                // TodoManager へは従来どおり生値を渡す（GET 側が正規化する）。
+                // SSE 側だけ canonical 値を流し、GET と wire 値を一致させる。
                 state.todo_manager.update(&session_id, items).await;
-                state.broadcast(
-                    &serde_json::json!({
-                        "type": "todo.updated",
-                        "sessionID": session_id,
-                        "todos": todos.iter().map(|todo| serde_json::json!({
-                            "content": todo.content,
-                            "status": todo.status,
-                            "priority": todo.priority,
-                        })).collect::<Vec<_>>(),
-                    })
-                    .to_string(),
-                );
+                state.broadcast(&todo_updated_payload(&session_id, &todos));
                 Ok(())
             })
         });
@@ -7599,6 +7612,51 @@ mod mapping_tests {
         let (status, priority) = normalize_todo_wire_values("completed", "low");
         assert_eq!(status, "completed");
         assert_eq!(priority, "low");
+    }
+
+    /// R2: `todo.updated` SSE ペイロードの status/priority が
+    /// `GET /session/{id}/todo` と同じ canonical 値になること。
+    /// イベント名・JSON キー・sessionID が不変なことも併せて検証する。
+    #[test]
+    fn todo_updated_sse_payload_uses_canonical_values() {
+        let todos = vec![
+            opencode_tool::TodoItemData {
+                content: "legacy".to_string(),
+                status: "InProgress".to_string(),
+                priority: "High".to_string(),
+            },
+            opencode_tool::TodoItemData {
+                content: "hyphen".to_string(),
+                status: "in-progress".to_string(),
+                priority: "MEDIUM".to_string(),
+            },
+            opencode_tool::TodoItemData {
+                content: "canonical".to_string(),
+                status: "completed".to_string(),
+                priority: "low".to_string(),
+            },
+        ];
+
+        let payload = todo_updated_payload("sess-test", &todos);
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload must be valid JSON");
+
+        assert_eq!(value["type"], "todo.updated");
+        assert_eq!(value["sessionID"], "sess-test");
+
+        let wire = value["todos"].as_array().expect("todos must be an array");
+        assert_eq!(wire.len(), 3);
+        assert_eq!(wire[0]["content"], "legacy");
+        assert_eq!(wire[0]["status"], "in_progress");
+        assert_eq!(wire[0]["priority"], "high");
+        assert_eq!(wire[1]["status"], "in_progress");
+        assert_eq!(wire[1]["priority"], "medium");
+        assert_eq!(wire[2]["status"], "completed");
+        assert_eq!(wire[2]["priority"], "low");
+
+        // TodoManager へ渡す元データ（生値）は不変。
+        assert_eq!(todos[0].status, "InProgress");
+        assert_eq!(todos[0].priority, "High");
     }
 
     /// serde ベースへ置換しても `/session/status` の status 値は従来と同一。

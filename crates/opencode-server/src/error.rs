@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -269,7 +269,16 @@ impl IntoResponse for ApiError {
             })
         };
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        // RFC 9110 / RFC 6750: 401 レスポンスには WWW-Authenticate ヘッダが必須。
+        // スキーム名 "Bearer" のみの固定値を返し、トークン値やパスは一切含めない。
+        // 他のバリアント（4xx/5xx）にはヘッダを付与せずレスポンスを不変に保つ。
+        if status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
     }
 }
 
@@ -625,5 +634,38 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "unauthorized");
         assert_eq!(body["message"], "Invalid or missing authentication token");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_includes_bearer_www_authenticate_header() {
+        // 回帰ガード (AUTH-401-HEADER-01): 401 には固定値 "Bearer" の
+        // WWW-Authenticate ヘッダが必要（RFC 9110 / RFC 6750）。
+        // トークン値やパスはヘッダへ出さず、ボディの旧形式も不変とする。
+        let response = ApiError::Unauthorized("Invalid or missing authentication token".to_owned())
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticate = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("401 response must carry WWW-Authenticate");
+        assert_eq!(authenticate.to_str().unwrap(), "Bearer");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // 旧 401 ボディ形式 `{"error":"unauthorized","message":"..."}` は不変。
+        assert_eq!(body["error"], "unauthorized");
+        assert_eq!(body["message"], "Invalid or missing authentication token");
+    }
+
+    #[test]
+    fn non_unauthorized_response_has_no_www_authenticate_header() {
+        // 回帰ガード: ヘッダ追加は Unauthorized(401) のみに限定し、
+        // 他のバリアントのレスポンスは不変（ヘッダ無し）を保つ。
+        let response = ApiError::BadRequest("bad".to_owned()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
     }
 }
