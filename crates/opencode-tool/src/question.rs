@@ -116,6 +116,46 @@ impl Tool for QuestionTool {
     }
 }
 
+/// Parse raw stdin text into answers for a multiple-choice question.
+///
+/// Numeric tokens are resolved to the corresponding option label; every other
+/// non-empty token is kept verbatim. When no token could be resolved and the
+/// question offers choices, the traditional fallback picks the first option —
+/// except when a "Yes" option is present (case-insensitive). In that case an
+/// empty input stays unanswered so a bare Enter cannot implicitly approve a
+/// Plan transition through the CLI.
+fn parse_stdin_answers(input: &str, q: &QuestionDef) -> Vec<String> {
+    let answers: Vec<String> = input
+        .trim()
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+
+            if let Ok(num) = s.parse::<usize>() {
+                if num > 0 && num <= q.options.len() {
+                    return Some(q.options[num - 1].label.clone());
+                }
+            }
+
+            Some(s.to_string())
+        })
+        .collect();
+
+    let has_yes_option = q
+        .options
+        .iter()
+        .any(|opt| opt.label.trim().eq_ignore_ascii_case("yes"));
+
+    if answers.is_empty() && !q.options.is_empty() && !has_yes_option {
+        return vec![q.options[0].label.clone()];
+    }
+
+    answers
+}
+
 fn ask_question_via_stdin(q: &QuestionDef) -> Result<Vec<String>, ToolError> {
     println!();
 
@@ -174,30 +214,7 @@ fn ask_question_via_stdin(q: &QuestionDef) -> Result<Vec<String>, ToolError> {
         .read_line(&mut input)
         .map_err(|e| ToolError::execution_with_source(e.to_string(), e))?;
 
-    let input = input.trim();
-    let answers: Vec<String> = input
-        .split(',')
-        .filter_map(|s| {
-            let s = s.trim();
-            if s.is_empty() {
-                return None;
-            }
-
-            if let Ok(num) = s.parse::<usize>() {
-                if num > 0 && num <= q.options.len() {
-                    return Some(q.options[num - 1].label.clone());
-                }
-            }
-
-            Some(s.to_string())
-        })
-        .collect();
-
-    if answers.is_empty() && !q.options.is_empty() {
-        return Ok(vec![q.options[0].label.clone()]);
-    }
-
-    Ok(answers)
+    Ok(parse_stdin_answers(&input, q))
 }
 
 impl Default for QuestionTool {
@@ -338,5 +355,61 @@ mod tests {
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["answers"][0][0], "Yes");
         assert_eq!(json["answers"][1][1], "b");
+    }
+
+    fn question_with_options(labels: &[&str]) -> QuestionDef {
+        QuestionDef {
+            question: "Choose one".to_string(),
+            header: None,
+            options: labels
+                .iter()
+                .map(|label| crate::QuestionOption {
+                    label: (*label).to_string(),
+                    description: None,
+                })
+                .collect(),
+            multiple: false,
+        }
+    }
+
+    #[test]
+    fn empty_input_does_not_default_to_yes_option() {
+        // PlanEnter/PlanExit: bare Enter (empty input) must not become "Yes".
+        let q = question_with_options(&["Yes", "No"]);
+        assert!(
+            parse_stdin_answers("", &q).is_empty(),
+            "empty input must not silently select the approval option"
+        );
+        assert!(
+            parse_stdin_answers("   ", &q).is_empty(),
+            "whitespace-only input must not silently select the approval option"
+        );
+    }
+
+    #[test]
+    fn empty_input_does_not_default_to_lowercase_yes_option() {
+        let q = question_with_options(&["yes", "no"]);
+        assert!(
+            parse_stdin_answers("", &q).is_empty(),
+            "case-insensitive Yes options must also stay unanswered"
+        );
+    }
+
+    #[test]
+    fn empty_input_still_defaults_to_first_option_without_yes() {
+        // Backward compatibility for ordinary option lists (e.g. colors).
+        let q = question_with_options(&["Red", "Green", "Blue"]);
+        assert_eq!(parse_stdin_answers("", &q), vec!["Red".to_string()]);
+    }
+
+    #[test]
+    fn numeric_and_label_inputs_are_unchanged() {
+        let q = question_with_options(&["Yes", "No", "Maybe"]);
+        assert_eq!(parse_stdin_answers("2", &q), vec!["No".to_string()]);
+        assert_eq!(parse_stdin_answers("No", &q), vec!["No".to_string()]);
+        assert_eq!(
+            parse_stdin_answers("1,3", &q),
+            vec!["Yes".to_string(), "Maybe".to_string()]
+        );
     }
 }
