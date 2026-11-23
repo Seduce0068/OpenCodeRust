@@ -1280,6 +1280,14 @@ impl ApiClient {
         Ok(())
     }
 
+    /// 質問要求へ reply を送る。サーバが「既に回答済み」を表す 404 は成功扱いにする。
+    ///
+    // API 契約: サーバは存在しない／回答済みの質問へ HTTP 404 を返す。
+    // この契約は変更しない。1 回目の reply がサーバに届いたのに応答が失われた
+    // 場合、再送は必ず 404 になる。TUI 側で 404 を「既に回答済み」として
+    // `Ok(())` に変換し、再送が失敗扱いになってダイアログが閉じない問題を防ぐ。
+    // 404 以外の非成功ステータスは従来どおり `Err` とする。
+    // エラー・ログには要求 ID / トークン / パスを一切含めない。
     pub fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> anyhow::Result<()> {
         let url = format!("{}/question/{}/reply", self.base_url, request_id);
         let body = serde_json::json!({
@@ -1291,8 +1299,14 @@ impl ApiClient {
             .json(&body)
             .send()
             .map_err(|_| anyhow::anyhow!("Failed to send question reply"))?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 既に回答済み。ボディは内容を見ずに読み捨てる（Keep-Alive の
+            // コネクションをプールへ戻すため）。ログ・エラーへは渡さない。
+            let _ = response.bytes();
+            return Ok(());
+        }
+        if !status.is_success() {
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
                 "Failed to reply to question: {}",
@@ -1302,6 +1316,11 @@ impl ApiClient {
         Ok(())
     }
 
+    /// 質問要求を reject する。サーバが「既に回答済み」を表す 404 は成功扱いにする。
+    ///
+    // API 契約・理由は `reply_question` と同じ。404 以外の非成功ステータスは
+    // 従来どおり `Err` とし、エラー・ログには要求 ID / トークン / パスを
+    // 一切含めない。
     pub fn reject_question(&self, request_id: &str) -> anyhow::Result<()> {
         let url = format!("{}/question/{}/reject", self.base_url, request_id);
         let response = self
@@ -1309,8 +1328,14 @@ impl ApiClient {
             .post(&url)
             .send()
             .map_err(|_| anyhow::anyhow!("Failed to send question rejection"))?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 既に回答済み。ボディは内容を見ずに読み捨てる（Keep-Alive の
+            // コネクションをプールへ戻すため）。ログ・エラーへは渡さない。
+            let _ = response.bytes();
+            return Ok(());
+        }
+        if !status.is_success() {
             let text = response.text().unwrap_or_default();
             anyhow::bail!("Failed to reject question: {}", error_detail(status, &text));
         }
@@ -2853,6 +2878,111 @@ mod tests {
         );
         assert!(
             !message.contains("/permission/"),
+            "path must not leak into error: {message}"
+        );
+        let _request = mock.request();
+    }
+
+    // --- R2 (APICON-03): 質問 reply / reject の 404 を冪等な「既に回答済み」として扱う回帰テスト ---
+    // サーバ契約（存在しない／回答済みの質問へ 404）は変更せず、TUI 側の解釈のみを検証する。
+
+    #[test]
+    fn reply_question_returns_ok_on_404_already_answered() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "404 Not Found",
+            r#"{"error":{"type":"NotFound","message":"question reply not found"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        client
+            .reply_question("q_already_answered", &[vec!["yes".to_string()]])
+            .expect("404 must be interpreted as already answered, not an error");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("POST /question/q_already_answered/reply "),
+            "reply must POST to /question/{{id}}/reply: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn reject_question_returns_ok_on_404_already_answered() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "404 Not Found",
+            r#"{"error":{"type":"NotFound","message":"question reject not found"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        client
+            .reject_question("q_already_answered")
+            .expect("404 must be interpreted as already answered, not an error");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("POST /question/q_already_answered/reject "),
+            "reject must POST to /question/{{id}}/reject: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn reply_question_still_errors_on_500_without_leaking_request_id() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "500 Internal Server Error",
+            r#"{"error":{"type":"internal_error","message":"boom"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let err = client
+            .reply_question("q-secret-id", &[vec!["yes".to_string()]])
+            .expect_err("500 must remain an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("500 Internal Server Error"),
+            "message: {message}"
+        );
+        assert!(
+            !message.contains("q-secret-id"),
+            "request id must not leak into error: {message}"
+        );
+        assert!(
+            !message.contains("/question/"),
+            "path must not leak into error: {message}"
+        );
+        let _request = mock.request();
+    }
+
+    #[test]
+    fn reject_question_still_errors_on_500_without_leaking_request_id() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "500 Internal Server Error",
+            r#"{"error":{"type":"internal_error","message":"boom"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let err = client
+            .reject_question("q-secret-id")
+            .expect_err("500 must remain an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("500 Internal Server Error"),
+            "message: {message}"
+        );
+        assert!(
+            !message.contains("q-secret-id"),
+            "request id must not leak into error: {message}"
+        );
+        assert!(
+            !message.contains("/question/"),
             "path must not leak into error: {message}"
         );
         let _request = mock.request();

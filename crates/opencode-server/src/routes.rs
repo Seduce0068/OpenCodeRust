@@ -740,6 +740,15 @@ async fn delete_session(
         );
     }
     persist_sessions_if_enabled(&state).await;
+    // TUI の session.deleted 待機（cleanup）を満たすため、削除完了を SSE で配信する。
+    // ペイロードは forward_server_event が読む "sessionID" キーに合わせる。
+    state.broadcast(
+        &serde_json::json!({
+            "type": "session.deleted",
+            "sessionID": id,
+        })
+        .to_string(),
+    );
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -8752,6 +8761,47 @@ mod abort_tests {
             .await
             .expect_err("second delete must fail safely");
         assert!(matches!(error, ApiError::SessionNotFound(_)));
+    }
+
+    /// APICON-02 回帰: セッション削除成功時に event_bus の購読者へ
+    /// {"type":"session.deleted","sessionID":<id>} が届くこと（TUI cleanup の解放）。
+    #[tokio::test]
+    async fn delete_session_broadcasts_session_deleted_event() {
+        let (state, session_id, _repo, _db) = state_with_queued_input().await;
+        // 削除前に購読し、配信イベントを取り逃さないようにする。
+        let mut rx = state.event_bus.subscribe();
+
+        let response = delete_session(State(state.clone()), Path(session_id.clone()))
+            .await
+            .expect("delete should succeed");
+        assert_eq!(response.0["deleted"], true);
+
+        // 削除処理中に他イベントが混ざる可能性があるため session.deleted を探す。
+        let expected_session_id = session_id.clone();
+        let matched = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match rx.recv().await {
+                    Ok(raw) => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(&raw).expect("event payload is JSON");
+                        if value["type"].as_str() == Some("session.deleted") {
+                            return value;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            serde_json::Value::Null
+        })
+        .await
+        .expect("session.deleted event should arrive within timeout");
+
+        assert_eq!(matched["type"].as_str(), Some("session.deleted"));
+        assert_eq!(
+            matched["sessionID"].as_str(),
+            Some(expected_session_id.as_str())
+        );
     }
 
     #[test]
