@@ -537,8 +537,26 @@ impl PluginSubprocess {
 
                 match method {
                     Some("auth.fetch.stream.chunk") => {
-                        if let Some(chunk) = params.get("chunk").and_then(Value::as_str) {
-                            if !Self::push_chunk(&chunk_tx, Ok(chunk.to_string())).await {
+                        match params.get("chunk").and_then(Value::as_str) {
+                            Some(chunk) => {
+                                if !Self::push_chunk(&chunk_tx, Ok(chunk.to_string())).await {
+                                    break;
+                                }
+                            }
+                            None => {
+                                // PARSE-04: a chunk frame whose `chunk` is absent or not a
+                                // string must fail the stream instead of being silently
+                                // dropped — a trailing `stream.end` would otherwise make
+                                // the truncation look like a clean completion. Use a fixed
+                                // message only: never include the value, path or token.
+                                Self::report_stream_error(
+                                    &chunk_tx,
+                                    &mut start_tx,
+                                    PluginSubprocessError::Protocol(
+                                        "invalid auth.fetch stream chunk".into(),
+                                    ),
+                                )
+                                .await;
                                 break;
                             }
                         }
@@ -1052,6 +1070,153 @@ mod tests {
             acquired.is_ok(),
             "rpc_lock remained held after chunk overflow"
         );
+    }
+
+    /// PARSE-04: a non-string chunk must fail the stream with a fixed Protocol
+    /// error even when a `stream.end` follows it — no chunk event may be
+    /// delivered and the trailing end must not be mistaken for clean completion.
+    #[tokio::test]
+    async fn invalid_numeric_chunk_fails_even_with_trailing_stream_end() {
+        let frames = vec![
+            stream_frame(stream_start_frame(1)),
+            stream_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "auth.fetch.stream.chunk",
+                "params": {"requestId": 1, "chunk": 12345},
+            })),
+            stream_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "auth.fetch.stream.end",
+                "params": {"requestId": 1},
+            })),
+        ];
+        let sub = cat_subprocess(&frames, Duration::from_millis(500)).await;
+        let headers = std::collections::HashMap::new();
+        let stream = sub
+            .auth_fetch_stream("http://example.invalid", "GET", &headers, None)
+            .await
+            .expect("start frame should arrive");
+        let mut chunks = stream.chunks;
+
+        // Drain until the channel closes: the reader breaks on the bad chunk,
+        // so the only item must be the terminal error and no `Ok` chunk.
+        let items = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut items = Vec::new();
+            while let Some(item) = chunks.recv().await {
+                items.push(item);
+            }
+            items
+        })
+        .await
+        .expect("channel must close after the terminal error");
+        assert_eq!(items.len(), 1, "invalid chunk must yield exactly one error");
+        match &items[0] {
+            Err(PluginSubprocessError::Protocol(message)) => {
+                assert_eq!(message, "invalid auth.fetch stream chunk");
+                assert!(!message.contains("12345"), "chunk value leaked into error");
+            }
+            other => panic!(
+                "invalid chunk must fail with a fixed Protocol error, got {:?}",
+                other.as_ref().map(|_| ())
+            ),
+        }
+    }
+
+    /// Normal string chunks keep the original wire contract: delivered verbatim,
+    /// and `stream.end` closes the channel cleanly without an error.
+    #[tokio::test]
+    async fn valid_string_chunk_is_delivered_and_stream_ends_cleanly() {
+        let payload = "normal-chunk-payload";
+        let frames = vec![
+            stream_frame(stream_start_frame(1)),
+            stream_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "auth.fetch.stream.chunk",
+                "params": {"requestId": 1, "chunk": payload},
+            })),
+            stream_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "auth.fetch.stream.end",
+                "params": {"requestId": 1},
+            })),
+        ];
+        let sub = cat_subprocess(&frames, Duration::from_millis(500)).await;
+        let headers = std::collections::HashMap::new();
+        let stream = sub
+            .auth_fetch_stream("http://example.invalid", "GET", &headers, None)
+            .await
+            .expect("start frame should arrive");
+        let mut chunks = stream.chunks;
+
+        let first = tokio::time::timeout(Duration::from_secs(2), chunks.recv())
+            .await
+            .expect("chunk should arrive before deadline")
+            .expect("stream must emit the chunk");
+        assert_eq!(first.expect("chunk should be Ok"), payload);
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), chunks.recv())
+            .await
+            .expect("channel close should arrive before deadline");
+        assert!(
+            terminal.is_none(),
+            "clean stream.end must not emit an error"
+        );
+    }
+
+    /// PARSE-04 covers every non-string form: number, null, object and missing.
+    #[tokio::test]
+    async fn non_string_chunk_forms_all_fail_without_leaking_values() {
+        let invalid_params: [serde_json::Value; 4] = [
+            serde_json::json!({"requestId": 1, "chunk": 7}),
+            serde_json::json!({"requestId": 1, "chunk": null}),
+            serde_json::json!({"requestId": 1, "chunk": {"secret": "leak-marker-chunk"}}),
+            serde_json::json!({"requestId": 1}), // `chunk` absent entirely
+        ];
+        for params in invalid_params {
+            let frames = vec![
+                stream_frame(stream_start_frame(1)),
+                stream_frame(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "auth.fetch.stream.chunk",
+                    "params": params,
+                })),
+                stream_frame(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "auth.fetch.stream.end",
+                    "params": {"requestId": 1},
+                })),
+            ];
+            let sub = cat_subprocess(&frames, Duration::from_millis(500)).await;
+            let headers = std::collections::HashMap::new();
+            let stream = sub
+                .auth_fetch_stream("http://example.invalid", "GET", &headers, None)
+                .await
+                .expect("start frame should arrive");
+            let mut chunks = stream.chunks;
+
+            let first = tokio::time::timeout(Duration::from_secs(2), chunks.recv())
+                .await
+                .expect("terminal error should arrive before deadline")
+                .expect("stream must emit a terminal item, not close cleanly");
+            match first {
+                Err(PluginSubprocessError::Protocol(message)) => {
+                    assert_eq!(message, "invalid auth.fetch stream chunk");
+                    assert!(!message.contains("leak-marker"), "chunk value leaked");
+                    assert!(!message.contains("secret"), "chunk key leaked");
+                }
+                other => panic!(
+                    "non-string chunk must fail with a fixed Protocol error, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+            let next = tokio::time::timeout(Duration::from_secs(2), chunks.recv())
+                .await
+                .expect("channel close should arrive before deadline");
+            assert!(
+                next.is_none(),
+                "no chunk event expected after invalid chunk"
+            );
+        }
     }
 
     /// `printf` はシェルを使わずに 1 フレームだけ書き出すテストfixture。
