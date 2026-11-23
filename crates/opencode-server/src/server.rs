@@ -1823,9 +1823,31 @@ static LEGACY_CORS_SEED: LazyLock<RwLock<HashSet<String>>> =
 fn normalize_origin(origin: &str) -> Option<String> {
     let trimmed = origin.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+        return None;
+    }
+
+    // URL として解釈できる場合は scheme/host を小文字化し、port を維持した
+    // Origin 形式へ寄せる。大文字の whitelist と Url::parse 済みの小文字
+    // request origin が一致しない問題（NORM-01）をここで解消する。
+    match Url::parse(trimmed) {
+        Ok(parsed) => {
+            let Some(host) = parsed.host_str() else {
+                // 階層的な host を持たない URL は従来どおり trimmed を維持する。
+                return Some(trimmed.to_string());
+            };
+            // Url::parse は scheme を小文字化するが host は保持するため、
+            // ここで host も小文字化して判定側（is_allowed_origin_with_extra）と
+            // 同じ正規化規則に揃える（R4）。
+            let mut normalized = format!("{}://{}", parsed.scheme(), host.to_ascii_lowercase());
+            if let Some(port) = parsed.port() {
+                // 既定ポートは Url::port() が None を返すため、明示的な
+                // 非既定ポートだけが残る（ブラウザの Origin 直列化と同形）。
+                normalized.push_str(&format!(":{port}"));
+            }
+            Some(normalized)
+        }
+        // 後方互換: パースできない値は trim 済み文字列をそのまま返す。
+        Err(_) => Some(trimmed.to_string()),
     }
 }
 
@@ -1874,7 +1896,9 @@ fn is_allowed_origin_with_extra(origin: &str, whitelist: &RwLock<HashSet<String>
     };
 
     let scheme = parsed.scheme();
-    let host = parsed.host_str().unwrap_or("");
+    // Url::parse は scheme を小文字化するが host は保持するため、比較用に小文字化する（R4）。
+    let host_owned = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = host_owned.as_str();
 
     // Allow localhost with any port, including when the port is omitted.
     // Browsers omit the port for the scheme's default (http://localhost => 80,
@@ -1884,11 +1908,11 @@ fn is_allowed_origin_with_extra(origin: &str, whitelist: &RwLock<HashSet<String>
     let is_localhost =
         matches!(host, "localhost" | "127.0.0.1" | "[::1]") && matches!(scheme, "http" | "https");
 
-    // Allow tauri
-    let is_tauri = matches!(
-        origin,
-        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
-    );
+    // Allow tauri. scheme は Url 側で、host は上の to_ascii_lowercase で
+    // 小文字化済みのため、"TAURI://LOCALHOST" も許可できる（NORM-02, R4）。
+    let is_tauri = (scheme == "tauri" && host == "localhost")
+        || (scheme == "http" && host == "tauri.localhost")
+        || (scheme == "https" && host == "tauri.localhost");
 
     // Allow exact opencode.ai subdomains (no wildcard suffix)
     let is_opencode_ai = scheme == "https" && matches!(host, "opencode.ai" | "www.opencode.ai");
@@ -3717,6 +3741,66 @@ mod tests {
         assert!(!first.is_allowed_origin(second_origin));
         assert!(first.is_allowed_origin(first_origin));
         assert!(!second.is_allowed_origin(first_origin));
+    }
+
+    // ---- R2 回帰テスト: NORM-01 / NORM-02 (origin の scheme/host 大小文字) ----
+
+    #[test]
+    fn cors_whitelist_matches_lowercase_request_when_configured_uppercase() {
+        let state = ServerState::new();
+        state.set_cors_whitelist(vec![
+            "HTTPS://EXAMPLE.COM/".to_string(),
+            "  HTTPS://API.EXAMPLE.COM:8443/  ".to_string(),
+        ]);
+
+        // 大文字 + 末尾スラッシュ付き whitelist が小文字 request origin と一致する。
+        assert!(state.is_extra_allowed_origin_exact("https://example.com"));
+        assert!(state.is_allowed_origin("https://example.com"));
+        assert!(state.is_extra_allowed_origin_exact("https://api.example.com:8443"));
+        assert!(state.is_allowed_origin("https://api.example.com:8443"));
+        // request 側が大文字でも Url::parse により小文字化されるため一致する。
+        assert!(state.is_allowed_origin("HTTPS://EXAMPLE.COM"));
+        // port は維持されるため、誤った port は一致しない（許可範囲は拡大しない）。
+        assert!(!state.is_extra_allowed_origin_exact("https://example.com:8443"));
+        assert!(!state.is_allowed_origin("https://example.com:8443"));
+    }
+
+    #[test]
+    fn cors_allows_uppercase_tauri_scheme_and_host() {
+        let state = ServerState::new();
+        // is_tauri が origin 生文字列の完全一致ではなく parsed scheme/host に基づく。
+        assert!(state.is_allowed_origin("TAURI://LOCALHOST"));
+        assert!(state.is_allowed_origin("HTTP://TAURI.LOCALHOST"));
+        assert!(state.is_allowed_origin("HTTPS://TAURI.LOCALHOST"));
+        // 既存の小文字表記は不変。
+        assert!(state.is_allowed_origin("tauri://localhost"));
+        assert!(state.is_allowed_origin("http://tauri.localhost"));
+    }
+
+    #[test]
+    fn cors_lowercase_whitelist_with_trailing_slash_is_unchanged() {
+        let state = ServerState::new();
+        state.set_cors_whitelist(vec![
+            "https://first.example.com".to_string(),
+            "https://second.example.com/".to_string(),
+            "http://localhost:3000/".to_string(),
+        ]);
+
+        for origin in [
+            "https://first.example.com",
+            "https://second.example.com",
+            "http://localhost:3000",
+        ] {
+            assert!(
+                state.is_extra_allowed_origin_exact(origin),
+                "lowercase whitelist entry must still match: {origin}"
+            );
+            assert!(
+                state.is_allowed_origin(origin),
+                "lowercase whitelist origin must still be allowed: {origin}"
+            );
+        }
+        assert!(!state.is_allowed_origin("https://third.example.com"));
     }
 
     // ---- R2 回帰テスト: CORS カスタムヘッダ / 401 スキーマ / fail-open ----
