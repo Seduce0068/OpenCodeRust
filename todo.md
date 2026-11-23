@@ -67,8 +67,8 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **compaction 設定が実行系へ一切届かない**
-  — `session/prompt.rs:1339` / CFGAPPLY-01 / 高
+- [ ] **StreamProcessor の compaction_config が本番配線されない**
+  — `session/llm.rs:474` / CFGAPPLY-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **未登録ルート/405 が空ボディで JSON 契約と不整合**
@@ -291,6 +291,8 @@ status: current
 
 ## 完了
 
+- [x] **[compaction 設定配線 1 件]** auto/prune/reserved を実行系へ反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI SSE UTF-8 1 件]** チャンク境界のマルチバイト破壊を防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設計判断 2 件]** timeout 既定 / limit=0 を現状維持で確定
@@ -864,6 +866,13 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（compaction 配線の修正時）: 親が low（load_config 失敗時に
+  env kill switch が fail-open になる問題）を、失敗経路のみ env override を
+  適用する match 方式へ直接修正（成功時に再適用すると managed config の
+  優先順位が壊れるため）。残存 low（StreamProcessor 未配線、env→実行系の
+  E2E テスト欠落、env 名の表記ゆれ DISABLE_PRUNE vs OPENCODE_DISABLE_PRUNE）
+  は記録のみ。StreamProcessor は本番呼び出し 0 件で現行の本番ループは
+  prompt.rs 側の gate が機能するため実害なし。
 - 2026-11-23 cross-skill 集約（swarm261、2 担当・16 件、観点: 設定適用漏れ /
   レスポンス契約）: response の high（CLI SSE の per-chunk UTF-8 破壊）を
   coding、他 15 件を triage。compaction 設定未配線（CFGAPPLY-01）は high だが
