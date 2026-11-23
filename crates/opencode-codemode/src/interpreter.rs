@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
 use oxc_ast::ast::{
@@ -2298,7 +2298,9 @@ impl<'a> Interpreter<'a> {
                     ));
                 };
                 let repaired = repair_overflow_numbers(&text);
-                let parse_text = repaired.as_deref().unwrap_or(&text);
+                let parse_text = repaired
+                    .as_ref()
+                    .map_or(text.as_str(), |repair| repair.text.as_str());
                 let json: serde_json::Value =
                     serde_json::from_str(parse_text).map_err(|error| {
                         RuntimeError::new(
@@ -2307,15 +2309,18 @@ impl<'a> Interpreter<'a> {
                             _span,
                         )
                     })?;
-                let value = json_to_value_with_overflow(&json, _span, repaired.is_some()).map_err(
-                    |error| {
-                        RuntimeError::new(
-                            RuntimeErrorKind::SyntaxError,
-                            format!("JSON.parse received invalid JSON: {}", error.message()),
-                            _span,
-                        )
-                    },
-                )?;
+                let value = json_to_value_with_overflow(
+                    &json,
+                    _span,
+                    repaired.as_ref().map(|repair| &repair.sentinels),
+                )
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorKind::SyntaxError,
+                        format!("JSON.parse received invalid JSON: {}", error.message()),
+                        _span,
+                    )
+                })?;
                 // Upstream runs copyIn inside the same try block, so blocked
                 // properties and over-deep results surface as SyntaxError too.
                 check_data(&value, "JSON.parse result").map_err(|error| {
@@ -7765,27 +7770,105 @@ pub(crate) fn is_js_whitespace(character: char) -> bool {
 }
 
 fn json_to_value(json: &serde_json::Value, span: Span) -> Result<Value, RuntimeError> {
-    json_to_value_with_overflow(json, span, false)
+    json_to_value_with_overflow(json, span, None)
 }
 
-/// Placeholders used while parsing JSON numeric literals that overflow `f64`.
+/// Per-call placeholders for JSON numeric literals that overflow `f64`.
 ///
 /// `serde_json` rejects `1e400`, while ECMAScript `JSON.parse` returns
-/// `Infinity`. The scanner below replaces only those literals, so the sentinels
-/// can be recognized after a successful parse.
-const POSITIVE_INFINITY_SENTINEL: &str = "__opencode_codemode_positive_infinity__";
-const NEGATIVE_INFINITY_SENTINEL: &str = "__opencode_codemode_negative_infinity__";
+/// `Infinity`. The scanner below replaces only those literals with one of
+/// these tokens. A fresh pair is generated for every parse, so no caller can
+/// accidentally turn an ordinary string into an infinity by writing a name
+/// that once served as a fixed placeholder.
+struct OverflowSentinels {
+    positive: String,
+    negative: String,
+}
 
-/// Rewrites overflowing JSON number literals to sentinel strings.
+impl OverflowSentinels {
+    fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("__opencode_codemode_{nanos}_{id}_");
+        Self {
+            positive: format!("{prefix}positive__"),
+            negative: format!("{prefix}negative__"),
+        }
+    }
+}
+
+/// Repaired JSON source together with the tokens that stand for infinities.
+struct OverflowRepair {
+    text: String,
+    sentinels: OverflowSentinels,
+}
+
+/// Checks a number token against the complete RFC 8259 number grammar:
+/// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+///
+/// Rust's `f64` parser also accepts JSON-invalid spellings such as `01e400`
+/// and `1.e400` and returns infinity for them. Replacing those with sentinel
+/// strings would silently convert a `SyntaxError` into a successful parse, so
+/// only exact JSON numbers are eligible for overflow repair.
+fn is_valid_json_number(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let mut index = 0;
+
+    if bytes.first() == Some(&b'-') {
+        index += 1;
+    }
+    match bytes.get(index).copied() {
+        Some(b'0') => index += 1,
+        Some(b'1'..=b'9') => {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+        _ => return false,
+    }
+
+    if bytes.get(index).copied() == Some(b'.') {
+        index += 1;
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+
+    if matches!(bytes.get(index).copied(), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index).copied(), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+
+    index == bytes.len()
+}
+
+/// Rewrites overflowing JSON number literals to per-call sentinel strings.
 ///
 /// Returns `None` when every number fits in `f64`, which keeps the common path
 /// identical to a plain `serde_json` parse. Strings are copied verbatim so
 /// digits and `-` inside string values are never touched.
-fn repair_overflow_numbers(source: &str) -> Option<String> {
+fn repair_overflow_numbers(source: &str) -> Option<OverflowRepair> {
     let bytes = source.as_bytes();
-    let mut output = String::with_capacity(source.len() + 16);
+    let mut output = String::with_capacity(source.len() + 64);
     let mut index = 0;
-    let mut changed = false;
+    let mut sentinels: Option<OverflowSentinels> = None;
 
     while index < bytes.len() {
         match bytes[index] {
@@ -7829,15 +7912,15 @@ fn repair_overflow_numbers(source: &str) -> Option<String> {
                 }
                 let token = &source[start..index];
                 match token.parse::<f64>() {
-                    Ok(value) if value.is_infinite() => {
+                    Ok(value) if value.is_infinite() && is_valid_json_number(token) => {
+                        let sentinels = sentinels.get_or_insert_with(OverflowSentinels::new);
                         output.push('"');
                         output.push_str(if value.is_sign_negative() {
-                            NEGATIVE_INFINITY_SENTINEL
+                            &sentinels.negative
                         } else {
-                            POSITIVE_INFINITY_SENTINEL
+                            &sentinels.positive
                         });
                         output.push('"');
-                        changed = true;
                     }
                     _ => output.push_str(token),
                 }
@@ -7853,35 +7936,51 @@ fn repair_overflow_numbers(source: &str) -> Option<String> {
         }
     }
 
-    changed.then_some(output)
+    sentinels.map(|sentinels| OverflowRepair {
+        text: output,
+        sentinels,
+    })
 }
 
 fn json_to_value_with_overflow(
     json: &serde_json::Value,
     span: Span,
-    allow_overflow_sentinels: bool,
+    overflow: Option<&OverflowSentinels>,
 ) -> Result<Value, RuntimeError> {
     use serde_json::Value as Json;
     Ok(match json {
         Json::Null => Value::Null,
         Json::Bool(value) => Value::Boolean(*value),
         Json::Number(value) => Value::Number(value.as_f64().unwrap_or(f64::NAN)),
-        Json::String(value) if allow_overflow_sentinels && value == POSITIVE_INFINITY_SENTINEL => {
+        Json::String(value) if matches!(overflow, Some(sentinels) if value == &sentinels.positive) => {
             Value::Number(f64::INFINITY)
         }
-        Json::String(value) if allow_overflow_sentinels && value == NEGATIVE_INFINITY_SENTINEL => {
+        Json::String(value) if matches!(overflow, Some(sentinels) if value == &sentinels.negative) => {
             Value::Number(f64::NEG_INFINITY)
         }
         Json::String(value) => Value::String(value.clone()),
         Json::Array(items) => Value::array(
             items
                 .iter()
-                .map(|item| json_to_value_with_overflow(item, span, allow_overflow_sentinels))
+                .map(|item| json_to_value_with_overflow(item, span, overflow))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Json::Object(map) => {
             let mut object = IndexMap::new();
             for (key, value) in map {
+                // A repaired overflowing key would otherwise become an
+                // observable object property containing this call's token.
+                let is_sentinel_key = matches!(
+                    overflow,
+                    Some(sentinels) if key == &sentinels.positive || key == &sentinels.negative
+                );
+                if is_sentinel_key {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorKind::InvalidDataValue,
+                        "Overflow sentinel cannot be used as an object property name.",
+                        span,
+                    ));
+                }
                 if is_blocked_member(key) {
                     return Err(RuntimeError::new(
                         RuntimeErrorKind::InvalidDataValue,
@@ -7891,7 +7990,7 @@ fn json_to_value_with_overflow(
                 }
                 object.insert(
                     key.clone(),
-                    json_to_value_with_overflow(value, span, allow_overflow_sentinels)?,
+                    json_to_value_with_overflow(value, span, overflow)?,
                 );
             }
             Value::Object(Rc::new(RefCell::new(object)))
@@ -9653,7 +9752,10 @@ mod tests {
 
     use oxc_allocator::Allocator;
 
-    use super::{execute, Interpreter, RuntimeError};
+    use super::{
+        execute, json_to_value_with_overflow, repair_overflow_numbers, Interpreter,
+        OverflowSentinels, RuntimeError, Span,
+    };
     use crate::limits::ExecutionLimits;
     use crate::tools::{ToolError, ToolHost, DEFAULT_TOOL_TIMEOUT_MS};
     use crate::{parse_program, Value};
@@ -11088,6 +11190,139 @@ mod tests {
         assert_eq!(
             run_value("return String(JSON.parse('1.7976931348623157e308'));"),
             string("1.7976931348623157e+308")
+        );
+    }
+
+    #[test]
+    fn overflow_sentinels_are_per_call_and_unforgeable() {
+        // The old fixed names used to be the real tokens. They must now behave
+        // as ordinary strings even when another value in the same input
+        // overflows.
+        assert_eq!(
+            run_value(
+                "return JSON.parse('[1e400, \"__opencode_codemode_positive_infinity__\"]')[1];"
+            ),
+            string("__opencode_codemode_positive_infinity__")
+        );
+        assert_eq!(
+            run_value(
+                "return String(JSON.parse('[1e400, \"__opencode_codemode_positive_infinity__\"]')[0]);"
+            ),
+            string("Infinity")
+        );
+        assert_eq!(
+            run_value(
+                "return JSON.parse('[1e400, \"__opencode_codemode_negative_infinity__\"]')[1];"
+            ),
+            string("__opencode_codemode_negative_infinity__")
+        );
+        assert_eq!(
+            run_value("return JSON.parse('\"__opencode_codemode_positive_infinity__\"');"),
+            string("__opencode_codemode_positive_infinity__")
+        );
+
+        // A token from an earlier call is equally harmless when the caller
+        // embeds it in a later JSON.parse input that does overflow.
+        let stale = OverflowSentinels::new();
+        assert_eq!(
+            run_value(&format!(
+                "return JSON.parse('[1e400, \"{}\"]')[1];",
+                stale.positive
+            )),
+            string(&stale.positive)
+        );
+
+        // No overflow means no tokens are produced on the ordinary path.
+        assert!(
+            repair_overflow_numbers(r#"["__opencode_codemode_positive_infinity__"]"#).is_none()
+        );
+
+        // Two calls never share a token.
+        let first = OverflowSentinels::new();
+        let second = OverflowSentinels::new();
+        assert_ne!(first.positive, first.negative);
+        assert_ne!(first.positive, second.positive);
+        assert_ne!(first.negative, second.negative);
+
+        // Strings copied from an earlier call's tokens stay strings, while the
+        // overflowing literal in this call is still converted to -Infinity.
+        let source = format!(r#"[-1e400, "{}", "{}"]"#, first.negative, first.positive);
+        let repaired = repair_overflow_numbers(&source).expect("overflowing literal");
+        assert_ne!(repaired.sentinels.positive, first.positive);
+        assert_ne!(repaired.sentinels.negative, first.negative);
+        let json: serde_json::Value =
+            serde_json::from_str(&repaired.text).expect("repaired source is valid JSON");
+        let value = json_to_value_with_overflow(&json, Span::default(), Some(&repaired.sentinels))
+            .expect("conversion succeeds");
+        let items = value.as_array().expect("expected an array");
+        assert_eq!(items[0], number(f64::NEG_INFINITY));
+        assert_eq!(items[1], string(&first.negative));
+        assert_eq!(items[2], string(&first.positive));
+    }
+
+    #[test]
+    fn json_number_grammar_validation() {
+        for valid in ["0", "-0", "10", "1.5", "-1.5e+3", "1E400", "0e999"] {
+            assert!(super::is_valid_json_number(valid), "{valid}");
+        }
+        for invalid in [
+            "", "-", "01", "01e400", "1.", "1.e400", "1e", "1e+", ".1", "+1", "00",
+        ] {
+            assert!(!super::is_valid_json_number(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn malformed_overflow_literals_stay_syntax_errors() {
+        // Rust's f64 parser accepts these spellings and returns infinity, but
+        // RFC 8259 does not. They must reach serde_json untouched.
+        for source in [
+            "return JSON.parse('01e400');",
+            "return JSON.parse('1.e400');",
+            "return JSON.parse('[1e400,01e400]');",
+        ] {
+            let error = run(source).expect_err("malformed number must fail");
+            assert_eq!(
+                error.kind(),
+                super::RuntimeErrorKind::SyntaxError,
+                "{source}"
+            );
+            assert!(!error.message().contains("__opencode_codemode"), "{source}");
+        }
+
+        // An overflowing object key must be rejected instead of leaking the
+        // generated token as an observable property name.
+        let error =
+            run("return JSON.parse('{1e400:2}');").expect_err("sentinel object key must fail");
+        assert_eq!(error.kind(), super::RuntimeErrorKind::SyntaxError);
+        assert!(!error.message().contains("__opencode_codemode"));
+
+        let repaired = repair_overflow_numbers("{1e400:2}").expect("overflowing key literal");
+        let json: serde_json::Value =
+            serde_json::from_str(&repaired.text).expect("repaired key source is valid JSON");
+        let error = json_to_value_with_overflow(&json, Span::default(), Some(&repaired.sentinels))
+            .expect_err("sentinel object key is rejected");
+        assert_eq!(error.kind(), super::RuntimeErrorKind::InvalidDataValue);
+        assert!(!error
+            .message()
+            .contains(repaired.sentinels.positive.as_str()));
+        assert!(!error
+            .message()
+            .contains(repaired.sentinels.negative.as_str()));
+
+        // Well-formed overflow literals still map to infinities.
+        assert_eq!(
+            run_value("return String(JSON.parse('1e400'));"),
+            string("Infinity")
+        );
+        assert_eq!(
+            run_value("return String(JSON.parse('-1e400'));"),
+            string("-Infinity")
+        );
+        // Sentinel-like text inside a string value is never rewritten.
+        assert_eq!(
+            run_value("return JSON.parse('\"prefix__opencode_codemode_positive_infinity__\"');"),
+            string("prefix__opencode_codemode_positive_infinity__")
         );
     }
 
