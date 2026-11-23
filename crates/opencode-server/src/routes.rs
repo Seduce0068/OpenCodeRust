@@ -2818,15 +2818,68 @@ fn resolve_prompt_agent_name<'a>(
     config_default_agent: Option<&'a str>,
     registry: &AgentRegistry,
 ) -> &'a str {
+    // trim 済み名をレジストリ検索と返却に使う（前後空白のある有効名を尊重、R4）。
     let candidate = task_agent
-        .filter(|name| !name.trim().is_empty())
-        .or_else(|| config_default_agent.filter(|name| !name.trim().is_empty()));
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            config_default_agent
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        });
 
     match candidate {
         Some(name) if registry.get(name).is_some() => name,
         // 未知名と未設定はどちらも build に正規化する（例外は投げない）。
         _ => BuiltinAgent::Build.as_str(),
     }
+}
+
+/// CFGAPPLY-04-R4: `build_prompt_input` へ渡す入力をまとめる小さな構造体。
+///
+/// 9 引数による `clippy::too_many_arguments` を解消するため、既存の引数を
+/// 同じ名前・同じ型でフィールドへ移しただけのもの。値や順序は変更しない。
+struct PromptInputParts<'a> {
+    session_id: &'a str,
+    message_id: Option<String>,
+    task_provider: &'a str,
+    task_model: &'a str,
+    agent_name: &'a str,
+    system_prompt: &'a str,
+    task_variant: Option<String>,
+    prompt_text: String,
+    tools: &'a [opencode_provider::ToolDefinition],
+}
+
+/// CFGAPPLY-04-R4: `PromptInput` を組み立てる純粋ヘルパ。
+///
+/// `spawn_prompt_execution` と回帰テストが同じ経路を通るための抽出であり、
+/// 本番のフィールド値・順序は変更しない。設定値やパスはログ・エラーへ出さない。
+fn build_prompt_input(parts: PromptInputParts<'_>) -> opencode_session::PromptInput {
+    opencode_session::PromptInput {
+        session_id: parts.session_id.to_string(),
+        message_id: parts.message_id,
+        model: Some(opencode_session::prompt::ModelRef {
+            provider_id: parts.task_provider.to_string(),
+            model_id: parts.task_model.to_string(),
+        }),
+        agent: Some(parts.agent_name.to_string()),
+        no_reply: false,
+        system: Some(parts.system_prompt.to_string()),
+        variant: parts.task_variant,
+        parts: vec![opencode_session::PartInput::Text {
+            text: parts.prompt_text,
+        }],
+        tools: Some(parts.tools.iter().map(|t| (t.name.clone(), true)).collect()),
+    }
+}
+
+/// CFGAPPLY-04-R4: assistant metadata へ解決済み agent 名を挿入する純粋ヘルパ。
+///
+/// `SessionMessage.metadata` の実型は `HashMap<String, serde_json::Value>`。
+/// キー・値・挿入順は本番と同一で、設定値そのものはログへ出さない。
+fn insert_agent_metadata(metadata: &mut HashMap<String, serde_json::Value>, agent_name: &str) {
+    metadata.insert("agent".to_string(), serde_json::json!(agent_name));
 }
 
 #[cfg(test)]
@@ -2914,6 +2967,15 @@ mod default_agent_resolution_tests {
     }
 
     #[test]
+    fn surrounding_whitespace_is_trimmed_before_registry_lookup() {
+        let registry = default_registry();
+        let name = resolve_prompt_agent_name(Some("  general  "), None, &registry);
+        assert_eq!(name, "general", "task agent must be trimmed before lookup");
+        let name = resolve_prompt_agent_name(None, Some("\tbuild\n"), &registry);
+        assert_eq!(name, BuiltinAgent::Build.as_str());
+    }
+
+    #[test]
     fn whitespace_only_values_are_treated_as_unset_and_fall_back_to_build() {
         let registry = default_registry();
         let name = resolve_prompt_agent_name(Some("  \t"), Some("   "), &registry);
@@ -2926,16 +2988,87 @@ mod default_agent_resolution_tests {
     fn downstream_agent_name_is_normalized_to_build_for_unknown_task_agent() {
         let registry = default_registry();
         let name = resolve_prompt_agent_name(Some("missing-agent"), None, &registry);
-        // PromptInput.agent / assistant metadata と同じ形で下流へ渡す値を検証する。
-        let prompt_input_agent = Some(name.to_string());
-        let metadata_agent = serde_json::json!(name);
+
+        // 本番と同じ build_prompt_input を通し、PromptInput.agent が build になることを直接検証。
+        let prompt_input = build_prompt_input(PromptInputParts {
+            session_id: "session-id",
+            message_id: None,
+            task_provider: "provider-id",
+            task_model: "model-id",
+            agent_name: name,
+            system_prompt: "system-prompt",
+            task_variant: None,
+            prompt_text: "prompt-text".to_string(),
+            tools: &[],
+        });
         assert_eq!(
-            prompt_input_agent.as_deref(),
+            prompt_input.agent.as_deref(),
+            Some(BuiltinAgent::Build.as_str()),
+            "unknown task agent must reach PromptInput.agent as normalized build"
+        );
+
+        // 本番と同じ insert_agent_metadata を通し、metadata.agent が build になることを直接検証。
+        let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+        insert_agent_metadata(&mut metadata, name);
+        assert_eq!(
+            metadata.get("agent"),
+            Some(&serde_json::json!(BuiltinAgent::Build.as_str())),
+            "unknown task agent must reach assistant metadata as normalized build"
+        );
+    }
+
+    #[test]
+    fn downstream_agent_name_uses_config_default_agent() {
+        let registry = default_registry();
+        let config = AppConfig {
+            default_agent: Some("general".to_string()),
+            ..Default::default()
+        };
+
+        // タスク側未指定なら config.default_agent がそのまま下流へ届く。
+        let name = resolve_prompt_agent_name(None, config.default_agent.as_deref(), &registry);
+        let prompt_input = build_prompt_input(PromptInputParts {
+            session_id: "session-id",
+            message_id: None,
+            task_provider: "provider-id",
+            task_model: "model-id",
+            agent_name: name,
+            system_prompt: "system-prompt",
+            task_variant: None,
+            prompt_text: "prompt-text".to_string(),
+            tools: &[],
+        });
+        assert_eq!(prompt_input.agent.as_deref(), Some("general"));
+        let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+        insert_agent_metadata(&mut metadata, name);
+        assert_eq!(metadata.get("agent"), Some(&serde_json::json!("general")));
+
+        // タスク側が未知名なら、有効な config.default_agent があっても build に正規化される。
+        let name = resolve_prompt_agent_name(
+            Some("missing-agent"),
+            config.default_agent.as_deref(),
+            &registry,
+        );
+        let prompt_input = build_prompt_input(PromptInputParts {
+            session_id: "session-id",
+            message_id: None,
+            task_provider: "provider-id",
+            task_model: "model-id",
+            agent_name: name,
+            system_prompt: "system-prompt",
+            task_variant: None,
+            prompt_text: "prompt-text".to_string(),
+            tools: &[],
+        });
+        assert_eq!(
+            prompt_input.agent.as_deref(),
             Some(BuiltinAgent::Build.as_str())
         );
+        let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+        insert_agent_metadata(&mut metadata, name);
         assert_eq!(
-            metadata_agent,
-            serde_json::json!(BuiltinAgent::Build.as_str())
+            metadata.get("agent"),
+            Some(&serde_json::json!(BuiltinAgent::Build.as_str()))
         );
     }
 }
@@ -3294,20 +3427,18 @@ fn spawn_prompt_execution(
         )))
         .with_todo_hooks(todo_update, todo_get)
         .with_compaction_config(compaction_config);
-        let input = opencode_session::PromptInput {
-            session_id: session_id.clone(),
+        // CFGAPPLY-04-R4: 純粋ヘルパへ抽出。フィールド値・順序は従来どおり。
+        let input = build_prompt_input(PromptInputParts {
+            session_id: &session_id,
             message_id,
-            model: Some(opencode_session::prompt::ModelRef {
-                provider_id: task_provider.clone(),
-                model_id: task_model.clone(),
-            }),
-            agent: Some(agent_name.to_string()),
-            no_reply: false,
-            system: Some(system_prompt.clone()),
-            variant: task_variant.clone(),
-            parts: vec![opencode_session::PartInput::Text { text: prompt_text }],
-            tools: Some(tools.iter().map(|t| (t.name.clone(), true)).collect()),
-        };
+            task_provider: &task_provider,
+            task_model: &task_model,
+            agent_name,
+            system_prompt: &system_prompt,
+            task_variant: task_variant.clone(),
+            prompt_text,
+            tools: &tools,
+        });
 
         // この実行で追加された assistant メッセージだけに queue_id を付与するため、
         // プロンプト実行前のメッセージ数を記録する。
@@ -3355,9 +3486,8 @@ fn spawn_prompt_execution(
             assistant
                 .metadata
                 .insert("model_id".to_string(), serde_json::json!(&task_model));
-            assistant
-                .metadata
-                .insert("agent".to_string(), serde_json::json!(agent_name));
+            // CFGAPPLY-04-R4: 純粋ヘルパへ抽出。キー・値は従来どおり。
+            insert_agent_metadata(&mut assistant.metadata, agent_name);
             assistant.add_text(format!("{client_message} (reference: {correlation_id})"));
             if let (Some(queue_id), Some(input_repo)) =
                 (queue_id.as_deref(), task_state.input_repo.as_ref())
