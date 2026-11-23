@@ -221,6 +221,7 @@ struct LegacySseParserState {
     tool_call_ids: HashMap<u32, String>,
     tool_call_names: HashMap<u32, String>,
     reasoning_open: bool,
+    index_out_of_range_warned: bool,
 }
 
 // usage のデコード失敗はトークン値を一切ログに出さず、同一ストリーム内では
@@ -246,6 +247,30 @@ fn warn_tool_arguments_decode_failure_once(warned: &mut bool) {
     tracing::warn!(
         event = "provider_tool_arguments_decode_failed",
         "tool arguments decode failed"
+    );
+}
+
+// 外部 SSE 由来の tool_call index を安全に u32 へ変換する。
+// - index 欠落 (None) は従来どおり 0 として扱う (0 は正当な index のため)。
+// - u32::MAX 超の値は下位 32bit へ切詰めると 0 等と同じキーになり ID/引数が
+//   混線するため、None を返して呼び出し側で当該エントリをスキップさせる。
+fn safe_tool_call_index(raw: Option<u64>) -> Option<u32> {
+    match raw {
+        None => Some(0),
+        Some(value) => u32::try_from(value).ok(),
+    }
+}
+
+// index 範囲外によるスキップは値を一切ログに出さず、同一ストリーム/レスポンス内では
+// 最初の 1 回だけ固定文言の構造化 warn を出す。
+fn warn_tool_call_index_out_of_range_once(warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        event = "provider_tool_call_index_out_of_range",
+        "tool call index out of range"
     );
 }
 
@@ -430,7 +455,14 @@ impl OpenAIProvider {
                             });
                         }
                         for tc in tool_calls {
-                            let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                            let Some(index) =
+                                safe_tool_call_index(tc.get("index").and_then(Value::as_u64))
+                            else {
+                                warn_tool_call_index_out_of_range_once(
+                                    &mut state.index_out_of_range_warned,
+                                );
+                                continue;
+                            };
                             let id = if let Some(id) = tc.get("id").and_then(Value::as_str) {
                                 let id = id.to_string();
                                 state.tool_call_ids.insert(index, id.clone());
@@ -834,6 +866,7 @@ impl OpenAIProvider {
         let mut usage_warned = false;
         // tool_calls keyed by index: (id, name, arguments)
         let mut tool_calls: HashMap<u32, (Option<String>, Option<String>, String)> = HashMap::new();
+        let mut index_out_of_range_warned = false;
 
         for line in body.lines() {
             let line = line.trim();
@@ -864,8 +897,14 @@ impl OpenAIProvider {
                         }
                         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for tc in tcs {
-                                let idx =
-                                    tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let Some(idx) =
+                                    safe_tool_call_index(tc.get("index").and_then(Value::as_u64))
+                                else {
+                                    warn_tool_call_index_out_of_range_once(
+                                        &mut index_out_of_range_warned,
+                                    );
+                                    continue;
+                                };
                                 let entry =
                                     tool_calls.entry(idx).or_insert((None, None, String::new()));
                                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
@@ -1643,6 +1682,141 @@ mod tests {
             delta.first(),
             Some(StreamEvent::ToolCallDelta { id, input }) if id == "tool-call-0" && input == "{\"cmd\":\"ls\"}"
         ));
+    }
+
+    #[test]
+    fn parse_legacy_sse_data_out_of_range_index_does_not_collide_with_zero() {
+        let mut state = LegacySseParserState::default();
+
+        // 先に正当な index=0 を登録する。
+        let events = OpenAIProvider::parse_legacy_sse_data(
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc-zero\",\"function\":{\"name\":\"zero\"}}]}}]}",
+            &mut state,
+        );
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::ToolCallStart { id, name }) if id == "tc-zero" && name == "zero"
+        ));
+
+        // 2^32 は u32 を超えるためスキップされ、index=0 のエントリを汚さない。
+        let events = OpenAIProvider::parse_legacy_sse_data(
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":4294967296,\"id\":\"tc-overflow\",\"function\":{\"name\":\"overflow\"},\"arguments\":\"leak-marker-overflow\"}]}}]}",
+            &mut state,
+        );
+        assert!(
+            events.is_empty(),
+            "out-of-range index must be skipped: {events:?}"
+        );
+        assert_eq!(
+            state.tool_call_ids.get(&0).map(String::as_str),
+            Some("tc-zero"),
+            "index=0 entry must stay intact"
+        );
+        assert_eq!(
+            state.tool_call_names.get(&0).map(String::as_str),
+            Some("zero")
+        );
+        assert!(!state
+            .tool_call_ids
+            .values()
+            .any(|value| value.contains("overflow")));
+        assert!(!state
+            .tool_call_names
+            .values()
+            .any(|value| value.contains("overflow")));
+    }
+
+    #[test]
+    fn parse_legacy_sse_data_missing_index_uses_zero_as_before() {
+        let mut state = LegacySseParserState::default();
+        let start = OpenAIProvider::parse_legacy_sse_data(
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"f\"}}]}}]}",
+            &mut state,
+        );
+        assert!(matches!(
+            start.first(),
+            Some(StreamEvent::ToolCallStart { id, name }) if id == "tool-call-0" && name == "f"
+        ));
+
+        let delta = OpenAIProvider::parse_legacy_sse_data(
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"arg-zero\"}}]}}]}",
+            &mut state,
+        );
+        assert!(matches!(
+            delta.first(),
+            Some(StreamEvent::ToolCallDelta { id, input }) if id == "tool-call-0" && input == "arg-zero"
+        ));
+    }
+
+    #[test]
+    fn reassemble_sse_chunks_out_of_range_index_does_not_collide_with_zero() {
+        let capture = UsageWarnCapture::default();
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc-zero\",\"function\":{\"name\":\"zero\",\"arguments\":\"arg-zero\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":4294967296,\"id\":\"tc-overflow\",\"function\":{\"name\":\"overflow\",\"arguments\":\"leak-marker-overflow\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":8589934592,\"id\":\"tc-overflow-2\",\"function\":{\"name\":\"overflow\",\"arguments\":\"leak-marker-overflow-2\"}}]}}]}\n",
+            "\n"
+        );
+
+        let result = tracing::subscriber::with_default(capture.clone(), || {
+            OpenAIProvider::reassemble_sse_chunks(body).expect("SSE should reassemble")
+        });
+
+        let calls = result.choices[0]
+            .message
+            .as_ref()
+            .and_then(|message| message.tool_calls.as_ref())
+            .expect("tool_calls should be present");
+        assert_eq!(calls.len(), 1, "out-of-range index must be skipped");
+        let call = &calls[0];
+        assert_eq!(call.id.as_deref(), Some("tc-zero"));
+        assert_eq!(
+            call.function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("zero")
+        );
+        assert_eq!(
+            call.function.as_ref().and_then(|f| f.arguments.as_deref()),
+            Some("arg-zero")
+        );
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "out-of-range index must warn once");
+        assert_eq!(events[0].0, "provider_tool_call_index_out_of_range");
+        assert!(!events[0].0.contains("overflow"));
+        assert!(!events[0].1.contains("overflow"));
+    }
+
+    #[test]
+    fn reassemble_sse_chunks_missing_index_uses_zero_as_before() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"tc-missing\",\"function\":{\"name\":\"f\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"arg-zero\"}}]}}]}\n",
+            "\n"
+        );
+
+        let result = OpenAIProvider::reassemble_sse_chunks(body).expect("SSE should reassemble");
+        let calls = result.choices[0]
+            .message
+            .as_ref()
+            .and_then(|message| message.tool_calls.as_ref())
+            .expect("tool_calls should be present");
+        assert_eq!(
+            calls.len(),
+            1,
+            "missing index maps to key 0 and merges with explicit index 0"
+        );
+        assert_eq!(calls[0].id.as_deref(), Some("tc-missing"));
+        assert_eq!(
+            calls[0].function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("f")
+        );
+        assert_eq!(
+            calls[0]
+                .function
+                .as_ref()
+                .and_then(|f| f.arguments.as_deref()),
+            Some("arg-zero")
+        );
     }
 
     #[test]
