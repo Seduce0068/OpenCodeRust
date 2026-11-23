@@ -67,12 +67,12 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **default_agent の下流経路が回帰テストで直接検証されていない**
+  — `server/routes.rs:2926` / CFGAPPLY-04-R4 / 中（high）
 - [ ] **StreamProcessor の compaction_config が本番配線されない**
   — `session/llm.rs:474` / CFGAPPLY-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
-- [ ] **default_agent 設定がエージェント選択へ反映されない**
-  — `server/routes.rs:3010` / CFGAPPLY-04 / 中
 - [ ] **skills.urls がスキル探索ルートに使われない**
   — `tool/skill.rs:83` / CFGAPPLY-05 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
@@ -277,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[default_agent 配線 1 件]** エージェント選択/downstream へ反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[404/405 JSON 契約 1 件]** fallback envelope を追加
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[設定配線 2 件]** LSP env と MCP OAuth clientId
@@ -860,6 +862,13 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（default_agent 配線の修正時）: 下流経路の回帰ガードが
+  実際の PromptInput/metadata 構築を通していない（medium、テスト品質）、
+  hidden エージェントが解決候補として受理され得る、設定値の前後空白が
+  trim されずカスタムエージェントが build に落ちる（low 2 件）— 後方互換
+  に関わるため記録のみ。親が子の指摘で未知名/空文字を build へ正規化する
+  よう直接修正済み。session.metadata の config 非反映は config ロード
+  順序の問題で resume_session 未呼び出しのため即時影響なし。
 - 2026-11-23 R4 指摘（404/405 fallback の修正時）: 子が記録した
   「ネスト内サブルーターには fallback が効かない」は axum 0.8.9 の実装と
   矛盾。親が一時テストで実挙動を確認（GET /session/no-such は JSON
