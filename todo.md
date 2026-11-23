@@ -67,6 +67,8 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **apply_patch が diff ヘッダ形式の行を黙って捨てる**
+  — `tool/apply_patch.rs:868` / PARSE-01 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -164,6 +166,20 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **CLI 質問の空入力が暗黙に最初の選択肢（Yes）として扱われる**
+  — `tool/question.rs:196` / AV-03 / 低
+- [ ] **task ツールが任意 task_id を検証せず渡す**
+  — `tool/task.rs:56` / AV-04 / 低
+- [ ] **WebSearch/CodeSearch の query に空/過大の検証が無い**
+  — `tool/websearch.rs:43` / AV-05 / 低
+- [ ] **LspTool の位置・rename 名がスキーマ制約をすり抜ける**
+  — `tool/lsp_tool.rs:63` / AV-06 / 低
+- [ ] **CodeMode JSON.parse がセンチネル文字列を Infinity に誤変換**
+  — `codemode/interpreter.rs:7869` / PARSE-02 / 低
+- [ ] **不正な mcp.timeout がゴースト MCP サーバーとして読まれる**
+  — `config/schema.rs:1470` / PARSE-03 / 低
+- [ ] **plugin auth.fetch の不正チャンクが通知を捨てる**
+  — `plugin/subprocess/client.rs:538` / PARSE-04 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
   — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -261,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[入力検証 2 件]** Plan 誤承認と CodeSearch エラー露出を修正
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI theme 1 件]** 起動時に config.theme / tui.sidebar を反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[SSE join 1 件]** 終了時の待ちを 2 秒の期限付き並列待ちへ
@@ -868,6 +886,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 cross-skill 集約（swarm289、2 担当・10 件、観点: パース境界 /
+  入力検証と権限）: 入力検証から medium 2 件（PlanEnter/Exit の誤承認、
+  CodeSearch の生エラー露出）を coding、計 8 件を triage。R4 指摘なし。
+  Plan の承認判定を許可リスト（Yes のみ）へ反転。子が CLI 空入力の
+  Yes フォールバック（AV-03）を残存として指摘し triage 済み。
 - 2026-11-24 TUI theme 配線: opencode-tui に workspace 内 opencode-config 依存
   を追加し、AppContext::apply_ui_config / new_with_config と App::new_with_config
   を追加。config I/O は run_tui 起動経路のみに限定し new() は副作用なし
