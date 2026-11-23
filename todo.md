@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **command の subtask フラグが実行へ渡されない**
-  — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -261,6 +259,8 @@ status: current
 
 ## 完了
 
+- [x] **[command subtask 1 件]** 未配線として MAPPING.md へ明記
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[task_id 検証 1 件]** 生成形式を受理し再開を維持
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin チャンク検証 1 件]** 不正 chunk を Protocol エラー化
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 command subtask: Config.command は loader が parse／DeepMerge
+  するが runtime 消費 0 件、/command 一覧は 501。機能全体が未実装という
+  過剰一般化を R4 が指摘したため親が表現を修正（POST /{id}/command の
+  キュー投入と CLI CommandRegistry は別経路で動作）。subtask 単独配線は
+  意味を持たないため MAPPING.md 未配線セクションへ明記。
 - 2026-11-24 task_id: 生成 ID の実形式が `task_{agent}_{uuid}`（simple/
   standard）であることを親が確認（最初の sub_{uuid} という判断は
   PartInput::Subtask の別 ID で誤り）。検証を task_ 形式も受理するよう

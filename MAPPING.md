@@ -191,6 +191,19 @@ runtime 消費箇所は schema.rs 外に 0 件である (grep による事実確
   参加するが、schema.rs 外の runtime 消費箇所は 0 件 (grep による事実確認)。
   環境由来の値は設定ファイルへ書き戻されない
   (`loader.rs:2710-2713`、username 永続化を避ける既存の挙動)。
+- `command` (`CommandConfig`) とサブフィールド `subtask` (`Option<bool>`)
+   — 2026-11-24 再確認。`Config.command` は loader
+   (`crates/opencode-config/src/loader.rs:1459`、`:1638`) で parse され、
+   `CommandConfig.subtask` (`crates/opencode-config/src/schema.rs:950-963`)
+   は `DeepMerge` に参加する。schema.rs 外の runtime 消費箇所は
+   0 件 (grep による事実確認)。server の `/command` エンドポイントは
+   `not_implemented("commands")` で 501 を返す
+   (`crates/opencode-server/src/routes.rs:7153-7154`)。`Config.command` の
+   runtime 消費経路が無いため、`subtask` 単独の配線は意味を持たない
+   (R4: `POST /{id}/command` のキュー投入と CLI の `CommandRegistry` は
+   別経路で動作するため「command 機能全体が未実装」ではない)。前出の
+   「upstream 新規キーとキー名ズレ」節の表で `commands` が
+   「未対応 (alias せず)」とある点と整合する。
 - 本節の Config フィールドとは別に、`StreamProcessor` の
   `with_compaction_config` (`opencode-session` の `llm.rs`) も 2026-11-23
   再確認で本番未配線である。`StreamProcessor::new` の呼び出しは `llm.rs` の
