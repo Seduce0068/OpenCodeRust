@@ -85,6 +85,30 @@ fn collect_skill_roots(base: &Path) -> Vec<PathBuf> {
             for raw in skills.paths.into_inner() {
                 roots.push(resolve_skill_path(base, &raw));
             }
+            for raw in skills.urls.into_inner() {
+                // RFC 3986 のスキームは大小文字を区別しない（R4）。
+                let lowered = raw.to_ascii_lowercase();
+                if lowered.starts_with("http://") || lowered.starts_with("https://") {
+                    // リモート URL はローカルの探索ルートとして扱えないためスキップする。
+                    // 値や URL はログに出さない（固定文言のみ）。
+                    tracing::debug!("skipping remote URL in skills.urls");
+                    continue;
+                }
+                // file:// はスキームを除いたパス部分をローカルルートとして扱う（R4）。
+                // file://host/path の host は無視し、続くパス部分のみを使う。
+                let path = if lowered.starts_with("file://") {
+                    raw["file://".len()..]
+                        .split_once('/')
+                        .map(|(_, rest)| rest)
+                        .unwrap_or("")
+                } else {
+                    raw.as_str()
+                };
+                if path.is_empty() {
+                    continue;
+                }
+                roots.push(resolve_skill_path(base, path));
+            }
         }
     }
 
@@ -479,6 +503,82 @@ custom content
 
         assert!(names.contains(&"local-skill".to_string()));
         assert!(names.contains(&"custom-skill".to_string()));
+    }
+
+    #[test]
+    fn collect_skill_roots_includes_local_urls_from_config() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("opencode.json"),
+            r#"{
+  "skills": {
+    "urls": ["url-skills"]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let roots = collect_skill_roots(root);
+        assert!(roots.contains(&root.join("url-skills")));
+    }
+
+    #[test]
+    fn collect_skill_roots_handles_file_scheme_and_uppercase_remote_scheme() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("opencode.json"),
+            r#"{
+  "skills": {
+    "urls": ["file:///opt/shared/skills", "HTTPS://EXAMPLE.COM/skills"]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let roots = collect_skill_roots(root);
+        assert!(
+            roots.iter().any(|path| path.ends_with("opt/shared/skills")),
+            "file:// URL must be resolved to its path component"
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|path| !path.to_string_lossy().contains("EXAMPLE.COM")),
+            "uppercase remote scheme must also be skipped"
+        );
+    }
+
+    #[test]
+    fn collect_skill_roots_skips_remote_urls_from_config() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("opencode.json"),
+            r#"{
+  "skills": {
+    "urls": [
+      "https://example.com/skills",
+      "http://example.com/skills",
+      "local-url-skills"
+    ]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let roots = collect_skill_roots(root);
+        assert!(roots.contains(&root.join("local-url-skills")));
+        assert!(
+            roots
+                .iter()
+                .all(|root| !root.to_string_lossy().contains("example.com")),
+            "remote URLs must not become skill roots"
+        );
     }
 
     #[test]
