@@ -1243,14 +1243,29 @@ impl ApiClient {
         current.clone()
     }
 
+    /// 権限要求へ reply を送る。サーバが「既に回答済み」を表す 404 は成功扱いにする。
+    ///
+    // API 契約: サーバは `broker.reply` が false（要求が既にキューから
+    // 除去済み）なら HTTP 404 を返す。この契約は変更しない。
+    // 1 回目の reply がサーバに届いたのに応答が失われた場合、再送は必ず
+    // 404 になる。TUI 側で 404 を「既に回答済み」として `Ok(())` に
+    // 変換し、再送が失敗扱いになってプロンプトが閉じない問題を防ぐ。
+    // 404 以外の非成功ステータスは従来どおり `Err` とする。
+    // エラー・ログには要求 ID / トークン / パスを一切含めない。
     pub fn reply_permission(&self, request_id: &str, reply: &str) -> anyhow::Result<()> {
         let url = format!("{}/permission/{}/reply", self.base_url, request_id);
         let body = serde_json::json!({
             "reply": reply,
         });
         let response = self.client.post(&url).json(&body).send()?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 既に回答済み。ボディは内容を見ずに読み捨てる（Keep-Alive の
+            // コネクションをプールへ戻すため）。ログ・エラーへは渡さない。
+            let _ = response.bytes();
+            return Ok(());
+        }
+        if !status.is_success() {
             let text = response.text().unwrap_or_default();
             anyhow::bail!(
                 "Failed to reply to permission request: {}",
@@ -2719,6 +2734,60 @@ mod tests {
             "delete must DELETE /session/{{id}}: {}",
             request.request_line
         );
+    }
+
+    // --- R2 (RETRY-01): 権限 reply の 404 を冪等な「既に回答済み」として扱う回帰テスト ---
+    // サーバ契約（broker.reply が false なら 404）は変更せず、TUI 側の解釈のみを検証する。
+
+    #[test]
+    fn reply_permission_returns_ok_on_404_already_answered() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "404 Not Found",
+            r#"{"error":{"type":"NotFound","message":"permission reply not found"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        client
+            .reply_permission("perm_already_answered", "once")
+            .expect("404 must be interpreted as already answered, not an error");
+
+        let request = mock.request();
+        assert!(
+            request
+                .request_line
+                .starts_with("POST /permission/perm_already_answered/reply "),
+            "reply must POST to /permission/{{id}}/reply: {}",
+            request.request_line
+        );
+    }
+
+    #[test]
+    fn reply_permission_still_errors_on_500_without_leaking_request_id() {
+        ensure_no_proxy();
+        let mock = RecordingMock::spawn_with_status(
+            "500 Internal Server Error",
+            r#"{"error":{"type":"internal_error","message":"boom"}}"#,
+        );
+        let client = ApiClient::new(mock.base_url.clone());
+
+        let err = client
+            .reply_permission("perm-secret-id", "once")
+            .expect_err("500 must remain an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("500 Internal Server Error"),
+            "message: {message}"
+        );
+        assert!(
+            !message.contains("perm-secret-id"),
+            "request id must not leak into error: {message}"
+        );
+        assert!(
+            !message.contains("/permission/"),
+            "path must not leak into error: {message}"
+        );
+        let _request = mock.request();
     }
 
     // --- R2 (API-08): セッション一覧の pagination 引数露出の回帰テスト（loopback のみ） ---

@@ -5938,8 +5938,9 @@ mod tests {
 
     #[test]
     fn permission_reply_http_failure_keeps_request_for_retry() {
-        // 送信失敗（500 / 404）時は要求を残し、トーストを出して再試行可能にする。
-        for status in ["500 Internal Server Error", "404 Not Found"] {
+        // 送信失敗（404 以外の非成功ステータス）時は要求を残し、トーストを出して
+        // 再試行可能にする。404（既に回答済み）は成功扱いになるため含めない。
+        for status in ["500 Internal Server Error", "503 Service Unavailable"] {
             let (base_url, reply_hits, recorded) = spawn_permission_reply_api_with_status(status);
             let context = Arc::new(AppContext::new());
             context.set_api_client(Arc::new(ApiClient::new(base_url)));
@@ -6072,6 +6073,70 @@ mod tests {
                 .iter()
                 .all(|(path, _)| path.contains("/permission/perm_retry_flow/reply")),
             "both attempts must reuse the original request id"
+        );
+    }
+
+    #[test]
+    fn permission_reply_already_answered_404_closes_prompt_without_error() {
+        // 1 回目 200 でサーバ側の要求は除去済み。同名 id の再送には 404 が返る。
+        // 404 は「既に回答済み」として成功扱いになり、要求は残らずエラーも出ない。
+        let (base_url, reply_hits, recorded) =
+            spawn_permission_reply_api_with_statuses(vec!["200 OK", "404 Not Found"]);
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(context);
+
+        app.permission_prompt.add_request(PermissionRequest {
+            id: "perm_already_answered".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: "ls -la".to_string(),
+            tool_name: "bash".to_string(),
+        });
+
+        // 1 回目: 200 → 要求が削除されプロンプトが閉じる。
+        app.apply_permission_action(PermissionAction::Approve);
+        assert!(
+            app.permission_prompt.is_empty(),
+            "first 200 reply must close the prompt"
+        );
+
+        // 同じ id の要求が再キューされた状況を再現（重複イベント等）。
+        app.permission_prompt.add_request(PermissionRequest {
+            id: "perm_already_answered".to_string(),
+            permission_type: PermissionType::Bash,
+            resource: "ls -la".to_string(),
+            tool_name: "bash".to_string(),
+        });
+
+        // 2 回目: 404（既に回答済み）→ Err にならず要求が残らない。
+        app.apply_permission_action(PermissionAction::Approve);
+        assert!(
+            app.permission_prompt.is_empty(),
+            "already-answered 404 must remove the request and close the prompt"
+        );
+        assert_eq!(
+            app.permission_prompt.pending_count(),
+            0,
+            "already-answered 404 must not leave a pending request"
+        );
+        assert_eq!(
+            reply_hits.load(Ordering::SeqCst),
+            2,
+            "both replies must reach the server"
+        );
+        {
+            let recorded = recorded.lock().expect("record lock");
+            assert_eq!(recorded.len(), 2, "both replies must be recorded");
+            assert!(
+                recorded
+                    .iter()
+                    .all(|(path, _)| path.contains("/permission/perm_already_answered/reply")),
+                "both replies must reuse the original request id"
+            );
+        }
+        assert!(
+            !app.toast.is_visible(),
+            "already-answered 404 must not surface an error toast"
         );
     }
 
