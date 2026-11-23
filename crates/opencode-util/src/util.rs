@@ -27,7 +27,7 @@ pub mod color {
     }
 
     pub fn ansi_length(s: &str) -> usize {
-        strip_ansi(s).len()
+        strip_ansi(s).chars().count()
     }
 }
 
@@ -88,7 +88,7 @@ pub mod token {
         if input.is_empty() {
             return 0;
         }
-        input.len() / CHARS_PER_TOKEN
+        input.chars().count() / CHARS_PER_TOKEN
     }
 
     pub fn estimate_messages(messages: &[&str]) -> usize {
@@ -334,5 +334,17 @@ mod tests {
         let input = "\x1b[32mhello\x1b[0m";
         assert_eq!(color::strip_ansi(input), "hello");
         assert_eq!(color::ansi_length(input), 5);
+    }
+
+    #[test]
+    fn test_token_estimate_multibyte() {
+        assert_eq!(token::estimate("あ".repeat(4).as_str()), 1);
+        assert_eq!(token::estimate("😀".repeat(4).as_str()), 1);
+    }
+
+    #[test]
+    fn test_color_ansi_length_multibyte() {
+        assert_eq!(color::ansi_length("\x1b[32mあ\x1b[0m"), 1);
+        assert_eq!(color::ansi_length("\x1b[32m😀\x1b[0m"), 1);
     }
 }
