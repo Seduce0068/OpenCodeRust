@@ -191,6 +191,14 @@ runtime 消費箇所は schema.rs 外に 0 件である (grep による事実確
   参加するが、schema.rs 外の runtime 消費箇所は 0 件 (grep による事実確認)。
   環境由来の値は設定ファイルへ書き戻されない
   (`loader.rs:2710-2713`、username 永続化を避ける既存の挙動)。
+- 本節の Config フィールドとは別に、`StreamProcessor` の
+  `with_compaction_config` (`opencode-session` の `llm.rs`) も 2026-11-23
+  再確認で本番未配線である。`StreamProcessor::new` の呼び出しは `llm.rs` の
+  テストモジュールのみで本番配線は 0 件 (grep による事実確認)。本番の
+  compaction 判定は `SessionPrompt` 側 (`should_compact` /
+  `prune_after_loop`) が担い、設定は `SessionPrompt::with_compaction_config`
+  経由で反映される (`routes.rs` で配線済み)。配線そのものは本タスクの
+  scope 外のため、ここでは現状を明記するのみとする。
 
 `ExperimentalConfig` のサブフィールド 6 件も同様に未配線である:
 `disable_paste_summary`、`batch_tool`、`open_telemetry` (alias

@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **StreamProcessor の compaction_config が本番配線されない**
-  — `session/llm.rs:474` / CFGAPPLY-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[StreamProcessor 1 件]** 本番未使用を明記して現状確定
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[Config.username 1 件]** 未配線として MAPPING.md へ明記
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[skills.urls 配線 1 件]** ローカル URL を探索ルートへ反映
@@ -862,6 +862,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 StreamProcessor の確定: new() の呼び出し 9 件はすべて
+  llm.rs テストモジュール内で本番配線 0 件、本番の compaction gate は
+  SessionPrompt 側（routes.rs:3429 で配線済み）が担う事実を doc と MAPPING.md
+  へ明記。API/wire/動作は不変。R4 が「テストモジュール専用」表現の不正確さ
+  （型は pub re-export 済み）を指摘したため親が呼び出しベースの表現へ修正。
 - 2026-11-23 Config.username の確定: runtime consumer 0 件を再確認し
   MAPPING.md の未配線一覧へ明記（USER/USERNAME 注入、永続化抑止、URL の
   username は別物）。子が指示の行番号誤りを指摘し実コード (loader.rs:2410)
