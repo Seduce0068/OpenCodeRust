@@ -650,7 +650,7 @@ impl CompositeReplacer {
 }
 
 pub fn normalize_line_endings(text: &str) -> String {
-    text.replace("\r\n", "\n")
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub fn trim_diff(diff: &str) -> String {
@@ -771,6 +771,14 @@ impl FileDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_line_endings_replaces_lone_cr() {
+        // 回帰: pub 再エクスポート版も CRLF と同様に CR 単独を LF へ正規化する (NORM-07)。
+        assert_eq!(normalize_line_endings("a\rb"), "a\nb");
+        assert_eq!(normalize_line_endings("a\r\nb"), "a\nb");
+        assert_eq!(normalize_line_endings("a\nb"), "a\nb");
+    }
 
     #[test]
     fn test_levenshtein() {

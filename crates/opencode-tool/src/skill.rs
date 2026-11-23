@@ -119,7 +119,9 @@ fn parse_frontmatter_value(frontmatter: &str, key: &str) -> Option<String> {
 
 fn parse_skill_file(path: &Path) -> Option<SkillInfo> {
     let raw = fs::read_to_string(path).ok()?;
-    let normalized = raw.replace("\r\n", "\n");
+    // CRLF はまず LF へ寄せ、残った CR 単独（旧 Mac 形式）も LF として扱う。
+    // これにより "---\rname: ...\r---" のような 1 行化を防ぐ。
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = normalized.lines();
 
     if lines.next()?.trim() != "---" {
@@ -395,6 +397,39 @@ Do a thorough review.
         assert_eq!(parsed.name, "reviewer");
         assert_eq!(parsed.description, "Review code changes");
         assert!(parsed.content.contains("Do a thorough review."));
+    }
+
+    #[test]
+    fn parse_skill_file_reads_cr_only_line_endings() {
+        let dir = tempdir().unwrap();
+        let skill_path = dir.path().join("SKILL.md");
+        // CR 単独（旧 Mac 形式）でも frontmatter が 1 行に化けないこと。
+        fs::write(
+            &skill_path,
+            "---\rname: cr-skill\rdescription: CR only\r---\r\rbody line\r",
+        )
+        .unwrap();
+
+        let parsed = parse_skill_file(&skill_path).unwrap();
+        assert_eq!(parsed.name, "cr-skill");
+        assert_eq!(parsed.description, "CR only");
+        assert_eq!(parsed.content, "body line");
+    }
+
+    #[test]
+    fn parse_skill_file_crlf_matches_lf() {
+        let dir = tempdir().unwrap();
+        let lf = "---\nname: same\ndescription: d\n---\nbody\n";
+        let lf_path = dir.path().join("LF.md");
+        let crlf_path = dir.path().join("CRLF.md");
+        fs::write(&lf_path, lf).unwrap();
+        fs::write(&crlf_path, lf.replace('\n', "\r\n")).unwrap();
+
+        let from_lf = parse_skill_file(&lf_path).unwrap();
+        let from_crlf = parse_skill_file(&crlf_path).unwrap();
+        assert_eq!(from_lf.name, from_crlf.name);
+        assert_eq!(from_lf.description, from_crlf.description);
+        assert_eq!(from_lf.content, from_crlf.content);
     }
 
     #[test]

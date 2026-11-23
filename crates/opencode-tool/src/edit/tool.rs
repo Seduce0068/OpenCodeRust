@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::replacers::CompositeReplacer;
+use super::replacers::{normalize_line_endings, CompositeReplacer};
 use crate::tool::parse_bool_arg;
 use crate::{with_file_lock, Metadata, Tool, ToolContext, ToolError, ToolResult};
 
@@ -508,10 +508,6 @@ fn create_diff(filepath: &str, old_content: &str, new_content: &str) -> String {
     diff
 }
 
-fn normalize_line_endings(text: &str) -> String {
-    text.replace("\r\n", "\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +525,16 @@ mod tests {
     #[test]
     fn normalize_line_endings_replaces_crlf() {
         assert_eq!(normalize_line_endings("a\r\nb\r\nc"), "a\nb\nc");
+        assert_eq!(normalize_line_endings("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn normalize_line_endings_replaces_lone_cr() {
+        // 回帰: CR 単独の改行も LF へ正規化しないと、行分割が 1 行扱いになり
+        // LF で渡した old_string が一致しなくなる (NORM-07)。
+        assert_eq!(normalize_line_endings("a\rb"), "a\nb");
+        // CRLF / LF の既存結果は不変。
+        assert_eq!(normalize_line_endings("a\r\nb"), "a\nb");
         assert_eq!(normalize_line_endings("a\nb"), "a\nb");
     }
 
