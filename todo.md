@@ -168,10 +168,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **CodeMode trim が NEL を除去し JS 非準拠**
-  — `codemode/date.rs:122` / NORM-03 / 低
-- [ ] **日付と時刻の区切りが ASCII 半角スペースのみ**
-  — `codemode/date.rs:118` / NORM-04 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -274,6 +270,8 @@ status: current
 
 ## 完了
 
+- [x] **[CodeMode 空白 2 件]** ECMAScript 準拠の trim / 日付区切り
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[パス区切り 2 件]** ls ignore / grep glob の Windows 区切り対応
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CORS 大小文字 2 件]** whitelist / ビルトイン許可リストを統一
