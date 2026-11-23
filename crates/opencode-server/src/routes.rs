@@ -1,9 +1,9 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Extension, Path, Query, State,
+        Extension, FromRequest, FromRequestParts, Path, Query, State,
     },
-    http::{HeaderMap, Request, StatusCode},
+    http::{request::Parts, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, Sse},
     response::{Html, IntoResponse, Response},
@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
@@ -45,6 +45,62 @@ use opencode_provider::{
 };
 use opencode_session::system::{EnvironmentContext, SystemPrompt};
 use opencode_tool::create_default_registry;
+
+/// `axum::Json` と同じく JSON 本文を `T` へデシリアライズする extractor。
+///
+/// `axum` 0.8 の `JsonRejection` は `Content-Type` 不正・JSON 構文不正・
+/// 型不一致を `text/plain` で返し、クライアントの JSON envelope 解釈
+/// （`error.type` / `error.message`）を壊す (ERR-ENVELOPE-01)。
+/// ここでは `axum::Json` に委譲して成功値はそのままアンラップし、
+/// rejection だけを [`ApiError::BadRequest`] の JSON envelope へ変換する。
+/// 固定文言のみを返し、本文の内容（トークン／パス等）は一切載せない。
+#[derive(Debug, Clone, Copy, Default)]
+struct JsonBody<T>(pub T);
+
+impl<T, S> FromRequest<S> for JsonBody<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        match <Json<T> as FromRequest<S>>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(JsonBody(value)),
+            Err(_) => Err(ApiError::BadRequest("Invalid JSON request body".to_owned())),
+        }
+    }
+}
+
+/// `axum::Query` と同じくクエリ文字列を `T` へデシリアライズする extractor。
+///
+/// `QueryRejection` も `text/plain` を返すため、[`ApiError::BadRequest`] の
+/// JSON envelope へ変換する。body を消費せず `FromRequestParts` 経由で
+/// 動作する点も `axum::Query` と同じ。固定文言のみを返し、クエリ値は
+/// ログ・エラーへ一切出さない。
+#[derive(Debug, Clone, Copy, Default)]
+struct QueryParams<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for QueryParams<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        match <Query<T> as FromRequestParts<S>>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(QueryParams(value)),
+            Err(_) => Err(ApiError::BadRequest("Invalid query parameters".to_owned())),
+        }
+    }
+}
 
 /// prompt 失敗の内部詳細を error.rs の共通 redact 経路へ渡し、
 /// クライアント向けの汎用文言と相関 ID を取り出す。
@@ -450,7 +506,7 @@ async fn persist_sessions_if_enabled(state: &Arc<ServerState>) {
 
 async fn list_sessions(
     State(state): State<Arc<ServerState>>,
-    Query(query): Query<ListSessionsQuery>,
+    QueryParams(query): QueryParams<ListSessionsQuery>,
 ) -> Result<(HeaderMap, Json<Vec<SessionInfo>>)> {
     // クランプ判定は元の query.limit に対して行う（クランプ後の値では検出できない）。
     let headers = build_limit_clamp_headers(query.limit);
@@ -588,8 +644,8 @@ pub struct PermissionRulesetInput {
 async fn create_session(
     State(state): State<Arc<ServerState>>,
     Extension(open_code_dir): Extension<OpenCodeDirectory>,
-    Query(query): Query<CreateSessionQuery>,
-    Json(req): Json<CreateSessionRequest>,
+    QueryParams(query): QueryParams<CreateSessionQuery>,
+    JsonBody(req): JsonBody<CreateSessionRequest>,
 ) -> Result<Json<SessionInfo>> {
     let directory = query
         .directory
@@ -781,7 +837,7 @@ pub struct ForkSessionRequest {
 async fn fork_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<ForkSessionRequest>,
+    JsonBody(req): JsonBody<ForkSessionRequest>,
 ) -> Result<Json<SessionInfo>> {
     let forked = state
         .sessions
@@ -828,7 +884,7 @@ pub struct ArchiveSessionRequest {
 async fn archive_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<ArchiveSessionRequest>,
+    JsonBody(req): JsonBody<ArchiveSessionRequest>,
 ) -> Result<Json<SessionInfo>> {
     let mut sessions = state.sessions.lock().await;
     let info = if req.archive.unwrap_or(true) {
@@ -870,7 +926,7 @@ mod archive_session_tests {
         let archived = archive_session(
             State(state.clone()),
             Path(id.clone()),
-            Json(ArchiveSessionRequest {
+            JsonBody(ArchiveSessionRequest {
                 archive: Some(true),
             }),
         )
@@ -888,7 +944,7 @@ mod archive_session_tests {
         let restored = archive_session(
             State(state.clone()),
             Path(id.clone()),
-            Json(ArchiveSessionRequest {
+            JsonBody(ArchiveSessionRequest {
                 archive: Some(false),
             }),
         )
@@ -910,7 +966,7 @@ mod archive_session_tests {
         let archived = archive_session(
             State(state.clone()),
             Path(id.clone()),
-            Json(ArchiveSessionRequest {
+            JsonBody(ArchiveSessionRequest {
                 archive: Some(true),
             }),
         )
@@ -922,7 +978,7 @@ mod archive_session_tests {
         let again = archive_session(
             State(state.clone()),
             Path(id.clone()),
-            Json(ArchiveSessionRequest { archive: None }),
+            JsonBody(ArchiveSessionRequest { archive: None }),
         )
         .await
         .expect("default archive should succeed");
@@ -944,7 +1000,7 @@ pub struct SetTitleRequest {
 async fn set_session_title(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<SetTitleRequest>,
+    JsonBody(req): JsonBody<SetTitleRequest>,
 ) -> Result<Json<SessionInfo>> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -960,7 +1016,7 @@ async fn set_session_title(
 async fn set_session_permission(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<PermissionRulesetInput>,
+    JsonBody(req): JsonBody<PermissionRulesetInput>,
 ) -> Result<Json<SessionInfo>> {
     let mut sessions = state.sessions.lock().await;
     let updated = sessions
@@ -1004,7 +1060,7 @@ pub struct SetSummaryRequest {
 async fn set_session_summary(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<SetSummaryRequest>,
+    JsonBody(req): JsonBody<SetSummaryRequest>,
 ) -> Result<Json<SessionInfo>> {
     let mut sessions = state.sessions.lock().await;
     let updated = sessions
@@ -1038,7 +1094,7 @@ pub struct RevertRequest {
 async fn session_revert(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<RevertRequest>,
+    JsonBody(req): JsonBody<RevertRequest>,
 ) -> Result<Json<SessionInfo>> {
     let mut sessions = state.sessions.lock().await;
     let updated = sessions
@@ -1481,7 +1537,7 @@ fn resolve_provider_and_model(
 async fn send_message(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<String>,
-    Json(req): Json<SendMessageRequest>,
+    JsonBody(req): JsonBody<SendMessageRequest>,
 ) -> Result<Json<MessageInfo>> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -1503,7 +1559,7 @@ async fn send_message(
 async fn list_messages(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<String>,
-    Query(query): Query<ListMessagesQuery>,
+    QueryParams(query): QueryParams<ListMessagesQuery>,
 ) -> Result<Json<Vec<MessageInfo>>> {
     let sessions = state.sessions.lock().await;
     let session = sessions
@@ -1668,7 +1724,7 @@ fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<opencode_sess
 async fn add_message_part(
     State(state): State<Arc<ServerState>>,
     Path((session_id, msg_id)): Path<(String, String)>,
-    Json(req): Json<AddPartRequest>,
+    JsonBody(req): JsonBody<AddPartRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -1755,7 +1811,7 @@ mod add_part_idempotency_tests {
         let first = add_message_part(
             State(state.clone()),
             Path((session_id.clone(), msg_id.clone())),
-            Json(text_part_request(Some("prt_fixed_1"), "retry")),
+            JsonBody(text_part_request(Some("prt_fixed_1"), "retry")),
         )
         .await
         .expect("first add should succeed");
@@ -1765,7 +1821,7 @@ mod add_part_idempotency_tests {
         let second = add_message_part(
             State(state.clone()),
             Path((session_id.clone(), msg_id.clone())),
-            Json(text_part_request(Some("prt_fixed_1"), "retry")),
+            JsonBody(text_part_request(Some("prt_fixed_1"), "retry")),
         )
         .await
         .expect("retry should be handled idempotently");
@@ -1801,14 +1857,14 @@ mod add_part_idempotency_tests {
         let first = add_message_part(
             State(state.clone()),
             Path((session_id.clone(), msg_id.clone())),
-            Json(text_part_request(None, "first")),
+            JsonBody(text_part_request(None, "first")),
         )
         .await
         .expect("first add should succeed");
         let second = add_message_part(
             State(state.clone()),
             Path((session_id.clone(), msg_id.clone())),
-            Json(text_part_request(None, "second")),
+            JsonBody(text_part_request(None, "second")),
         )
         .await
         .expect("second add should succeed");
@@ -1995,7 +2051,7 @@ async fn finalize_stream_message(
 async fn stream_message(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<String>,
-    Json(req): Json<SendMessageRequest>,
+    JsonBody(req): JsonBody<SendMessageRequest>,
 ) -> std::result::Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>, ApiError>
 {
     let config = state.config.read().await;
@@ -2398,7 +2454,7 @@ pub struct SessionPromptRequest {
 async fn session_prompt(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<SessionPromptRequest>,
+    JsonBody(req): JsonBody<SessionPromptRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let prompt_text = if let Some(message) = req.message.as_deref() {
         message.to_string()
@@ -3757,7 +3813,7 @@ pub struct UpdateSessionRequest {
 async fn update_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateSessionRequest>,
+    JsonBody(req): JsonBody<UpdateSessionRequest>,
 ) -> Result<Json<SessionInfo>> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -3806,7 +3862,7 @@ pub struct UpdatePartRequest {
 async fn update_part(
     State(state): State<Arc<ServerState>>,
     Path((session_id, msg_id, part_id)): Path<(String, String, String)>,
-    Json(req): Json<UpdatePartRequest>,
+    JsonBody(req): JsonBody<UpdatePartRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -3854,7 +3910,7 @@ pub struct ExecuteShellRequest {
 async fn execute_shell(
     State(_state): State<Arc<ServerState>>,
     Path(_id): Path<String>,
-    Json(_req): Json<ExecuteShellRequest>,
+    JsonBody(_req): JsonBody<ExecuteShellRequest>,
 ) -> Response {
     not_implemented("shell")
 }
@@ -3890,7 +3946,7 @@ fn text_from_parts(parts: &[TextPartInput]) -> String {
 async fn prompt_async(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<PromptAsyncRequest>,
+    JsonBody(req): JsonBody<PromptAsyncRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let message_text: String = req
         .message
@@ -3975,7 +4031,10 @@ pub struct InitSessionRequest {
     pub force: Option<bool>,
 }
 
-async fn init_session(Path(_id): Path<String>, Json(_req): Json<InitSessionRequest>) -> Response {
+async fn init_session(
+    Path(_id): Path<String>,
+    JsonBody(_req): JsonBody<InitSessionRequest>,
+) -> Response {
     not_implemented("init")
 }
 
@@ -3987,7 +4046,7 @@ pub struct SummarizeSessionRequest {
 
 async fn summarize_session(
     Path(_id): Path<String>,
-    Json(_req): Json<SummarizeSessionRequest>,
+    JsonBody(_req): JsonBody<SummarizeSessionRequest>,
 ) -> Response {
     not_implemented("summarize")
 }
@@ -4007,7 +4066,7 @@ pub struct ExecuteCommandRequest {
 async fn execute_command(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<ExecuteCommandRequest>,
+    JsonBody(req): JsonBody<ExecuteCommandRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -4437,7 +4496,7 @@ pub struct OAuthAuthorizeResponse {
 async fn oauth_authorize(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<OAuthAuthorizeRequest>,
+    JsonBody(req): JsonBody<OAuthAuthorizeRequest>,
 ) -> Result<Json<OAuthAuthorizeResponse>> {
     let loader = state
         .plugin_loader()
@@ -4465,7 +4524,7 @@ pub struct OAuthCallbackRequest {
 async fn oauth_callback(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<OAuthCallbackRequest>,
+    JsonBody(req): JsonBody<OAuthCallbackRequest>,
 ) -> Result<Json<bool>> {
     let loader = state
         .plugin_loader()
@@ -4622,7 +4681,7 @@ async fn rebuild_provider_registry_after_patch(state: &Arc<ServerState>) {
 
 async fn patch_config(
     State(state): State<Arc<ServerState>>,
-    Json(patch): Json<AppConfig>,
+    JsonBody(patch): JsonBody<AppConfig>,
 ) -> Result<Json<serde_json::Value>> {
     let mut config = state.config.write().await;
     config.merge(patch.clone());
@@ -4842,7 +4901,7 @@ pub struct McpConfigInput {
 
 async fn add_mcp_server(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<AddMcpRequest>,
+    JsonBody(req): JsonBody<AddMcpRequest>,
 ) -> Result<Json<HashMap<String, McpStatusInfo>>> {
     let manager = get_mcp_oauth_manager(&state);
     let (runtime, enabled) = parse_runtime_from_request(req.config)?;
@@ -4893,7 +4952,7 @@ pub struct McpAuthCallbackRequest {
 async fn mcp_auth_callback(
     State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
-    Json(req): Json<McpAuthCallbackRequest>,
+    JsonBody(req): JsonBody<McpAuthCallbackRequest>,
 ) -> Result<Json<McpStatusInfo>> {
     // The caller must echo back the state it received. Without this check,
     // handle_callback would compare the stored state against itself and a
@@ -5322,7 +5381,9 @@ fn is_within_root(path: &FsPath, root: &FsPath) -> bool {
     canonicalize_within_root(path, root).is_ok()
 }
 
-async fn list_files(Query(query): Query<ListFilesQuery>) -> Result<Json<Vec<FileInfo>>> {
+async fn list_files(
+    QueryParams(query): QueryParams<ListFilesQuery>,
+) -> Result<Json<Vec<FileInfo>>> {
     let root = project_root()?;
     let path = resolve_input_path(&query.path, &root)?;
     let mut files = Vec::new();
@@ -5390,7 +5451,9 @@ async fn list_files(Query(query): Query<ListFilesQuery>) -> Result<Json<Vec<File
     Ok(Json(files))
 }
 
-async fn read_file(Query(query): Query<ListFilesQuery>) -> Result<Json<serde_json::Value>> {
+async fn read_file(
+    QueryParams(query): QueryParams<ListFilesQuery>,
+) -> Result<Json<serde_json::Value>> {
     let root = project_root()?;
     let path = resolve_input_path(&query.path, &root)?;
 
@@ -5488,7 +5551,9 @@ pub struct SearchResult {
     pub match_text: String,
 }
 
-async fn find_text(Query(query): Query<FindTextQuery>) -> Result<Json<Vec<SearchResult>>> {
+async fn find_text(
+    QueryParams(query): QueryParams<FindTextQuery>,
+) -> Result<Json<Vec<SearchResult>>> {
     let root = project_root()?;
     let base_input = query
         .path
@@ -5650,7 +5715,7 @@ fn collect_find_files(
     results
 }
 
-async fn find_files(Query(query): Query<FindFilesQuery>) -> Result<Json<Vec<String>>> {
+async fn find_files(QueryParams(query): QueryParams<FindFilesQuery>) -> Result<Json<Vec<String>>> {
     let base_path = project_root()?;
     let limit = clamp_limit(query.limit).unwrap_or(100);
     let name_query = query.query;
@@ -5680,7 +5745,7 @@ pub struct SymbolInfo {
     pub line: usize,
 }
 
-async fn find_symbols(Query(_query): Query<FindSymbolsQuery>) -> Response {
+async fn find_symbols(QueryParams(_query): QueryParams<FindSymbolsQuery>) -> Response {
     not_implemented("find_symbols")
 }
 
@@ -5706,7 +5771,7 @@ pub struct ReplyPermissionRequest {
 async fn reply_permission(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<ReplyPermissionRequest>,
+    JsonBody(req): JsonBody<ReplyPermissionRequest>,
 ) -> Result<Json<bool>> {
     let response = match req.reply.as_str() {
         "once" => crate::server::PermissionResponse::Once,
@@ -5812,7 +5877,7 @@ pub struct UpdateProjectRequest {
 async fn update_project(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateProjectRequest>,
+    JsonBody(req): JsonBody<UpdateProjectRequest>,
 ) -> Result<Json<ProjectInfo>> {
     let current = current_project_info(&state).await?;
     if id != current.id {
@@ -5878,7 +5943,7 @@ pub struct CreatePtyRequest {
 
 async fn create_pty(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<CreatePtyRequest>,
+    JsonBody(req): JsonBody<CreatePtyRequest>,
 ) -> Result<Json<PtyInfo>> {
     let session = state
         .pty_manager
@@ -5909,7 +5974,7 @@ pub struct UpdatePtyRequest {
 async fn update_pty(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdatePtyRequest>,
+    JsonBody(req): JsonBody<UpdatePtyRequest>,
 ) -> Result<Json<PtyInfo>> {
     let session = state
         .pty_manager
@@ -5983,7 +6048,7 @@ pub struct PtyConnectQuery {
 async fn pty_connect(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Query(query): Query<PtyConnectQuery>,
+    QueryParams(query): QueryParams<PtyConnectQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Validate the session exists before upgrading.
@@ -6270,7 +6335,7 @@ pub struct ReplyQuestionRequest {
 async fn reply_question(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<ReplyQuestionRequest>,
+    JsonBody(req): JsonBody<ReplyQuestionRequest>,
 ) -> Result<Json<bool>> {
     let ok = state.question_broker.reply(&id, req.answers).await;
     if !ok {
@@ -6352,7 +6417,7 @@ async fn enqueue_tui_request(state: &Arc<ServerState>, path: &str, body: serde_j
 
 async fn append_prompt(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<PromptRequest>,
+    JsonBody(req): JsonBody<PromptRequest>,
 ) -> Result<Json<bool>> {
     enqueue_tui_request(
         &state,
@@ -6365,7 +6430,7 @@ async fn append_prompt(
 
 async fn set_prompt(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<PromptRequest>,
+    JsonBody(req): JsonBody<PromptRequest>,
 ) -> Result<Json<bool>> {
     enqueue_tui_request(
         &state,
@@ -6378,7 +6443,7 @@ async fn set_prompt(
 
 async fn submit_prompt(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<PromptRequest>,
+    JsonBody(req): JsonBody<PromptRequest>,
 ) -> Result<Json<bool>> {
     enqueue_tui_request(
         &state,
@@ -6461,7 +6526,7 @@ fn map_tui_command(command: &str) -> &str {
 
 async fn execute_tui_command(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<TuiCommandRequest>,
+    JsonBody(req): JsonBody<TuiCommandRequest>,
 ) -> Result<Json<bool>> {
     let mapped = map_tui_command(&req.command);
     enqueue_tui_request(
@@ -6484,7 +6549,7 @@ pub struct ToastRequest {
 
 async fn show_toast(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<ToastRequest>,
+    JsonBody(req): JsonBody<ToastRequest>,
 ) -> Result<Json<bool>> {
     enqueue_tui_request(
         &state,
@@ -6506,7 +6571,7 @@ pub struct PublishEventRequest {
 
 async fn publish_tui_event(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<PublishEventRequest>,
+    JsonBody(req): JsonBody<PublishEventRequest>,
 ) -> Result<Json<bool>> {
     enqueue_tui_request(
         &state,
@@ -6527,7 +6592,7 @@ pub struct SelectSessionRequest {
 
 async fn select_session(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<SelectSessionRequest>,
+    JsonBody(req): JsonBody<SelectSessionRequest>,
 ) -> Result<Json<bool>> {
     let sessions = state.sessions.lock().await;
     if sessions.get(&req.session_id).is_none() {
@@ -6568,7 +6633,7 @@ async fn get_next_tui_request(State(state): State<Arc<ServerState>>) -> Json<Opt
 // of a process-global static (see `ServerState::tui_response_queue`).
 async fn submit_tui_response(
     State(state): State<Arc<ServerState>>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Json<bool> {
     let mut queue = state.tui_response_queue.lock().await;
     // RES-02: cap the externally writable inbox. Drop the oldest entry so
@@ -6703,19 +6768,19 @@ fn experimental_not_implemented(operation: &str) -> Response {
     (StatusCode::NOT_IMPLEMENTED, body).into_response()
 }
 
-async fn experimental_analyze(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+async fn experimental_analyze(JsonBody(_payload): JsonBody<ExperimentalTaskRequest>) -> Response {
     experimental_not_implemented("analyze")
 }
 
-async fn experimental_generate(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+async fn experimental_generate(JsonBody(_payload): JsonBody<ExperimentalTaskRequest>) -> Response {
     experimental_not_implemented("generate")
 }
 
-async fn experimental_refactor(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+async fn experimental_refactor(JsonBody(_payload): JsonBody<ExperimentalTaskRequest>) -> Response {
     experimental_not_implemented("refactor")
 }
 
-async fn experimental_test(Json(_payload): Json<ExperimentalTaskRequest>) -> Response {
+async fn experimental_test(JsonBody(_payload): JsonBody<ExperimentalTaskRequest>) -> Response {
     experimental_not_implemented("test")
 }
 
@@ -6730,7 +6795,7 @@ async fn list_tool_ids() -> Response {
     not_implemented("tool ids")
 }
 
-async fn list_tools(Query(_params): Query<HashMap<String, String>>) -> Response {
+async fn list_tools(QueryParams(_params): QueryParams<HashMap<String, String>>) -> Response {
     not_implemented("tools")
 }
 
@@ -6788,7 +6853,9 @@ pub struct CreateWorktreeRequest {
     pub path: Option<String>,
 }
 
-async fn create_worktree(Json(req): Json<CreateWorktreeRequest>) -> Result<Json<WorktreeInfo>> {
+async fn create_worktree(
+    JsonBody(req): JsonBody<CreateWorktreeRequest>,
+) -> Result<Json<WorktreeInfo>> {
     let cwd = current_dir_for_worktree()?;
 
     let info = worktree::create_worktree_async(&cwd, req.branch.as_deref(), req.path.as_deref())
@@ -6804,7 +6871,7 @@ pub struct RemoveWorktreeRequest {
     pub force: Option<bool>,
 }
 
-async fn remove_worktree(Json(req): Json<RemoveWorktreeRequest>) -> Result<Json<bool>> {
+async fn remove_worktree(JsonBody(req): JsonBody<RemoveWorktreeRequest>) -> Result<Json<bool>> {
     let cwd = current_dir_for_worktree()?;
 
     worktree::remove_worktree_async(&cwd, &req.path, req.force.unwrap_or(false))
@@ -7000,7 +7067,7 @@ fn sanitize_log_field(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
-async fn write_log(Json(req): Json<WriteLogRequest>) -> Result<Json<bool>> {
+async fn write_log(JsonBody(req): JsonBody<WriteLogRequest>) -> Result<Json<bool>> {
     let service = sanitize_log_field(&req.service, 64);
     let message = sanitize_log_field(&req.message, 4096);
     if service.is_empty() || message.is_empty() {
@@ -7050,7 +7117,7 @@ struct PathsResponse {
     directory: String,
 }
 
-async fn get_paths(Query(params): Query<PathQuery>) -> Result<Json<PathsResponse>> {
+async fn get_paths(QueryParams(params): QueryParams<PathQuery>) -> Result<Json<PathsResponse>> {
     let home = dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -7183,7 +7250,7 @@ struct SetAuthRequest {
 async fn set_auth(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<SetAuthRequest>,
+    JsonBody(req): JsonBody<SetAuthRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let auth_info = parse_auth_info_payload(req.body)
         .ok_or_else(|| ApiError::BadRequest("Invalid auth payload".to_string()))?;
@@ -7294,7 +7361,7 @@ struct PluginAuthAuthorizeResponse {
 async fn plugin_auth_authorize(
     state: State<Arc<ServerState>>,
     Path(name): Path<String>,
-    Json(req): Json<PluginAuthAuthorizeRequest>,
+    JsonBody(req): JsonBody<PluginAuthAuthorizeRequest>,
 ) -> Result<Json<PluginAuthAuthorizeResponse>> {
     let bridge = get_auth_bridge(&state, &name).await?;
 
@@ -7328,7 +7395,7 @@ fn plugin_callback_args(req: &PluginAuthCallbackRequest) -> (Option<&str>, Optio
 async fn plugin_auth_callback(
     state: State<Arc<ServerState>>,
     Path(name): Path<String>,
-    Json(req): Json<PluginAuthCallbackRequest>,
+    JsonBody(req): JsonBody<PluginAuthCallbackRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let bridge = get_auth_bridge(&state, &name).await?;
 
@@ -7385,7 +7452,7 @@ struct PluginAuthFetchResponse {
 async fn plugin_auth_fetch(
     state: State<Arc<ServerState>>,
     Path(name): Path<String>,
-    Json(req): Json<PluginAuthFetchRequest>,
+    JsonBody(req): JsonBody<PluginAuthFetchRequest>,
 ) -> Result<Json<PluginAuthFetchResponse>> {
     let bridge = get_auth_bridge(&state, &name).await?;
 
@@ -7628,7 +7695,7 @@ mod mcp_callback_tests {
         let result = mcp_auth_callback(
             State(Arc::new(ServerState::new())),
             Path("remote".to_string()),
-            Json(McpAuthCallbackRequest {
+            JsonBody(McpAuthCallbackRequest {
                 code: "dummy-code".to_string(),
                 state: None,
             }),
@@ -8906,7 +8973,7 @@ mod experimental_not_implemented_tests {
             prompt: Some("inspect this".to_string()),
             context: None,
         };
-        assert_not_implemented(experimental_analyze(Json(payload)).await, "analyze").await;
+        assert_not_implemented(experimental_analyze(JsonBody(payload)).await, "analyze").await;
     }
 
     #[tokio::test]
@@ -8915,7 +8982,7 @@ mod experimental_not_implemented_tests {
             prompt: Some("generate this".to_string()),
             context: None,
         };
-        assert_not_implemented(experimental_generate(Json(payload)).await, "generate").await;
+        assert_not_implemented(experimental_generate(JsonBody(payload)).await, "generate").await;
     }
 
     #[tokio::test]
@@ -8924,7 +8991,7 @@ mod experimental_not_implemented_tests {
             prompt: Some("refactor this".to_string()),
             context: None,
         };
-        assert_not_implemented(experimental_refactor(Json(payload)).await, "refactor").await;
+        assert_not_implemented(experimental_refactor(JsonBody(payload)).await, "refactor").await;
     }
 
     #[tokio::test]
@@ -8933,7 +9000,7 @@ mod experimental_not_implemented_tests {
             prompt: Some("test this".to_string()),
             context: None,
         };
-        assert_not_implemented(experimental_test(Json(payload)).await, "test").await;
+        assert_not_implemented(experimental_test(JsonBody(payload)).await, "test").await;
     }
 
     // 以下、固定値・キュー投入のみで実処理がないハンドラの 501 化検証。
@@ -8944,7 +9011,7 @@ mod experimental_not_implemented_tests {
         let response = execute_shell(
             State(state),
             Path("session-1".to_string()),
-            Json(ExecuteShellRequest {
+            JsonBody(ExecuteShellRequest {
                 command: "echo hi".to_string(),
                 workdir: None,
             }),
@@ -8957,7 +9024,7 @@ mod experimental_not_implemented_tests {
     async fn init_session_returns_501() {
         let response = init_session(
             Path("session-1".to_string()),
-            Json(InitSessionRequest { force: Some(true) }),
+            JsonBody(InitSessionRequest { force: Some(true) }),
         )
         .await;
         assert_not_implemented(response, "init").await;
@@ -8967,7 +9034,7 @@ mod experimental_not_implemented_tests {
     async fn summarize_session_returns_501() {
         let response = summarize_session(
             Path("session-1".to_string()),
-            Json(SummarizeSessionRequest {
+            JsonBody(SummarizeSessionRequest {
                 provider_id: None,
                 model_id: None,
             }),
@@ -8984,7 +9051,7 @@ mod experimental_not_implemented_tests {
 
     #[tokio::test]
     async fn find_symbols_returns_501() {
-        let response = find_symbols(Query(FindSymbolsQuery {
+        let response = find_symbols(QueryParams(FindSymbolsQuery {
             query: "needle".to_string(),
         }))
         .await;
@@ -9054,7 +9121,7 @@ mod experimental_not_implemented_tests {
 
     #[tokio::test]
     async fn list_tools_returns_501() {
-        let response = list_tools(Query(HashMap::new())).await;
+        let response = list_tools(QueryParams(HashMap::new())).await;
         assert_not_implemented(response, "tools").await;
     }
 
@@ -9120,7 +9187,7 @@ mod project_metadata_tests {
         let updated = update_project(
             State(state_a.clone()),
             Path(project_id.clone()),
-            Json(UpdateProjectRequest {
+            JsonBody(UpdateProjectRequest {
                 name: Some("instance-a-name".to_string()),
                 icon: None,
             }),
@@ -9298,7 +9365,7 @@ mod get_message_wire_format_tests {
         let list = list_messages(
             State(state.clone()),
             Path(session_id.clone()),
-            Query(ListMessagesQuery {
+            QueryParams(ListMessagesQuery {
                 limit: None,
                 offset: None,
             }),
@@ -9437,7 +9504,7 @@ mod limit_clamp_tests {
         }
 
         let query = |limit: Option<usize>| {
-            Query(ListSessionsQuery {
+            QueryParams(ListSessionsQuery {
                 directory: None,
                 roots: None,
                 start: None,
@@ -9526,7 +9593,7 @@ mod list_messages_pagination_tests {
         let response = list_messages(
             State(state.clone()),
             Path(session_id.to_string()),
-            Query(ListMessagesQuery { limit, offset }),
+            QueryParams(ListMessagesQuery { limit, offset }),
         )
         .await
         .expect("list_messages should succeed");
@@ -9708,6 +9775,84 @@ mod api_alias_tests {
         http_request(addr, "GET", path).await
     }
 
+    /// ループバックのテストサーバへ body 付き HTTP/1.1 リクエストを送り、
+    /// (status, body) を返す。既存 `http_request` と同じ TCP 生リクエスト方式だが、
+    /// `Content-Type` と `Content-Length` を明示する点が異なる。
+    /// `content_type` が空文字列のときは `Content-Type` ヘッダを送らない
+    /// （Content-Type 欠落の拒否を実ルータ経由で検証するため）。
+    async fn http_request_with_body(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let (status, _, body) =
+            http_request_with_body_detailed(addr, method, path, content_type, body).await;
+        (status, body)
+    }
+
+    /// `http_request_with_body` の内部実装で、レスポンスの `Content-Type` も返す。
+    /// extractor rejection が `text/plain` ではなく JSON envelope であることを
+    /// 実ルータ経由で検証するために使用する。
+    async fn http_request_with_body_detailed(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (StatusCode, String, String) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect to loopback test server");
+            let content_type_header = if content_type.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Type: {content_type}\r\n")
+            };
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{content_type_header}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.expect("read response");
+            let raw = String::from_utf8(raw).expect("response should be utf-8");
+            let (head, response_body) = raw
+                .split_once("\r\n\r\n")
+                .expect("response must have header terminator");
+            let status: u16 = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("status line")
+                .parse()
+                .expect("numeric status");
+            let response_content_type = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-type") {
+                        Some(value.trim().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            (
+                StatusCode::from_u16(status).expect("valid status"),
+                response_content_type,
+                response_body.to_owned(),
+            )
+        })
+        .await
+        .expect("http exchange should not hang")
+    }
+
     /// 実際のルーティングを通すテストサーバを起動する。
     async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let app = router().with_state(Arc::new(ServerState::new()));
@@ -9843,6 +9988,101 @@ mod api_alias_tests {
         assert!(
             value["healthy"].as_bool().unwrap_or(false),
             "GET /health: {body}"
+        );
+
+        server.abort();
+    }
+
+    /// 回帰ガード (ERR-ENVELOPE-01): extractor を直接呼ぶ既存テストではなく、
+    /// 実ルータを通した JsonBody 拒否も 400 + `application/json` +
+    /// 固定文言の JSON envelope になること。要求本文の値は出さない。
+    #[tokio::test]
+    async fn json_body_rejection_through_router_returns_fixed_json_envelope() {
+        let (addr, server) = spawn_test_server().await;
+
+        // POST /session -> create_session は QueryParams<CreateSessionQuery> と
+        // JsonBody<CreateSessionRequest> を使う。クエリは全て任意なので
+        // JsonBody の拒否まで到達する。
+        let (status, content_type, body) = http_request_with_body_detailed(
+            addr,
+            "POST",
+            "/session",
+            "application/json",
+            "{not-json-router-rejection-probe",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "malformed JSON must be rejected with 400"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "rejection must be JSON, not text/plain"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("rejection body must be JSON");
+        assert_eq!(value["error"]["type"], "bad_request");
+        assert_eq!(value["error"]["message"], "Invalid JSON request body");
+        assert!(
+            !body.contains("router-rejection-probe"),
+            "request body must not leak into response"
+        );
+
+        // Content-Type 欠落も同じ envelope（spec どおり (status, body) を受け取る）。
+        let (status, body) = http_request_with_body(
+            addr,
+            "POST",
+            "/session",
+            "",
+            "{\"value\":\"missing-content-type-probe\"}",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "missing content type must be rejected with 400"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("rejection body must be JSON");
+        assert_eq!(value["error"]["type"], "bad_request");
+        assert_eq!(value["error"]["message"], "Invalid JSON request body");
+        assert!(
+            !body.contains("missing-content-type-probe"),
+            "request body must not leak into response"
+        );
+
+        server.abort();
+    }
+
+    /// 回帰ガード (ERR-ENVELOPE-01): 必須クエリ欠落も実ルータ経由で
+    /// 400 + `application/json` + 固定文言の JSON envelope になること。
+    #[tokio::test]
+    async fn query_params_rejection_through_router_returns_fixed_json_envelope() {
+        let (addr, server) = spawn_test_server().await;
+
+        // GET /file -> list_files は QueryParams<ListFilesQuery> を使い `path` が必須。
+        // 未知のクエリ値を付けても必須フィールド欠落の拒否は変わらず、
+        // その値がレスポンスへ漏れないことを併せて検証する。
+        let (status, content_type, body) =
+            http_request_with_body_detailed(addr, "GET", "/file?probe=router-query-probe", "", "")
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "missing required query must be rejected with 400"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "rejection must be JSON, not text/plain"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("rejection body must be JSON");
+        assert_eq!(value["error"]["type"], "bad_request");
+        assert_eq!(value["error"]["message"], "Invalid query parameters");
+        assert!(
+            !body.contains("router-query-probe"),
+            "request query value must not leak into response"
         );
 
         server.abort();
@@ -10463,7 +10703,7 @@ mod patch_summary_persistence_tests {
         let response = set_session_summary(
             State(state.clone()),
             Path(session_id.clone()),
-            Json(SetSummaryRequest {
+            JsonBody(SetSummaryRequest {
                 additions: Some(11),
                 deletions: Some(7),
                 files: Some(3),
@@ -11098,7 +11338,7 @@ mod tui_response_queue_tests {
         for index in 0..total {
             let response = submit_tui_response(
                 State(state.clone()),
-                Json(serde_json::json!({ "n": index })),
+                JsonBody(serde_json::json!({ "n": index })),
             )
             .await;
             assert!(response.0, "external response shape must stay Json<bool>");
@@ -11266,5 +11506,134 @@ mod todo_route_stable_id_tests {
         );
 
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod extractor_rejection_tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct BodyFixture {
+        value: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct QueryFixture {
+        required: String,
+    }
+
+    async fn rejection_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("rejection body must be readable");
+        serde_json::from_slice(&bytes).expect("rejection body must be JSON")
+    }
+
+    /// 回帰ガード (ERR-ENVELOPE-01): 不正 JSON は text/plain ではなく
+    /// 400 + JSON envelope (`error.type=bad_request`) になること。
+    #[tokio::test]
+    async fn json_body_rejects_malformed_json_with_json_envelope() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{not-json"))
+            .expect("request must build");
+
+        let error = JsonBody::<BodyFixture>::from_request(req, &())
+            .await
+            .expect_err("malformed JSON must be rejected");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = rejection_body(response).await;
+        assert_eq!(body["error"]["type"], "bad_request");
+        assert_eq!(body["error"]["message"], "Invalid JSON request body");
+        assert!(!body.to_string().contains("not-json"));
+    }
+
+    /// `Content-Type` 欠落も同じ JSON envelope になること。
+    #[tokio::test]
+    async fn json_body_rejects_missing_content_type_with_json_envelope() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .body(axum::body::Body::from(r#"{"value":"ok"}"#))
+            .expect("request must build");
+
+        let error = JsonBody::<BodyFixture>::from_request(req, &())
+            .await
+            .expect_err("missing content type must be rejected");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = rejection_body(response).await;
+        assert_eq!(body["error"]["type"], "bad_request");
+        assert!(!body.to_string().contains("ok"));
+    }
+
+    /// 回帰ガード (ERR-ENVELOPE-01): 必須クエリ欠落も 400 + JSON envelope。
+    #[tokio::test]
+    async fn query_params_rejects_missing_required_field_with_json_envelope() {
+        let req = Request::builder()
+            .uri("/list")
+            .body(())
+            .expect("request must build");
+        let (mut parts, _) = req.into_parts();
+
+        let error = QueryParams::<QueryFixture>::from_request_parts(&mut parts, &())
+            .await
+            .expect_err("missing required query parameter must be rejected");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = rejection_body(response).await;
+        assert_eq!(body["error"]["type"], "bad_request");
+        assert_eq!(body["error"]["message"], "Invalid query parameters");
+    }
+
+    /// 成功系は `axum::Json` / `axum::Query` と同じく内側の `T` を渡すこと。
+    #[tokio::test]
+    async fn extractors_unwrap_to_inner_value_unchanged() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"value":"secret-token"}"#))
+            .expect("request must build");
+        let JsonBody(body) = JsonBody::<BodyFixture>::from_request(req, &())
+            .await
+            .expect("valid JSON must succeed");
+        assert_eq!(body.value, "secret-token");
+
+        let req = Request::builder()
+            .uri("/list?required=alpha")
+            .body(())
+            .expect("request must build");
+        let (mut parts, _) = req.into_parts();
+        let QueryParams(query) = QueryParams::<QueryFixture>::from_request_parts(&mut parts, &())
+            .await
+            .expect("valid query must succeed");
+        assert_eq!(query.required, "alpha");
+    }
+
+    /// 回帰ガード: 成功系の wire 形式（`Json<T>` 戻り値）は変更せず、
+    /// 素の axum extractor がハンドラ引数へ残っていないこと。
+    #[test]
+    fn success_response_shape_is_unchanged_and_no_plain_extractor_remains() {
+        let source = include_str!("routes.rs");
+        assert!(
+            source.contains("-> Result<Json<Vec<FileInfo>>>"),
+            "success responses must keep axum::Json as the return type"
+        );
+        // 自らの検証リテラルがマッチしないよう、needle を連結して組み立てる。
+        let plain_json = concat!(": ", "Json<");
+        let plain_query = concat!(": ", "Query<");
+        assert!(
+            !source.contains(plain_json),
+            "no handler may keep the plain axum::Json extractor"
+        );
+        assert!(
+            !source.contains(plain_query),
+            "no handler may keep the plain axum::Query extractor"
+        );
     }
 }
