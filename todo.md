@@ -67,8 +67,8 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **SSE 再接続で permission/question 保留要求が再同期されない**
-  — `tui/app.rs:4162` / RETRY-04 / 中
+- [ ] **resync と SSE で要求 ID の重複排除が分断**
+  — `tui/app.rs:4302` / RETRY-04-R4 / 中（high）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[SSE 保留要求再同期 1 件]** 再接続時に permission/question を復元
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth 共有ロック 2 件]** プロセス共有化と 401 経路の直列化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth refresh 1 件]** 同一インスタンスの並行 refresh を抑制
@@ -829,6 +831,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（SSE 再同期の修正時）: 親が low（通信エラーの生 URL
+  露出）を固定文言へ直接修正。残存 medium（resync 専用 thread_local と SSE
+  の去重が分断され同一 ID が二重 enqueue され得る）は App 側共通状態の
+  設計変更を伴うため中優先 TODO へ。low（question の一括 typed デシリアライズ
+  で 1 件の不正データが全件を失う、thread_local ID が無期限成長）も記録のみ。
 - 2026-11-23 R4 指摘（OAuth 共有ロックの修正時）: 親が REFRESH_LOCKS の
   エントリを remove_auth で回収（forget_refresh_lock、PREPARE_SLOTS と
   同ライフサイクル）。残存 low（TokenMock の peak 計測が write 後に
