@@ -130,6 +130,12 @@ pub struct McpOAuthManager {
     /// Kept on the manager (not `McpOAuthConfig`) so existing external config
     /// struct literals remain source-compatible. `None` omits the parameter.
     resource: RwLock<Option<String>>,
+    /// Serializes the HTTP refresh exchange for this manager (RETRY-03).
+    /// `get_token` observes expiry without this lock, then takes it only in
+    /// the expired branch and re-checks the store inside the critical section
+    /// so two concurrent callers cannot exchange the same refresh token twice.
+    /// This is the `tokio::sync::Mutex` imported above (not `std::sync`).
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,6 +186,7 @@ impl McpOAuthManager {
             config: RwLock::new(config),
             pending: RwLock::new(HashMap::new()),
             resource: RwLock::new(None),
+            refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -723,28 +730,79 @@ impl McpOAuthManager {
             None => return Ok(None),
         };
 
-        // Check expiry (with a 60-second buffer).
+        // Check expiry (with a 60-second buffer). This fast path deliberately
+        // does NOT take `refresh_lock`: a still-valid token is returned exactly
+        // as before, with no serialization overhead (RETRY-03).
         if let Some(exp) = tokens.expires_at {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
             if exp < now + 60.0 {
-                if tokens.refresh_token.is_some() {
-                    self.refresh_token().await?;
-                    if let Some(refreshed) =
-                        auth::try_get_for_url(&self.mcp_name, &self.server_url).await?
-                    {
-                        if let Some(t) = refreshed.tokens {
-                            return Ok(Some(t.access_token));
-                        }
-                    }
-                }
-                return Ok(None);
+                // The token is expired. Serialize the refresh and re-check the
+                // freshest store state inside the lock so a concurrent caller
+                // that already refreshed is reused instead of exchanging the
+                // same refresh token a second time.
+                return self.refresh_if_needed().await;
             }
         }
 
         Ok(Some(tokens.access_token.clone()))
+    }
+
+    /// Refresh an expired token under `McpOAuthManager::refresh_lock` using a
+    /// double-checked read of the auth store (RETRY-03).
+    ///
+    /// The caller has already observed expiry *before* taking the lock. Inside
+    /// the lock the newest store state is re-read and re-checked: when another
+    /// concurrent caller refreshed in the meantime, that fresh token is
+    /// returned and no second HTTP exchange occurs. `refresh_token()` runs
+    /// only while the token is still expired. Neither token values nor the
+    /// store path are logged or embedded in errors.
+    async fn refresh_if_needed(&self) -> Result<Option<String>, OAuthError> {
+        let _guard = self.refresh_lock.lock().await;
+
+        // Re-read the latest token; another task may have updated the store
+        // while we waited for the lock.
+        let entry = match auth::try_get_for_url(&self.mcp_name, &self.server_url).await? {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+        let tokens = match entry.tokens {
+            Some(tokens) => tokens,
+            None => return Ok(None),
+        };
+
+        // Second check under the lock: still expired (same 60s buffer)?
+        let still_expired = match tokens.expires_at {
+            Some(exp) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                exp < now + 60.0
+            }
+            None => false,
+        };
+
+        if !still_expired {
+            // Someone else already refreshed the token while we waited.
+            return Ok(Some(tokens.access_token));
+        }
+
+        if tokens.refresh_token.is_none() {
+            return Ok(None);
+        }
+
+        self.refresh_token().await?;
+
+        // Read back the token the winning caller just stored.
+        if let Some(refreshed) = auth::try_get_for_url(&self.mcp_name, &self.server_url).await? {
+            if let Some(tokens) = refreshed.tokens {
+                return Ok(Some(tokens.access_token));
+            }
+        }
+        Ok(None)
     }
 
     /// Remove all stored OAuth credentials for this server.
@@ -1434,7 +1492,7 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex as StdMutex, Once};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1564,6 +1622,86 @@ mod tests {
         fn requests(self) -> Vec<String> {
             self.thread.join().expect("mock thread must not panic");
             self.seen.lock().expect("mock seen lock").clone()
+        }
+    }
+
+    /// Loopback OAuth token endpoint that counts exchange requests. Every
+    /// request receives a valid token response so `exchange_refresh_token`
+    /// succeeds; `hits()` later reveals how many refreshes actually happened.
+    /// No credentials or external network are involved.
+    struct TokenMock {
+        token_url: String,
+        hits: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TokenMock {
+        fn spawn() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+            let addr = listener.local_addr().expect("loopback addr must succeed");
+            let token_url = format!("http://{addr}/token");
+            let hits = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let hits_for_thread = Arc::clone(&hits);
+            let stop_for_thread = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                listener
+                    .set_nonblocking(true)
+                    .expect("mock listener must be nonblocking");
+                while !stop_for_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .expect("mock stream read timeout");
+                            let _request = read_http_request(&mut stream);
+                            hits_for_thread.fetch_add(1, Ordering::SeqCst);
+                            let body = r#"{"access_token":"refreshed-access-token","token_type":"Bearer","expires_in":3600,"refresh_token":"refreshed-refresh-token"}"#;
+                            let headers = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            stream
+                                .write_all(headers.as_bytes())
+                                .expect("mock must write headers");
+                            stream
+                                .write_all(body.as_bytes())
+                                .expect("mock must write body");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock accept failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                token_url,
+                hits,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// Stop the accept loop and join the thread, then return the final hit
+        /// count. Mirrors `PrepareMock::requests()` so each isolated-store
+        /// attempt owns its own counter.
+        fn finish(&mut self) -> usize {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for TokenMock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -1741,6 +1879,65 @@ mod tests {
             registrations.len(),
             1,
             "concurrent prepare must register exactly once: {requests:?}"
+        );
+    }
+
+    /// RETRY-03 regression: two concurrent `get_token` calls that both observe
+    /// an expired token must perform exactly one HTTP refresh exchange. The
+    /// lock holder refreshes; the waiter re-reads the store inside the lock,
+    /// sees the fresh token and skips its own exchange.
+    #[tokio::test]
+    async fn concurrent_get_token_refreshes_expired_token_once() {
+        ensure_no_proxy_for_loopback();
+        let store = TestAuthFile::new("concurrent-refresh", false);
+
+        let (tokens, hits) = with_isolated_store(&store, || async {
+            let mut mock = TokenMock::spawn();
+            let config = McpOAuthConfig {
+                client_id: Some("dummy-client".to_string()),
+                client_secret: Some("dummy-secret".to_string()),
+                auth_url: DUMMY_AUTH_URL.to_string(),
+                token_url: mock.token_url.clone(),
+                scopes: Vec::new(),
+                redirect_uri: DUMMY_REDIRECT_URI.to_string(),
+            };
+            let manager = McpOAuthManager::new(
+                "refresh-once".to_string(),
+                DUMMY_SERVER_URL.to_string(),
+                config,
+            );
+
+            // Seed an already-expired token (one hour in the past).
+            let expired_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                - 3600.0;
+            auth::try_update_tokens(
+                "refresh-once",
+                auth::OAuthTokens {
+                    access_token: "expired-access-token".to_string(),
+                    refresh_token: Some("dummy-refresh-token".to_string()),
+                    expires_at: Some(expired_at),
+                    scope: None,
+                },
+                Some(DUMMY_SERVER_URL),
+            )
+            .await?;
+
+            let (first, second) = tokio::join!(manager.get_token(), manager.get_token());
+            let tokens = (first?, second?);
+            let hits = mock.finish();
+            Ok::<_, OAuthError>((tokens, hits))
+        })
+        .await
+        .expect("concurrent refresh scenario must run");
+
+        assert_eq!(tokens.0.as_deref(), Some("refreshed-access-token"));
+        assert_eq!(tokens.1.as_deref(), Some("refreshed-access-token"));
+        assert_eq!(
+            hits, 1,
+            "two concurrent get_token calls must exchange the refresh token exactly once"
         );
     }
 }
