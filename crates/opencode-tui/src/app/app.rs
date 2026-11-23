@@ -2628,37 +2628,89 @@ impl App {
             return;
         }
 
-        if let Some(finished) = self.active_question_request.take() {
-            if let Some(client) = self.context.get_api_client() {
-                if let Err(error) = client.reply_question(&finished.request_id, &finished.answers) {
-                    self.toast.show(
-                        ToastVariant::Error,
-                        &format!("Failed to send answer: {}", error),
-                        3000,
-                    );
-                }
-            }
+        // 要求を削除せずに参照し、id / answers を取得する。
+        // 送信失敗時に同じ要求を再送できるよう、take() は成功時まで遅らせる。
+        let (request_id, answers) = {
+            let Some(active) = self.active_question_request.as_ref() else {
+                return;
+            };
+            (active.request_id.clone(), active.answers.clone())
+        };
+
+        let Some(client) = self.context.get_api_client() else {
+            // id・トークン・パスを出さない固定文言（権限側と同じ方針）。
+            tracing::warn!("question reply skipped: API client unavailable");
+            self.toast.show(
+                ToastVariant::Error,
+                "Failed to send answer: API client unavailable",
+                3000,
+            );
+            self.restore_question_for_retry();
+            return;
+        };
+
+        if let Err(error) = client.reply_question(&request_id, &answers) {
+            // 404 の「既に回答済み」扱いは今回スコープ外（RETRY-01）。
+            // Err のまま要求を残し、再送できるようにする。
+            self.toast.show(
+                ToastVariant::Error,
+                &format!("Failed to send answer: {}", error),
+                3000,
+            );
+            self.restore_question_for_retry();
+            return;
         }
 
+        // 送信成功時のみ要求を削除してダイアログを閉じ、次の要求へ進む。
+        self.active_question_request.take();
+        self.question_prompt.close();
+        self.ask_next_question();
+    }
+
+    /// 送信失敗時に最後の質問を再表示し、同じ要求の再送／拒否を可能にする。
+    /// 直前に追加した回答は取り消し、再確認時に重複しないようにする。
+    fn restore_question_for_retry(&mut self) {
+        if let Some(active) = self.active_question_request.as_mut() {
+            active.index = active.index.saturating_sub(1);
+            active.answers.pop();
+        }
         self.ask_next_question();
     }
 
     /// Reject the active question request and continue with the next one.
     fn reject_active_question(&mut self) {
-        self.question_prompt.close();
+        let Some(active) = self.active_question_request.as_ref() else {
+            // 要求が無い場合は従前どおりダイアログだけ閉じる。
+            self.question_prompt.close();
+            return;
+        };
+        let request_id = active.request_id.clone();
 
-        if let Some(active) = self.active_question_request.take() {
-            if let Some(client) = self.context.get_api_client() {
-                if let Err(error) = client.reject_question(&active.request_id) {
-                    self.toast.show(
-                        ToastVariant::Error,
-                        &format!("Failed to reject question: {}", error),
-                        3000,
-                    );
-                }
-            }
+        let Some(client) = self.context.get_api_client() else {
+            // id・トークン・パスを出さない固定文言。
+            tracing::warn!("question reject skipped: API client unavailable");
+            self.toast.show(
+                ToastVariant::Error,
+                "Failed to reject question: API client unavailable",
+                3000,
+            );
+            // 要求もダイアログも残して再試行可能にする。
+            return;
+        };
+
+        if let Err(error) = client.reject_question(&request_id) {
+            self.toast.show(
+                ToastVariant::Error,
+                &format!("Failed to reject question: {}", error),
+                3000,
+            );
+            // 要求もダイアログも残して再試行可能にする。
+            return;
         }
 
+        // 送信成功時のみ要求を削除してダイアログを閉じ、次の要求へ進む。
+        self.active_question_request.take();
+        self.question_prompt.close();
         self.ask_next_question();
     }
 
@@ -6138,6 +6190,298 @@ mod tests {
             !app.toast.is_visible(),
             "already-answered 404 must not surface an error toast"
         );
+    }
+
+    /// 質問 reply/reject スタブの (base_url, 呼び出し回数, 記録済みリクエスト)。
+    type QuestionReplyStub = (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<RecordedReply>>>,
+    );
+
+    /// リクエストごとに `statuses` を順に返す質問 reply/reject スタブ
+    /// （loopback のみ、外部送信なし）。最後のステータスは以降にも使う。
+    /// トークンも実ファイルパスもレスポンスへ含めない。
+    fn spawn_question_reply_api_with_statuses(statuses: Vec<&'static str>) -> QuestionReplyStub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub api");
+        let addr = listener.local_addr().expect("stub api addr");
+        let reply_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits = Arc::clone(&reply_hits);
+        let log = Arc::clone(&recorded);
+        let status_queue = Arc::new(std::sync::Mutex::new(statuses));
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stub api");
+        let _stub = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 64 * 1024 {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end + 4]).to_string();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    while request.len() < body_start + content_length {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                let first_line = text.lines().next().unwrap_or("").to_string();
+                if first_line.contains("/question/")
+                    && (first_line.contains("/reply") || first_line.contains("/reject"))
+                {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    log.lock().expect("record lock").push((first_line, text));
+                }
+                let status = {
+                    let mut queue = status_queue.lock().expect("status lock");
+                    if queue.len() > 1 {
+                        queue.remove(0)
+                    } else {
+                        queue.first().copied().unwrap_or("200 OK")
+                    }
+                };
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), reply_hits, recorded)
+    }
+
+    /// テキスト質問を 1 件キューし、アクティブ要求とダイアログを開く。
+    fn enqueue_text_question(app: &mut App, id: &str) {
+        app.enqueue_question_request(QuestionRequestInfo {
+            id: id.to_string(),
+            session_id: "session_probe".to_string(),
+            questions: vec![crate::api::QuestionInfo {
+                question: "Proceed?".to_string(),
+                header: None,
+                options: vec![],
+                multiple: false,
+            }],
+        });
+    }
+
+    /// 2 問の質問リクエストを投入する（再送時の回答重複検証用）。
+    fn enqueue_two_text_questions(app: &mut App, id: &str) {
+        app.enqueue_question_request(QuestionRequestInfo {
+            id: id.to_string(),
+            session_id: "session_probe".to_string(),
+            questions: vec![
+                crate::api::QuestionInfo {
+                    question: "First?".to_string(),
+                    header: None,
+                    options: vec![],
+                    multiple: false,
+                },
+                crate::api::QuestionInfo {
+                    question: "Second?".to_string(),
+                    header: None,
+                    options: vec![],
+                    multiple: false,
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn question_reply_retry_with_multiple_questions_does_not_duplicate_answers() {
+        // 1 問目回答 → 2 問目で 500 → 再送 200。answers が 1 セットだけ送られる。
+        let (base_url, reply_hits, recorded) =
+            spawn_question_reply_api_with_statuses(vec!["500 Internal Server Error", "200 OK"]);
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(context);
+        enqueue_two_text_questions(&mut app, "q_multi_retry");
+
+        // 1 問目に回答（まだ送信されない）。
+        app.submit_question_answer(vec!["first".to_string()]);
+        assert_eq!(reply_hits.load(Ordering::SeqCst), 0);
+
+        // 2 問目に回答 → 500 で失敗、要求が残る。
+        app.submit_question_answer(vec!["second".to_string()]);
+        assert_eq!(reply_hits.load(Ordering::SeqCst), 1);
+        assert!(app.active_question_request.is_some());
+
+        // 再送 → 200 で要求が消える。
+        app.submit_question_answer(vec!["second".to_string()]);
+        assert_eq!(reply_hits.load(Ordering::SeqCst), 2);
+        assert!(app.active_question_request.is_none());
+
+        let recorded = recorded.lock().expect("record lock");
+        assert_eq!(recorded.len(), 2, "both attempts must be recorded");
+        for (_, raw) in recorded.iter() {
+            // 記録は HTTP リクエスト全体（ヘッダ + ボディ）なのでボディだけを取り出す。
+            let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+            let body = body.trim_end_matches(|c: char| c.is_control() || c.is_whitespace());
+            let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON body");
+            let answers = parsed
+                .get("answers")
+                .and_then(|v| v.as_array())
+                .expect("answers");
+            assert_eq!(answers.len(), 2, "exactly one answer set must be sent");
+        }
+    }
+
+    #[test]
+    fn question_reply_retry_after_failure_removes_request_on_success() {
+        // 1 回目 500 で失敗 → 要求・ダイアログが残り、2 回目 200 で消える。
+        let (base_url, reply_hits, recorded) =
+            spawn_question_reply_api_with_statuses(vec!["500 Internal Server Error", "200 OK"]);
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(context);
+        enqueue_text_question(&mut app, "q_reply_retry");
+
+        // 失敗: 要求が残り、ダイアログも残る（トーストを表示）。
+        app.submit_question_answer(vec!["yes".to_string()]);
+        assert_eq!(
+            reply_hits.load(Ordering::SeqCst),
+            1,
+            "first reply must reach the stub"
+        );
+        assert!(
+            app.active_question_request.is_some(),
+            "failed reply must keep the request for retry"
+        );
+        assert_eq!(
+            app.active_question_request
+                .as_ref()
+                .map(|r| r.request_id.as_str()),
+            Some("q_reply_retry"),
+            "the same request must remain for retry"
+        );
+        assert!(
+            app.question_prompt.is_open,
+            "failed reply must keep the question dialog open"
+        );
+        assert!(app.toast.is_visible(), "failed reply must surface a toast");
+
+        // 2 回目成功: 要求が削除されダイアログが閉じる。
+        app.submit_question_answer(vec!["yes".to_string()]);
+        assert_eq!(
+            reply_hits.load(Ordering::SeqCst),
+            2,
+            "retry must reach the stub"
+        );
+        assert!(
+            app.active_question_request.is_none(),
+            "successful retry must remove the request"
+        );
+        assert!(
+            !app.question_prompt.is_open,
+            "successful retry must close the question dialog"
+        );
+        let recorded = recorded.lock().expect("record lock");
+        assert_eq!(recorded.len(), 2, "both attempts must be recorded");
+        assert!(
+            recorded
+                .iter()
+                .all(|(path, _)| path.contains("/question/q_reply_retry/reply")),
+            "both attempts must reuse the original request id"
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|(_, body)| body.contains("\"answers\":[[\"yes\"]]")),
+            "retry must send the same answer exactly once"
+        );
+    }
+
+    #[test]
+    fn question_reject_retry_after_failure_removes_request_on_success() {
+        // reject も送信成功時のみ要求を削除する。
+        let (base_url, reject_hits, recorded) =
+            spawn_question_reply_api_with_statuses(vec!["500 Internal Server Error", "200 OK"]);
+        let context = Arc::new(AppContext::new());
+        context.set_api_client(Arc::new(ApiClient::new(base_url)));
+        let mut app = headless_app(context);
+        enqueue_text_question(&mut app, "q_reject_retry");
+
+        app.reject_active_question();
+        assert_eq!(reject_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            app.active_question_request.is_some(),
+            "failed reject must keep the request"
+        );
+        assert!(
+            app.question_prompt.is_open,
+            "failed reject must keep the dialog open"
+        );
+
+        app.reject_active_question();
+        assert_eq!(reject_hits.load(Ordering::SeqCst), 2);
+        assert!(
+            app.active_question_request.is_none(),
+            "successful reject must remove the request"
+        );
+        assert!(
+            !app.question_prompt.is_open,
+            "successful reject must close the dialog"
+        );
+        let recorded = recorded.lock().expect("record lock");
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            recorded
+                .iter()
+                .all(|(path, _)| path.contains("/question/q_reject_retry/reject")),
+            "both attempts must reuse the original request id"
+        );
+    }
+
+    #[test]
+    fn question_reply_and_reject_without_client_keep_request() {
+        // API クライアント未設定でも要求を捨てず、再試行可能にする。
+        let mut submit_app = headless_app(Arc::new(AppContext::new()));
+        enqueue_text_question(&mut submit_app, "q_no_client_submit");
+        submit_app.submit_question_answer(vec!["yes".to_string()]);
+        assert!(
+            submit_app.active_question_request.is_some() && submit_app.question_prompt.is_open,
+            "submit without client must keep request and dialog"
+        );
+        assert!(submit_app.toast.is_visible());
+
+        let mut reject_app = headless_app(Arc::new(AppContext::new()));
+        enqueue_text_question(&mut reject_app, "q_no_client_reject");
+        reject_app.reject_active_question();
+        assert!(
+            reject_app.active_question_request.is_some() && reject_app.question_prompt.is_open,
+            "reject without client must keep request and dialog"
+        );
+        assert!(reject_app.toast.is_visible());
     }
 
     /// セッション一覧は成功させ、`/session/status` の成否を `status_fails`
