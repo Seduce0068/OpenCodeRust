@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
+use crate::{with_file_lock, Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[cfg(feature = "lsp")]
 use crate::MAX_DIAGNOSTICS_PER_FILE;
@@ -99,108 +99,134 @@ impl Tool for WriteTool {
             .await?;
         }
 
-        // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
-        // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
-        // がスキップされ、並行編集による上書きを防げなくなる。
-        let exists = fs::try_exists(&path).await.map_err(|e| {
-            ToolError::execution_with_source(format!("Failed to check file existence: {}", e), e)
-        })?;
-        // 既存ファイルが非 UTF-8 等の理由で読めない場合、空文字として扱うと
-        // 「新規作成」として無警告に上書きされる。EditTool と同じく伝播する（R4）。
-        let old_content = if exists {
-            fs::read_to_string(&path).await.map_err(|e| {
-                ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
-            })?
-        } else {
-            String::new()
-        };
-
-        if exists {
-            ctx.do_file_time_assert(path_str.clone()).await?;
-        }
-
-        let diff = create_diff(&path_str, &old_content, &content);
-
-        ctx.ask_permission(
-            crate::PermissionRequest::new("edit")
-                .with_pattern(&path_str)
-                .with_metadata("diff", serde_json::json!(diff))
-                .always_allow(),
-        )
-        .await?;
-
         let title = path
             .strip_prefix(&ctx.worktree)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::execution_with_source(format!("Failed to create directory: {}", e), e)
+        // EditTool と同じく path_str をキーにしたファイルロックで
+        // 存在確認〜書込までを直列化する（IOORDER-01）。キーが同一なら
+        // Write/Edit は同じ Mutex を共有し、read→write 間の lost update を防ぐ。
+        // ロック内に閉じ込めても既存の順序・エラー伝播は一切変わらない。
+        let ctx_clone = ctx.clone();
+        let path_clone = path.clone();
+        let path_str_clone = path_str.clone();
+        let title_clone = title.clone();
+        let content_clone = content.clone();
+
+        with_file_lock(&path_str, || async {
+            // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
+            // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
+            // がスキップされ、並行編集による上書きを防げなくなる。
+            let exists = fs::try_exists(&path_clone).await.map_err(|e| {
+                ToolError::execution_with_source(
+                    format!("Failed to check file existence: {}", e),
+                    e,
+                )
             })?;
-        }
+            // 既存ファイルが非 UTF-8 等の理由で読めない場合、空文字として扱うと
+            // 「新規作成」として無警告に上書きされる。EditTool と同じく伝播する（R4）。
+            let old_content = if exists {
+                fs::read_to_string(&path_clone).await.map_err(|e| {
+                    ToolError::execution_with_source(format!("Failed to read file: {}", e), e)
+                })?
+            } else {
+                String::new()
+            };
 
-        fs::write(&path, &content).await.map_err(|e| {
-            ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
-        })?;
+            if exists {
+                ctx_clone
+                    .do_file_time_assert(path_str_clone.clone())
+                    .await?;
+            }
 
-        ctx.do_publish_bus(
-            "file.edited",
-            serde_json::json!({
-                "file": path_str
-            }),
-        )
-        .await;
+            let diff = create_diff(&path_str_clone, &old_content, &content_clone);
 
-        ctx.do_publish_bus(
-            "file_watcher.updated",
-            serde_json::json!({
-                "file": path_str,
-                "event": if exists { "change" } else { "add" }
-            }),
-        )
-        .await;
+            ctx_clone
+                .ask_permission(
+                    crate::PermissionRequest::new("edit")
+                        .with_pattern(&path_str_clone)
+                        .with_metadata("diff", serde_json::json!(diff))
+                        .always_allow(),
+                )
+                .await?;
 
-        ctx.do_lsp_touch_file(path_str.clone(), true).await?;
-        ctx.do_file_time_read(path_str.clone()).await?;
+            if let Some(parent) = path_clone.parent() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    ToolError::execution_with_source(
+                        format!("Failed to create directory: {}", e),
+                        e,
+                    )
+                })?;
+            }
 
-        let line_count = content.lines().count();
-        let byte_count = content.len();
+            fs::write(&path_clone, &content_clone).await.map_err(|e| {
+                ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
+            })?;
 
-        let diagnostics_output = get_lsp_diagnostics(&path, &ctx).await;
+            ctx_clone
+                .do_publish_bus(
+                    "file.edited",
+                    serde_json::json!({
+                        "file": path_str_clone
+                    }),
+                )
+                .await;
 
-        let output = if diagnostics_output.is_empty() {
-            format!(
-                "Successfully wrote {} bytes ({} lines) to {}",
-                byte_count,
-                line_count,
-                path.display()
-            )
-        } else {
-            format!(
-                "Successfully wrote {} bytes ({} lines) to {}\n\n{}",
-                byte_count,
-                line_count,
-                path.display(),
-                diagnostics_output
-            )
-        };
+            ctx_clone
+                .do_publish_bus(
+                    "file_watcher.updated",
+                    serde_json::json!({
+                        "file": path_str_clone,
+                        "event": if exists { "change" } else { "add" }
+                    }),
+                )
+                .await;
 
-        Ok(ToolResult {
-            title,
-            output,
-            metadata: {
-                let mut m = Metadata::new();
-                m.insert("bytes".into(), serde_json::json!(byte_count));
-                m.insert("lines".into(), serde_json::json!(line_count));
-                m.insert("filepath".into(), serde_json::json!(path_str));
-                m.insert("exists".into(), serde_json::json!(exists));
-                m.insert("diff".into(), serde_json::json!(diff));
-                m
-            },
-            truncated: false,
+            ctx_clone
+                .do_lsp_touch_file(path_str_clone.clone(), true)
+                .await?;
+            ctx_clone.do_file_time_read(path_str_clone.clone()).await?;
+
+            let line_count = content_clone.lines().count();
+            let byte_count = content_clone.len();
+
+            let diagnostics_output = get_lsp_diagnostics(&path_clone, &ctx_clone).await;
+
+            let output = if diagnostics_output.is_empty() {
+                format!(
+                    "Successfully wrote {} bytes ({} lines) to {}",
+                    byte_count,
+                    line_count,
+                    path_clone.display()
+                )
+            } else {
+                format!(
+                    "Successfully wrote {} bytes ({} lines) to {}\n\n{}",
+                    byte_count,
+                    line_count,
+                    path_clone.display(),
+                    diagnostics_output
+                )
+            };
+
+            Ok(ToolResult {
+                title: title_clone,
+                output,
+                metadata: {
+                    let mut m = Metadata::new();
+                    m.insert("bytes".into(), serde_json::json!(byte_count));
+                    m.insert("lines".into(), serde_json::json!(line_count));
+                    m.insert("filepath".into(), serde_json::json!(path_str_clone));
+                    m.insert("exists".into(), serde_json::json!(exists));
+                    m.insert("diff".into(), serde_json::json!(diff));
+                    m
+                },
+                truncated: false,
+            })
         })
+        .await
     }
 }
 
@@ -611,6 +637,108 @@ mod tests {
             let events = events.lock().unwrap();
             assert_eq!(watcher_event(&events)["event"], "change");
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// IOORDER-01 回帰: Write と Edit が同一パスのファイルロックを共有し、
+    /// クリティカルセクション（存在確認〜書込）が重ならないこと。
+    /// ロックが無い旧実装では Write の file_time_assert 待ちの間に Edit が入り
+    /// peak が 2 になり、両変更のうち一方が失われる。
+    #[tokio::test]
+    async fn write_and_edit_share_file_lock_on_same_path() {
+        use std::time::Duration;
+
+        let dir = temp_dir();
+        let file = dir.join("shared.txt");
+        // 双方が file_time_assert を通るよう既存ファイルにしておく。
+        std::fs::write(&file, "AAA\nBBB\n").unwrap();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        // Write がクリティカルセクションへ入ったことを親テストへ知らせる旗。
+        let write_entered = Arc::new(AtomicUsize::new(0));
+
+        let make_ctx = |entered: Arc<AtomicUsize>| {
+            let active = active.clone();
+            let peak = peak.clone();
+            context(&dir).with_file_time_assert(move |_s, _p| {
+                let active = active.clone();
+                let peak = peak.clone();
+                let entered = entered.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    entered.store(1, Ordering::SeqCst);
+                    // ロックが無い間に他方が入れば peak が 2 になるよう窓を広げる。
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<(), ToolError>(())
+                }
+            })
+        };
+
+        let file_path = file.to_string_lossy().to_string();
+
+        let write_ctx = make_ctx(write_entered.clone());
+        let write_path = file_path.clone();
+        let write = tokio::spawn(async move {
+            WriteTool::new()
+                .execute(
+                    serde_json::json!({
+                        "file_path": write_path,
+                        "content": "AAA\nBBB\nCCC\n",
+                    }),
+                    write_ctx,
+                )
+                .await
+                .unwrap()
+        });
+
+        // Write が file_time_assert（ロック保持中）へ入るまで待つ。
+        for _ in 0..500 {
+            if write_entered.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            write_entered.load(Ordering::SeqCst) > 0,
+            "Write が開始すること"
+        );
+
+        // Edit は Write がロックを手放すまで file_time_assert に到達しないはず。
+        let edit_ctx = make_ctx(Arc::new(AtomicUsize::new(0)));
+        let edit_path = file_path.clone();
+        let edit = tokio::spawn(async move {
+            crate::edit::EditTool::new()
+                .execute(
+                    serde_json::json!({
+                        "file_path": edit_path,
+                        "old_string": "BBB",
+                        "new_string": "BBB_EDITED",
+                    }),
+                    edit_ctx,
+                )
+                .await
+                .unwrap()
+        });
+
+        write.await.unwrap();
+        edit.await.unwrap();
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "Write と Edit は同一パスでファイルロックを共有し直列化されること"
+        );
+
+        // 直列化により Write の追加行と Edit の置換の両方が残ること。
+        let final_content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            final_content.contains("BBB_EDITED") && final_content.contains("CCC"),
+            "両変更が残ること (actual: {final_content})"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
