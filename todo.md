@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **質問の回答が HTTP 送信前にローカル要求を破棄**
-  — `tui/app.rs:2631` / RETRY-02 / 中
 - [ ] **MCP OAuth の期限切れトークンが並行 get_token で二重 refresh**
   — `mcp/oauth.rs:715` / RETRY-03 / 中
 - [ ] **SSE 再接続で permission/question 保留要求が再同期されない**
@@ -288,6 +286,8 @@ status: current
 
 ## 完了
 
+- [x] **[質問再送 1 件]** 送信成功時のみ要求を削除
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[権限 reply 冪等化 1 件]** 再送 404 でプロンプトを閉じる
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[権限 await ロック外 1 件]** Head-of-line ブロックを解消
@@ -835,6 +835,9 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（質問再送の修正時）: 親が複数質問（2 問）の
+  失敗→再送で answers が重複しない回帰テストを直接追加。HTTP スタブの
+  記録がリクエスト全体なのでボディ部分を取り出してパース。
 - 2026-11-23 cross-skill 集約（swarm249、2 担当・12 件、観点: リトライ冪等性 /
   文字列正規化）: retry から high の RETRY-01（権限 reply 再送 404）を coding、
   他 3 件を triage。norm 8 件すべて triage（NORM-01 中、他低）。
