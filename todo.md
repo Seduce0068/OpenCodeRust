@@ -168,8 +168,6 @@ status: current
   — `tool/task.rs:56` / AV-04 / 低
 - [ ] **WebSearch/CodeSearch の query に空/過大の検証が無い**
   — `tool/websearch.rs:43` / AV-05 / 低
-- [ ] **LspTool の位置・rename 名がスキーマ制約をすり抜ける**
-  — `tool/lsp_tool.rs:63` / AV-06 / 低
 - [ ] **不正な mcp.timeout がゴースト MCP サーバーとして読まれる**
   — `config/schema.rs:1470` / PARSE-03 / 低
 - [ ] **plugin auth.fetch の不正チャンクが通知を捨てる**
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[LSP 入力検証 1 件]** 座標 0・空 rename 名を拒否
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CodeMode センチネル 1 件]** Infinity トークンを一意化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI 空入力 1 件]** 暗黙 Yes 選択を防止
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 LSP 入力検証: zero_based_position で座標 0 を早期拒否、
+  resolve_new_name で空/空白のみ拒否＋前後空白を trim。R4 が低 3 件を指摘、
+  親が newName trim を直接修正し最大2回で停止。残存 low（位置を使わない
+  操作でも line=0 が拒否される後方互換副作用、デフォルト new_name の
+  実 LSP 呼び出しアサーション欠落）は記録のみ。
 - 2026-11-24 CodeMode センチネル: 固定 Infinity センチネルを呼び出しごとの
   一意トークン（SystemTime ナノ秒＋AtomicU64）へ変更し、ユーザー文字列の
   誤変換を防止。R4 が 2 件（不正 JSON 数値 `01e400` / `1.e400` の誤受理、
