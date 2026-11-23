@@ -256,6 +256,16 @@ pub enum LspEvent {
     Diagnostics { path: PathBuf, server_id: String },
 }
 
+/// Converts the internal document version counter to the LSP wire `i32`.
+///
+/// The counter is a `u32` and can exceed `i32::MAX` after enough edits, while
+/// `VersionedTextDocumentIdentifier::version` is an `i32`. A plain `as` cast
+/// would wrap into a negative number, which is not a valid LSP version.
+/// Overflow is clamped to `i32::MAX`; in-range values pass through unchanged.
+fn wire_document_version(version: u32) -> i32 {
+    i32::try_from(version).unwrap_or(i32::MAX)
+}
+
 impl LspClient {
     pub async fn start(config: LspServerConfig, root: PathBuf) -> Result<Self, LspError> {
         let mut child = Command::new(&config.command)
@@ -474,7 +484,7 @@ impl LspClient {
             let params = DidChangeTextDocumentParams {
                 text_document: VersionedTextDocumentIdentifier {
                     uri,
-                    version: next_version as i32,
+                    version: wire_document_version(next_version),
                 },
                 content_changes: vec![TextDocumentContentChangeEvent {
                     range: None,
@@ -1181,6 +1191,114 @@ mod tests {
             child: Some(child),
             reader_handle: None,
         }
+    }
+
+    #[test]
+    fn wire_document_version_preserves_normal_and_clamps_overflow() {
+        for version in [0u32, 1, 42, i32::MAX as u32] {
+            assert_eq!(wire_document_version(version), version as i32);
+        }
+        for version in [i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(wire_document_version(version), i32::MAX);
+        }
+    }
+
+    /// `cat` echoes the client's stdin back to stdout, so the exact JSON-RPC
+    /// notification can be inspected without starting a real language server.
+    #[cfg(unix)]
+    fn echo_client() -> (LspClient, tokio::process::ChildStdout) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (event_tx, _) = broadcast::channel(16);
+        let client = LspClient {
+            root: PathBuf::from("/tmp"),
+            stdin: Arc::new(Mutex::new(stdin)),
+            request_id: Arc::new(Mutex::new(0)),
+            pending_responses: Arc::new(RwLock::new(HashMap::new())),
+            diagnostics: Arc::new(RwLock::new(HashMap::new())),
+            file_versions: Arc::new(RwLock::new(HashMap::new())),
+            event_tx,
+            child: Some(child),
+            reader_handle: None,
+        };
+        (client, stdout)
+    }
+
+    #[cfg(unix)]
+    async fn next_notification(
+        reader: &mut BufReader<tokio::process::ChildStdout>,
+    ) -> JsonRpcNotification {
+        let payload = tokio::time::timeout(Duration::from_secs(5), read_lsp_message(reader))
+            .await
+            .expect("timed out waiting for echoed LSP notification")
+            .unwrap()
+            .expect("LSP child closed stdout before sending a notification");
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_document_version_never_wraps_negative_on_wire() {
+        let (client, stdout) = echo_client();
+        let mut reader = BufReader::new(stdout);
+
+        // Internal counter just above i32::MAX: a plain `as i32` would send
+        // -2147483648, which is an invalid LSP document version.
+        let overflow_path = Path::new("/tmp/project/src/overflow.rs");
+        client
+            .file_versions
+            .write()
+            .await
+            .insert(overflow_path.to_path_buf(), i32::MAX as u32);
+
+        client
+            .open_document(overflow_path, "fn main() {}", "rust")
+            .await
+            .unwrap();
+
+        let notification = next_notification(&mut reader).await;
+        assert_eq!(notification.method, "textDocument/didChange");
+        let params: DidChangeTextDocumentParams =
+            serde_json::from_value(notification.params.expect("missing params")).unwrap();
+        assert_eq!(
+            params.text_document.version,
+            i32::MAX,
+            "overflowed version must be clamped, not wrapped negative"
+        );
+        assert_eq!(
+            *client
+                .file_versions
+                .read()
+                .await
+                .get(overflow_path)
+                .unwrap(),
+            i32::MAX as u32 + 1,
+            "internal u32 counter must keep advancing independently of the wire clamp"
+        );
+
+        // An ordinary version must be forwarded unchanged.
+        let normal_path = Path::new("/tmp/project/src/normal.rs");
+        client
+            .file_versions
+            .write()
+            .await
+            .insert(normal_path.to_path_buf(), 5);
+        client
+            .open_document(normal_path, "fn main() {}", "rust")
+            .await
+            .unwrap();
+
+        let notification = next_notification(&mut reader).await;
+        assert_eq!(notification.method, "textDocument/didChange");
+        let params: DidChangeTextDocumentParams =
+            serde_json::from_value(notification.params.expect("missing params")).unwrap();
+        assert_eq!(params.text_document.version, 6);
     }
 
     #[cfg(unix)]

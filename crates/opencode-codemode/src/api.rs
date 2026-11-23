@@ -301,7 +301,9 @@ fn source_location(code: &str, offset: usize) -> Option<Location> {
     let column_prefix = prefix.rsplit('\n').next().unwrap_or("");
     Some(Location {
         line,
-        column: column_prefix.chars().count() as u32 + 1,
+        // JavaScript SourceLocation columns count UTF-16 code units, so a
+        // surrogate pair (e.g. an emoji) advances the column by two.
+        column: column_prefix.encode_utf16().count() as u32 + 1,
     })
 }
 
@@ -471,6 +473,42 @@ mod tests {
             Some(super::Location { line: 2, column: 8 })
         );
         assert_eq!(failure.logs, ["before"]);
+    }
+
+    #[test]
+    fn source_location_counts_utf16_code_units_in_column() {
+        use super::source_location;
+
+        // ASCII-only prefixes keep the existing 1-based, one-column-per-character
+        // behavior (the seven-character prefix in the runtime-location test still
+        // maps to column 8).
+        assert_eq!(
+            source_location("return missing;", 7),
+            Some(super::Location { line: 1, column: 8 })
+        );
+
+        // An emoji is one scalar but two UTF-16 code units. The JavaScript
+        // SourceLocation column advances by 2 across it; the previous
+        // chars().count() advanced by only 1 and reported a column one too far
+        // left. An offset right after the emoji must yield column 3 (old: 2).
+        assert_eq!(
+            source_location("😀x", 0),
+            Some(super::Location { line: 1, column: 1 })
+        );
+        assert_eq!(
+            source_location("😀x", 4),
+            Some(super::Location { line: 1, column: 3 })
+        );
+        assert_eq!(
+            source_location("😀x", 5),
+            Some(super::Location { line: 1, column: 4 })
+        );
+
+        // Line counting stays byte-based on '\n' and the 1-based addition is unchanged.
+        assert_eq!(
+            source_location("a\n😀b", 6),
+            Some(super::Location { line: 2, column: 3 })
+        );
     }
 
     #[test]
