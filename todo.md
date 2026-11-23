@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
-  — `tui/context/app_context.rs:132` / CFGAPPLY-06 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -263,6 +261,8 @@ status: current
 
 ## 完了
 
+- [x] **[TUI theme 1 件]** 起動時に config.theme / tui.sidebar を反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[SSE join 1 件]** 終了時の待ちを 2 秒の期限付き並列待ちへ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[extractor rejection 1 件]** 400 を JSON エラー envelope へ統一
@@ -868,6 +868,13 @@ status: current
 
 ## メモ
 
+- 2026-11-24 TUI theme 配線: opencode-tui に workspace 内 opencode-config 依存
+  を追加し、AppContext::apply_ui_config / new_with_config と App::new_with_config
+  を追加。config I/O は run_tui 起動経路のみに限定し new() は副作用なし
+  （UI 状態 kv.json の読み込みは従来どおり）。R4 が new() への I/O 波及と
+  起動経路テスト不足を指摘したため 2 段で修正。tui.mode/scroll/diff_style と
+  layout は対応フィールドが無くスキップ（明記済み）。親が clippy 3 件と
+  doc の副作用表現を直接修正。
 - 2026-11-24 SSE join: Drop の直接 join を期限付き（2秒）待ちへ変更。
   R4 が直列待ちで最悪 4 秒になる点を指摘したため、spawn_join_notifier +
   wait_join_notifiers の 2 段 API へ分割し deadline 基準で並列待ちに。
