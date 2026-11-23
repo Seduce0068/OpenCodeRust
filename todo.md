@@ -67,8 +67,8 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **resync と SSE で要求 ID の重複排除が分断**
-  — `tui/app.rs:4302` / RETRY-04-R4 / 中（high）
+- [ ] **回答済み要求 ID が共有集合に残り再利用時に誤スキップ**
+  — `tui/app.rs:4269` / RETRY-04-R4 / 中（high）
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -268,6 +268,8 @@ status: current
 
 ## 完了
 
+- [x] **[要求 ID 去重 1 件]** SSE/resync の双方向去重を共有状態へ集約
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[SSE 保留要求再同期 1 件]** 再接続時に permission/question を復元
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth 共有ロック 2 件]** プロセス共有化と 401 経路の直列化
@@ -831,6 +833,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 残存（双方向去重の修正時）: 親が low 2 件（既存 warn の
+  要求 ID 露出、parse_question_asked の空 ID 検証欠落）を直接修正。残存
+  medium（回答/拒否時に共有集合から ID を削除する経路が無く、ID 再利用時に
+  新規要求が誤スキップ＋集合が単調増加）は削除契機の設計を伴うため中優先
+  TODO へ。
 - 2026-11-23 R4 残存（SSE 再同期の修正時）: 親が low（通信エラーの生 URL
   露出）を固定文言へ直接修正。残存 medium（resync 専用 thread_local と SSE
   の去重が分断され同一 ID が二重 enqueue され得る）は App 側共通状態の
