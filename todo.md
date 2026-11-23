@@ -67,6 +67,12 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **send_message が prompt_locks を外れて上書きされる**
+  — `server/routes.rs:1542` / CONC-01 / 中
+- [ ] **/stream の provider error が生文字列で配信される**
+  — `server/routes.rs:2317` / APICON-01 / 中
+- [ ] **MCP OAuth エラーが 400 ボディへ露出する**
+  — `server/routes.rs:5072` / APICON-04 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -164,6 +170,10 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **permission.replied / question.replied が TUI で未処理**
+  — `tui/app.rs:4741` / APICON-05 / 低
+- [ ] **add_server_with_origin の origin 判定 TOCTOU**
+  — `server/mcp_oauth.rs:283` / CONC-02 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -257,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[API 契約 2 件]** 質問 404 冪等化・session.deleted 配信
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[永続化トランザクション 1 件]** session/message を原子保存
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[command subtask 1 件]** 未配線として MAPPING.md へ明記
@@ -888,6 +900,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 cross-skill 集約（swarm306、2 担当・7 件、観点: 並行/所有権 /
+  API 契約）: medium 2 件（質問 404 冪等化、session.deleted 配信）を coding、
+  残り 5 件を triage。R4 が低 2 件（200 成功パスのテスト欠落、SSE 統合
+  経路未検証）を指摘したが実装は条件を満たすため残存記録のみ。
 - 2026-11-24 永続化トランザクション: SessionPersistence::upsert_session_with_messages
   を追加し session upsert + message 置換を同一プール上で単一トランザクション化。
   既存 SessionRepository / MessageRepository の API・SQL・破損行拒否は共有
