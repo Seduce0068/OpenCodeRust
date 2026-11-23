@@ -71,8 +71,6 @@ status: current
   — `mcp/oauth.rs:715` / RETRY-03 / 中
 - [ ] **SSE 再接続で permission/question 保留要求が再同期されない**
   — `tui/app.rs:4162` / RETRY-04 / 中
-- [ ] **CORS whitelist の URL scheme/host 大小文字非対称**
-  — `server/server.rs:1823` / NORM-01 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -170,8 +168,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **ビルトイン許可リストの URL 大小文字非対称**
-  — `server/server.rs:1876` / NORM-02 / 低
 - [ ] **CodeMode trim が NEL を除去し JS 非準拠**
   — `codemode/date.rs:122` / NORM-03 / 低
 - [ ] **日付と時刻の区切りが ASCII 半角スペースのみ**
@@ -282,6 +278,8 @@ status: current
 
 ## 完了
 
+- [x] **[CORS 大小文字 2 件]** whitelist / ビルトイン許可リストを統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CR 改行 2 件]** Edit / skill の正規化を apply_patch と統一
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[質問再送 1 件]** 送信成功時のみ要求を削除
@@ -833,6 +831,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（CORS 正規化の修正時）: 親が「Url::parse は scheme を
+  小文字化するが host は保持する」をデバッグ確認し、判定側と whitelist 側
+  双方で host を to_ascii_lowercase して比較するよう直接修正。残存 low
+  （大文字リモート host 拒否テスト欠落、path/query 付き whitelist の許可範囲）は
+  記録のみ。
 - 2026-11-23 R4 指摘（CR 改行の修正時）: 親が重複する normalize_line_endings
   を replacers の公開実装へ一本化（DRY）。残存 low（エスケープ `\r` の
   一致、pub API の generate_unified_diff / trim_diff が CR 未正規化）は
