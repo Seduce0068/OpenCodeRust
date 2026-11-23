@@ -139,6 +139,34 @@ mod compaction_kill_switch_tests {
     }
 }
 
+/// 未登録パス向けの固定 404 ハンドラ。
+///
+/// リクエストパスやトークン値を一切ボディへ含めず、既存の
+/// [`ApiError::NotFound`] と同じ JSON エラー契約
+/// (`{"error":{"message","type"}}`) を返す。
+async fn not_found_fallback() -> Response {
+    ApiError::NotFound("Not found".to_owned()).into_response()
+}
+
+/// 登録済みパスに対する未対応メソッド向けの固定 405 ハンドラ。
+///
+/// `ApiError` に 405 のバリアントが無いため、既存のエラー envelope
+/// (`error.type` = `bad_request`) を再利用しつつ、ステータスは axum の
+/// デフォルトと同じ 405 を維持する（400 への変更は後方互換でない）。
+/// 固定文言のみで、パスやトークン値は出さない。
+async fn method_not_allowed_fallback() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(serde_json::json!({
+            "error": {
+                "message": "Method not allowed",
+                "type": "bad_request"
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// アプリケーション全体のルータ。
 ///
 /// 既存の全ルート（prefix なし）を維持したまま、同じハンドラを `/api` 配下にも
@@ -190,6 +218,11 @@ fn api_routes() -> Router<Arc<ServerState>> {
         .nest("/global", global_routes())
         .nest("/experimental", experimental_routes())
         .nest("/plugin", plugin_auth_routes())
+        // 未マッチ時のみ発火するため、登録済みルートの挙動は不変。
+        // `/api` エイリアスはこの Router を共有しているため同じ fallback が効く。
+        .fallback(not_found_fallback)
+        // axum 0.8.9 の API。全ルート登録後に呼ぶ必要がある。
+        .method_not_allowed_fallback(method_not_allowed_fallback)
 }
 
 /// Injected by middleware from x-opencode-directory header for session create.
@@ -9272,17 +9305,23 @@ mod api_alias_tests {
         );
     }
 
-    /// ループバックのテストサーバへ素の HTTP/1.1 GET を送り、(status, body) を返す。
+    /// ループバックのテストサーバへ素の HTTP/1.1 リクエストを送り、(status, body) を返す。
     ///
     /// tower が workspace から削除済みのため `ServiceExt::oneshot` は使えず、
     /// 既存依存（tokio + axum）のみで実際のルーティングを通す。
-    async fn http_get(addr: SocketAddr, path: &str) -> (StatusCode, String) {
+    async fn http_request(addr: SocketAddr, method: &str, path: &str) -> (StatusCode, String) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut stream = TcpStream::connect(addr)
                 .await
                 .expect("connect to loopback test server");
-            let request =
-                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let content_length = if method == "GET" {
+                String::new()
+            } else {
+                "Content-Length: 0\r\n".to_owned()
+            };
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{content_length}\r\n"
+            );
             stream
                 .write_all(request.as_bytes())
                 .await
@@ -9305,6 +9344,26 @@ mod api_alias_tests {
         })
         .await
         .expect("http exchange should not hang")
+    }
+
+    async fn http_get(addr: SocketAddr, path: &str) -> (StatusCode, String) {
+        http_request(addr, "GET", path).await
+    }
+
+    /// 実際のルーティングを通すテストサーバを起動する。
+    async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = router().with_state(Arc::new(ServerState::new()));
+        // loopback bind 失敗時に return すると false green になるため失敗させる。
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed in tests; skipping hides failures");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("test server stopped: {err}");
+            }
+        });
+        (addr, server)
     }
 
     #[tokio::test]
@@ -9330,6 +9389,103 @@ mod api_alias_tests {
             assert_eq!(aliased.0, plain.0, "GET /api{path} status should match");
             assert_eq!(aliased.1, plain.1, "GET /api{path} body should match");
         }
+
+        server.abort();
+    }
+
+    /// R4: axum 0.8.9 は nest されたサブルーターも親の fallback を継承し、
+    /// method_not_allowed_fallback は全 MethodRouter へ波及する。
+    /// この実挙動を固定し、誤った「ネスト内は空ボディ」記録を防ぐ。
+    #[tokio::test]
+    async fn fallback_envelope_covers_nested_routes_and_api_alias() {
+        let (addr, server) = spawn_test_server().await;
+
+        let (status, body) = http_request(addr, "POST", "/api/health").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "POST /api/health");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("405 body must be JSON");
+        assert_eq!(
+            value["error"]["type"], "bad_request",
+            "405 envelope: {body}"
+        );
+        assert_eq!(
+            value["error"]["message"], "Method not allowed",
+            "405 envelope: {body}"
+        );
+
+        let (status, body) = http_request(addr, "GET", "/session/no-such").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "GET /session/no-such");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("404 body must be JSON");
+        assert_eq!(
+            value["error"]["type"], "session_not_found",
+            "404 envelope: {body}"
+        );
+        // 既存の SessionNotFound 契約はセッション ID を message に含める。
+        // fallback の固定文言リーク検証は unregistered_path_returns_json_not_found_envelope が担う。
+
+        server.abort();
+    }
+
+    /// 回帰ガード (ERR-ENVELOPE-02): 未登録パスは空ボディではなく、
+    /// 既存ルートと同じ JSON エラー契約（error.type = not_found）を返す。
+    /// `/api` エイリアス配下にも同じ fallback が効くことを併せて検証する。
+    #[tokio::test]
+    async fn unregistered_path_returns_json_not_found_envelope() {
+        let (addr, server) = spawn_test_server().await;
+
+        for path in ["/no-such-path", "/api/no-such-path"] {
+            let (status, body) = http_get(addr, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "GET {path}");
+            let value: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|err| panic!("GET {path} body must be JSON: {err}: {body}"));
+            assert_eq!(value["error"]["type"], "not_found", "GET {path}: {body}");
+            assert_eq!(value["error"]["message"], "Not found", "GET {path}: {body}");
+            // 固定文言のみで、リクエストパスやトークン値は出さない。
+            assert!(
+                !body.contains("no-such-path"),
+                "request path must not leak into body: {body}"
+            );
+        }
+
+        server.abort();
+    }
+
+    /// 回帰ガード (ERR-ENVELOPE-02): 登録済みパスの未対応メソッドは
+    /// 空ボディではなく JSON エラー envelope を返し、GET /health は不変。
+    #[tokio::test]
+    async fn method_not_allowed_returns_json_and_registered_route_is_unchanged() {
+        let (addr, server) = spawn_test_server().await;
+
+        let (status, body) = http_request(addr, "POST", "/health").await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /health must stay 405"
+        );
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|err| panic!("POST /health body must be JSON: {err}: {body}"));
+        assert_eq!(
+            value["error"]["type"], "bad_request",
+            "POST /health: {body}"
+        );
+        assert_eq!(
+            value["error"]["message"], "Method not allowed",
+            "POST /health: {body}"
+        );
+        assert!(
+            !body.contains("/health"),
+            "request path must not leak into body: {body}"
+        );
+
+        // 既存ルートの挙動は完全に不変（200 + 従来の健康応答）。
+        let (status, body) = http_get(addr, "/health").await;
+        assert_eq!(status, StatusCode::OK, "GET /health must stay 200");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("GET /health body must be JSON");
+        assert_eq!(value["status"], "ok", "GET /health: {body}");
+        assert!(
+            value["healthy"].as_bool().unwrap_or(false),
+            "GET /health: {body}"
+        );
 
         server.abort();
     }
