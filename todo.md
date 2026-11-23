@@ -67,6 +67,8 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **todo SSE の update→読戻しが writer lock 外で非アトミック**
+  — `server/routes.rs:3333` / TODO-SSE-ID-01-R4 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
@@ -168,8 +170,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **todo.updated SSE 項目に安定 id が無い**
-  — `server/routes.rs:2981` / TODO-SSE-ID-01 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
   — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -269,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[todo SSE id 1 件]** GET と同じ安定 id を配信
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[StreamProcessor 1 件]** 本番未使用を明記して現状確定
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[Config.username 1 件]** 未配線として MAPPING.md へ明記
@@ -862,6 +864,13 @@ status: current
 
 ## メモ
 
+- 2026-11-24 R4 残存（todo SSE id の修正時）: update → get_with_ids が
+  writer lock 外で非アトミック（並行更新時に後勝ちスナップショットが
+  配信され得る）、回帰テストが実コールバック/broadcast 経路を通らず
+  ペイロード生成を手作業で複製、DB 永続化失敗時に旧状態を配信する挙動差
+  — いずれも TodoManager API 設計／統合テスト構築／エラーパス設計を伴う
+  ため設計判断として記録のみ。SSE と GET の id の 1:1 対応は達成。
+  親が子のテストの format string 問題を直接修正。
 - 2026-11-23 StreamProcessor の確定: new() の呼び出し 9 件はすべて
   llm.rs テストモジュール内で本番配線 0 件、本番の compaction gate は
   SessionPrompt 側（routes.rs:3429 で配線済み）が担う事実を doc と MAPPING.md
