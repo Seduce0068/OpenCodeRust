@@ -172,8 +172,6 @@ status: current
 
 - [ ] **todo.updated SSE 項目に安定 id が無い**
   — `server/routes.rs:2981` / TODO-SSE-ID-01 / 低
-- [ ] **Config.username に consumer が無い**
-  — `config/loader.rs:2391` / CFGAPPLY-07 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
   — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -273,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[Config.username 1 件]** 未配線として MAPPING.md へ明記
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[skills.urls 配線 1 件]** ローカル URL を探索ルートへ反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[default_agent 下流検証 1 件]** PromptInput/metadata を直接検証
@@ -862,6 +862,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 Config.username の確定: runtime consumer 0 件を再確認し
+  MAPPING.md の未配線一覧へ明記（USER/USERNAME 注入、永続化抑止、URL の
+  username は別物）。子が指示の行番号誤りを指摘し実コード (loader.rs:2410)
+  に修正。R4 が全参照を実コードで照合し指摘なし。
 - 2026-11-23 R4 残存（skills.urls の修正時）: 親が medium（file:// の
   スキーム除去）と low（大文字スキーム判定）を直接修正し回帰テストを追加。
   残存 low（paths と urls の同名スキル衝突時の後勝ち優先順）は設計判断
