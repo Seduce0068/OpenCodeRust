@@ -67,6 +67,8 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **McpClientRegistry::remove が connection_configs を残存**
+  — `mcp/client.rs:1318` / R1-RES-02 / 中
 - [ ] **axum extractor rejection が text/plain で JSON 契約と不整合**
   — `server/routes.rs:6325` / ERR-ENVELOPE-01 / 中
 - [ ] **theme / tui.* / layout が TUI 起動時に読まれない**
@@ -267,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[session cleanup 1 件]** 削除時に per-session コレクションを回収
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[todo SSE 原子化 1 件]** 更新と ID 読戻しを同一ロックで実行
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[todo SSE id 1 件]** GET と同じ安定 id を配信
@@ -864,6 +868,14 @@ status: current
 
 ## メモ
 
+- 2026-11-24 cross-skill 集約（swarm278、2 担当・2 件、観点: 境界値 /
+  Resource リーク）: boundary 0 件。resource から TUI セッション削除時の
+  per-session コレクション残留（medium）を coding、MCP connection_configs
+  残留（low）を triage。削除処理を delete_session_confirmed ヘルパへ抽出し
+  本番とテストが同じ経路を通るようにした。親がテストのスタブ判定
+  ("DELETE /session ") の誤りを直接修正。R4 が削除失敗アラートへの
+  セッション ID 再挿入と SSE 経路の一覧未更新を指摘、親が直接修正。
+  残存 low（キーハンドラ経路のテスト）は記録のみ。
 - 2026-11-24 R4 残存（todo SSE 原子化の修正時）: update_and_get_with_ids を
   追加し writer_lock 内で update_locked → get_with_ids_locked を連続実行。
   公開 update/get_with_ids の挙動（DB 失敗時 early return 含む）は不変。
