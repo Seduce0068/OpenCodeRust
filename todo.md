@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **CLI 質問の空入力が暗黙に最初の選択肢（Yes）として扱われる**
-  — `tool/question.rs:196` / AV-03 / 低
 - [ ] **task ツールが任意 task_id を検証せず渡す**
   — `tool/task.rs:56` / AV-04 / 低
 - [ ] **WebSearch/CodeSearch の query に空/過大の検証が無い**
@@ -275,6 +273,8 @@ status: current
 
 ## 完了
 
+- [x] **[CLI 空入力 1 件]** 暗黙 Yes 選択を防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[unified diff 行解析 1 件]** hunk 内ヘッダ誤認を修正
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[apply_patch 行解析 1 件]** `--` / `++` 始まりデータ行を保持
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 CLI 空入力: Yes を含む選択肢では空入力の先頭選択肢フォールバックを
+  無効化し空回答を返す（Plan 側 require_approval が fail-closed で拒否）。
+  stdin 読み取りと回答パースを分離し純粋関数化、回帰4件。R4 が低（テストが
+  実経路を通らない、yes 判定が plan.rs の APPROVE_LABEL と文字列分離で
+  改名時に暗黙承認が復活し得る）を指摘したが、今回の目的は達成のため記録のみ。
 - 2026-11-24 unified diff 行解析: file_header/new_file_header 判定を !in_hunk
   ゲート内へ移動し、hunk 内のスキップ条件も削除。子が `diff --git` なし
   複数ファイル連続形式は元々未対応と指摘、親がコードコメントへ明記し
