@@ -10,6 +10,13 @@ use crate::MAX_DIAGNOSTICS_PER_FILE;
 #[cfg(feature = "lsp")]
 const MAX_PROJECT_DIAGNOSTICS_FILES: usize = 5;
 
+/// 第1フェーズのロック内で計算し、権限確認を跨いで第2フェーズへ渡す値。
+/// パスやトークン値は含まない（エラー・ログは固定文言のみ）。
+struct PreparedWrite {
+    existed: bool,
+    diff: String,
+}
+
 pub struct WriteTool {
     directory: PathBuf,
 }
@@ -108,14 +115,17 @@ impl Tool for WriteTool {
         // EditTool と同じく path_str をキーにしたファイルロックで
         // 存在確認〜書込までを直列化する（IOORDER-01）。キーが同一なら
         // Write/Edit は同じ Mutex を共有し、read→write 間の lost update を防ぐ。
-        // ロック内に閉じ込めても既存の順序・エラー伝播は一切変わらない。
+        // IOORDER-01-R4: ただし権限確認（ask_permission）はロック外で行う。
+        // 第1フェーズで存在確認・読取り・assert・diff を計算してロックを解放し、
+        // 権限確認後に第2フェーズで stale 再検証を行ってから書込む。
+
+        // ---- 第1フェーズ: ロック内で権限確認に必要な値だけを準備する ----
         let ctx_clone = ctx.clone();
         let path_clone = path.clone();
         let path_str_clone = path_str.clone();
-        let title_clone = title.clone();
         let content_clone = content.clone();
 
-        with_file_lock(&path_str, || async {
+        let prepared = with_file_lock(&path_str, || async move {
             // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
             // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
             // がスキップされ、並行編集による上書きを防げなくなる。
@@ -142,15 +152,55 @@ impl Tool for WriteTool {
             }
 
             let diff = create_diff(&path_str_clone, &old_content, &content_clone);
+            Ok::<_, ToolError>(PreparedWrite {
+                existed: exists,
+                diff,
+            })
+        })
+        .await?;
 
-            ctx_clone
-                .ask_permission(
-                    crate::PermissionRequest::new("edit")
-                        .with_pattern(&path_str_clone)
-                        .with_metadata("diff", serde_json::json!(diff))
-                        .always_allow(),
-                )
-                .await?;
+        // ---- 権限確認: ロック外で行う ----
+        // HTTP 経路の PermissionBroker::ask がユーザ応答を待つ間も、同一パスの
+        // Write/Edit/ApplyPatch/MultiEdit はロックを取得でき、Head-of-line
+        // ブロックしない。
+        ctx.ask_permission(
+            crate::PermissionRequest::new("edit")
+                .with_pattern(&path_str)
+                .with_metadata("diff", serde_json::json!(prepared.diff))
+                .always_allow(),
+        )
+        .await?;
+
+        // ---- 第2フェーズ: 再度ロックを取り、stale 再検証後に書込む ----
+        let ctx_clone = ctx.clone();
+        let path_clone = path.clone();
+        let path_str_clone = path_str.clone();
+        let title_clone = title.clone();
+        let content_clone = content.clone();
+        let existed = prepared.existed;
+        let diff = prepared.diff;
+
+        with_file_lock(&path_str, || async move {
+            // 権限確認中に他操作がファイルを変更していた場合は、ここで固定文言の
+            // エラー（本番の file_time_assert: "File changed since read"）を返す。
+            if existed {
+                ctx_clone
+                    .do_file_time_assert(path_str_clone.clone())
+                    .await?;
+            } else {
+                // 新規作成だったのに権限待ち中に他操作が作成した場合は上書きしない（R4）。
+                let now_exists = fs::try_exists(&path_clone).await.map_err(|e| {
+                    ToolError::execution_with_source(
+                        format!("Failed to check file existence: {}", e),
+                        e,
+                    )
+                })?;
+                if now_exists {
+                    return Err(ToolError::ExecutionError(
+                        "File changed since read".to_string(),
+                    ));
+                }
+            }
 
             if let Some(parent) = path_clone.parent() {
                 fs::create_dir_all(parent).await.map_err(|e| {
@@ -179,7 +229,7 @@ impl Tool for WriteTool {
                     "file_watcher.updated",
                     serde_json::json!({
                         "file": path_str_clone,
-                        "event": if exists { "change" } else { "add" }
+                        "event": if existed { "change" } else { "add" }
                     }),
                 )
                 .await;
@@ -219,7 +269,7 @@ impl Tool for WriteTool {
                     m.insert("bytes".into(), serde_json::json!(byte_count));
                     m.insert("lines".into(), serde_json::json!(line_count));
                     m.insert("filepath".into(), serde_json::json!(path_str_clone));
-                    m.insert("exists".into(), serde_json::json!(exists));
+                    m.insert("exists".into(), serde_json::json!(existed));
                     m.insert("diff".into(), serde_json::json!(diff));
                     m
                 },
@@ -560,8 +610,8 @@ mod tests {
 
         assert_eq!(
             assert_calls.load(Ordering::SeqCst),
-            1,
-            "既存の空ファイルでも file_time_assert が呼ばれること"
+            2,
+            "既存の空ファイルでは第1フェーズと第2フェーズの両方で file_time_assert が呼ばれること"
         );
         assert_eq!(result.metadata["exists"], true);
         {
@@ -629,8 +679,8 @@ mod tests {
 
         assert_eq!(
             assert_calls.load(Ordering::SeqCst),
-            1,
-            "既存の非空ファイルでは file_time_assert が呼ばれること"
+            2,
+            "既存の非空ファイルでは第1フェーズと第2フェーズの両方で file_time_assert が呼ばれること"
         );
         assert_eq!(result.metadata["exists"], true);
         {
@@ -641,10 +691,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// IOORDER-01 回帰: Write と Edit が同一パスのファイルロックを共有し、
-    /// クリティカルセクション（存在確認〜書込）が重ならないこと。
-    /// ロックが無い旧実装では Write の file_time_assert 待ちの間に Edit が入り
-    /// peak が 2 になり、両変更のうち一方が失われる。
+    /// IOORDER-01 / -R4 回帰: Write と Edit はフェーズ単位で同一パスの
+    /// ファイルロックを共有し、各フェーズのクリティカルセクション（存在確認〜
+    /// file_time_assert）は重ならないこと。ロックが無い旧実装では peak が 2 になる。
+    ///
+    /// 2 フェーズ化により権限待ちの間はロックが解放されるため、このテストの
+    /// no-op assert では stale 検出が働かず、最後に書込んだ側の内容が残る。
+    /// 権限待ち中のロック取得と stale 検出は専用テストで検証する。
     #[tokio::test]
     async fn write_and_edit_share_file_lock_on_same_path() {
         use std::time::Duration;
@@ -733,11 +786,206 @@ mod tests {
             "Write と Edit は同一パスでファイルロックを共有し直列化されること"
         );
 
-        // 直列化により Write の追加行と Edit の置換の両方が残ること。
+        // 2 フェーズ化では権限待ちの間に他側が書込めるため、no-op assert の
+        // このテストでは最後の書込が勝つ。いずれかの完全な結果であり、
+        // 途中状態の混在や破損がないことを確認する。
         let final_content = std::fs::read_to_string(&file).unwrap();
         assert!(
-            final_content.contains("BBB_EDITED") && final_content.contains("CCC"),
-            "両変更が残ること (actual: {final_content})"
+            final_content == "AAA\nBBB\nCCC\n"
+                || final_content == "AAA\nBBB_EDITED\n"
+                || final_content == "AAA\nBBB_EDITED\nCCC\n",
+            "いずれかの完全な結果であること (actual: {final_content})"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// IOORDER-01-R4 回帰: 権限確認（ask_permission）を待つ間はファイルロックを
+    /// 保持しない。別タスクが同一パスのロックを取得でき、並行度が 2 以上になる。
+    #[tokio::test]
+    async fn permission_wait_does_not_hold_file_lock() {
+        use std::time::Duration;
+
+        let dir = temp_dir();
+        let file = dir.join("permission.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let permission_entered = Arc::new(AtomicUsize::new(0));
+        let permission_gate = Arc::new(AtomicUsize::new(0));
+
+        let entered = permission_entered.clone();
+        let gate = permission_gate.clone();
+        let active_for_ask = active.clone();
+        let peak_for_ask = peak.clone();
+        let ctx = context(&dir).with_ask(move |_req| {
+            let entered = entered.clone();
+            let gate = gate.clone();
+            let active = active_for_ask.clone();
+            let peak = peak_for_ask.clone();
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                entered.store(1, Ordering::SeqCst);
+                while gate.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<(), ToolError>(())
+            }
+        });
+
+        let file_path = file.to_string_lossy().to_string();
+        let write_path = file_path.clone();
+        let write = tokio::spawn(async move {
+            WriteTool::new()
+                .execute(
+                    serde_json::json!({
+                        "file_path": write_path,
+                        "content": "new",
+                    }),
+                    ctx,
+                )
+                .await
+                .unwrap()
+        });
+
+        // 権限待ちへ入るまで待つ（第1フェーズのロックは既に解放済み）。
+        for _ in 0..500 {
+            if permission_entered.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            permission_entered.load(Ordering::SeqCst) > 0,
+            "権限確認コールバックが呼ばれること"
+        );
+
+        // 権限待ちの間に別タスクが同一パスのロックを取得できること。
+        let other_path = file_path.clone();
+        let other_active = active.clone();
+        let other_peak = peak.clone();
+        let other = tokio::spawn(async move {
+            crate::with_file_lock(&other_path, || async move {
+                let now = other_active.fetch_add(1, Ordering::SeqCst) + 1;
+                other_peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                other_active.fetch_sub(1, Ordering::SeqCst);
+            })
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), other)
+            .await
+            .expect("権限待ち中に他タスクがロックを取得できること")
+            .expect("他タスクが正常終了すること");
+
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "権限待ちと他操作が重なり peak が 2 以上になること (actual: {})",
+            peak.load(Ordering::SeqCst)
+        );
+
+        permission_gate.store(1, Ordering::SeqCst);
+        write.await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// IOORDER-01-R4 回帰: 権限確認中に他操作がファイルを変更した場合、
+    /// 第2フェーズの file_time_assert が固定文言のエラーを返し、書込まない。
+    #[tokio::test]
+    async fn stale_change_during_permission_is_rejected() {
+        use std::time::Duration;
+
+        let dir = temp_dir();
+        let file = dir.join("stale.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let permission_entered = Arc::new(AtomicUsize::new(0));
+        let permission_gate = Arc::new(AtomicUsize::new(0));
+        let entered = permission_entered.clone();
+        let gate = permission_gate.clone();
+
+        // 2 回目（第2フェーズ）の assert で stale を検出したものとして失敗させる。
+        // エラー文言は本番配線と同じ固定文言のみで、パスは含まない。
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let calls = assert_calls.clone();
+
+        let ctx = context(&dir)
+            .with_ask(move |_req| {
+                let entered = entered.clone();
+                let gate = gate.clone();
+                async move {
+                    entered.store(1, Ordering::SeqCst);
+                    while gate.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Ok::<(), ToolError>(())
+                }
+            })
+            .with_file_time_assert(move |_s, _p| {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 2 {
+                        Err(ToolError::ExecutionError(
+                            "File changed since read".to_string(),
+                        ))
+                    } else {
+                        Ok::<(), ToolError>(())
+                    }
+                }
+            });
+
+        let file_path = file.to_string_lossy().to_string();
+        let write_path = file_path.clone();
+        let write = tokio::spawn(async move {
+            WriteTool::new()
+                .execute(
+                    serde_json::json!({
+                        "file_path": write_path,
+                        "content": "new",
+                    }),
+                    ctx,
+                )
+                .await
+        });
+
+        for _ in 0..500 {
+            if permission_entered.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(permission_entered.load(Ordering::SeqCst) > 0);
+
+        // 権限待ちの間に外部変更を模擬（ロックは第1フェーズで解放済み）。
+        std::fs::write(&file, "changed by other op").unwrap();
+        permission_gate.store(1, Ordering::SeqCst);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), write)
+            .await
+            .expect("書き込みが完了すること")
+            .expect("スレッドが正常終了すること")
+            .expect_err("stale エラーが返ること");
+
+        assert!(
+            matches!(&error, ToolError::ExecutionError(msg) if msg.as_str() == "File changed since read"),
+            "固定文言の stale エラーであること (actual: {error})"
+        );
+        assert_eq!(
+            assert_calls.load(Ordering::SeqCst),
+            2,
+            "第1フェーズと第2フェーズの両方で assert が呼ばれること"
+        );
+        // 変更は上書きされていないこと。
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "changed by other op"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

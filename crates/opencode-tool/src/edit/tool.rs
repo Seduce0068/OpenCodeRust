@@ -9,6 +9,24 @@ use crate::{with_file_lock, Metadata, Tool, ToolContext, ToolError, ToolResult};
 #[cfg(feature = "lsp")]
 use crate::MAX_DIAGNOSTICS_PER_FILE;
 
+/// 第1フェーズのロック内で計算し、権限確認を跨いで第2フェーズへ渡す値。
+/// パスやトークン値は含まない（エラー・ログは固定文言のみ）。
+struct PreparedEdit {
+    existed: bool,
+    diff: String,
+    kind: PreparedEditKind,
+}
+
+enum PreparedEditKind {
+    /// `old_string` が空: 新規内容で上書きする経路。
+    Create { new_content: String },
+    /// 通常の置換経路。
+    Replace {
+        new_content: String,
+        replacements: usize,
+    },
+}
+
 pub struct EditTool {
     directory: PathBuf,
 }
@@ -119,14 +137,16 @@ impl Tool for EditTool {
             .to_string_lossy()
             .to_string();
 
+        // ---- 第1フェーズ: ロック内で存在確認〜diff 計算まで行い値を取り出す ----
+        // IOORDER-01-R4: ask_permission はロック外で行うため、ここでは権限確認に
+        // 必要な値（existed / diff）と書込内容だけを PreparedEdit として返す。
         let ctx_clone = ctx.clone();
         let path_clone = path.clone();
         let path_str_clone = path_str.clone();
-        let title_clone = title.clone();
         let old_string_clone = old_string.clone();
         let new_string_clone = new_string.clone();
 
-        with_file_lock(&path_str, || async {
+        let prepared = with_file_lock(&path_str, || async move {
             // 既存判定は内容の空・非空ではなく、実際にパスが存在するかで行う。
             // 既存の空ファイルを新規作成と誤判定すると file_time_assert（stale 検出）
             // がスキップされ、並行編集による上書きを防げなくなる（write.rs の M-58 と同種）。
@@ -158,163 +178,207 @@ impl Tool for EditTool {
                     .await?;
             }
 
-            if old_string_clone.is_empty() {
-                let new_string_normalized = normalize_line_endings(&new_string_clone);
-                let diff = create_diff(&path_str_clone, "", &new_string_normalized);
-                ctx_clone
-                    .ask_permission(
-                        crate::PermissionRequest::new("edit")
-                            .with_pattern(&path_str_clone)
-                            .with_metadata("diff", serde_json::json!(diff))
-                            .always_allow(),
-                    )
-                    .await?;
+            let new_string_normalized = normalize_line_endings(&new_string_clone);
 
-                fs::write(&path_clone, &new_string_normalized)
-                    .await
-                    .map_err(|e| {
+            if old_string_clone.is_empty() {
+                let diff = create_diff(&path_str_clone, "", &new_string_normalized);
+                Ok::<_, ToolError>(PreparedEdit {
+                    existed,
+                    diff,
+                    kind: PreparedEditKind::Create {
+                        new_content: new_string_normalized,
+                    },
+                })
+            } else {
+                let replacer = CompositeReplacer::new();
+                let old_string_normalized = normalize_line_endings(&old_string_clone);
+                let new_content = replacer
+                    .replace(
+                        &content,
+                        &old_string_normalized,
+                        &new_string_normalized,
+                        replace_all,
+                    )
+                    .map_err(ToolError::ExecutionError)?;
+
+                let diff = create_diff(&path_str_clone, &content, &new_content);
+                let replacements = if replace_all {
+                    content.matches(&old_string_normalized).count()
+                } else {
+                    1
+                };
+
+                Ok::<_, ToolError>(PreparedEdit {
+                    existed,
+                    diff,
+                    kind: PreparedEditKind::Replace {
+                        new_content,
+                        replacements,
+                    },
+                })
+            }
+        })
+        .await?;
+
+        // ---- 権限確認: ロック外で行う ----
+        // 2 つの old_string.is_empty() 分岐は、どちらも同じくこの地点で権限確認し、
+        // 第2フェーズで同じ構造（stale 再検証 → 書込 → 通知）へ合流する。
+        ctx.ask_permission(
+            crate::PermissionRequest::new("edit")
+                .with_pattern(&path_str)
+                .with_metadata("diff", serde_json::json!(prepared.diff))
+                .always_allow(),
+        )
+        .await?;
+
+        // ---- 第2フェーズ: 再度ロックを取り、stale 再検証後に書込む ----
+        let ctx_clone = ctx.clone();
+        let path_clone = path.clone();
+        let path_str_clone = path_str.clone();
+        let title_clone = title.clone();
+        let existed = prepared.existed;
+        let diff = prepared.diff;
+        let kind = prepared.kind;
+
+        with_file_lock(&path_str, || async move {
+            // 権限確認中に他操作がファイルを変更していた場合は、ここで固定文言の
+            // エラー（本番の file_time_assert: "File changed since read"）を返す。
+            if existed {
+                ctx_clone
+                    .do_file_time_assert(path_str_clone.clone())
+                    .await?;
+            } else {
+                // 新規作成だったのに権限待ち中に他操作が作成した場合は上書きしない（R4）。
+                let now_exists = fs::try_exists(&path_clone).await.map_err(|e| {
+                    ToolError::execution_with_source(
+                        format!("Failed to check file existence: {}", e),
+                        e,
+                    )
+                })?;
+                if now_exists {
+                    return Err(ToolError::ExecutionError(
+                        "File changed since read".to_string(),
+                    ));
+                }
+            }
+
+            match kind {
+                PreparedEditKind::Create { new_content } => {
+                    fs::write(&path_clone, &new_content).await.map_err(|e| {
                         ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
                     })?;
 
-                ctx_clone
-                    .do_publish_bus(
-                        "file.edited",
-                        serde_json::json!({
-                            "file": path_str_clone.clone()
-                        }),
-                    )
-                    .await;
+                    ctx_clone
+                        .do_publish_bus(
+                            "file.edited",
+                            serde_json::json!({
+                                "file": path_str_clone.clone()
+                            }),
+                        )
+                        .await;
 
-                ctx_clone
-                    .do_publish_bus(
-                        "file_watcher.updated",
-                        serde_json::json!({
-                            "file": path_str_clone.clone(),
-                            "event": if existed { "change" } else { "add" }
-                        }),
-                    )
-                    .await;
+                    ctx_clone
+                        .do_publish_bus(
+                            "file_watcher.updated",
+                            serde_json::json!({
+                                "file": path_str_clone.clone(),
+                                "event": if existed { "change" } else { "add" }
+                            }),
+                        )
+                        .await;
 
-                ctx_clone
-                    .do_lsp_touch_file(path_str_clone.clone(), true)
-                    .await?;
-                ctx_clone.do_file_time_read(path_str_clone.clone()).await?;
+                    ctx_clone
+                        .do_lsp_touch_file(path_str_clone.clone(), true)
+                        .await?;
+                    ctx_clone.do_file_time_read(path_str_clone.clone()).await?;
 
-                let output = format!("Created new file content at {}", path_clone.display());
-                let (lsp_output, lsp_diagnostics) =
-                    get_lsp_diagnostics_with_meta(&path_clone, &ctx_clone).await;
-                let final_output = if !lsp_output.is_empty() {
-                    format!("{}\n\n{}", output, lsp_output)
-                } else {
-                    output
-                };
+                    let output = format!("Created new file content at {}", path_clone.display());
+                    let (lsp_output, lsp_diagnostics) =
+                        get_lsp_diagnostics_with_meta(&path_clone, &ctx_clone).await;
+                    let final_output = if !lsp_output.is_empty() {
+                        format!("{}\n\n{}", output, lsp_output)
+                    } else {
+                        output
+                    };
 
-                let path_for_metadata = path_str_clone.clone();
+                    Ok(ToolResult {
+                        title: title_clone,
+                        output: final_output,
+                        metadata: {
+                            let mut m = Metadata::new();
+                            m.insert("filepath".into(), serde_json::json!(path_str_clone));
+                            if !lsp_diagnostics.is_empty() {
+                                m.insert("diagnostics".into(), serde_json::json!(lsp_diagnostics));
+                            }
+                            m
+                        },
+                        truncated: false,
+                    })
+                }
+                PreparedEditKind::Replace {
+                    new_content,
+                    replacements,
+                } => {
+                    fs::write(&path_clone, &new_content).await.map_err(|e| {
+                        ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
+                    })?;
 
-                return Ok(ToolResult {
-                    title: title_clone,
-                    output: final_output,
-                    metadata: {
-                        let mut m = Metadata::new();
-                        m.insert("filepath".into(), serde_json::json!(path_for_metadata));
-                        if !lsp_diagnostics.is_empty() {
-                            m.insert("diagnostics".into(), serde_json::json!(lsp_diagnostics));
-                        }
-                        m
-                    },
-                    truncated: false,
-                });
+                    ctx_clone
+                        .do_publish_bus(
+                            "file.edited",
+                            serde_json::json!({
+                                "file": path_str_clone.clone()
+                            }),
+                        )
+                        .await;
+
+                    ctx_clone
+                        .do_publish_bus(
+                            "file_watcher.updated",
+                            serde_json::json!({
+                                "file": path_str_clone.clone(),
+                                "event": if existed { "change" } else { "add" }
+                            }),
+                        )
+                        .await;
+
+                    ctx_clone
+                        .do_lsp_touch_file(path_str_clone.clone(), true)
+                        .await?;
+                    ctx_clone.do_file_time_read(path_str_clone.clone()).await?;
+
+                    let base_output = format!(
+                        "Successfully edited {} ({} replacement{})",
+                        path_clone.display(),
+                        replacements,
+                        if replacements != 1 { "s" } else { "" }
+                    );
+
+                    let (lsp_output, lsp_diagnostics) =
+                        get_lsp_diagnostics_with_meta(&path_clone, &ctx_clone).await;
+                    let final_output = if lsp_output.is_empty() {
+                        base_output
+                    } else {
+                        format!("{}\n\n{}", base_output, lsp_output)
+                    };
+
+                    Ok(ToolResult {
+                        title: title_clone,
+                        output: final_output,
+                        metadata: {
+                            let mut m = Metadata::new();
+                            m.insert("replacements".into(), serde_json::json!(replacements));
+                            m.insert("filepath".into(), serde_json::json!(path_str_clone));
+                            m.insert("diff".into(), serde_json::json!(diff));
+                            if !lsp_diagnostics.is_empty() {
+                                m.insert("diagnostics".into(), serde_json::json!(lsp_diagnostics));
+                            }
+                            m
+                        },
+                        truncated: false,
+                    })
+                }
             }
-
-            let replacer = CompositeReplacer::new();
-            let old_string_normalized = normalize_line_endings(&old_string_clone);
-            let new_string_normalized = normalize_line_endings(&new_string_clone);
-            let new_content = replacer
-                .replace(
-                    &content,
-                    &old_string_normalized,
-                    &new_string_normalized,
-                    replace_all,
-                )
-                .map_err(ToolError::ExecutionError)?;
-
-            let diff = create_diff(&path_str_clone, &content, &new_content);
-            ctx_clone
-                .ask_permission(
-                    crate::PermissionRequest::new("edit")
-                        .with_pattern(&path_str_clone)
-                        .with_metadata("diff", serde_json::json!(diff))
-                        .always_allow(),
-                )
-                .await?;
-
-            let replacements = if replace_all {
-                content.matches(&old_string_normalized).count()
-            } else {
-                1
-            };
-
-            fs::write(&path_clone, &new_content).await.map_err(|e| {
-                ToolError::execution_with_source(format!("Failed to write file: {}", e), e)
-            })?;
-
-            ctx_clone
-                .do_publish_bus(
-                    "file.edited",
-                    serde_json::json!({
-                        "file": path_str_clone.clone()
-                    }),
-                )
-                .await;
-
-            ctx_clone
-                .do_publish_bus(
-                    "file_watcher.updated",
-                    serde_json::json!({
-                        "file": path_str_clone.clone(),
-                        "event": if existed { "change" } else { "add" }
-                    }),
-                )
-                .await;
-
-            ctx_clone
-                .do_lsp_touch_file(path_str_clone.clone(), true)
-                .await?;
-            ctx_clone.do_file_time_read(path_str_clone.clone()).await?;
-
-            let base_output = format!(
-                "Successfully edited {} ({} replacement{})",
-                path_clone.display(),
-                replacements,
-                if replacements != 1 { "s" } else { "" }
-            );
-
-            let (lsp_output, lsp_diagnostics) =
-                get_lsp_diagnostics_with_meta(&path_clone, &ctx_clone).await;
-            let final_output = if lsp_output.is_empty() {
-                base_output
-            } else {
-                format!("{}\n\n{}", base_output, lsp_output)
-            };
-
-            let diff_for_metadata = diff.clone();
-            let path_for_metadata = path_str_clone.clone();
-
-            Ok(ToolResult {
-                title: title_clone,
-                output: final_output,
-                metadata: {
-                    let mut m = Metadata::new();
-                    m.insert("replacements".into(), serde_json::json!(replacements));
-                    m.insert("filepath".into(), serde_json::json!(path_for_metadata));
-                    m.insert("diff".into(), serde_json::json!(diff_for_metadata));
-                    if !lsp_diagnostics.is_empty() {
-                        m.insert("diagnostics".into(), serde_json::json!(lsp_diagnostics));
-                    }
-                    m
-                },
-                truncated: false,
-            })
         })
         .await
     }
@@ -566,8 +630,8 @@ mod tests {
 
         assert_eq!(
             assert_calls.load(Ordering::SeqCst),
-            1,
-            "既存の空ファイルでも file_time_assert が呼ばれること"
+            2,
+            "既存の空ファイルでは第1フェーズと第2フェーズの両方で file_time_assert が呼ばれること"
         );
         {
             let events = events.lock().unwrap();
@@ -637,8 +701,8 @@ mod tests {
 
         assert_eq!(
             assert_calls.load(Ordering::SeqCst),
-            1,
-            "既存の非空ファイルでは file_time_assert が呼ばれること"
+            2,
+            "既存の非空ファイルでは第1フェーズと第2フェーズの両方で file_time_assert が呼ばれること"
         );
         {
             let events = events.lock().unwrap();
@@ -788,6 +852,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar only");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// IOORDER-01-R4 回帰: `old_string` が空の分岐も権限待ちの後で
+    /// 第2フェーズの stale 再検証を行い、固定文言のエラーで失敗すること。
+    #[tokio::test]
+    async fn empty_old_string_branch_revalidates_after_permission() {
+        use std::time::Duration;
+
+        let dir = temp_dir();
+        let file = dir.join("create.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let permission_entered = Arc::new(AtomicUsize::new(0));
+        let permission_gate = Arc::new(AtomicUsize::new(0));
+        let entered = permission_entered.clone();
+        let gate = permission_gate.clone();
+        let assert_calls = Arc::new(AtomicUsize::new(0));
+        let calls = assert_calls.clone();
+
+        let ctx = context(&dir)
+            .with_ask(move |_req| {
+                let entered = entered.clone();
+                let gate = gate.clone();
+                async move {
+                    entered.store(1, Ordering::SeqCst);
+                    while gate.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Ok::<(), ToolError>(())
+                }
+            })
+            .with_file_time_assert(move |_s, _p| {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 2 {
+                        Err(ToolError::ExecutionError(
+                            "File changed since read".to_string(),
+                        ))
+                    } else {
+                        Ok::<(), ToolError>(())
+                    }
+                }
+            });
+
+        let file_path = file.to_string_lossy().to_string();
+        let edit = tokio::spawn(async move {
+            EditTool::new()
+                .execute(
+                    serde_json::json!({
+                        "file_path": file_path,
+                        "old_string": "",
+                        "new_string": "created",
+                    }),
+                    ctx,
+                )
+                .await
+        });
+
+        for _ in 0..500 {
+            if permission_entered.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(permission_entered.load(Ordering::SeqCst) > 0);
+
+        // 権限待ちの間に外部変更を模擬。
+        std::fs::write(&file, "changed by other op").unwrap();
+        permission_gate.store(1, Ordering::SeqCst);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), edit)
+            .await
+            .expect("編集が完了すること")
+            .expect("スレッドが正常終了すること")
+            .expect_err("stale エラーが返ること");
+
+        assert!(
+            matches!(&error, ToolError::ExecutionError(msg) if msg.as_str() == "File changed since read"),
+            "固定文言の stale エラーであること (actual: {error})"
+        );
+        assert_eq!(assert_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "changed by other op"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
