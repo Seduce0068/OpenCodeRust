@@ -164,8 +164,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **task ツールが任意 task_id を検証せず渡す**
-  — `tool/task.rs:56` / AV-04 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
   — `config/schema.rs:950` / CFGAPPLY-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -263,6 +261,8 @@ status: current
 
 ## 完了
 
+- [x] **[task_id 検証 1 件]** 生成形式を受理し再開を維持
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[plugin チャンク検証 1 件]** 不正 chunk を Protocol エラー化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[search query 検証 1 件]** 空拒否・trim・上限 4096 char
@@ -888,6 +888,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 task_id: 生成 ID の実形式が `task_{agent}_{uuid}`（simple/
+  standard）であることを親が確認（最初の sub_{uuid} という判断は
+  PartInput::Subtask の別 ID で誤り）。検証を task_ 形式も受理するよう
+  拡張し、実生成 ID の往復テストを追加して再開機能の全面停止という high
+  回帰を解消。所有権チェックは session 側に既存機構が無く未実装と明記。
+  R2→R4→R2 の最大2回で停止。
 - 2026-11-24 plugin チャンク: auth.fetch.stream.chunk の非文字列値を固定文言
   Protocol エラー化（stream.end が正常完了に見えないように）。status の
   unwrap_or(200) は旧ホスト互換のため据え置き（子の判断）。R4 指摘なし。
