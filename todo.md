@@ -170,10 +170,6 @@ status: current
 
 - [ ] **差分表示の折返しが表示幅ではなく scalar 数を使用**
   — `tui/components/diff.rs:249` / NUM-04 / 低
-- [ ] **ツール名の TaskKind 分類が部分文字列一致で誤分類**
-  — `tui/app.rs:4018` / STRING-01 / 低
-- [ ] **空ファイル名のパスで候補が全マッチ**
-  — `tool/read.rs:51` / STRING-02 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -278,6 +274,8 @@ status: current
 
 ## 完了
 
+- [x] **[文字列境界 2 件]** TaskKind 誤分類・空ファイル名候補
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[column/version 2 件]** UTF-16 column・LSP version checked
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[util 文字数 2 件]** バイト数ではなく文字数で算出
@@ -807,6 +805,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（TaskKind の修正時）: トークン完全一致化で区切りなし
+  ビルトイン名（todowrite / todoread / multiedit）が ToolCall へ回帰したため、
+  親が完全一致分岐と回帰テストを直接追加。clippy manual_pattern_char_comparison
+  も直接修正。
 - 2026-11-23 R4 残存（column/version の修正時）: file_versions カウンタの
   u32::MAX overflow（約43億回編集で到達、子も記録済み）、open_document の
   version 読取と更新が別ロックで非アトミック（変更非起因の既存構造）、
