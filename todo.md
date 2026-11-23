@@ -168,8 +168,6 @@ status: current
   — `tool/task.rs:56` / AV-04 / 低
 - [ ] **WebSearch/CodeSearch の query に空/過大の検証が無い**
   — `tool/websearch.rs:43` / AV-05 / 低
-- [ ] **不正な mcp.timeout がゴースト MCP サーバーとして読まれる**
-  — `config/schema.rs:1470` / PARSE-03 / 低
 - [ ] **plugin auth.fetch の不正チャンクが通知を捨てる**
   — `plugin/subprocess/client.rs:538` / PARSE-04 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
@@ -269,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[mcp.timeout 検証 1 件]** 不正値を設定エラー化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[LSP 入力検証 1 件]** 座標 0・空 rename 名を拒否
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CodeMode センチネル 1 件]** Infinity トークンを一意化
@@ -888,6 +888,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 mcp.timeout: デシリアライズ失敗を '?' で伝播し固定文言エラーへ。
+  R4 が 3 件指摘（サーバー風キー混在時のゴースト残存、servers 解析エラーの
+  値露出、明示 null のハードエラー化）— looks_like_mcp_server の設計変更を
+  伴う／既存経路／旧挙動未確認のため残存記録のみ。McpTimeoutConfig の実
+  フィールドは startup/catalog/execution（shutdown は存在しない）。
 - 2026-11-24 LSP 入力検証: zero_based_position で座標 0 を早期拒否、
   resolve_new_name で空/空白のみ拒否＋前後空白を trim。R4 が低 3 件を指摘、
   親が newName trim を直接修正し最大2回で停止。残存 low（位置を使わない
