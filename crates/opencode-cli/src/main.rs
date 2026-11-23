@@ -3259,8 +3259,10 @@ fn provider_to_bootstrap(provider: &opencode_config::ProviderConfig) -> Bootstra
         npm: provider.npm.clone(),
         options: (!options.is_empty()).then_some(options),
         models,
-        blacklist: (!provider.blacklist.is_empty()).then_some(provider.blacklist.clone()),
-        whitelist: (!provider.whitelist.is_empty()).then_some(provider.whitelist.clone()),
+        blacklist: (!provider.blacklist.is_empty())
+            .then_some(provider.blacklist.as_slice().to_vec()),
+        whitelist: (!provider.whitelist.is_empty())
+            .then_some(provider.whitelist.as_slice().to_vec()),
         ..Default::default()
     }
 }

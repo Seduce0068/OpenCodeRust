@@ -1073,10 +1073,20 @@ pub struct ProviderConfig {
     /// `options.compatibility`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<HashMap<String, serde_json::Value>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub whitelist: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blacklist: Vec<String>,
+    // `whitelist: []` / `blacklist: []` are explicit clear directives; an
+    // omitted key must leave the accumulated value intact. `ExplicitStringList`
+    // tracks that presence bit while its custom serde impl keeps the JSON wire
+    // shape as an array.
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub whitelist: ExplicitStringList,
+    #[serde(
+        default,
+        skip_serializing_if = "ExplicitStringList::should_skip_serializing"
+    )]
+    pub blacklist: ExplicitStringList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2367,12 +2377,8 @@ impl DeepMerge for ProviderConfig {
         merge_option_json_map(&mut self.settings, other.settings);
         merge_option_json_map(&mut self.headers, other.headers);
         merge_option_json_map(&mut self.compatibility, other.compatibility);
-        if !other.whitelist.is_empty() {
-            self.whitelist = other.whitelist;
-        }
-        if !other.blacklist.is_empty() {
-            self.blacklist = other.blacklist;
-        }
+        merge_explicit_string_list_replace(&mut self.whitelist, other.whitelist);
+        merge_explicit_string_list_replace(&mut self.blacklist, other.blacklist);
     }
 }
 
@@ -3197,6 +3203,157 @@ mod tests {
             Some(&serde_json::json!(["anthropic", "google"]))
         );
         assert_eq!(json.get("enabled_providers"), Some(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn explicit_empty_provider_whitelist_blacklist_clear_accumulated_values() {
+        let mut base = Config {
+            provider: Some(HashMap::from([(
+                "openai".to_string(),
+                ProviderConfig {
+                    whitelist: vec!["model-a".to_string()].into(),
+                    blacklist: vec!["model-b".to_string()].into(),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let clear: Config =
+            serde_json::from_str(r#"{"provider": {"openai": {"whitelist": [], "blacklist": []}}}"#)
+                .unwrap();
+        let clear_provider = &clear.provider.as_ref().expect("clear provider")["openai"];
+        assert!(clear_provider.whitelist.is_explicit());
+        assert!(clear_provider.blacklist.is_explicit());
+        assert!(clear_provider.whitelist.is_empty());
+        assert!(clear_provider.blacklist.is_empty());
+
+        base.merge(clear);
+
+        let merged = base
+            .provider
+            .expect("merged provider")
+            .remove("openai")
+            .expect("merged openai provider");
+        assert!(
+            merged.whitelist.is_empty(),
+            "provider.whitelist: [] must clear lower-precedence values"
+        );
+        assert!(
+            merged.blacklist.is_empty(),
+            "provider.blacklist: [] must clear lower-precedence values"
+        );
+        assert!(merged.whitelist.is_explicit());
+        assert!(merged.blacklist.is_explicit());
+    }
+
+    #[test]
+    fn omitted_provider_whitelist_blacklist_keep_accumulated_values() {
+        let mut base = Config {
+            provider: Some(HashMap::from([(
+                "openai".to_string(),
+                ProviderConfig {
+                    whitelist: vec!["model-a".to_string()].into(),
+                    blacklist: vec!["model-b".to_string()].into(),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        // Provider object present, but both list keys absent: must not clear.
+        let theme_only: Config = serde_json::from_str(
+            r#"{"provider": {"openai": {"name": "OpenAI"}}, "theme": "dark"}"#,
+        )
+        .unwrap();
+        let overlay_provider = &theme_only.provider.as_ref().expect("overlay provider")["openai"];
+        assert!(!overlay_provider.whitelist.is_explicit());
+        assert!(!overlay_provider.blacklist.is_explicit());
+
+        base.merge(theme_only);
+        {
+            let merged = base
+                .provider
+                .as_ref()
+                .expect("merged provider")
+                .get("openai")
+                .expect("merged openai provider");
+            assert_eq!(merged.whitelist.as_slice(), &["model-a".to_string()]);
+            assert_eq!(merged.blacklist.as_slice(), &["model-b".to_string()]);
+        }
+
+        // The whole `provider` key is absent: it must be left untouched too.
+        let no_provider: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        base.merge(no_provider);
+        let merged = base
+            .provider
+            .as_ref()
+            .expect("merged provider")
+            .get("openai")
+            .expect("merged openai provider");
+        assert_eq!(merged.whitelist.as_slice(), &["model-a".to_string()]);
+        assert_eq!(merged.blacklist.as_slice(), &["model-b".to_string()]);
+    }
+
+    #[test]
+    fn provider_whitelist_blacklist_serialize_as_arrays_including_explicit_empty() {
+        let parsed: Config = serde_json::from_str(
+            r#"{"provider": {"openai": {"whitelist": ["model-a", "model-b"], "blacklist": ["model-c"]}}}"#,
+        )
+        .unwrap();
+        let provider = &parsed.provider.as_ref().expect("provider")["openai"];
+        assert_eq!(
+            provider.whitelist.as_slice(),
+            &["model-a".to_string(), "model-b".to_string()]
+        );
+        assert_eq!(provider.blacklist.as_slice(), &["model-c".to_string()]);
+
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            json["provider"]["openai"]["whitelist"],
+            serde_json::json!(["model-a", "model-b"])
+        );
+        assert_eq!(
+            json["provider"]["openai"]["blacklist"],
+            serde_json::json!(["model-c"])
+        );
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"provider": {"openai": {"whitelist": [], "blacklist": []}}}"#)
+                .unwrap();
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(
+            json["provider"]["openai"]["whitelist"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            json["provider"]["openai"]["blacklist"],
+            serde_json::json!([])
+        );
+
+        let reloaded: Config = serde_json::from_value(json).unwrap();
+        let reloaded_provider = &reloaded.provider.as_ref().expect("reloaded provider")["openai"];
+        assert!(
+            reloaded_provider.whitelist.is_explicit() && reloaded_provider.whitelist.is_empty(),
+            "provider.whitelist: [] must persist as an explicit clear directive"
+        );
+        assert!(
+            reloaded_provider.blacklist.is_explicit() && reloaded_provider.blacklist.is_empty(),
+            "provider.blacklist: [] must persist as an explicit clear directive"
+        );
+
+        // An omitted key stays omitted even when the provider object is present.
+        let absent: Config =
+            serde_json::from_str(r#"{"provider": {"openai": {"name": "OpenAI"}}}"#).unwrap();
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json["provider"]["openai"].get("whitelist").is_none(),
+            "an omitted provider.whitelist key must stay omitted"
+        );
+        assert!(
+            json["provider"]["openai"].get("blacklist").is_none(),
+            "an omitted provider.blacklist key must stay omitted"
+        );
     }
 
     #[test]
