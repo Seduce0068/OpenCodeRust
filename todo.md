@@ -180,12 +180,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **Unauthorized のドキュメントと実装が不一致**
-  — `server/error.rs:159` / AUTH-401-SCHEMA-01 / 低
 - [ ] **todo.updated SSE 項目に安定 id が無い**
   — `server/routes.rs:2981` / TODO-SSE-ID-01 / 低
-- [ ] **JsonRpcMessage が id+method 要求を空レスポンスと誤分類**
-  — `mcp/protocol.rs:28` / MCP-JSONRPC-CLASSIFY-01 / 低
 - [ ] **Config.username に consumer が無い**
   — `config/loader.rs:2391` / CFGAPPLY-07 / 低
 - [ ] **command の subtask フラグが実行へ渡されない**
@@ -287,6 +283,8 @@ status: current
 
 ## 完了
 
+- [x] **[wire/doc 2 件]** JSON-RPC 要求分類と 401 ドキュメント整合
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[server wire 2 件]** todo SSE 正規化と 401 Bearer ヘッダ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[compaction 設定配線 1 件]** auto/prune/reserved を実行系へ反映
@@ -864,6 +862,11 @@ status: current
 
 ## メモ
 
+- 2026-11-23 wire/doc 2 件: parse_json_str が method キーを最優先で検査し
+  id+method 要求を Notification へ分類（旧実装は空 Response に誤分類）。
+  Unauthorized の doc を実装（legacy 形式のみ）に合わせ到達不能分岐を削除、
+  401 ボディと WWW-Authenticate ヘッダは不変。R4 が残存コメントを指摘、
+  親が直接修正。
 - 2026-11-23 server wire 2 件: todo.updated ペイロードをヘルパへ抽出し GET と
   同じ canonical 値へ（todo_manager の保存値は生値のまま）、Unauthorized に
   WWW-Authenticate: Bearer 固定値を追加。R4 指摘なし。
