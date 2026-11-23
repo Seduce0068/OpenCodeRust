@@ -2592,13 +2592,29 @@ fn emit_local_stream_event_json(event: &StreamEvent) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SSE の生バイト チャンクをバッファへ追加し、改行（`\n`）まで揃った行を
+/// String として返す（終端の改行は含まない）。
+///
+/// UTF-8 のマルチバイト文字がチャンク境界で分断されても行全体が揃うまで
+/// デコードしないため U+FFFD へ化けない。改行がまだ来ていない生バイトは
+/// `buffer` に残り、次のチャンクで結合される（CLI-SSE-UTF8-01）。
+fn push_sse_chunk_lines(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buffer.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+        lines.push(String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]).into_owned());
+    }
+    lines
+}
+
 async fn consume_remote_sse(
     response: reqwest::Response,
     session_id: &str,
     format: RunOutputFormat,
 ) -> anyhow::Result<()> {
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer: Vec<u8> = Vec::new();
     let mut current_event: Option<String> = None;
     let mut current_data: Vec<String> = Vec::new();
 
@@ -2676,11 +2692,7 @@ async fn consume_remote_sse(
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(pos) = buffer.find('\n') {
-            let mut line = buffer[..pos].to_string();
-            buffer = buffer[pos + 1..].to_string();
+        for mut line in push_sse_chunk_lines(&mut buffer, &chunk) {
             if line.ends_with('\r') {
                 line.pop();
             }
@@ -9563,5 +9575,173 @@ mod tests {
             parse_share_slug("https://opencode.ai/s/abc#/share/evil"),
             None
         );
+    }
+
+    /// 既存 SSE 契約の直接検証: 複数行の順序、空行（dispatch 境界）が
+    /// 行として返ること、末尾改行なしの行はバッファへ残ること（R4）。
+    /// CR はヘルパでは除去せず consume_remote_sse 側の既存処理が行う。
+    #[test]
+    fn sse_chunk_lines_preserve_line_contract() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let lines = push_sse_chunk_lines(
+            &mut buffer,
+            b"event: ping\r\ndata: first\r\ndata: second\r\n\r\ntail-without-newline",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "event: ping\r".to_string(),
+                "data: first\r".to_string(),
+                "data: second\r".to_string(),
+                "\r".to_string(),
+            ],
+            "空行（dispatch 境界）も行として返り、CR は呼び出し側で除去されること"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&buffer),
+            "tail-without-newline",
+            "末尾改行の無い行は次チャンクへ残ること"
+        );
+    }
+
+    /// CLI-SSE-UTF8-01 回帰テスト: 日本語・絵文字の UTF-8 バイト列を 1 バイト
+    /// ずつチャンク分割しても、行全体が揃ってからデコードされるため
+    /// U+FFFD が発生せず元文字列どおり復元されること。
+    #[test]
+    fn sse_one_byte_chunks_preserve_multibyte_utf8() {
+        let content = "日本語と絵文字🚀のストリーム";
+        let sse = format!(
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"content\":\"{}\"}}\n\n",
+            content
+        );
+
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut lines = Vec::new();
+        // 1 バイトずつ投入し、各マルチバイト文字を必ずチャンク境界で分断する。
+        for byte in sse.as_bytes() {
+            lines.extend(push_sse_chunk_lines(&mut buffer, &[*byte]));
+        }
+        assert!(
+            buffer.is_empty(),
+            "全行が改行で終わるため未処理の残バイトは空であること"
+        );
+
+        let data = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("data:"))
+            .expect("data 行が生成されること");
+        let parsed: serde_json::Value =
+            serde_json::from_str(data.trim_start()).expect("data は有効な JSON であること");
+        let decoded = parsed
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("message_delta の content が存在すること");
+        assert_eq!(decoded, content);
+        assert!(!decoded.contains('\u{FFFD}'));
+    }
+
+    /// CLI-SSE-UTF8-01 回帰テスト: 改行前の不完全なマルチバイト列はバッファに
+    /// 残り、後続チャンクで完成した時点で正しくデコードされること。
+    #[test]
+    fn sse_incomplete_multibyte_stays_buffered_until_completed() {
+        let content = "あ";
+        let bytes = content.as_bytes();
+        assert_eq!(bytes.len(), 3, "あ は 3 バイトの UTF-8 文字");
+
+        let mut buffer: Vec<u8> = Vec::new();
+        // 先頭 2 バイトだけでは行が完成しないためデコードされない。
+        assert!(push_sse_chunk_lines(&mut buffer, &bytes[..2]).is_empty());
+        assert_eq!(buffer.as_slice(), &bytes[..2]);
+
+        // 残り 1 バイトと改行を足して初めて 1 行が完成する。
+        let mut rest = bytes[2..].to_vec();
+        rest.push(b'\n');
+        let lines = push_sse_chunk_lines(&mut buffer, &rest);
+        assert_eq!(lines, vec![content.to_string()]);
+        assert!(!lines[0].contains('\u{FFFD}'));
+        assert!(buffer.is_empty());
+    }
+
+    /// CLI-SSE-UTF8-01 回帰テスト: loopback の HTTP レスポンスでマルチバイト
+    /// 文字を 1 バイトずつチャンク分割して送っても、`bytes_stream` →
+    /// `push_sse_chunk_lines` の経路で message_delta の content が
+    /// U+FFFD を含まず元文字列と一致すること。
+    #[tokio::test]
+    async fn sse_loopback_one_byte_chunks_preserve_multibyte_utf8() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let url = format!(
+            "http://{}/stream",
+            listener.local_addr().expect("local addr")
+        );
+        let content = "こんにちは世界🌍";
+        let sse = format!(
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"content\":\"{}\"}}\n\n",
+            content
+        );
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept SSE request");
+            socket.set_nodelay(true).expect("set nodelay");
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await.expect("read request");
+
+            // 1 バイトずつ HTTP chunked のチャンクとして送出し、reqwest の
+            // bytes_stream が確実に分断されるようにする。
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("write SSE headers");
+            for byte in sse.as_bytes() {
+                socket.write_all(b"1\r\n").await.expect("write chunk size");
+                socket.write_all(&[*byte]).await.expect("write chunk data");
+                socket
+                    .write_all(b"\r\n")
+                    .await
+                    .expect("write chunk terminator");
+            }
+            socket
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("write final chunk");
+            socket.flush().await.expect("flush SSE response");
+        });
+
+        // 環境変数の proxy 設定に影響されないよう no_proxy のクライアントを使う。
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback client");
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .expect("send loopback SSE request");
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut lines = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("read stream chunk");
+            lines.extend(push_sse_chunk_lines(&mut buffer, &chunk));
+        }
+        server.await.expect("loopback server task");
+
+        let data = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("data:"))
+            .expect("data 行が生成されること");
+        let parsed: serde_json::Value =
+            serde_json::from_str(data.trim_start()).expect("data は有効な JSON であること");
+        let decoded = parsed
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("message_delta の content が存在すること");
+        assert_eq!(decoded, content, "loopback SSE で元文字列が保たれること");
+        assert!(!decoded.contains('\u{FFFD}'));
     }
 }
