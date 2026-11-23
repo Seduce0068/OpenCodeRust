@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-23T13:05:03+09:00"
+  at: "2026-11-23T13:22:03+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3288 件（all-features は 3287 件）
+  テスト総数 594 → 3292 件（all-features は 3291 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `tool`: Edit / skill の改行正規化で CR 単独も LF として扱う
+  （swarm-coding R1-R6）
 - `tui`: 質問の回答/拒否を送信成功時のみ削除（失敗時に再送可能）
   （swarm-coding R1-R6）
 - `tui`: 権限 reply の再送（404）を冪等化しプロンプトが閉じるように修正

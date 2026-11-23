@@ -180,10 +180,6 @@ status: current
   — `tool/ls.rs:139` / NORM-05 / 低
 - [ ] **grep の glob がバックスラッシュ区切りを正規化しない**
   — `grep/search.rs:289` / NORM-06 / 低
-- [ ] **Edit の改行正規化が CR 単独を扱わない**
-  — `tool/edit/tool.rs:511` / NORM-07 / 低
-- [ ] **skill frontmatter の改行正規化が CR 単独を扱わない**
-  — `tool/skill.rs:120` / NORM-08 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -286,6 +282,8 @@ status: current
 
 ## 完了
 
+- [x] **[CR 改行 2 件]** Edit / skill の正規化を apply_patch と統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[質問再送 1 件]** 送信成功時のみ要求を削除
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[権限 reply 冪等化 1 件]** 再送 404 でプロンプトを閉じる
@@ -835,6 +833,10 @@ status: current
 
 ## メモ
 
+- 2026-11-23 R4 指摘（CR 改行の修正時）: 親が重複する normalize_line_endings
+  を replacers の公開実装へ一本化（DRY）。残存 low（エスケープ `\r` の
+  一致、pub API の generate_unified_diff / trim_diff が CR 未正規化）は
+  設計判断として記録のみ。
 - 2026-11-23 R4 指摘（質問再送の修正時）: 親が複数質問（2 問）の
   失敗→再送で answers が重複しない回帰テストを直接追加。HTTP スタブの
   記録がリクエスト全体なのでボディ部分を取り出してパース。
