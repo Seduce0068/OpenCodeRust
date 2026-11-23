@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -276,6 +276,113 @@ pub struct AgentParams {
 
 pub type SessionUpdateHook = Arc<dyn Fn(&Session) + Send + Sync + 'static>;
 
+/// ファイルの更新時刻とサイズ。mtime だけでは内容不変の時刻更新や mtime を保つ
+/// 外部変更を区別できないため、両方を突き合わせる（IOORDER-03 / R4 指摘）。
+type FileStamp = (SystemTime, u64);
+
+/// read が記録したファイル stamp の共有マップ。キーは (session_id, 正規化済み file_path)。
+type FileTimeMap = Arc<Mutex<HashMap<(String, String), FileStamp>>>;
+
+/// read / assert で共有するキー正規化ヘルパ。
+///
+/// `std::fs::canonicalize` が成功すれば絶対・`.` / `..` 解消済みのパスを使い、
+/// 失敗した場合（新規ファイル等）は元の path 文字列へフォールバックする。
+/// これにより `./foo` と `foo` のような表記差でキーが割れ、assert が no-op に
+/// なることを防ぐ。
+fn normalized_file_time_key(path: &str) -> String {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
+/// `ToolContext` へ `file_time_read` / `file_time_assert` コールバックを注入する（IOORDER-03）。
+///
+/// - read: ファイルの (mtime, size) を `(session_id, 正規化済み file_path)` をキーに記録する。
+/// - assert: 記録済みキーについて現在の (mtime, size) と比較し、不一致なら固定文言の
+///   `ExecutionError("File changed since read")` を返す。未記録キーは従来どおり
+///   no-op（Ok）として扱い、後方互換性を保つ。
+///
+/// いずれのコールバックも [`normalized_file_time_key`] でキーを正規化するため、
+/// `./foo` と `foo` の表記差で stale 検出が効かなくなることはない。
+/// メタデータ取得に失敗した場合も固定文言のエラーを返す（安全側）。パスやトークン値は
+/// エラー文言へ一切含めない。
+fn with_file_time_tracking(
+    mut tool_context: opencode_tool::ToolContext,
+    file_times: FileTimeMap,
+) -> opencode_tool::ToolContext {
+    let read_times = file_times.clone();
+    tool_context = tool_context.with_file_time_read(move |session_id, file_path| {
+        let times = read_times.clone();
+        Box::pin(async move {
+            let path = std::path::Path::new(&file_path);
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    return Err(opencode_tool::ToolError::ExecutionError(
+                        "Failed to read file time".to_string(),
+                    ));
+                }
+            };
+            let mtime = match metadata.modified() {
+                Ok(mtime) => mtime,
+                Err(_) => {
+                    return Err(opencode_tool::ToolError::ExecutionError(
+                        "Failed to read file time".to_string(),
+                    ));
+                }
+            };
+            let stamp = (mtime, metadata.len());
+            let key = (session_id, normalized_file_time_key(&file_path));
+            times.lock().await.insert(key, stamp);
+            Ok(())
+        })
+    });
+
+    tool_context = tool_context.with_file_time_assert(move |session_id, file_path| {
+        let times = file_times.clone();
+        Box::pin(async move {
+            let key = (session_id, normalized_file_time_key(&file_path));
+            let recorded = {
+                let guard = times.lock().await;
+                guard.get(&key).copied()
+            };
+            let Some(recorded) = recorded else {
+                // このセッションで read していないファイルは no-op のまま。
+                return Ok(());
+            };
+            let path = std::path::Path::new(&file_path);
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    // メタデータが取得できない場合は stale として扱う（安全側）。
+                    return Err(opencode_tool::ToolError::ExecutionError(
+                        "File changed since read".to_string(),
+                    ));
+                }
+            };
+            let mtime = match metadata.modified() {
+                Ok(mtime) => mtime,
+                Err(_) => {
+                    return Err(opencode_tool::ToolError::ExecutionError(
+                        "File changed since read".to_string(),
+                    ));
+                }
+            };
+            let current = (mtime, metadata.len());
+            if current == recorded {
+                Ok(())
+            } else {
+                Err(opencode_tool::ToolError::ExecutionError(
+                    "File changed since read".to_string(),
+                ))
+            }
+        })
+    });
+
+    tool_context
+}
+
 pub struct SessionPrompt {
     state: Arc<Mutex<HashMap<String, PromptState>>>,
     session_state: Arc<RwLock<SessionStateManager>>,
@@ -285,6 +392,8 @@ pub struct SessionPrompt {
     todo_update: Option<opencode_tool::TodoUpdateCallback>,
     /// `todoread` が参照する TODO 取得コールバック。
     todo_get: Option<opencode_tool::TodoGetCallback>,
+    /// read が記録したファイル stamp（mtime, size）。IOORDER-03 の stale 検出用。
+    file_times: FileTimeMap,
 }
 
 impl SessionPrompt {
@@ -296,6 +405,7 @@ impl SessionPrompt {
             lsp_registry: None,
             todo_update: None,
             todo_get: None,
+            file_times: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1057,6 +1167,7 @@ impl SessionPrompt {
             question_callback,
             self.todo_update.clone(),
             self.todo_get.clone(),
+            self.file_times.clone(),
         )
         .await;
 
@@ -1141,6 +1252,7 @@ impl SessionPrompt {
             None,
             self.todo_update.clone(),
             self.todo_get.clone(),
+            self.file_times.clone(),
         )
         .await;
 
@@ -1170,6 +1282,7 @@ impl SessionPrompt {
         question_callback: QuestionCallback,
         todo_update: Option<opencode_tool::TodoUpdateCallback>,
         todo_get: Option<opencode_tool::TodoGetCallback>,
+        file_times: FileTimeMap,
     ) -> anyhow::Result<()> {
         let mut step = 0u32;
         let provider_type = ProviderType::from_provider_id(&provider_id);
@@ -1612,6 +1725,10 @@ impl SessionPrompt {
                     tool_context =
                         tool_context.with_todo_get(move |session_id| callback(session_id));
                 }
+
+                // IOORDER-03: read が記録した mtime を write/edit/apply_patch の
+                // stale 検出へ配線する。ループは複数周するため Arc を clone して注入。
+                tool_context = with_file_time_tracking(tool_context, file_times.clone());
 
                 let registry = Arc::new(opencode_tool::create_default_registry().await);
                 if let Err(e) = Self::execute_tool_calls_with_attachments(
@@ -6112,5 +6229,173 @@ mod tests {
 
         // プロンプト指示文の "subagent: <name>" にも対応する。
         assert_eq!(agent_statuses(&session), vec![("build", "completed")]);
+    }
+
+    // ---- IOORDER-03: file_time_read / file_time_assert の本番配線回帰テスト ----
+
+    fn file_time_test_context(file_times: FileTimeMap) -> opencode_tool::ToolContext {
+        with_file_time_tracking(
+            opencode_tool::ToolContext::new(
+                "sess-file-time".to_string(),
+                "msg-file-time".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string(),
+            ),
+            file_times,
+        )
+    }
+
+    fn file_time_stamp(path: &Path) -> FileStamp {
+        let metadata = std::fs::metadata(path).expect("metadata");
+        (metadata.modified().expect("mtime"), metadata.len())
+    }
+
+    async fn recorded_file_time_stamp(file_times: &FileTimeMap, path: &str) -> FileStamp {
+        file_times
+            .lock()
+            .await
+            .get(&("sess-file-time".to_string(), normalized_file_time_key(path)))
+            .copied()
+            .expect("read callback must record stamp")
+    }
+
+    #[tokio::test]
+    async fn file_time_assert_is_noop_without_prior_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("never-read.txt");
+        std::fs::write(&path, b"content").expect("write");
+        let path_str = path.to_string_lossy().to_string();
+
+        let file_times: FileTimeMap = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = file_time_test_context(file_times);
+
+        // read していないキーは従来の no-op と同じく Ok。
+        ctx.do_file_time_assert(path_str)
+            .await
+            .expect("untracked file must not be rejected");
+    }
+
+    #[tokio::test]
+    async fn file_time_assert_ok_when_unchanged_and_err_after_external_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tracked.txt");
+        std::fs::write(&path, b"original").expect("write");
+        let path_str = path.to_string_lossy().to_string();
+
+        let file_times: FileTimeMap = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = file_time_test_context(file_times.clone());
+
+        // read で (mtime, size) を記録し、変更がなければ assert は Ok。
+        ctx.do_file_time_read(path_str.clone())
+            .await
+            .expect("read callback");
+        let recorded = recorded_file_time_stamp(&file_times, &path_str).await;
+        assert_eq!(recorded, file_time_stamp(&path));
+        ctx.do_file_time_assert(path_str.clone())
+            .await
+            .expect("unchanged file must be accepted");
+
+        // 外部変更で stamp が変われば stale として検出される。
+        for _ in 0..50 {
+            std::fs::write(&path, b"changed externally").expect("write");
+            if file_time_stamp(&path) != recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_ne!(
+            file_time_stamp(&path),
+            recorded,
+            "external write must change stamp"
+        );
+
+        let err = ctx
+            .do_file_time_assert(path_str.clone())
+            .await
+            .expect_err("stale file must be rejected");
+        assert!(
+            matches!(&err, opencode_tool::ToolError::ExecutionError(msg) if msg.as_str() == "File changed since read"),
+            "unexpected error: {err:?}"
+        );
+        // エラー文言は固定文言のみで、パス値を含まない。
+        assert!(!err.to_string().contains(path_str.as_str()));
+    }
+
+    #[tokio::test]
+    async fn file_time_assert_detects_size_change_even_when_mtime_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("size-tracked.txt");
+        std::fs::write(&path, b"AB").expect("write");
+        let path_str = path.to_string_lossy().to_string();
+
+        let file_times: FileTimeMap = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = file_time_test_context(file_times.clone());
+
+        ctx.do_file_time_read(path_str.clone())
+            .await
+            .expect("read callback");
+        let (_, original_len) = recorded_file_time_stamp(&file_times, &path_str).await;
+        assert_eq!(original_len, 2);
+
+        // 外部からサイズを変更する。記録側 mtime を現在値へ揃えることで
+        // 「mtime 一致・size 不一致」の状態を作り、mtime を保つ外部変更を再現する。
+        std::fs::write(&path, b"ABCDE").expect("write");
+        let actual = file_time_stamp(&path);
+        assert_eq!(actual.1, 5);
+        assert_ne!(actual.1, original_len);
+        file_times.lock().await.insert(
+            (
+                "sess-file-time".to_string(),
+                normalized_file_time_key(&path_str),
+            ),
+            (actual.0, original_len),
+        );
+
+        let err = ctx
+            .do_file_time_assert(path_str)
+            .await
+            .expect_err("size change must be detected even if mtime matches");
+        assert!(
+            matches!(&err, opencode_tool::ToolError::ExecutionError(msg) if msg.as_str() == "File changed since read"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_time_key_normalization_matches_dot_and_plain_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("normalized.txt");
+        std::fs::write(&path, b"content").expect("write");
+        let plain = path.to_string_lossy().to_string();
+        let dotted = format!("{}/./normalized.txt", dir.path().display());
+        let canonical = std::fs::canonicalize(&path)
+            .expect("canonicalize")
+            .to_string_lossy()
+            .into_owned();
+
+        // `./` を含む表記で read し、通常表記で assert しても同じキーになる。
+        let file_times: FileTimeMap = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = file_time_test_context(file_times.clone());
+        ctx.do_file_time_read(dotted.clone())
+            .await
+            .expect("read callback");
+        assert!(file_times
+            .lock()
+            .await
+            .contains_key(&("sess-file-time".to_string(), canonical)));
+        ctx.do_file_time_assert(plain.clone())
+            .await
+            .expect("normalized key must match");
+
+        // 逆順（通常表記で read → `./` 表記で assert）も確認する。
+        let file_times_rev: FileTimeMap = Arc::new(Mutex::new(HashMap::new()));
+        let ctx_rev = file_time_test_context(file_times_rev);
+        ctx_rev
+            .do_file_time_read(plain)
+            .await
+            .expect("read callback");
+        ctx_rev
+            .do_file_time_assert(dotted)
+            .await
+            .expect("normalized key must match");
     }
 }
