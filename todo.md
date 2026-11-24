@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **タイトル失敗 warn の prompt.rs 実経路テストが無い**
-  — `session/prompt.rs:3751` / ERR-R1-02-R4 / 中
 - [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
   — `cli/main.rs:147` / CFGMAP-01-R4 / 中
 - [ ] **CLIARG-05 が attach/TUI 経路に適用されない**
@@ -273,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[タイトル warn 実経路テスト 1 件]** Err 分岐を直接検証
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[WarnVisitor 検証精度 1 件]** 構造化 error も検出
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[タイトル生成エラー 1 件]** 固定 warn で可視化
@@ -950,6 +950,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 タイトル warn 実経路テスト: chat() が Err を返す
+  FailingProvider を prompt.rs に追加し、generate_session_title_llm の
+  Err 分岐（fallback、warn 1回、固定文言、全フィールド非露出）を直接検証。
+  R4 指摘なし。
 - 2026-11-24 WarnVisitor: summary.rs / prompt.rs の WarnVisitor に
   all_values を追加し全フィールド値を退避。should_panic 回帰で構造化
   error フィールドの漏洩が検出されることを直接検証。親が clippy
