@@ -131,6 +131,22 @@ fn resolve_agent_from(found: Option<AgentInfo>, agent_name: &str) -> anyhow::Res
     }
 }
 
+/// CFGMAP-01: ローカル run で使うエージェント名を解決する。
+///
+/// 優先順は `--agent` 明示 > `config.default_agent` > `build`（後方互換）。
+/// config 側の空文字・空白のみは未設定として扱う。ここで返した名前だけを
+/// 後段の `resolve_agent` / バナーへ渡し、設定値そのものはエラーへ出さない。
+fn resolve_run_agent_name(cli_agent: Option<&str>, config_default_agent: Option<&str>) -> String {
+    if let Some(name) = cli_agent {
+        return name.to_string();
+    }
+    config_default_agent
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "build".to_string())
+}
+
 #[cfg(test)]
 mod resolve_agent_tests {
     use super::*;
@@ -171,6 +187,39 @@ mod resolve_agent_tests {
         let registry = AgentRegistry::new();
         let err = resolve_agent(&registry, "does-not-exist").expect_err("unknown must fail");
         assert_eq!(err.to_string(), "unknown agent");
+    }
+}
+
+#[cfg(test)]
+mod resolve_run_agent_name_tests {
+    use super::*;
+
+    /// CFGMAP-01 回帰: --agent 未指定なら config.default_agent が使われること。
+    #[test]
+    fn config_default_agent_is_used_when_cli_agent_absent() {
+        assert_eq!(resolve_run_agent_name(None, Some("general")), "general");
+    }
+
+    /// --agent 明示時は config.default_agent より優先されること。
+    #[test]
+    fn explicit_cli_agent_takes_precedence_over_config_default() {
+        assert_eq!(
+            resolve_run_agent_name(Some("plan"), Some("general")),
+            "plan"
+        );
+    }
+
+    /// config も未指定なら従来どおり build にフォールバックすること。
+    #[test]
+    fn build_is_fallback_when_both_absent() {
+        assert_eq!(resolve_run_agent_name(None, None), "build");
+    }
+
+    /// config.default_agent が空・空白のみなら未設定として扱うこと。
+    #[test]
+    fn blank_config_default_is_treated_as_absent() {
+        assert_eq!(resolve_run_agent_name(None, Some("")), "build");
+        assert_eq!(resolve_run_agent_name(None, Some("   ")), "build");
     }
 }
 
@@ -884,8 +933,9 @@ enum Commands {
         fork: bool,
         #[arg(long)]
         prompt: Option<String>,
-        #[arg(long, default_value = "build")]
-        agent: String,
+        // CFGMAP-01: 既定値を付けず未指定を区別し、config.default_agent 解決へ委ねる。
+        #[arg(long)]
+        agent: Option<String>,
         // config.server.* を基底にするため、未指定と明示指定を区別する。
         #[arg(long)]
         port: Option<u16>,
@@ -932,8 +982,9 @@ enum Commands {
         share: bool,
         #[arg(short = 'm', long)]
         model: Option<String>,
-        #[arg(long, default_value = "build")]
-        agent: String,
+        // CFGMAP-01: 既定値を付けず未指定を区別し、config.default_agent 解決へ委ねる。
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(short = 'f', long)]
         file: Vec<PathBuf>,
         #[arg(long, default_value = "default")]
@@ -1563,7 +1614,7 @@ async fn main() -> anyhow::Result<()> {
                 false,
                 session,
                 false,
-                "build".to_string(),
+                None,
                 None,
                 ServerCliOverrides::default(),
                 Some(url),
@@ -1744,7 +1795,7 @@ async fn main() -> anyhow::Result<()> {
                 false,
                 None,
                 false,
-                "build".to_string(),
+                None,
                 None,
                 ServerCliOverrides::default(),
                 None,
@@ -1849,7 +1900,7 @@ async fn run_tui(
     continue_last: bool,
     session: Option<String>,
     fork: bool,
-    agent_name: String,
+    agent_name: Option<String>,
     initial_prompt: Option<String>,
     overrides: ServerCliOverrides,
     attach_url: Option<String>,
@@ -1926,7 +1977,17 @@ async fn run_tui(
     if let Some(prompt) = initial_prompt {
         std::env::set_var("OPENCODE_TUI_PROMPT", prompt);
     }
-    std::env::set_var("OPENCODE_TUI_AGENT", agent_name);
+    // CFGMAP-01: --agent 未指定時に "build" を明示して渡すと config.default_agent が
+    // マスクされるため、Some のときだけ env を設定する。None のときは TUI 側の
+    // 既定（build）に委ねる（TUI 側に config.default_agent を読む経路は無い）。
+    if let Some(agent_name) = agent_name {
+        std::env::set_var("OPENCODE_TUI_AGENT", agent_name);
+    } else {
+        // 起動前に外来の OPENCODE_TUI_AGENT が残っていても TUI 既定（build）を
+        // 保証するため、未指定時は明示的に除去する（R4）。RestoreTuiEnv が
+        // 終了時に元の値を復元する。
+        std::env::remove_var("OPENCODE_TUI_AGENT");
+    }
     if let Some(session_id) = selected_session {
         std::env::set_var("OPENCODE_TUI_SESSION", session_id);
     }
@@ -2774,7 +2835,7 @@ async fn run_non_interactive(
     fork: bool,
     share: bool,
     model: Option<String>,
-    agent_name: String,
+    agent_name: Option<String>,
     files: Vec<PathBuf>,
     format: RunOutputFormat,
     title: Option<String>,
@@ -2882,7 +2943,7 @@ async fn run_non_interactive(
 async fn run_chat_session(
     model: Option<String>,
     provider: Option<String>,
-    agent_name: String,
+    agent_name: Option<String>,
     initial_prompt: Option<String>,
     single_shot: bool,
     format: RunOutputFormat,
@@ -2919,8 +2980,11 @@ async fn run_chat_session(
     let tool_registry = Arc::new(create_default_registry().await);
 
     let agent_registry = AgentRegistry::from_config(&config);
+    // CFGMAP-01: --agent 未指定なら config.default_agent、それも無ければ build。
+    let resolved_agent_name =
+        resolve_run_agent_name(agent_name.as_deref(), config.default_agent.as_deref());
     // CLIARG-05: 未知名を黙って build に化けさせない（resolve_agent 内で明示エラー）。
-    let mut agent_info = resolve_agent(&agent_registry, &agent_name)?;
+    let mut agent_info = resolve_agent(&agent_registry, &resolved_agent_name)?;
 
     if let Some(ref model_id) = model {
         let provider_id = provider.clone().unwrap_or_else(|| {
@@ -2940,7 +3004,7 @@ async fn run_chat_session(
         println!("╚══════════════════════════════════════════╝");
         println!();
         println!("  Model: {}", model.as_deref().unwrap_or("auto"));
-        println!("  Agent: {}", agent_name);
+        println!("  Agent: {}", resolved_agent_name);
         println!("  Directory: {}", current_dir.display());
         println!();
         println!("  Commands: exit, quit, help, clear, /clear");
@@ -7572,6 +7636,41 @@ mod tests {
                 assert_eq!(message, vec!["Check this repo"]);
                 assert_eq!(model.as_deref(), Some("gpt-5"));
             }
+            _ => panic!("expected Run variant"),
+        }
+    }
+
+    /// CFGMAP-01 回帰: Tui の --agent は既定値を持たず未指定なら None。
+    #[test]
+    fn tui_agent_has_no_build_default() {
+        let cli = Cli::try_parse_from(["opencoderust", "tui"]).unwrap();
+        match cli.command {
+            Some(Commands::Tui { agent, .. }) => assert_eq!(agent, None),
+            _ => panic!("expected Tui variant"),
+        }
+    }
+
+    /// CFGMAP-01 回帰: Run の --agent は既定値を持たず未指定なら None。
+    #[test]
+    fn run_agent_has_no_build_default() {
+        let cli = Cli::try_parse_from(["opencoderust", "run", "hi"]).unwrap();
+        match cli.command {
+            Some(Commands::Run { agent, .. }) => assert_eq!(agent, None),
+            _ => panic!("expected Run variant"),
+        }
+    }
+
+    /// 明示 --agent build は従来どおり Some として届くこと（後方互換）。
+    #[test]
+    fn explicit_agent_is_preserved_for_both_commands() {
+        let tui = Cli::try_parse_from(["opencoderust", "tui", "--agent", "build"]).unwrap();
+        match tui.command {
+            Some(Commands::Tui { agent, .. }) => assert_eq!(agent.as_deref(), Some("build")),
+            _ => panic!("expected Tui variant"),
+        }
+        let run = Cli::try_parse_from(["opencoderust", "run", "--agent", "plan", "hi"]).unwrap();
+        match run.command {
+            Some(Commands::Run { agent, .. }) => assert_eq!(agent.as_deref(), Some("plan")),
             _ => panic!("expected Run variant"),
         }
     }
