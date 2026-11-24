@@ -67,6 +67,10 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **well-known キャッシュの poison を握りつぶす**
+  — `config/wellknown.rs:292` / ERR-R1-01 / 中
+- [ ] **ls の WalkDir エントリ失敗が黙って除外される**
+  — `tool/ls.rs:166` / ERR-R1-04 / 中
 - [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
   — `cli/main.rs:147` / CFGMAP-01-R4 / 中
 - [ ] **CLIARG-05 が attach/TUI 経路に適用されない**
@@ -170,6 +174,12 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **タイトル生成の LLM エラーが握りつぶされる**
+  — `session/summary.rs:345` / ERR-R1-02 / 低
+- [ ] **CLI file URI の呼び出し側エラーにパスが残る**
+  — `cli/main.rs:5508` / ERR-R1-03-R4 / 低
+- [ ] **Object 静的メソッドのエラー文言・マルチバイトテスト不足**
+  — `codemode/interpreter.rs:2606` / COLL-R1-01-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
   — `config/loader.rs:5296` / CFGMAP-03-R4 / 低
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
@@ -269,6 +279,8 @@ status: current
 
 ## 完了
 
+- [x] **[エラー/Object 静的メソッド 2 件]** URI エラー固定化と入力統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown 内部マージ 1 件]** permissions をキー単位集約
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown permissions 1 件]** 全レイヤ事前正規化を完了
@@ -934,6 +946,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 cross-skill 集約（swarm328、2 担当・5 件、観点: エラー伝播 /
+  コレクション境界）: medium 2 件（CLI file URI エラー固定化、Object 静的
+  メソッドの Array/String 受付統一）を coding、残り 5 件を triage。
+  親が子のテストバグ（区切り文字、raw string 行末バックスラッシュ、
+  マルチバイト直接リテラル）を直接修正。R4 の残存 4 件はテスト品質・
+  文言のため記録のみ。
 - 2026-11-24 wellknown 内部マージ: 各エントリの cached/fetched Config も
   merge 直前に正規化し、複数エントリの permissions がキー単位で集約される
   ように。回帰1件（キャッシュヒット経路、実 fetch 未検証）。R4 が 5 件
