@@ -166,8 +166,6 @@ status: current
 
 - [ ] **stream error redact が実 SSE 経路で未検証＋ログ残留**
   — `server/routes.rs:8443` / APICON-01-R4 / 低
-- [ ] **permission.replied / question.replied が TUI で未処理**
-  — `tui/app.rs:4741` / APICON-05 / 低
 - [ ] **add_server_with_origin の origin 判定 TOCTOU**
   — `server/mcp_oauth.rs:283` / CONC-02 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -263,6 +261,8 @@ status: current
 
 ## 完了
 
+- [x] **[replied イベント処理 1 件]** 共有 ID 集合を更新
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP OAuth redact 1 件]** 生 message を 400 ボディから除去
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[send_message ロック 1 件]** prompt 実行中の上書きを防止
@@ -902,6 +902,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 replied イベント: forward_server_event に permission.replied /
+  question.replied（＋親が question.rejected も追加）分岐を追加し requestID から
+  共有集合を forget。空 requestID ガード・rejected テスト・二重 forget テストを
+  親が R4 指摘で直接追加。R2→R4→親修正の2回で停止。
 - 2026-11-24 MCP OAuth redact: OAuthFailed/RuntimeError の生 message を捨て
   固定文言 BadRequest へ、warn も固定イベント名のみ（disk-sync 失敗と同方針）。
   ServerNotFound/OAuthNotSupported の server 名エコーと OAuthInProgress は不変。
