@@ -350,6 +350,20 @@ impl ConfigLoader {
         Ok(self.config.clone())
     }
 
+    /// wellknown レイヤを正規化してからマージする唯一の経路。
+    ///
+    /// 他レイヤ（`load_from_str` / `load_from_file`）と同じく `permissions` ->
+    /// `permission` の事前変換を `merge` の直前に挟む。呼び出し site をここ 1
+    /// 箇所へ集約し、`load_all_with_remote` は wellknown を読み込んだ後にこの
+    /// メソッドを呼ぶだけにする。テストからも Config を注入して実経路を通せる。
+    /// 値やパスは一切ログに出さない。
+    fn merge_wellknown_layer(&mut self, mut wellknown: Config) {
+        // wellknown ルールがキー単位の DeepMerge に参加し、後続レイヤに
+        // 丸ごと置き換えられないようにする（他レイヤと同一の順序）。
+        normalize_permissions_field(&mut wellknown);
+        self.config.merge(wellknown);
+    }
+
     /// Loads all config sources including remote `.well-known/opencode` endpoints.
     /// Merge order (low -> high precedence):
     /// 1. Remote .well-known/opencode (org defaults) -- lowest priority
@@ -363,7 +377,8 @@ impl ConfigLoader {
     /// 8. Managed config directory (enterprise, highest priority)
     pub async fn load_all_with_remote<P: AsRef<Path>>(&mut self, project_dir: P) -> Result<Config> {
         let wellknown_config = crate::wellknown::load_wellknown().await;
-        self.config.merge(wellknown_config);
+        // wellknown の正規化とマージは `merge_wellknown_layer` に集約した。
+        self.merge_wellknown_layer(wellknown_config);
 
         // Delegate to load_all which handles everything else
         self.load_all(project_dir)
@@ -6260,5 +6275,92 @@ mod provider_normalization_tests {
         // JSON string literal (quotes included), not as raw source text.
         let result = substitute_env_vars("prefix:{env:OPENCODE_TEST_ENV_VAR}:suffix", None);
         assert_eq!(result, "prefix:\"resolved-value\":suffix");
+    }
+}
+
+#[cfg(test)]
+mod wellknown_permissions_tests {
+    use super::*;
+
+    /// wellknown 由来の Config に含まれる `permissions` が `permission` へ
+    /// 事前変換され、後続レイヤの `permission` とキー単位でマージされても
+    /// wellknown ルールが残ることを固定する。
+    ///
+    /// 本番 `load_all_with_remote` と同じ `merge_wellknown_layer` へ Config を
+    /// 注入して実ヘルパ経路（正規化 -> merge）を通す。後続レイヤも本番と同じ
+    /// `load_from_str`（正規化 -> merge）で重ね、wellknown ルールの生存を検証する。
+    /// wellknown のロード自体は auth.json / ネットワーク依存だが、ここでは
+    /// マージ入口へ Config を注入するためその依存は持たない。
+    #[test]
+    fn wellknown_permissions_are_normalized_and_survive_later_permission_layer() {
+        // wellknown（最低優先度）が permissions を設定
+        let wellknown: Config =
+            serde_json::from_str(r#"{"permissions":["read","edit"]}"#).expect("wellknown config");
+
+        // 本番 path（load_all_with_remote）と同じヘルパへ注入する。
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader.merge_wellknown_layer(wellknown);
+
+        let after_wellknown = loader.get_config();
+        assert!(
+            after_wellknown.permissions.is_none(),
+            "permissions must be consumed by normalization"
+        );
+        let rules = after_wellknown
+            .permission
+            .as_ref()
+            .expect("permission populated")
+            .rules();
+        assert!(matches!(
+            rules.get("read"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+        assert!(matches!(
+            rules.get("edit"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+
+        // 後続レイヤが permission を設定しても、wellknown 由来ルールが
+        // キー単位で残る（修正前は permissions が final transform で破棄された）。
+        // load_from_str は本番の後続レイヤと同じ 正規化 -> merge 経路である。
+        loader
+            .load_from_str(r#"{"permission":{"write":"allow"}}"#)
+            .expect("later inline layer");
+
+        let merged_rules = loader.get_config().permission.expect("permission").rules();
+        assert!(matches!(
+            merged_rules.get("read"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+        assert!(matches!(
+            merged_rules.get("edit"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+        assert!(matches!(
+            merged_rules.get("write"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+    }
+
+    /// wellknown が permission を直接設定している場合は既存ルールどおり
+    /// permissions が消費され、明示 permission が優先される（後方互換）。
+    /// こちらも実ヘルパ経路（merge_wellknown_layer）で検証する。
+    #[test]
+    fn wellknown_explicit_permission_takes_priority_over_permissions() {
+        let config: Config =
+            serde_json::from_str(r#"{"permissions":["read"],"permission":{"write":"deny"}}"#)
+                .expect("config");
+
+        let mut loader = ConfigLoader::new().without_global_config();
+        loader.merge_wellknown_layer(config);
+
+        let merged = loader.get_config();
+        assert!(merged.permissions.is_none(), "permissions must be dropped");
+        let rules = merged.permission.expect("permission").rules();
+        assert_eq!(rules.len(), 1, "explicit permission is preserved verbatim");
+        assert!(matches!(
+            rules.get("write"),
+            Some(PermissionRule::Action(PermissionAction::Deny))
+        ));
     }
 }
