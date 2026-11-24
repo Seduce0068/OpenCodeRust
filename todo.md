@@ -166,8 +166,6 @@ status: current
 
 - [ ] **stream error redact が実 SSE 経路で未検証＋ログ残留**
   — `server/routes.rs:8443` / APICON-01-R4 / 低
-- [ ] **add_server_with_origin の origin 判定 TOCTOU**
-  — `server/mcp_oauth.rs:283` / CONC-02 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
   - 2026-11-19 対応済み: http_request スパン完成（/api session_id 対応、
     TraceLayer on_response で status/latency/outcome、x-request-id 正規化 128 文字）。
@@ -261,6 +259,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP origin TOCTOU 1 件]** 判定と insert を原子的に
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[replied イベント処理 1 件]** 共有 ID 集合を更新
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP OAuth redact 1 件]** 生 message を 400 ボディから除去
@@ -902,6 +902,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 MCP origin TOCTOU: add_server_with_origin の origin 判定と
+  insert を単一 servers.write + Entry API で原子的に実行。Disk 由来保持、
+  config/enabled 上書き、disk_server_names 条件は不変。並行 disk/CRUD 追加
+  テスト 100 反復。R4 指摘なし。
 - 2026-11-24 replied イベント: forward_server_event に permission.replied /
   question.replied（＋親が question.rejected も追加）分岐を追加し requestID から
   共有集合を forget。空 requestID ガード・rejected テスト・二重 forget テストを
