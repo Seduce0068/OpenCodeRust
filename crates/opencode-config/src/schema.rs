@@ -1242,6 +1242,12 @@ pub struct McpServer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 
+    /// Legacy spelling for turning a server off. Kept as a real field so the
+    /// key is not silently discarded by serde. Normalized to `enabled` when
+    /// the config is deserialized; an explicit `enabled` always wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<McpTimeoutConfig>,
 
@@ -1506,13 +1512,34 @@ impl<'de> Deserialize<'de> for McpConfig {
         if timeout.is_some() {
             legacy.remove("timeout");
         }
-        let servers: HashMap<String, McpServerConfig> =
-            serde_json::from_value(serde_json::Value::Object(legacy))
-                .map_err(serde::de::Error::custom)?;
+        let mut servers: HashMap<String, McpServerConfig> =
+            serde_json::from_value(serde_json::Value::Object(legacy)).map_err(|_| {
+                // 生の serde エラーには設定値が含まれ得るため固定文言のみ（R4）。
+                serde::de::Error::custom("invalid legacy MCP server configuration")
+            })?;
+        normalize_legacy_mcp_disabled(&mut servers);
         Ok(McpConfig {
             timeout,
             servers: Some(servers),
         })
+    }
+}
+
+/// Apply the V2 interpretation of `disabled` to legacy `mcp.<name>` entries.
+///
+/// `McpServerV2::into_mcp_server` resolves
+/// `enabled.or_else(|| disabled.map(|d| !d))`; legacy entries deserialize
+/// straight into `McpServer`, so the same resolution is applied here. An
+/// explicit `enabled` is left untouched, including when both keys are given,
+/// which keeps precedence identical on both paths.
+fn normalize_legacy_mcp_disabled(servers: &mut HashMap<String, McpServerConfig>) {
+    for server in servers.values_mut() {
+        let McpServerConfig::Full(server) = server else {
+            continue;
+        };
+        if server.enabled.is_none() {
+            server.enabled = server.disabled.map(|disabled| !disabled);
+        }
     }
 }
 
@@ -1620,6 +1647,7 @@ impl McpServerV2 {
             enabled: self
                 .enabled
                 .or_else(|| self.disabled.map(|disabled| !disabled)),
+            disabled: self.disabled,
             timeout: self.timeout,
             protocol: self.protocol,
             headers: self.headers.map(|values| string_map(values, "headers")),
@@ -2401,6 +2429,7 @@ impl DeepMerge for McpServer {
         merge_option_replace(&mut self.cwd, other.cwd);
         merge_option_replace(&mut self.url, other.url);
         merge_option_replace(&mut self.enabled, other.enabled);
+        merge_option_replace(&mut self.disabled, other.disabled);
         merge_option_deep(&mut self.timeout, other.timeout);
         merge_option_replace(&mut self.protocol, other.protocol);
         merge_option_map_overwrite_values(&mut self.headers, other.headers);
@@ -3616,6 +3645,88 @@ mod tests {
                 assert_eq!(server.command, vec!["npx", "server"]);
                 assert_eq!(server.enabled, Some(true));
             }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_mcp_disabled_true_disables_server() {
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{
+                "blocked":{"type":"remote","url":"https://example.invalid","disabled":true},
+                "bare":{"disabled":true}
+            }}"#,
+        )
+        .expect("legacy disabled servers must parse");
+        let servers = config.mcp.expect("mcp").servers.expect("servers");
+        for name in ["blocked", "bare"] {
+            match servers
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+            {
+                McpServerConfig::Full(server) => {
+                    assert_eq!(server.disabled, Some(true), "{name}");
+                    assert_eq!(server.enabled, Some(false), "{name}");
+                }
+                other => panic!("expected Full for {name}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_mcp_explicit_enabled_wins_over_disabled() {
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{
+                "off":{"type":"local","command":["x"],"enabled":false,"disabled":false},
+                "on":{"type":"local","command":["x"],"enabled":true,"disabled":true}
+            }}"#,
+        )
+        .expect("both flags must parse");
+        let servers = config.mcp.expect("mcp").servers.expect("servers");
+        match servers.get("off").expect("off") {
+            McpServerConfig::Full(server) => assert_eq!(server.enabled, Some(false)),
+            other => panic!("expected Full, got {other:?}"),
+        }
+        match servers.get("on").expect("on") {
+            McpServerConfig::Full(server) => assert_eq!(server.enabled, Some(true)),
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_mcp_disabled_false_leaves_server_enabled() {
+        let config: Config =
+            serde_json::from_str(r#"{"mcp":{"on":{"command":["x"],"disabled":false}}}"#)
+                .expect("disabled false must parse");
+        match config
+            .mcp
+            .expect("mcp")
+            .servers
+            .expect("servers")
+            .get("on")
+            .expect("on")
+        {
+            McpServerConfig::Full(server) => assert_eq!(server.enabled, Some(true)),
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_mcp_disabled_interpretation_stays_unchanged() {
+        let config: Config = serde_json::from_str(
+            r#"{"mcp":{"servers":{
+                "off":{"type":"remote","url":"https://example.invalid","disabled":true},
+                "on":{"type":"local","command":["x"],"enabled":true,"disabled":true}
+            }}}"#,
+        )
+        .expect("v2 servers must parse");
+        let servers = config.mcp.expect("mcp").servers.expect("servers");
+        match servers.get("off").expect("off") {
+            McpServerConfig::Full(server) => assert_eq!(server.enabled, Some(false)),
+            other => panic!("expected Full, got {other:?}"),
+        }
+        match servers.get("on").expect("on") {
+            McpServerConfig::Full(server) => assert_eq!(server.enabled, Some(true)),
             other => panic!("expected Full, got {other:?}"),
         }
     }
