@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **permissions の Names 形式が実効ルールを生成しない**
-  — `config/loader.rs:2356` / CFGMAP-03-R4 / 中
 - [ ] **レイヤ間で permission が上位 permissions を破棄**
   — `config/loader.rs:2436` / CFGMAP-03-R4 / 中
 - [ ] **default_agent が CLI --agent 既定値 'build' にマスクされる**
@@ -269,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[permissions Names 1 件]** permission 名を実効 Allow へ
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[permissions 配線 1 件]** 権限エンジンへ変換・反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[formatter 未配線 1 件]** MAPPING.md へ明記
@@ -920,6 +920,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 permissions Names: スキーマ doc の「permission names」に従い
+  各値を Allow ルールのキーへ変換。単独 allow/deny/ask のみ "*" グローバル
+  行動の後方互換を維持。R4 が空文字混入で global action 判定が壊れる low を
+  指摘、親が実効要素数で判定するよう直接修正＋回帰追加。
 - 2026-11-24 permissions 配線: resolve_permissions_rules を追加し top-level
   permissions を config.permission へ変換（明示 permission 優先、入力専用化）。
   R4 が high（同一 action の複数ルールが後勝ちで deny を失う権限バイパス）を
