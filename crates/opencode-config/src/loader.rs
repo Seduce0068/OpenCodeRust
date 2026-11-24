@@ -2348,22 +2348,47 @@ fn resolve_legacy_tools_actions(
 /// Converts the input-only top-level `permissions` list into runtime permission
 /// rules consumed through `config.permission`.
 ///
-/// Unrecognized legacy names are skipped and unknown/empty effects fail safe to
-/// `Ask`; no name, resource or effect value is emitted to logs or errors.
+/// In the legacy list-of-names form each value is a permission name and gets an
+/// `Allow` rule. A single `"allow"`, `"deny"` or `"ask"` value is still treated
+/// as a global action on the `"*"` key for backward compatibility. Empty names
+/// are skipped; no name, resource or effect value is emitted to logs or errors.
+/// The rules form and its merge behaviour are unchanged.
 fn resolve_permissions_rules(permissions: &PermissionsConfig) -> HashMap<String, PermissionRule> {
     let mut rules: HashMap<String, PermissionRule> = HashMap::new();
     match permissions {
         PermissionsConfig::Names(names) => {
-            for name in names {
-                // Only the three action spellings understood by the runtime
-                // engine are forwarded; anything else is ignored, not an error.
-                let action = match name.as_str() {
-                    "ask" => PermissionAction::Ask,
-                    "allow" => PermissionAction::Allow,
-                    "deny" => PermissionAction::Deny,
-                    _ => continue,
-                };
-                rules.insert(name.clone(), PermissionRule::Action(action));
+            // A lone action spelling is the legacy global-action form; any
+            // multi-value list is a set of permission names, even if it mixes
+            // action spellings in with real names. Empty entries are ignored
+            // before the count so an expanded placeholder cannot break the
+            // global-action form (R4).
+            let effective: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty())
+                .collect();
+            let global_action = if effective.len() == 1 {
+                match effective[0] {
+                    "allow" => Some(PermissionAction::Allow),
+                    "deny" => Some(PermissionAction::Deny),
+                    "ask" => Some(PermissionAction::Ask),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(action) = global_action {
+                rules.insert("*".to_string(), PermissionRule::Action(action));
+            } else {
+                for name in names {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    rules.insert(
+                        name.clone(),
+                        PermissionRule::Action(PermissionAction::Allow),
+                    );
+                }
             }
         }
         PermissionsConfig::Rules(entries) => {
@@ -5341,20 +5366,105 @@ theme = "dark"
             "input-only permissions field must be consumed"
         );
         let rules = config.permission.expect("permission set").rules();
-        assert_eq!(rules.len(), 3, "unrecognized names must be skipped");
+        assert_eq!(rules.len(), 4, "every name becomes a permission key");
+        for name in ["allow", "ask", "deny", "read"] {
+            assert!(
+                matches!(
+                    rules.get(name),
+                    Some(PermissionRule::Action(PermissionAction::Allow))
+                ),
+                "every name must resolve to an Allow rule"
+            );
+        }
+        assert!(
+            !rules.contains_key("*"),
+            "a multi-value list is not a global action"
+        );
+    }
+
+    #[test]
+    fn top_level_permissions_names_are_permission_names_with_allow() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"permissions":["read","edit"]}"#).unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert_eq!(rules.len(), 2);
+        assert!(matches!(
+            rules.get("read"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+        assert!(matches!(
+            rules.get("edit"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+    }
+
+    #[test]
+    fn top_level_permissions_single_action_name_keeps_global_meaning() {
+        let cases = [
+            (r#"{"permissions":["allow"]}"#, PermissionAction::Allow),
+            (r#"{"permissions":["deny"]}"#, PermissionAction::Deny),
+            (r#"{"permissions":["ask"]}"#, PermissionAction::Ask),
+        ];
+        for (json, expected) in cases {
+            let mut config: Config = serde_json::from_str(json).unwrap();
+            apply_post_load_transforms(&mut config, true);
+
+            let rules = config.permission.expect("permission set").rules();
+            assert_eq!(rules.len(), 1);
+            assert!(matches!(
+                rules.get("*"),
+                Some(PermissionRule::Action(actual)) if *actual == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn top_level_permissions_mixed_action_and_name_are_all_allow_keys() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"permissions":["read","allow"]}"#).unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert_eq!(rules.len(), 2);
+        assert!(matches!(
+            rules.get("read"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
         assert!(matches!(
             rules.get("allow"),
             Some(PermissionRule::Action(PermissionAction::Allow))
         ));
-        assert!(matches!(
-            rules.get("ask"),
-            Some(PermissionRule::Action(PermissionAction::Ask))
-        ));
-        assert!(matches!(
-            rules.get("deny"),
-            Some(PermissionRule::Action(PermissionAction::Deny))
-        ));
-        assert!(!rules.contains_key("read"));
+        assert!(!rules.contains_key("*"));
+    }
+
+    #[test]
+    fn top_level_permissions_empty_names_are_skipped() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"permissions":["read","","edit"]}"#).unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.contains_key("read"));
+        assert!(rules.contains_key("edit"));
+        assert!(!rules.contains_key(""));
+
+        // 空文字が混在しても実効 1 要素なら legacy global action を維持（R4）。
+        for (input, expected) in [
+            (r#"{"permissions":["deny",""]}"#, PermissionAction::Deny),
+            (r#"{"permissions":["allow",""]}"#, PermissionAction::Allow),
+        ] {
+            let mut config: Config = serde_json::from_str(input).unwrap();
+            apply_post_load_transforms(&mut config, true);
+            let rules = config.permission.expect("permission set").rules();
+            assert!(matches!(
+                rules.get("*"),
+                Some(PermissionRule::Action(actual)) if *actual == expected
+            ));
+            assert!(!rules.contains_key(""));
+        }
     }
 
     #[test]
