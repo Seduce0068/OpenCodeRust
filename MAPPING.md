@@ -118,7 +118,7 @@ legacy へ戻す挙動) は未実装で、`revision()` は `Legacy` と同じ
 ### upstream 新規キーとキー名ズレ (2026-11-18, P-06)
 
 調査元は `.cache/investigation/round5-audit.md` が特定した upstream checkout
-`/home/koppe/ドキュメント/作業用/opencode` (branch `permission-path-match`、
+`<upstream-checkout-path>` (branch `permission-path-match`、
 HEAD `9c7bc2f42f`、2026-10-31) の `packages/schema/src/config.ts`。
 MAPPING baseline (`941e71d`) とは異なる checkout である点に注意。
 

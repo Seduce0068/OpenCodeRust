@@ -29,7 +29,7 @@ status: Superseded
 で並列実行し、6 回目の本レポートで重複・妥当性を吸収した。
 
 対象: `OpenCodeRust`（21 クレート、Commit `71e8eef`）
-参照 upstream: `/home/koppe/ドキュメント/作業用/opencode` @ `9c7bc2f42f`
+参照 upstream: `<upstream-checkout-path>` @ `9c7bc2f42f`
 （2026-10-31）
 
 | ラウンド | 観点 | 状態 |

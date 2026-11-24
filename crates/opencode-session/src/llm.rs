@@ -3112,7 +3112,7 @@ mod tests {
 
         // 非一時 source の本文にはトークンとローカルパスを含め、漏洩も検証する。
         let source_secret = "sk-source-only-1234";
-        let source_path = "/home/koppe/.secret/source-only";
+        let source_path = "/home/test-user/.secret/source-only";
         let cases = [
             (
                 ProviderError::api_error_with_source(
