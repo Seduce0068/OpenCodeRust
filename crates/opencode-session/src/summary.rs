@@ -915,29 +915,38 @@ mod tests {
     }
 
     // tracing-subscriber を依存に追加せず、WARN イベントだけを捕捉する最小限の Subscriber。
+    // (event, message, all_values): .0/.1 は従来どおり後方互換、
+    // .2 に全フィールド値を退避して構造化 error の漏洩も検出する。
+    type CapturedWarn = (String, String, Vec<String>);
+
     #[derive(Clone, Default)]
     struct WarnCapture {
-        events: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedWarn>>>,
     }
 
     struct WarnVisitor {
         event: Option<String>,
         message: Option<String>,
+        all_values: Vec<String>,
     }
 
     impl tracing::field::Visit for WarnVisitor {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            let owned = value.to_owned();
             match field.name() {
-                "event" => self.event = Some(value.to_owned()),
-                "message" => self.message = Some(value.to_owned()),
+                "event" => self.event = Some(owned.clone()),
+                "message" => self.message = Some(owned.clone()),
                 _ => {}
             }
+            self.all_values.push(owned);
         }
 
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
             if field.name() == "message" {
-                self.message = Some(format!("{value:?}"));
+                self.message = Some(rendered.clone());
             }
+            self.all_values.push(rendered);
         }
     }
 
@@ -961,17 +970,38 @@ mod tests {
             let mut visitor = WarnVisitor {
                 event: None,
                 message: None,
+                all_values: Vec::new(),
             };
             event.record(&mut visitor);
             self.events.lock().expect("mutex poisoned").push((
                 visitor.event.unwrap_or_default(),
                 visitor.message.unwrap_or_default(),
+                visitor.all_values,
             ));
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
 
         fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    // message だけでなく退避した全フィールド値も検査する。
+    // これにより record_debug で "error" として届く構造化エラーの再混入を検出できる。
+    fn assert_no_leak_in_warn(event: &(String, String, Vec<String>)) {
+        assert!(
+            !event.0.contains("leak-marker"),
+            "event に leak-marker が混入"
+        );
+        assert!(
+            !event.1.contains("leak-marker"),
+            "message に leak-marker が混入"
+        );
+        for value in &event.2 {
+            assert!(
+                !value.contains("leak-marker"),
+                "構造化フィールドに leak-marker が混入: {value}"
+            );
+        }
     }
 
     /// chat() が失敗する Provider。エラー本文に目印を含め、ログへの漏洩を検証する。
@@ -1048,8 +1078,7 @@ mod tests {
         assert_eq!(events.len(), 1, "must warn exactly once per failed call");
         assert_eq!(events[0].0, "title_generation_failed");
         assert!(events[0].1.contains("title generation failed"));
-        assert!(!events[0].0.contains("leak-marker"));
-        assert!(!events[0].1.contains("leak-marker"));
+        assert_no_leak_in_warn(&events[0]);
     }
 
     #[tokio::test]
@@ -1089,7 +1118,36 @@ mod tests {
         let events = capture.events.lock().expect("mutex poisoned");
         assert_eq!(events.len(), 1, "must warn exactly once per failed call");
         assert_eq!(events[0].0, "title_generation_failed");
-        assert!(!events[0].0.contains("leak-marker"));
-        assert!(!events[0].1.contains("leak-marker"));
+        assert_no_leak_in_warn(&events[0]);
+    }
+
+    // 回帰テスト: 旧実装は record_debug の "error" フィールドを破棄していたため、
+    // 構造化エラーが再混入しても非露出チェックが通る偽陽性だった。
+    // error = %e と同等のイベントを発行し、all_values への保持と
+    // 非露出アサーションの失敗を直接検証する。
+    #[test]
+    #[should_panic(expected = "leak-marker")]
+    fn warn_visitor_retains_structured_error_and_non_exposure_check_fails() {
+        let leaked_error = "secret-error-leak-marker-structure-88";
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            tracing::warn!(
+                event = "title_generation_failed",
+                message = "title generation failed",
+                error = %leaked_error
+            );
+        });
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .2
+                .iter()
+                .any(|value| value.contains("leak-marker")),
+            "構造化 error は all_values に保持されるべき"
+        );
+        // 構造化 error が保持されているため、この非露出チェックは失敗する。
+        assert_no_leak_in_warn(&events[0]);
     }
 }
