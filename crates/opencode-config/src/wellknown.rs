@@ -289,8 +289,24 @@ fn config_from_wellknown_value(config_value: serde_json::Value) -> Result<Config
     crate::loader::validate_config_value(config_value)
 }
 
+type CacheGuard<'a> = std::sync::MutexGuard<'a, Option<HashMap<String, CacheEntry>>>;
+
+/// Locks the wellknown cache, recovering a poisoned lock instead of silently
+/// dropping the cache operation. Recovery emits a fixed-message warning each
+/// time the poison is observed (std::sync::Mutex has no stable poison-clearing
+/// API on this toolchain). No URL, cached value or token is ever logged.
+fn lock_cache() -> CacheGuard<'static> {
+    match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("recovered poisoned well-known cache lock");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn get_cached(url: &str) -> Option<Config> {
-    let mut guard = CACHE.lock().ok()?;
+    let mut guard = lock_cache();
     let map = guard.as_mut()?;
     let is_fresh = map.get(url)?.fetched_at.elapsed() < CACHE_TTL;
     if is_fresh {
@@ -304,10 +320,7 @@ fn get_cached(url: &str) -> Option<Config> {
 }
 
 fn set_cached(url: String, config: Config) {
-    let mut guard = match CACHE.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+    let mut guard = lock_cache();
     let map = guard.get_or_insert_with(HashMap::new);
     // 新規 URL で上限に達している場合は最古のエントリを追い出してから挿入する。
     // 既存 URL の更新ではエントリ数は増えないので追い出さない。
@@ -337,9 +350,10 @@ fn evict_oldest_cached(map: &mut HashMap<String, CacheEntry>) {
 
 /// Clears the wellknown config cache. Useful for testing or forced refresh.
 pub fn clear_cache() {
-    if let Ok(mut guard) = CACHE.lock() {
-        *guard = None;
-    }
+    // Poison is recoverable; use the same helper as get/set so a forced
+    // refresh never silently no-ops (R4).
+    let mut guard = lock_cache();
+    *guard = None;
 }
 
 #[cfg(test)]
@@ -540,7 +554,9 @@ mod tests {
 
         let url = "https://expired.example.com".to_string();
         {
-            let mut guard = CACHE.lock().unwrap();
+            let mut guard = CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let map = guard.get_or_insert_with(HashMap::new);
             map.insert(
                 url.clone(),
@@ -553,7 +569,9 @@ mod tests {
 
         assert!(get_cached(&url).is_none());
         {
-            let guard = CACHE.lock().unwrap();
+            let guard = CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let map = guard.as_ref().expect("cache map must still exist");
             assert!(!map.contains_key(&url), "expired entry must be removed");
         }
@@ -572,13 +590,130 @@ mod tests {
         }
 
         {
-            let guard = CACHE.lock().unwrap();
+            let guard = CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let map = guard.as_ref().expect("cache map must exist");
             assert!(
                 map.len() <= MAX_CACHE_ENTRIES,
                 "cache must stay within MAX_CACHE_ENTRIES"
             );
         }
+
+        clear_cache();
+    }
+
+    /// Creates a poisoned `CACHE` lock in a controlled way. The panic is caught
+    /// so only the lock's poison flag remains for the test.
+    fn poison_cache_lock() {
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = CACHE.lock().expect("lock the cache before poisoning");
+            panic!("intentional panic to poison the well-known cache lock");
+        });
+        assert!(outcome.is_err(), "the poisoning panic must be caught");
+        assert!(
+            CACHE.is_poisoned(),
+            "the cache lock must be poisoned before the test"
+        );
+    }
+
+    /// 回帰 (ERR-R1-01): poison された `CACHE` を `get_cached` が回復し、
+    /// キャッシュ値を返す。warn は固定文言で、URL と設定値は出ない。
+    #[test]
+    fn poisoned_cache_get_recovers_and_warns() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        clear_cache();
+
+        let url = "https://poison.example.com/URL_SENTINEL_NEVER_LOG";
+        let value = "TOKEN_SENTINEL_NEVER_LOG";
+        set_cached(
+            url.to_string(),
+            Config {
+                model: Some(value.to_string()),
+                ..Default::default()
+            },
+        );
+
+        poison_cache_lock();
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let cached = tracing::subscriber::with_default(subscriber, || {
+            let first = get_cached(url);
+            let second = get_cached(url);
+            (first, second)
+        });
+
+        for entry in [cached.0, cached.1] {
+            let cached = entry.expect("get_cached must recover the poisoned lock");
+            assert_eq!(cached.model.as_deref(), Some(value));
+        }
+
+        let text = buffer.text();
+        assert!(
+            text.matches("recovered poisoned well-known cache lock")
+                .count()
+                >= 1,
+            "poison recovery must warn at least once: {text}"
+        );
+        for forbidden in [url, "URL_SENTINEL_NEVER_LOG", value] {
+            assert!(
+                !text.contains(forbidden),
+                "URL or value leaked into warning: {text}"
+            );
+        }
+        // std::sync::Mutex に poison 解除の安定 API が無いため、フラグは残り得る。
+        // 重要なのは回復してキャッシュ処理が継続すること（R4）。
+
+        clear_cache();
+    }
+
+    /// 回帰 (ERR-R1-01): poison された `CACHE` を `set_cached` が回復し、
+    /// エントリを保存できる。warn は固定文言で、URL と設定値は出ない。
+    #[test]
+    fn poisoned_cache_set_recovers_and_warns() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        clear_cache();
+
+        let url = "https://poison-set.example.com/URL_SENTINEL_NEVER_LOG";
+        let value = "TOKEN_SENTINEL_NEVER_LOG_SET";
+        poison_cache_lock();
+
+        let buffer = WarningBuffer::default();
+        let subscriber = WarningSubscriber {
+            buffer: buffer.clone(),
+        };
+        let cached = tracing::subscriber::with_default(subscriber, || {
+            set_cached(
+                url.to_string(),
+                Config {
+                    model: Some(value.to_string()),
+                    ..Default::default()
+                },
+            );
+            get_cached(url)
+        });
+
+        let cached = cached.expect("set_cached must recover and store the entry");
+        assert_eq!(cached.model.as_deref(), Some(value));
+
+        let text = buffer.text();
+        assert!(
+            text.matches("recovered poisoned well-known cache lock")
+                .count()
+                >= 1,
+            "poison recovery must warn at least once: {text}"
+        );
+        for forbidden in [url, "URL_SENTINEL_NEVER_LOG", value] {
+            assert!(
+                !text.contains(forbidden),
+                "URL or value leaked into warning: {text}"
+            );
+        }
+        // std::sync::Mutex に poison 解除の安定 API が無いため、フラグは残り得る。
+        // 重要なのは回復してキャッシュ処理が継続すること（R4）。
 
         clear_cache();
     }
