@@ -61,6 +61,71 @@ fn has_glob_meta(pattern: &str) -> bool {
         .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
 }
 
+/// WalkDir のエントリ列を走査して相対ファイルパスを集める。
+///
+/// `Err` は内容を一切参照せず件数だけを数え、走査完了後に 1 回だけ固定イベントを
+/// 警告する。エラー型を汎化しているのは、呼び出し側の公開 API を変えずにテストから
+/// `Err` を注入できるようにするため（権限変更は環境依存のため）。
+/// 警告には失敗件数以外（パス・ファイル名・エラー本文）を含めない。
+fn collect_files_from_entries<E>(
+    entries: impl Iterator<Item = Result<walkdir::DirEntry, E>>,
+    base_dir: &Path,
+    ignore_set: &HashSet<String>,
+    ignore_globs: &[Pattern],
+) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut walk_errors: usize = 0;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                // エラー本文・パスは見ずに件数だけ数える（ログにも結果にも出さない）。
+                walk_errors += 1;
+                continue;
+            }
+        };
+
+        // follow_links(false) でも WalkDir はリンク自身をエントリとして返す。
+        // path.is_file() / File::open はリンク先を辿るため、外部のファイル名を
+        // 返さないようリンクを明示的に除外する。
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+
+        let rel_path = entry.path().strip_prefix(base_dir).unwrap_or(entry.path());
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+
+        if rel_str.is_empty() {
+            continue;
+        }
+
+        let should_skip = rel_str.split('/').any(|part| ignore_set.contains(part))
+            || ignore_globs.iter().any(|glob| glob.matches(&rel_str));
+
+        if should_skip {
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            files.push(rel_str);
+            if files.len() >= LIMIT {
+                break;
+            }
+        }
+    }
+
+    if walk_errors > 0 {
+        tracing::warn!(
+            event = "ls_walk_skipped_unreadable_entries",
+            failed = walk_errors,
+            "ls walk skipped unreadable entries"
+        );
+    }
+
+    files
+}
+
 #[async_trait]
 impl Tool for LsTool {
     fn id(&self) -> &str {
@@ -158,44 +223,16 @@ impl Tool for LsTool {
             }
         }
 
-        let mut files: Vec<String> = Vec::new();
         // 外部ディレクトリの権限チェックは走査ルート base_dir に対して走査前に
         // 一度だけ行われる。シンボリックリンクを辿ると、ディレクトリ内のリンクが
         // 外部を指す場合にそのチェックをすり抜けて外部のファイル名を返してしまう
         // ため、辿らない。follow_links(false) は symlink cycle も構造的に防ぐ。
-        for entry in WalkDir::new(&base_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            // follow_links(false) でも WalkDir はリンク自身をエントリとして返す。
-            // path.is_file() / File::open はリンク先を辿るため、外部のファイル名を
-            // 返さないようリンクを明示的に除外する。
-            if entry.file_type().is_symlink() {
-                continue;
-            }
-
-            let rel_path = entry.path().strip_prefix(&base_dir).unwrap_or(entry.path());
-            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-
-            if rel_str.is_empty() {
-                continue;
-            }
-
-            let should_skip = rel_str.split('/').any(|part| ignore_set.contains(part))
-                || ignore_globs.iter().any(|glob| glob.matches(&rel_str));
-
-            if should_skip {
-                continue;
-            }
-
-            if entry.file_type().is_file() {
-                files.push(rel_str);
-                if files.len() >= LIMIT {
-                    break;
-                }
-            }
-        }
+        let files = collect_files_from_entries(
+            WalkDir::new(&base_dir).follow_links(false).into_iter(),
+            &base_dir,
+            &ignore_set,
+            &ignore_globs,
+        );
 
         let mut dirs: HashSet<String> = HashSet::new();
         let mut files_by_dir: HashMap<String, Vec<String>> = HashMap::new();
@@ -314,6 +351,7 @@ impl Tool for LsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("opencode-ls-test-{}", uuid::Uuid::new_v4()));
@@ -512,5 +550,150 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    // 警告だけを捕捉する最小サブスクライバ（tracing-subscriber を依存に追加しない）。
+    #[derive(Clone, Default)]
+    struct WarnBuffer(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl WarnBuffer {
+        fn text(&self) -> String {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .join("\n")
+        }
+
+        fn len(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        }
+    }
+
+    struct WarnVisitor(String);
+
+    impl tracing::field::Visit for WarnVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = writeln!(self.0, "{}={:?}", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            let _ = writeln!(self.0, "{}={}", field.name(), value);
+        }
+    }
+
+    struct WarnSubscriber(WarnBuffer);
+
+    impl tracing::Subscriber for WarnSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = WarnVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                 .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// 走査対象のエントリ列に、本文を持つ Err を注入して返す（権限変更を使わない）。
+    /// 順序は「Err を先頭に 1 件 + 実エントリ + Err を末尾に 1 件」で、途中失敗でも
+    /// 正常系の収集が続くことを確認できるようにしている。
+    /// 本文は意図的に参照しない（参照しないことをテストで検証する）。
+    #[allow(dead_code)]
+    struct SentinelError(&'static str);
+
+    fn entries_with_injected_errors(dir: &Path) -> Vec<Result<walkdir::DirEntry, SentinelError>> {
+        let mut entries: Vec<Result<walkdir::DirEntry, SentinelError>> = Vec::new();
+        entries.push(Err(SentinelError("SENTINEL_ERROR_BODY_NEVER_LOG")));
+        entries.extend(
+            WalkDir::new(dir)
+                .follow_links(false)
+                .into_iter()
+                .map(|entry| entry.map_err(|_| SentinelError("SENTINEL_WALK_ERR"))),
+        );
+        entries.push(Err(SentinelError("SENTINEL_ERROR_BODY_NEVER_LOG")));
+        entries
+    }
+
+    /// WalkDir の Err が 1 件以上ある場合、走査完了後に固定イベントが 1 回だけ出て
+    /// 失敗件数が伝わること。パス・ファイル名・エラー本文は一切出ないこと。
+    #[test]
+    fn walk_errors_emit_single_fixed_warn_with_count_only() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("visible.txt"), "ok").unwrap();
+        let ignore_set: HashSet<String> = HashSet::new();
+        let ignore_globs: Vec<Pattern> = Vec::new();
+
+        let logs = WarnBuffer::default();
+        let files = tracing::subscriber::with_default(WarnSubscriber(logs.clone()), || {
+            collect_files_from_entries(
+                entries_with_injected_errors(&dir).into_iter(),
+                &dir,
+                &ignore_set,
+                &ignore_globs,
+            )
+        });
+
+        // 正常系ロジックは不変：Err を除いたファイルだけが結果に残る。
+        assert_eq!(files, vec!["visible.txt".to_string()]);
+        let text = logs.text();
+        assert_eq!(logs.len(), 1, "warn は 1 回だけ: {text}");
+        assert!(
+            text.contains("event=ls_walk_skipped_unreadable_entries"),
+            "{text}"
+        );
+        assert!(text.contains("failed=2"), "{text}");
+        // パス・ファイル名・エラー本文は warn に漏れない。
+        assert!(!text.contains(&dir.to_string_lossy().to_string()), "{text}");
+        assert!(!text.contains("visible.txt"), "{text}");
+        assert!(!text.contains("SENTINEL_ERROR_BODY_NEVER_LOG"), "{text}");
+        assert!(!text.contains("SENTINEL_WALK_ERR"), "{text}");
+        // 結果一覧にもエラー本文は含まれない。
+        assert!(!files.iter().any(|f| f.contains("SENTINEL")), "{files:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// エントリ失敗が無い通常ツリーでは warn が出ないこと。
+    #[test]
+    fn clean_walk_emits_no_warn() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        let ignore_set: HashSet<String> = HashSet::new();
+        let ignore_globs: Vec<Pattern> = Vec::new();
+
+        let logs = WarnBuffer::default();
+        let files = tracing::subscriber::with_default(WarnSubscriber(logs.clone()), || {
+            collect_files_from_entries(
+                WalkDir::new(&dir).follow_links(false).into_iter(),
+                &dir,
+                &ignore_set,
+                &ignore_globs,
+            )
+        });
+
+        assert_eq!(files, vec!["a.txt".to_string()]);
+        assert_eq!(logs.len(), 0, "正常系では warn が出ない: {}", logs.text());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
