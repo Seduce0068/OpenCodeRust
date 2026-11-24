@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **send_message が prompt_locks を外れて上書きされる**
-  — `server/routes.rs:1542` / CONC-01 / 中
 - [ ] **MCP OAuth エラーが 400 ボディへ露出する**
   — `server/routes.rs:5072` / APICON-04 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -267,6 +265,8 @@ status: current
 
 ## 完了
 
+- [x] **[send_message ロック 1 件]** prompt 実行中の上書きを防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[stream error redact 1 件]** provider 生エラーの SSE 露出を防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[API 契約 2 件]** 質問 404 冪等化・session.deleted 配信
@@ -902,6 +902,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 send_message ロック: セッション単位 prompt_locks を sessions.lock
+  より前に取得するよう変更（stream_message / prompt タスクと取得順を統一、
+  逆順取得箇所なし）。回帰2件（静的順序ガード＋動的ロック待ち／全件置換後の
+  メッセージ保持）。R4 指摘なし。
 - 2026-11-24 stream error redact: StreamEvent::Error 分岐の SSE error を
   safe_prompt_failure_client_info 経由の汎用文言へ。stream_failed は生保持
   （永続化側で redact）。R4 が 4 件（回帰が実 SSE 経路を通らない、
