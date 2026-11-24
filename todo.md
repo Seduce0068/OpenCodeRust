@@ -172,8 +172,6 @@ status: current
 
 - [ ] **タイトル生成の LLM エラーが握りつぶされる**
   — `session/summary.rs:345` / ERR-R1-02 / 低
-- [ ] **CLI file URI の呼び出し側エラーにパスが残る**
-  — `cli/main.rs:5508` / ERR-R1-03-R4 / 低
 - [ ] **Object 静的メソッドのエラー文言・マルチバイトテスト不足**
   — `codemode/interpreter.rs:2606` / COLL-R1-01-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
@@ -275,6 +273,8 @@ status: current
 
 ## 完了
 
+- [x] **[CLI パス露出 1 件]** 読み取りエラーを固定文言化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[ls 走査エラー 1 件]** 件数付き warn で通知
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[well-known poison 回復 1 件]** キャッシュ操作を黙って捨てない
@@ -946,6 +946,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 CLI パス露出: read_document_file ヘルパを追加し 3 箇所の
+  read_to_string エラーを固定文言 "Failed to read document file" へ。
+  4617 の remove_dir_all エラーは別機能で未修正（子が事実申告）。R4 が
+  /tmp ハードコードを指摘、親が std::env::temp_dir() へ修正。残存 low
+  （3 呼び出しサイトの静的ガード欠落）は記録のみ。
 - 2026-11-24 ls 走査エラー: filter_map(|e| e.ok()) を廃止し Err を数えて
   走査完了後に固定 warn（件数のみ、パス・ファイル名・本文非露出）を1回。
   注入テスト2件、R4 指摘なし。
