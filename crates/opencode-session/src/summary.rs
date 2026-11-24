@@ -342,7 +342,18 @@ async fn generate_message_title_llm(
         variant: None,
     };
 
-    let response = provider.chat(request).await.ok()?;
+    let response = match provider.chat(request).await {
+        Ok(response) => response,
+        Err(_) => {
+            // Log only a fixed event name: never the error body, prompt text,
+            // or title candidate. The None -> fallback flow stays unchanged.
+            tracing::warn!(
+                event = "title_generation_failed",
+                "title generation failed; using fallback"
+            );
+            return None;
+        }
+    };
     let raw = response
         .choices
         .first()
@@ -901,5 +912,184 @@ mod tests {
             .expect("title generation should succeed");
         assert_eq!(title, format!("{}...", "あ".repeat(32)));
         assert!(!title.contains('\u{fffd}'));
+    }
+
+    // tracing-subscriber を依存に追加せず、WARN イベントだけを捕捉する最小限の Subscriber。
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct WarnVisitor {
+        event: Option<String>,
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for WarnVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = Some(value.to_owned()),
+                "message" => self.message = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = WarnVisitor {
+                event: None,
+                message: None,
+            };
+            event.record(&mut visitor);
+            self.events.lock().expect("mutex poisoned").push((
+                visitor.event.unwrap_or_default(),
+                visitor.message.unwrap_or_default(),
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// chat() が失敗する Provider。エラー本文に目印を含め、ログへの漏洩を検証する。
+    struct FailingProvider {
+        model: ModelInfo,
+    }
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        fn id(&self) -> &str {
+            "failing-mock"
+        }
+
+        fn name(&self) -> &str {
+            "Failing Mock"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![self.model.clone()]
+        }
+
+        fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+            if id == self.model.id {
+                Some(&self.model)
+            } else {
+                None
+            }
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            Err(ProviderError::ApiError(
+                "secret-error-value-leak-marker-77".to_string(),
+            ))
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<StreamResult, ProviderError> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn failing_provider() -> FailingProvider {
+        FailingProvider {
+            model: ModelInfo {
+                id: "mock-model".to_string(),
+                name: "Mock".to_string(),
+                provider: "mock".to_string(),
+                context_window: 8192,
+                max_output_tokens: 1024,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_message_title_llm_failure_warns_once_without_leaking() {
+        let capture = WarnCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let title = generate_message_title_llm(
+            "secret-prompt-text-leak-marker-31",
+            &failing_provider(),
+            "mock-model",
+        )
+        .await;
+        assert_eq!(
+            title, None,
+            "failed chat must keep the None -> fallback control flow"
+        );
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "must warn exactly once per failed call");
+        assert_eq!(events[0].0, "title_generation_failed");
+        assert!(events[0].1.contains("title generation failed"));
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
+    }
+
+    #[tokio::test]
+    async fn test_summarize_message_for_session_failing_provider_uses_fallback_title() {
+        let capture = WarnCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let mut session = Session::new("proj", ".");
+        let text = "secret-prompt-text-leak-marker-32";
+        let message = session.add_user_message(text);
+        let message_id = message.id.clone();
+
+        summarize_message_for_session(
+            &mut session,
+            &message_id,
+            &[],
+            std::path::Path::new("."),
+            Some(&failing_provider()),
+            Some("mock-model"),
+        )
+        .await
+        .expect("summarize_message_for_session should work");
+
+        let expected = fallback_message_title(text);
+        let updated = session
+            .get_message(&message_id)
+            .expect("message should still exist");
+        assert_eq!(
+            updated
+                .metadata
+                .get("summary_title")
+                .and_then(|value| value.as_str()),
+            Some(expected.as_str()),
+            "fallback title must be stored when the provider fails"
+        );
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "must warn exactly once per failed call");
+        assert_eq!(events[0].0, "title_generation_failed");
+        assert!(!events[0].0.contains("leak-marker"));
+        assert!(!events[0].1.contains("leak-marker"));
     }
 }

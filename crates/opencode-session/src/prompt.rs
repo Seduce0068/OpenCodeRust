@@ -3748,8 +3748,12 @@ pub async fn generate_session_title_llm(
                 cleaned
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to generate title via LLM, using fallback");
+        Err(_) => {
+            // エラー本文には上流の URL や認証情報が含まれ得るためログへ出さない（R4）。
+            tracing::warn!(
+                event = "title_generation_failed",
+                "Failed to generate title via LLM, using fallback"
+            );
             fallback
         }
     }
