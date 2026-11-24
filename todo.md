@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **レイヤ間で permission が上位 permissions を破棄**
-  — `config/loader.rs:2436` / CFGMAP-03-R4 / 中
 - [ ] **default_agent が CLI --agent 既定値 'build' にマスクされる**
   — `cli/main.rs:887` / CFGMAP-01 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -168,6 +166,8 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **wellknown レイヤの permissions が事前正規化されない**
+  — `config/loader.rs:364` / CFGMAP-03-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
   — `config/loader.rs:5296` / CFGMAP-03-R4 / 低
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
@@ -267,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[レイヤ間 permissions 1 件]** キー単位マージへ（破棄防止）
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[permissions Names 1 件]** permission 名を実効 Allow へ
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[permissions 配線 1 件]** 権限エンジンへ変換・反映
@@ -920,6 +922,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 レイヤ間 permissions: normalize_permissions_field を抽出し各
+  レイヤ merge 直前に呼ぶ（permissions→permission の事前正規化）。上位
+  レイヤのルールが permission の DeepMerge でキー単位に勝つ。回帰4件。
+  R4 が ENV_LOCK の並列分離不足を medium で指摘、親が load_all を呼ぶ
+  全回帰テストへロックを追加。残存 low（wellknown レイヤ未正規化）は
+  既存挙動の可能性があるため triage。
 - 2026-11-24 permissions Names: スキーマ doc の「permission names」に従い
   各値を Allow ルールのキーへ変換。単独 allow/deny/ask のみ "*" グローバル
   行動の後方互換を維持。R4 が空文字混入で global action 判定が壊れる low を
