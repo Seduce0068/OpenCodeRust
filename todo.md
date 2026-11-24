@@ -67,6 +67,10 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **タイトル失敗 warn の prompt.rs 実経路テストが無い**
+  — `session/prompt.rs:3751` / ERR-R1-02-R4 / 中
+- [ ] **WarnVisitor が構造化 error フィールドを破棄し偽陽性**
+  — `session/summary.rs:923` / ERR-R1-02-R4 / 中
 - [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
   — `cli/main.rs:147` / CFGMAP-01-R4 / 中
 - [ ] **CLIARG-05 が attach/TUI 経路に適用されない**
@@ -170,8 +174,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **タイトル生成の LLM エラーが握りつぶされる**
-  — `session/summary.rs:345` / ERR-R1-02 / 低
 - [ ] **Object 静的メソッドのエラー文言・マルチバイトテスト不足**
   — `codemode/interpreter.rs:2606` / COLL-R1-01-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
@@ -273,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[タイトル生成エラー 1 件]** 固定 warn で可視化
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI パス露出 1 件]** 読み取りエラーを固定文言化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[ls 走査エラー 1 件]** 件数付き warn で通知
@@ -946,6 +950,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 タイトル生成エラー: summary.rs の .ok()? を match 化し
+  失敗時に固定 warn（event="title_generation_failed"）。子が申告した
+  prompt.rs のエラー本文ログも親が直接修正。R4 が prompt.rs 側の実失敗
+  テスト不在と WarnVisitor の構造化 error フィールド破棄（偽陽性）を
+  medium で指摘、残存 triage として最大2回で停止。
 - 2026-11-24 CLI パス露出: read_document_file ヘルパを追加し 3 箇所の
   read_to_string エラーを固定文言 "Failed to read document file" へ。
   4617 の remove_dir_all エラーは別機能で未修正（子が事実申告）。R4 が
