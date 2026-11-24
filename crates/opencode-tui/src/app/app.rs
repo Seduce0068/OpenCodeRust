@@ -4869,6 +4869,24 @@ fn forward_server_event(
                 }
             }
         }
+        // サーバが broadcast する回答／拒否イベントで共有集合を更新する。
+        // 自分の回答で既に forget 済みなら remove が no-op になり冪等。
+        // 要求 ID はログ・エラーへ出力しない。
+        Some("permission.replied") | Some("question.replied") | Some("question.rejected") => {
+            let Some(id) = value
+                .get("requestID")
+                .and_then(|item| item.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                return true;
+            };
+            let kind = if event_type == Some("permission.replied") {
+                "permission"
+            } else {
+                "question"
+            };
+            forget_request_seen(context, kind, id);
+        }
         _ => {}
     }
     true
@@ -7451,5 +7469,106 @@ mod tests {
             app.active_question_request.is_some(),
             "failed reject must keep the request for retry"
         );
+    }
+
+    /// サーバの replied broadcast で共有集合から対応キーが消えること。
+    /// 同じ ID を両 kind で登録し、kind の取り違えがないことも確認する。
+    #[test]
+    fn replied_events_forget_only_matching_kind() {
+        let context = Arc::new(AppContext::new());
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+
+        mark_request_seen(&context, "permission", "replied_1");
+        mark_request_seen(&context, "question", "replied_1");
+
+        let permission_reply = serde_json::json!({
+            "type": "permission.replied",
+            "requestID": "replied_1",
+            "sessionID": "ses_1",
+            "reply": "once"
+        });
+        forward_sse_payloads(&[permission_reply], &event_tx, &context);
+        {
+            let seen = context.seen_request_ids.read();
+            assert!(!seen.contains("permission:replied_1"));
+            assert!(
+                seen.contains("question:replied_1"),
+                "other kind must survive"
+            );
+        }
+
+        let question_reply = serde_json::json!({
+            "type": "question.replied",
+            "requestID": "replied_1",
+            "sessionID": "ses_1",
+            "answers": []
+        });
+        forward_sse_payloads(&[question_reply], &event_tx, &context);
+        assert!(context.seen_request_ids.read().is_empty());
+        assert!(
+            event_rx.try_recv().is_err(),
+            "replied events must not enqueue UI events"
+        );
+
+        // question.rejected も同じ kind のキーを消す（R4）。
+        mark_request_seen(&context, "question", "rejected_1");
+        let question_rejected = serde_json::json!({
+            "type": "question.rejected",
+            "requestID": "rejected_1",
+            "sessionID": "ses_1"
+        });
+        forward_sse_payloads(&[question_rejected], &event_tx, &context);
+        assert!(!context
+            .seen_request_ids
+            .read()
+            .contains("question:rejected_1"));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// requestID が無い replied イベントは集合もイベントチャネルも変更しない。
+    #[test]
+    fn replied_event_without_request_id_is_noop() {
+        let context = Arc::new(AppContext::new());
+        mark_request_seen(&context, "permission", "perm_no_id_1");
+        mark_request_seen(&context, "question", "q_no_id_1");
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+
+        let payloads = [
+            serde_json::json!({ "type": "permission.replied", "sessionID": "ses_1" }),
+            serde_json::json!({ "type": "question.replied", "sessionID": "ses_1" }),
+        ];
+        forward_sse_payloads(&payloads, &event_tx, &context);
+
+        let seen = context.seen_request_ids.read();
+        assert!(seen.contains("permission:perm_no_id_1"));
+        assert!(seen.contains("question:q_no_id_1"));
+        drop(seen);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// 自分の回答で既に forget 済みの ID でもエラーにならない（冪等）。
+    #[test]
+    fn replied_event_after_self_forget_is_idempotent() {
+        let context = Arc::new(AppContext::new());
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        // キーを登録しない = 送信成功側で既に forget 済みの状態を模す。
+        let payloads = [
+            serde_json::json!({
+                "type": "permission.replied",
+                "requestID": "perm_gone_1",
+                "sessionID": "ses_1"
+            }),
+            serde_json::json!({
+                "type": "question.replied",
+                "requestID": "q_gone_1",
+                "sessionID": "ses_1"
+            }),
+        ];
+        // 同じ replied を 2 回流しても冪等（R4）。
+        forward_sse_payloads(&payloads, &event_tx, &context);
+        forward_sse_payloads(&payloads, &event_tx, &context);
+
+        assert!(context.seen_request_ids.read().is_empty());
+        assert!(event_rx.try_recv().is_err());
     }
 }
