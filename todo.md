@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **TUI が config.default_agent を読まない（build 固定）**
-  — `tui/app.rs:238` / CFGMAP-01-R4 / 中
 - [ ] **CLI と server で agent 名の正規化が不一致**
   — `cli/main.rs:139` / CFGMAP-01-R4 / 中
 - [ ] **default_agent 配線の CLI 統合回帰テスト不足**
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[TUI default_agent 1 件]** current_agent へ反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[default_agent 配線 1 件]** CLI --agent 既定値によるマスクを解消
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[レイヤ間 permissions 1 件]** キー単位マージへ（破棄防止）
@@ -928,6 +928,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 TUI default_agent: apply_ui_config に config.default_agent を
+  反映（trim 非空なら set_agent）。env OPENCODE_TUI_AGENT は app.rs 側で
+  後に set_agent されるため明示指定が優先される順序は不変。回帰4件。
+  R4 指摘なし。
 - 2026-11-24 default_agent: CLI の --agent を Option 化し "build" 強制渡しを
   停止。ローカル run に --agent > config.default_agent > build の解決を追加、
   TUI 起動は未指定時に OPENCODE_TUI_AGENT を remove_var（R4）して既定 build を
