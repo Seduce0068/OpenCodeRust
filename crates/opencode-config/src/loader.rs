@@ -57,8 +57,13 @@ impl ConfigLoader {
         let content = resolve_file_references(&content, Path::new("."))
             .with_context(|| "Failed to resolve file references in inline config")?;
 
-        let config: Config =
+        let mut config: Config =
             parse_jsonc(&content).with_context(|| "Failed to parse config content")?;
+        // Normalize this layer before merging: `permissions` is replaced as a
+        // whole field by `Config::merge`, while `permission` is deep-merged key
+        // by key. Without this, a higher-priority layer's `permissions` would be
+        // silently discarded whenever a lower layer already set `permission`.
+        normalize_permissions_field(&mut config);
         self.config.merge(config);
         Ok(())
     }
@@ -92,9 +97,13 @@ impl ConfigLoader {
         // Never include the config path here: it can contain user identifiers.
         // `parse_jsonc` carries only a sanitized field path and never the serde
         // error body, which may embed the offending value.
-        let config: Config = parse_jsonc(&content)
+        let mut config: Config = parse_jsonc(&content)
             .map_err(|error| anyhow::anyhow!("Failed to parse config file: {error}"))?;
 
+        // See `load_from_str`: each layer must convert `permissions` into the
+        // runtime `permission` field before merging so its rules participate in
+        // the key-by-key `DeepMerge` instead of being dropped later.
+        normalize_permissions_field(&mut config);
         self.config.merge(config);
         self.config_paths.push(path.to_path_buf());
         Ok(())
@@ -2450,6 +2459,30 @@ fn resolve_permissions_rules(permissions: &PermissionsConfig) -> HashMap<String,
     rules
 }
 
+/// Normalizes the input-only top-level `permissions` field of a single config
+/// layer into the runtime `permission` field.
+///
+/// This runs on every layer *before* it is merged into the accumulated config:
+/// `Config::merge` replaces `permissions` wholesale but deep-merges `permission`
+/// key by key, so converting early lets a higher-priority layer's rules win on
+/// individual keys instead of being discarded when a lower layer (or the
+/// `OPENCODE_PERMISSION` override) already set `permission`.
+///
+/// Idempotent: with no `permissions` this is a no-op; when both fields are set,
+/// the explicit `permission` keeps priority and `permissions` is consumed. No
+/// action, resource, effect or path value is logged.
+fn normalize_permissions_field(config: &mut Config) {
+    if config.permission.is_none() {
+        if let Some(permissions) = config.permissions.take() {
+            let rules = resolve_permissions_rules(&permissions);
+            config.permission = Some(PermissionConfig::Map(rules));
+        }
+    } else {
+        // 明示 permission を優先。入力専用フィールドは消費して二重_SOURCE を防ぐ。
+        let _ = config.permissions.take();
+    }
+}
+
 /// Apply post-load transforms: legacy migrations, plugin dedup, provider normalization.
 ///
 /// Public so the server can normalize PATCH-merged config the same way the
@@ -2490,20 +2523,12 @@ pub fn apply_post_load_transforms(config: &mut Config, inject_environment_defaul
         }
     }
 
-    // Current-schema top-level `permissions` -> runtime `permission`. Run this
-    // before the legacy `tools` migration so the current-schema field wins on
-    // conflict. `permissions` is input-only: consume it so persistence never
-    // leaves a second source of truth. An explicit `permission` is never
-    // overwritten; no action/resource/effect value is logged.
-    if config.permission.is_none() {
-        if let Some(permissions) = config.permissions.take() {
-            let rules = resolve_permissions_rules(&permissions);
-            config.permission = Some(PermissionConfig::Map(rules));
-        }
-    } else {
-        // 明示 permission を優先。入力専用フィールドは消費して二重_SOURCE を防ぐ。
-        let _ = config.permissions.take();
-    }
+    // Current-schema top-level `permissions` -> runtime `permission`. Each
+    // loaded layer already did this before merging (see `load_from_str` /
+    // `load_from_file`); this final pass also covers configs injected directly
+    // by callers. Run before the legacy `tools` migration so the current-schema
+    // field wins on conflict.
+    normalize_permissions_field(config);
 
     // Backwards compatibility: legacy top-level `tools` config -> permission.
     // Log only the key names; tool names and enable flags are never included.

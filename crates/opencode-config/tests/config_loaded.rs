@@ -2,14 +2,51 @@
 //! Port of upstream packages/opencode/test/config/config.test.ts behaviour.
 //! Tests config loading: JSON/JSONC, merge precedence, env substitution.
 
-use opencode_config::ConfigLoader;
+use opencode_config::{Config, ConfigLoader, PermissionRule};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+// Environment variables are process-global. Serialize every test that sets
+// OPENCODE_PERMISSION and every test that reads it through load_all, so a
+// concurrent reader cannot observe another test's override (R4).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_config(dir: &PathBuf, content: &str, name: &str) {
     let path = dir.join(name);
     fs::write(path, content).unwrap();
+}
+
+fn rule_for(config: &Config, key: &str) -> Option<PermissionRule> {
+    config
+        .permission
+        .as_ref()
+        .expect("runtime permission field")
+        .rules()
+        .remove(key)
+}
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
 }
 
 #[test]
@@ -240,4 +277,143 @@ fn reads_global_mcp_timeout_and_server_overrides() {
         opencode_config::McpTimeoutConfig::resolve(Some(global), plain.timeout.as_ref());
     assert_eq!((startup, catalog, execution), (45000, 30000, 600000));
     assert!(!mcp.contains_key("timeout"), "timeout is not a server");
+}
+
+#[test]
+fn project_permissions_rules_override_lower_layer_permission() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // CFGMAP-03-R4: a lower layer's `permission` used to make the final
+    // transform drop a higher layer's `permissions` entirely.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    write_config(
+        &dir,
+        r#"{"permission":{"read":"allow","bash":"deny"}}"#,
+        "lower-opencode.json",
+    );
+    write_config(
+        &dir,
+        r#"{"permissions":[{"action":"read","resource":"","effect":"deny"}]}"#,
+        "opencode.json",
+    );
+
+    let mut loader = ConfigLoader::new().without_global_config();
+    loader
+        .load_from_file(dir.join("lower-opencode.json"))
+        .unwrap();
+    let config = loader.load_all(&dir).unwrap();
+
+    assert!(
+        config.permissions.is_none(),
+        "input-only permissions field must be consumed"
+    );
+    assert!(
+        matches!(
+            rule_for(&config, "read"),
+            Some(PermissionRule::Action(
+                opencode_config::PermissionAction::Deny
+            ))
+        ),
+        "higher-layer permissions rule must win"
+    );
+    assert!(
+        matches!(
+            rule_for(&config, "bash"),
+            Some(PermissionRule::Action(
+                opencode_config::PermissionAction::Deny
+            ))
+        ),
+        "lower-layer keys not overridden must survive the key-wise merge"
+    );
+}
+
+#[test]
+fn project_permissions_names_override_lower_layer_permission() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    write_config(
+        &dir,
+        r#"{"permission":{"read":"deny"}}"#,
+        "lower-opencode.json",
+    );
+    write_config(&dir, r#"{"permissions":["read"]}"#, "opencode.json");
+
+    let mut loader = ConfigLoader::new().without_global_config();
+    loader
+        .load_from_file(dir.join("lower-opencode.json"))
+        .unwrap();
+    let config = loader.load_all(&dir).unwrap();
+
+    assert!(
+        matches!(
+            rule_for(&config, "read"),
+            Some(PermissionRule::Action(
+                opencode_config::PermissionAction::Allow
+            ))
+        ),
+        "higher-layer permissions name must win over lower-layer permission"
+    );
+}
+
+#[test]
+fn explicit_permission_wins_over_permissions_in_the_same_layer() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    write_config(
+        &dir,
+        r#"{
+            "permission": {"read": "deny"},
+            "permissions": [
+                {"action":"read","effect":"allow"},
+                {"action":"bash","effect":"allow"}
+            ]
+        }"#,
+        "opencode.json",
+    );
+
+    let mut loader = ConfigLoader::new().without_global_config();
+    let config = loader.load_all(&dir).unwrap();
+
+    assert!(config.permissions.is_none());
+    assert!(
+        matches!(
+            rule_for(&config, "read"),
+            Some(PermissionRule::Action(
+                opencode_config::PermissionAction::Deny
+            ))
+        ),
+        "explicit permission keeps priority within one layer"
+    );
+    assert!(
+        rule_for(&config, "bash").is_none(),
+        "the discarded permissions list must not leak extra rules"
+    );
+}
+
+#[test]
+fn opencode_permission_env_override_keeps_priority_over_project_permissions() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    write_config(
+        &dir,
+        r#"{"permissions":[{"action":"read","effect":"allow"}]}"#,
+        "opencode.json",
+    );
+
+    let _env = EnvVarGuard::set("OPENCODE_PERMISSION", r#"{"read":"deny"}"#);
+    let mut loader = ConfigLoader::new().without_global_config();
+    let config = loader.load_all(&dir).unwrap();
+
+    assert!(
+        matches!(
+            rule_for(&config, "read"),
+            Some(PermissionRule::Action(
+                opencode_config::PermissionAction::Deny
+            ))
+        ),
+        "OPENCODE_PERMISSION must still override project-level permissions"
+    );
 }
