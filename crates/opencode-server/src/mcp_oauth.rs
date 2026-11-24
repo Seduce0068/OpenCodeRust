@@ -2,7 +2,10 @@ use chrono::Utc;
 use opencode_mcp::client::{
     McpClientError, McpClientRegistry, McpServerConfig as McpClientConfig, McpTimeouts,
 };
-use opencode_mcp::oauth::{McpOAuthConfig as RealOAuthConfig, McpOAuthManager as RealOAuthManager};
+use opencode_mcp::oauth::{
+    McpOAuthConfig as RealOAuthConfig, McpOAuthManager as RealOAuthManager,
+    OAuthError as RealOAuthError,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -716,7 +719,7 @@ impl McpOAuthManager {
         code: &str,
         returned_state: Option<&str>,
     ) -> Result<McpServerInfo, McpOAuthError> {
-        self.managed_server(server_name).await?;
+        let managed = self.managed_server(server_name).await?;
 
         {
             let states = self.oauth_states.read().await;
@@ -733,13 +736,27 @@ impl McpOAuthManager {
         })?;
         let oauth_client = self.oauth_client_for(server_name).await?;
 
-        oauth_client
-            .finish_auth(code, state)
-            .await
-            .map_err(|e| McpOAuthError::OAuthFailed(e.to_string()))?;
+        if let Err(error) = oauth_client.finish_auth(code, state).await {
+            if matches!(
+                &error,
+                RealOAuthError::StateMismatch | RealOAuthError::FlowExpired
+            ) {
+                // A CSRF mismatch (or a flow already reclaimed by its TTL)
+                // keeps the Pending guard, just like a missing state: a
+                // corrected callback may still be retried.
+                return Err(McpOAuthError::OAuthFailed(error.to_string()));
+            }
+            // Token exchange and configuration failures are terminal for this
+            // flow; release Pending and expose only a fixed message.
+            self.fail_pending_oauth(server_name, &managed).await;
+            return Err(McpOAuthError::OAuthFailed(
+                "OAuth token exchange failed".to_string(),
+            ));
+        }
 
         // Only mark authorized once real tokens are stored.
         if !oauth_client.has_stored_tokens().await {
+            self.fail_pending_oauth(server_name, &managed).await;
             return Err(McpOAuthError::OAuthFailed(
                 "token exchange did not store credentials".to_string(),
             ));
@@ -966,6 +983,42 @@ impl McpOAuthManager {
             .await
             .get(server_name)
             .map(|state| state.status.clone())
+    }
+
+    /// Drop the manager-level pending flow after a failed callback and record
+    /// a failed OAuth status.
+    ///
+    /// A lower-level `finish_auth` failure (for example a rejected token
+    /// exchange) leaves that manager's own flow in place until its TTL expires.
+    /// The manager-level `Pending` guard must therefore be released explicitly
+    /// so `/oauth/start` can be retried immediately. Locks follow the same
+    /// order as `start_oauth`: `oauth_states` is released before `statuses` is
+    /// taken, so the two are never held at the same time. Only fixed messages
+    /// are persisted; no exchange error text, URL or path is stored.
+    async fn fail_pending_oauth(&self, server_name: &str, managed: &ManagedServer) {
+        self.oauth_states.write().await.remove(server_name);
+
+        let mut statuses = self.statuses.write().await;
+        let info = statuses
+            .entry(server_name.to_string())
+            .or_insert_with(|| McpServerInfo {
+                name: server_name.to_string(),
+                status: if managed.enabled {
+                    "needs_auth".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                tools: 0,
+                resources: 0,
+                error: None,
+                oauth_required: managed.config.oauth_required(),
+                oauth_status: None,
+            });
+        // 並行 callback で成功側が先に Authorized へ遷移していたら上書きしない（R4）。
+        if info.oauth_status.is_none() || matches!(info.oauth_status, Some(McpOAuthStatus::Pending))
+        {
+            info.oauth_status = Some(McpOAuthStatus::Failed);
+        }
     }
 
     async fn default_status_for(
@@ -2007,6 +2060,81 @@ mod tests {
         assert!(result.is_err(), "invalid code must not authorize");
         let status = manager.get_server("remote").await.expect("remote server");
         assert_ne!(status.oauth_status, Some(McpOAuthStatus::Authorized));
+
+        let _ = std::fs::remove_file(&auth_file);
+    }
+
+    /// Regression (STATE-R1-01): a token-exchange failure must release the
+    /// manager-level Pending guard so a fresh flow can be started. A live flow
+    /// must keep blocking concurrent starts exactly as before.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn failed_token_exchange_allows_a_new_oauth_flow() {
+        let auth_file = temp_auth_file("failed-exchange-retry");
+        let _guard = auth_store_lock();
+        let _restore = RestoreMcpAuthFile(std::env::var("OPENCODE_MCP_AUTH_FILE").ok());
+        std::env::set_var("OPENCODE_MCP_AUTH_FILE", &auth_file);
+
+        let (issuer, _) = spawn_mock_authorization_server().await;
+        let (mcp_url, _) =
+            spawn_mock_mcp_with_auth(axum::http::StatusCode::OK, Some(issuer.clone())).await;
+
+        let manager = McpOAuthManager::new();
+        manager
+            .add_server(
+                "remote".to_string(),
+                McpRuntimeConfig::Remote(RemoteMcpConfig {
+                    url: mcp_url,
+                    oauth_enabled: true,
+                    ..Default::default()
+                }),
+                true,
+            )
+            .await;
+
+        let first = manager.start_oauth("remote").await.expect("first start");
+        let first_flow_key = flow_key_for("remote", &first.authorization_url);
+        let first_state = opencode_mcp::auth::try_get_oauth_state(&first_flow_key)
+            .await
+            .expect("read auth store")
+            .expect("first csrf state");
+
+        // The mock token endpoint rejects a wrong code, so finish_auth fails
+        // with a token-exchange error rather than a CSRF/TTL error.
+        let error = manager
+            .handle_callback("remote", "wrong-code", Some(&first_state))
+            .await
+            .expect_err("token exchange must fail");
+        assert!(
+            matches!(&error, McpOAuthError::OAuthFailed(message) if message == "OAuth token exchange failed"),
+            "unexpected error: {error}"
+        );
+
+        let status = manager.get_server("remote").await.expect("remote server");
+        assert_eq!(status.oauth_status, Some(McpOAuthStatus::Failed));
+
+        // Pending is gone, so the retry succeeds with a freshly issued URL.
+        let second = manager
+            .start_oauth("remote")
+            .await
+            .expect("retry after failed exchange");
+        assert_ne!(
+            second.authorization_url, first.authorization_url,
+            "retry must issue a new authorization URL"
+        );
+        let second_flow_key = flow_key_for("remote", &second.authorization_url);
+        let second_state = opencode_mcp::auth::try_get_oauth_state(&second_flow_key)
+            .await
+            .expect("read auth store")
+            .expect("second csrf state");
+        assert_ne!(first_state, second_state, "retry must use a fresh state");
+
+        // A live flow still blocks a concurrent start as before.
+        let error = manager
+            .start_oauth("remote")
+            .await
+            .expect_err("live flow must still be in progress");
+        assert!(matches!(error, McpOAuthError::OAuthInProgress));
 
         let _ = std::fs::remove_file(&auth_file);
     }
