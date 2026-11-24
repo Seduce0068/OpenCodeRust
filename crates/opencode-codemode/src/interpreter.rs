@@ -2603,7 +2603,7 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => {
                         return Err(RuntimeError::type_error(
-                            "Object.keys expects a data object or array.",
+                            "Object.keys expects a data object (including Error), array, or string.",
                             _span,
                         ));
                     }
@@ -2643,7 +2643,7 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => {
                         return Err(RuntimeError::type_error(
-                            "Object.values expects a data object.",
+                            "Object.values expects a data object (including Error), array, or string.",
                             _span,
                         ));
                     }
@@ -2685,7 +2685,7 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => {
                         return Err(RuntimeError::type_error(
-                            "Object.entries expects a data object.",
+                            "Object.entries expects a data object (including Error), array, or string.",
                             _span,
                         ));
                     }
@@ -2727,7 +2727,7 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                     _ => Err(RuntimeError::type_error(
-                        "Object.hasOwn expects a data object.",
+                        "Object.hasOwn expects a data object (including Error), array, or string.",
                         _span,
                     )),
                 }
@@ -13897,6 +13897,19 @@ mod tests {
             string("x,y,z")
         );
 
+        // マルチバイト文字列: \u エスケープで "あい" を作り、chars() 単位の
+        // インデックスキー (0,1) と各文字の値が返ることを裏付ける。
+        assert_eq!(
+            run_value(
+                "const s = \"\\u3042\\u3044\"; return [ \
+                 Object.keys(s).join(','), Object.values(s).join(','), \
+                 Object.entries(s).map(e => e.join(':')).join(','), \
+                 Object.hasOwn(s, '0'), Object.hasOwn(s, '2') \
+                 ].join('|');"
+            ),
+            string("0,1|\u{3042},\u{3044}|0:\u{3042},1:\u{3044}|true|false")
+        );
+
         // Object / Error の既存挙動は不変。
         assert_eq!(
             run_value(
@@ -13927,6 +13940,24 @@ mod tests {
                 .expect("tool key discovery should stay available"),
             string("add")
         );
+
+        // 4 関数すべてでエラー文言を統一し、Array / String も受け付ける旨を明示する。
+        for source in [
+            "Object.keys(42)",
+            "Object.values(42)",
+            "Object.entries(42)",
+            "Object.hasOwn(42, 'x')",
+        ] {
+            let error = run(source).expect_err("non-object primitives must be rejected");
+            assert_eq!(error.kind(), super::RuntimeErrorKind::TypeError);
+            assert!(
+                error
+                    .message()
+                    .contains("expects a data object (including Error), array, or string."),
+                "unified message missing for {source}: {}",
+                error.message()
+            );
+        }
     }
 
     #[test]
