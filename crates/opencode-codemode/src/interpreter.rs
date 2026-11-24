@@ -2583,7 +2583,7 @@ impl<'a> Interpreter<'a> {
                 }
                 check_data_argument(&source, "Object.keys input", _span)?;
                 match &source {
-                    Value::Object(_) | Value::Array(_) | Value::Error(_) => {}
+                    Value::Object(_) | Value::Array(_) | Value::String(_) | Value::Error(_) => {}
                     Value::Date(_) | Value::Map(_) | Value::Set(_) => {
                         return Ok(Value::array(Vec::new()));
                     }
@@ -2623,7 +2623,7 @@ impl<'a> Interpreter<'a> {
                 }
                 check_data_argument(&source, "Object.values input", _span)?;
                 match &source {
-                    Value::Object(_) | Value::Error(_) => {}
+                    Value::Object(_) | Value::Array(_) | Value::String(_) | Value::Error(_) => {}
                     Value::Date(_) | Value::Map(_) | Value::Set(_) => {
                         return Ok(Value::array(Vec::new()));
                     }
@@ -2665,7 +2665,7 @@ impl<'a> Interpreter<'a> {
                 }
                 check_data_argument(&source, "Object.entries input", _span)?;
                 match &source {
-                    Value::Object(_) | Value::Error(_) => {}
+                    Value::Object(_) | Value::Array(_) | Value::String(_) | Value::Error(_) => {}
                     Value::Date(_) | Value::Map(_) | Value::Set(_) => {
                         return Ok(Value::array(Vec::new()));
                     }
@@ -2710,7 +2710,9 @@ impl<'a> Interpreter<'a> {
                 let key = to_js_string(&argument(1));
                 match &source {
                     Value::Object(object) => Ok(Value::Boolean(object.borrow().contains_key(&key))),
-                    Value::Error(_) => Ok(Value::Boolean(own_keys(&source).contains(&key))),
+                    Value::Array(_) | Value::String(_) | Value::Error(_) => {
+                        Ok(Value::Boolean(own_keys(&source).contains(&key)))
+                    }
                     Value::Date(_) | Value::Map(_) | Value::Set(_) => Ok(Value::Boolean(false)),
                     Value::Promise(_) => Err(RuntimeError::new(
                         RuntimeErrorKind::InvalidDataValue,
@@ -13408,8 +13410,10 @@ mod tests {
             ),
             string("true,false,true,false")
         );
-        let error = run("return Object.hasOwn([1, 2], 1);").expect_err("arrays are not accepted");
-        assert_eq!(error.kind(), super::RuntimeErrorKind::TypeError);
+        assert_eq!(
+            run_value("return Object.hasOwn([1, 2], 1);"),
+            Value::Boolean(true)
+        );
         assert_eq!(
             run_value(
                 r#"const m = new Map([["a", 1], ["b", 2]]); return JSON.stringify(Object.fromEntries(m));"#
@@ -13829,14 +13833,100 @@ mod tests {
             number(0.0)
         );
 
-        let error = run(r#"return Object.keys("ab");"#).expect_err("primitive keys");
-        assert_eq!(error.kind(), super::RuntimeErrorKind::TypeError);
-        let error = run("return Object.values([1, 2]);").expect_err("array values");
-        assert_eq!(error.kind(), super::RuntimeErrorKind::TypeError);
-        let error = run("return Object.entries([1, 2]);").expect_err("array entries");
-        assert_eq!(error.kind(), super::RuntimeErrorKind::TypeError);
+        assert_eq!(
+            run_value(r#"return Object.keys("ab").join(",");"#),
+            string("0,1")
+        );
+        assert_eq!(
+            run_value("return Object.values([1, 2]).join(',');"),
+            string("1,2")
+        );
+        assert_eq!(
+            run_value("return Object.entries([1, 2]).length;"),
+            number(2.0)
+        );
         let error = run("return Object.assign({}, [1]);").expect_err("array source");
         assert_eq!(error.kind(), super::RuntimeErrorKind::TypeError);
+    }
+
+    #[test]
+    fn object_static_iterators_accept_arrays_and_strings_consistently() {
+        // 空配列: 4 関数すべてが一貫して空の結果を返す。
+        assert_eq!(
+            run_value("return JSON.stringify(Object.keys([]));"),
+            string("[]")
+        );
+        assert_eq!(
+            run_value("return JSON.stringify(Object.values([]));"),
+            string("[]")
+        );
+        assert_eq!(
+            run_value("return JSON.stringify(Object.entries([]));"),
+            string("[]")
+        );
+        assert_eq!(
+            run_value(r#"return Object.hasOwn([], "0");"#),
+            Value::Boolean(false)
+        );
+
+        // 配列: own_keys + get_property 経路で keys / values / entries が揃う。
+        assert_eq!(
+            run_value(
+                "const a = [10, 20]; return [ \
+                 Object.keys(a).join(','), Object.values(a).join(','), \
+                 Object.entries(a).map(e => e.join(':')).join(','), \
+                 Object.hasOwn(a, '1'), Object.hasOwn(a, '2') \
+                 ].join('|');"
+            ),
+            string("0,1|10,20|0:10,1:20|true|false")
+        );
+
+        // 文字列: インデックスキーと各文字の値が揃う（マルチバイトも文字単位）。
+        assert_eq!(
+            run_value(
+                "const s = \"ab\"; return [ \
+                 Object.keys(s).join(','), Object.values(s).join(','), \
+                 Object.entries(s).map(e => e.join(':')).join(','), \
+                 Object.hasOwn(s, '0'), Object.hasOwn(s, '2') \
+                 ].join('|');"
+            ),
+            string("0,1|a,b|0:a,1:b|true|false")
+        );
+        assert_eq!(
+            run_value(r#"return Object.values("xyz").join(",");"#),
+            string("x,y,z")
+        );
+
+        // Object / Error の既存挙動は不変。
+        assert_eq!(
+            run_value(
+                r#"const o = { a: 1 }; return [Object.keys(o).join(','), Object.values(o).join(','), Object.entries(o)[0].join(':'), Object.hasOwn(o, 'a'), Object.hasOwn(o, 'b')].join('|');"#
+            ),
+            string("a|1|a:1|true|false")
+        );
+        assert_eq!(
+            run_value(
+                r#"const e = new Error("m"); return [Object.keys(e).join(','), Object.values(e).join(','), Object.entries(e)[0].join(':'), Object.hasOwn(e, 'name'), Object.hasOwn(e, 'x')].join('|');"#
+            ),
+            string("name,message|Error,m|name:Error|true|false")
+        );
+
+        // tool references の拒否はセキュリ意図どおり不変。
+        for source in [
+            "Object.values(tools.math)",
+            "Object.entries(tools.math)",
+            "Object.hasOwn(tools.math, 'add')",
+        ] {
+            let error = run_with_host(source).expect_err("tool references must stay rejected");
+            assert_eq!(error.kind(), super::RuntimeErrorKind::InvalidDataValue);
+            assert!(error.message().contains("cannot read tool references"));
+        }
+        // keys の tool path 列挙は既存経路のまま。
+        assert_eq!(
+            run_with_host("return Object.keys(tools.math).join(',');")
+                .expect("tool key discovery should stay available"),
+            string("add")
+        );
     }
 
     #[test]

@@ -5224,10 +5224,12 @@ async fn handle_agent_command(action: AgentCommands) -> anyhow::Result<()> {
 
 fn resolve_document_input_to_path(input: &str) -> anyhow::Result<PathBuf> {
     if input.starts_with("file://") {
-        let url = url::Url::parse(input)?;
+        // 入力 URI（ホスト・パス・クエリ・トークン等）をエラー文言へ埋め込まない。
+        // パース失敗・パス変換失敗のどちらでも固定文言を返す。
+        let url = url::Url::parse(input).map_err(|_| anyhow::anyhow!("Invalid file URI"))?;
         return url
             .to_file_path()
-            .map_err(|_| anyhow::anyhow!("Invalid file URI: {}", input));
+            .map_err(|_| anyhow::anyhow!("Invalid file URI"));
     }
     let path = PathBuf::from(input);
     if path.is_absolute() {
@@ -7564,6 +7566,42 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// 不正な file:// 入力では、入力 URI（ホスト・クエリ・トークン）が
+    /// エラー文言へ露出せず固定文言になることを検証する。
+    #[test]
+    fn resolve_document_input_invalid_file_uri_error_is_fixed_text() {
+        // 不正ホスト + クエリ: to_file_path() 失敗経路。
+        let bad_host = "file://evil.example.invalid/secret?token=LEAKME_HOST_TOKEN";
+        let err = resolve_document_input_to_path(bad_host).expect_err("invalid host must fail");
+        let msg = err.to_string();
+        assert_eq!(msg, "Invalid file URI");
+        assert!(!msg.contains("evil.example.invalid"));
+        assert!(!msg.contains("LEAKME_HOST_TOKEN"));
+        assert!(!msg.contains("token"));
+
+        // 不正な IPv6 ホスト + クエリ: Url::parse() 失敗経路。
+        // 例外的にパースできても to_file_path() 側で失敗するため、いずれにせよ固定文言。
+        let bad_uri = "file://[not-an-ipv6]/secret?token=LEAKME_PARSE_TOKEN";
+        let err = resolve_document_input_to_path(bad_uri).expect_err("invalid URI must fail");
+        let msg = err.to_string();
+        assert_eq!(msg, "Invalid file URI");
+        assert!(!msg.contains("LEAKME_PARSE_TOKEN"));
+        assert!(!msg.contains("token"));
+    }
+
+    /// 有効な file:// URI は従来どおりパスへ変換されることを検証する。
+    #[test]
+    fn resolve_document_input_valid_file_uri_still_maps_to_path() {
+        let input = "file:///tmp/opencode-cli-file-uri-test.txt";
+        let path = resolve_document_input_to_path(input).expect("valid file URI must resolve");
+        let expected = url::Url::parse(input)
+            .expect("test input must parse")
+            .to_file_path()
+            .expect("test input must map to a path");
+        assert_eq!(path, expected);
+        assert!(path.ends_with("opencode-cli-file-uri-test.txt"));
     }
 
     #[test]
