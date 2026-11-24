@@ -204,6 +204,18 @@ runtime 消費箇所は schema.rs 外に 0 件である (grep による事実確
    別経路で動作するため「command 機能全体が未実装」ではない)。前出の
    「upstream 新規キーとキー名ズレ」節の表で `commands` が
    「未対応 (alias せず)」とある点と整合する。
+- `formatter` (`FormatterConfig`) — 2026-11-24 再確認。`Config.formatter`
+  は `Option<FormatterConfig>` で、`FormatterConfig` は `Disabled(bool)` と
+  `Enabled(HashMap<String, FormatterEntry>)` の enum
+  (`crates/opencode-config/src/schema.rs:1736-1739`) として定義される
+  (フィールド定義は `:254`、FormatterEntry は `:1741`)。
+  `known_config_keys()` (`:332`) と nested schema (`:685`) に登録済みで、
+  `DeepMerge` (`:2507` の FormatterEntry、`:2520` の FormatterConfig) にも
+  参加する。Config.formatter フィールドの runtime 消費箇所は 0 件
+  (grep による事実確認。TUI/CLI が `/formatter` API を呼ぶことはあるが、
+  設定フィールドの消費ではない)。server の `/formatter` エンドポイントは
+  `not_implemented("formatter status")` で 501 を返す
+  (`crates/opencode-server/src/routes.rs:7353-7354`)。
 - 本節の Config フィールドとは別に、`StreamProcessor` の
   `with_compaction_config` (`opencode-session` の `llm.rs`) も 2026-11-23
   再確認で本番未配線である。`StreamProcessor::new` の呼び出しは `llm.rs` の

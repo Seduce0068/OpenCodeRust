@@ -170,8 +170,6 @@ status: current
 
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
   — `mcp_oauth.rs:739` / STATE-R1-01-R4 / 低
-- [ ] **Config.formatter が未配線（MAPPING.md 未記載）**
-  — `config/schema.rs:1706` / CFGMAP-04 / 低
 - [ ] **stream error redact が実 SSE 経路で未検証＋ログ残留**
   — `server/routes.rs:8443` / APICON-01-R4 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -267,6 +265,8 @@ status: current
 
 ## 完了
 
+- [x] **[formatter 未配線 1 件]** MAPPING.md へ明記
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[レガシー MCP disabled 1 件]** V2 と同じ解釈へ統一
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[OAuth callback 1 件]** 失敗時に Pending を解除し再認証可能に
@@ -914,6 +914,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 formatter 未配線: MAPPING.md の未配線節へ明記。R4 が 5 件
+  （runtime 消費 0 件の表現、verified.at 鮮度、DeepMerge 行番号、
+  HashMap キー型、enum 行レンジ）を指摘、親が出典 4 件を直接修正。
+  verified.at は受け入れ条件「不変」を優先し現状維持。
 - 2026-11-24 レガシー MCP disabled: McpServer に disabled を追加し legacy
   deserialize 直後に enabled=!disabled 正規化（V2 と同解釈、明示 enabled 優先）。
   R4 が設定値を含む serde エラー漏れを指摘したため親が固定文言化。残存 low
