@@ -67,10 +67,12 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **permissions の Names 形式が実効ルールを生成しない**
+  — `config/loader.rs:2356` / CFGMAP-03-R4 / 中
+- [ ] **レイヤ間で permission が上位 permissions を破棄**
+  — `config/loader.rs:2436` / CFGMAP-03-R4 / 中
 - [ ] **default_agent が CLI --agent 既定値 'build' にマスクされる**
   — `cli/main.rs:887` / CFGMAP-01 / 中
-- [ ] **top-level permissions が権限エンジンへ渡らない**
-  — `config/schema.rs:1802` / CFGMAP-03 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -168,6 +170,8 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
+  — `config/loader.rs:5296` / CFGMAP-03-R4 / 低
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
   — `mcp_oauth.rs:739` / STATE-R1-01-R4 / 低
 - [ ] **stream error redact が実 SSE 経路で未検証＋ログ残留**
@@ -265,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[permissions 配線 1 件]** 権限エンジンへ変換・反映
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[formatter 未配線 1 件]** MAPPING.md へ明記
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[レガシー MCP disabled 1 件]** V2 と同じ解釈へ統一
@@ -914,6 +920,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 permissions 配線: resolve_permissions_rules を追加し top-level
+  permissions を config.permission へ変換（明示 permission 優先、入力専用化）。
+  R4 が high（同一 action の複数ルールが後勝ちで deny を失う権限バイパス）を
+  指摘、R2 が Object へのマージ（具体パス保持、"*" キー昇格）で修正。
+  親が edition 2021 let-chain と既存テストの新契約を直接修正。残存 medium
+  （Names 形式の実効性、レイヤ間破棄）と low（テスト範囲）は triage。
 - 2026-11-24 formatter 未配線: MAPPING.md の未配線節へ明記。R4 が 5 件
   （runtime 消費 0 件の表現、verified.at 鮮度、DeepMerge 行番号、
   HashMap キー型、enum 行レンジ）を指摘、親が出典 4 件を直接修正。

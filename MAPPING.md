@@ -80,7 +80,7 @@ v1 `opencode/src` の subsystem (`agent`、`session`、`tool`、`permission`、
 
 | 項目 | 状態 |
 | --- | --- |
-| `permissions` ルール配列 | 受理済み (`PermissionsConfig`、旧 string 配列も受理) |
+| `permissions` ルール配列 | マッピング済み (`permission` へ変換して権限エンジンへ渡す。旧配列も受理) |
 | `providers` (複数形) | マッピング済み (`provider` へ正規化) |
 | `mcp.servers` | マッピング済み (config 層で `mcp` 直下へ展開) |
 | `mcp.timeout` (グローバル既定) | 受理済み (`McpConfig::timeout`) |
