@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **MCP OAuth エラーが 400 ボディへ露出する**
-  — `server/routes.rs:5072` / APICON-04 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -265,6 +263,8 @@ status: current
 
 ## 完了
 
+- [x] **[MCP OAuth redact 1 件]** 生 message を 400 ボディから除去
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[send_message ロック 1 件]** prompt 実行中の上書きを防止
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[stream error redact 1 件]** provider 生エラーの SSE 露出を防止
@@ -902,6 +902,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 MCP OAuth redact: OAuthFailed/RuntimeError の生 message を捨て
+  固定文言 BadRequest へ、warn も固定イベント名のみ（disk-sync 失敗と同方針）。
+  ServerNotFound/OAuthNotSupported の server 名エコーと OAuthInProgress は不変。
+  R4 が回帰テストの IntoResponse 実経路不足を指摘したが、wire 露出防止という
+  目的は達成のため残存記録のみ。
 - 2026-11-24 send_message ロック: セッション単位 prompt_locks を sessions.lock
   より前に取得するよう変更（stream_message / prompt タスクと取得順を統一、
   逆順取得箇所なし）。回帰2件（静的順序ガード＋動的ロック待ち／全件置換後の
