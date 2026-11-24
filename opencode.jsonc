@@ -126,12 +126,12 @@
     },
     "devtools": {
       "type": "local",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-devtools"],
+      "command": ["npx", "-y", "@modelcontextprotocol/server-devtools@1.0.0"],
       "enabled": true,
     },
     "playwright": {
       "type": "local",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-playwright"],
+      "command": ["npx", "-y", "@modelcontextprotocol/server-playwright@1.0.0"],
       "enabled": true,
       "environment": {
         "PLAYWRIGHT_BROWSERS_PATH": "0",
