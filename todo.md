@@ -170,8 +170,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **wellknown 内部マージで permissions が丸ごと置換される**
-  — `config/wellknown.rs:230` / CFGMAP-03-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
   — `config/loader.rs:5296` / CFGMAP-03-R4 / 低
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[wellknown 内部マージ 1 件]** permissions をキー単位集約
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown permissions 1 件]** 全レイヤ事前正規化を完了
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[agent 名正規化 1 件]** CLI と server の trim/空値を統一
@@ -934,6 +934,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 wellknown 内部マージ: 各エントリの cached/fetched Config も
+  merge 直前に正規化し、複数エントリの permissions がキー単位で集約される
+  ように。回帰1件（キャッシュヒット経路、実 fetch 未検証）。R4 が 5 件
+  （既存 debug URL 露出、fetched 分岐テスト未検証、キャッシュの暗黙契約、
+  非露出テスト欠落、HashMap 順の非決定性）を指摘したが、本次差分外／
+  テスト品質のため残存記録として停止。
 - 2026-11-24 wellknown permissions: load_all_with_remote で wellknown も
   事前正規化するよう修正。R4 が本番呼び出し site のテスト未カバーを medium
   で指摘、R2 が merge_wellknown_layer ヘルパへ集約し本番とテストの双方から
