@@ -69,8 +69,6 @@ status: current
 
 - [ ] **タイトル失敗 warn の prompt.rs 実経路テストが無い**
   — `session/prompt.rs:3751` / ERR-R1-02-R4 / 中
-- [ ] **WarnVisitor が構造化 error フィールドを破棄し偽陽性**
-  — `session/summary.rs:923` / ERR-R1-02-R4 / 中
 - [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
   — `cli/main.rs:147` / CFGMAP-01-R4 / 中
 - [ ] **CLIARG-05 が attach/TUI 経路に適用されない**
@@ -275,6 +273,8 @@ status: current
 
 ## 完了
 
+- [x] **[WarnVisitor 検証精度 1 件]** 構造化 error も検出
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[タイトル生成エラー 1 件]** 固定 warn で可視化
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[CLI パス露出 1 件]** 読み取りエラーを固定文言化
@@ -950,6 +950,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 WarnVisitor: summary.rs / prompt.rs の WarnVisitor に
+  all_values を追加し全フィールド値を退避。should_panic 回帰で構造化
+  error フィールドの漏洩が検出されることを直接検証。親が clippy
+  type_complexity を型エイリアスで修正。R4 指摘なし。
 - 2026-11-24 タイトル生成エラー: summary.rs の .ok()? を match 化し
   失敗時に固定 warn（event="title_generation_failed"）。子が申告した
   prompt.rs のエラー本文ログも親が直接修正。R4 が prompt.rs 側の実失敗
