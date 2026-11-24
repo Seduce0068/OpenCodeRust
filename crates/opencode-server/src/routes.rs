@@ -5095,8 +5095,19 @@ async fn restart_mcp(
     }))
 }
 
+/// 固定のクライアント向け文言: `ApiError::BadRequest` は redact せずに
+/// message を 400 ボディへ載せるため、外部由来の生 message（URL / 認証情報 /
+/// パスを含み得る）をそのまま渡さず、これらの固定文言だけを返す。
+const MCP_OAUTH_FAILED_BAD_REQUEST_MESSAGE: &str = "MCP OAuth operation failed";
+const MCP_RUNTIME_FAILED_BAD_REQUEST_MESSAGE: &str = "MCP runtime operation failed";
+
+/// 構造化 warn の固定イベント名。値・URL・パス・トークンを一切含まない。
+const MCP_OAUTH_FAILED_WARN_EVENT: &str = "mcp_oauth_failed";
+const MCP_RUNTIME_FAILED_WARN_EVENT: &str = "mcp_runtime_failed";
+
 fn mcp_error_to_api_error(error: McpOAuthError) -> ApiError {
     match error {
+        // discovery の推奨どおり server 名のエコーは現状維持。
         McpOAuthError::ServerNotFound(name) => {
             ApiError::NotFound(format!("MCP server not found: {}", name))
         }
@@ -5104,8 +5115,84 @@ fn mcp_error_to_api_error(error: McpOAuthError) -> ApiError {
             ApiError::BadRequest(format!("MCP server does not support OAuth: {}", name))
         }
         McpOAuthError::OAuthInProgress => ApiError::BadRequest("OAuth already in progress".into()),
-        McpOAuthError::OAuthFailed(message) => ApiError::BadRequest(message),
-        McpOAuthError::RuntimeError(message) => ApiError::BadRequest(message),
+        // 生 message は mcp_oauth.rs の `e.to_string()` など外部由来で、
+        // URL / トークン / パスを含み得る。ボディにもログにも渡さない。
+        McpOAuthError::OAuthFailed(_) => {
+            tracing::warn!(
+                event = MCP_OAUTH_FAILED_WARN_EVENT,
+                "MCP OAuth operation failed"
+            );
+            ApiError::BadRequest(MCP_OAUTH_FAILED_BAD_REQUEST_MESSAGE.to_owned())
+        }
+        McpOAuthError::RuntimeError(_) => {
+            tracing::warn!(
+                event = MCP_RUNTIME_FAILED_WARN_EVENT,
+                "MCP runtime operation failed"
+            );
+            ApiError::BadRequest(MCP_RUNTIME_FAILED_BAD_REQUEST_MESSAGE.to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_error_to_api_error_redaction_tests {
+    use super::*;
+
+    fn bad_request_message(error: McpOAuthError) -> String {
+        match mcp_error_to_api_error(error) {
+            ApiError::BadRequest(message) => message,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// 回帰ガード: OAuthFailed の生 message（SENTINEL）が 400 ボディへ漏れないこと。
+    #[test]
+    fn oauth_failed_uses_fixed_message_without_raw_value() {
+        let message = bad_request_message(McpOAuthError::OAuthFailed("SENTINEL_SECRET".to_owned()));
+        assert_eq!(message, MCP_OAUTH_FAILED_BAD_REQUEST_MESSAGE);
+        assert!(
+            !message.contains("SENTINEL"),
+            "raw OAuth message leaked: {message}"
+        );
+        assert!(
+            !message.contains("OAuth failed:"),
+            "thiserror Display prefix leaked: {message}"
+        );
+    }
+
+    /// 回帰ガード: RuntimeError の生 message（SENTINEL）が 400 ボディへ漏れないこと。
+    #[test]
+    fn runtime_error_uses_fixed_message_without_raw_value() {
+        let message =
+            bad_request_message(McpOAuthError::RuntimeError("SENTINEL_SECRET".to_owned()));
+        assert_eq!(message, MCP_RUNTIME_FAILED_BAD_REQUEST_MESSAGE);
+        assert!(
+            !message.contains("SENTINEL"),
+            "raw runtime message leaked: {message}"
+        );
+        assert!(
+            !message.contains("MCP runtime error:"),
+            "thiserror Display prefix leaked: {message}"
+        );
+    }
+
+    /// 他バリアントは不変（server 名エコーと OAuthInProgress の固定文言）。
+    #[test]
+    fn other_variants_are_unchanged() {
+        match mcp_error_to_api_error(McpOAuthError::ServerNotFound("srv".to_owned())) {
+            ApiError::NotFound(message) => {
+                assert_eq!(message, "MCP server not found: srv");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert_eq!(
+            bad_request_message(McpOAuthError::OAuthNotSupported("srv".to_owned())),
+            "MCP server does not support OAuth: srv"
+        );
+        assert_eq!(
+            bad_request_message(McpOAuthError::OAuthInProgress),
+            "OAuth already in progress"
+        );
     }
 }
 
