@@ -1548,6 +1548,20 @@ async fn send_message(
     Path(session_id): Path<String>,
     JsonBody(req): JsonBody<SendMessageRequest>,
 ) -> Result<Json<MessageInfo>> {
+    // CON-01: `/prompt` / `stream_message` と同じセッション単位ロックを
+    // sessions.lock より先に取得する。prompt 実行中はこのロックが保持されるため、
+    // 完了時の `sessions.update`（clone の全件置換）で追加メッセージが失われる。
+    // 取得順は prompt / stream と同一（prompt_locks → sessions）で逆順は無い。
+    // ハンドラは同期的に完了するため OwnedMutexGuard は不要、通常の guard を保持する。
+    let run_lock = {
+        let mut locks = state.prompt_locks.write().await;
+        locks
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _run_guard = run_lock.lock().await;
+
     let mut sessions = state.sessions.lock().await;
     let session = sessions
         .get_mut(&session_id)
@@ -8436,6 +8450,117 @@ mod stream_message_serialization_tests {
         assert!(helper.contains("add_text(final_text)"), "{helper}");
         assert!(helper.contains("add_tool_call"), "{helper}");
         assert!(helper.contains("persist_sessions_if_enabled"), "{helper}");
+    }
+}
+
+#[cfg(test)]
+mod send_message_prompt_lock_tests {
+    use super::*;
+
+    fn source_fn_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("function must exist in source");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("function closing brace");
+        &rest[..end]
+    }
+
+    /// CON-01 回帰ガード: send_message が prompt / stream と同じ
+    /// セッション単位ロックを sessions.lock より先に取得すること。
+    #[test]
+    fn send_message_acquires_prompt_lock_before_sessions_lock() {
+        let source = include_str!("routes.rs");
+        let body = source_fn_body(source, "async fn send_message(");
+        let lock_pos = body
+            .find("state.prompt_locks")
+            .expect("send_message must share the per-session prompt lock: {body}");
+        let sessions_pos = body
+            .find("state.sessions.lock()")
+            .expect("send_message must lock sessions: {body}");
+        assert!(
+            lock_pos < sessions_pos,
+            "prompt lock must be acquired before sessions.lock: {body}"
+        );
+        assert!(body.contains("run_lock.lock().await"), "{body}");
+    }
+
+    /// CON-01 回帰ガード: prompt 実行中（ロック保持中）に呼ばれた send_message は
+    /// 完了まで待ち、prompt 完了時の古い session による全件置換後にも
+    /// 追加メッセージが残ることを検証する。
+    #[tokio::test]
+    async fn send_message_waits_for_prompt_lock_and_survives_stale_replace() {
+        let state = Arc::new(ServerState::new());
+        let session_id = {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create("default", ".").id
+        };
+
+        // prompt 実行開始を模擬: セッション単位ロックを取得し、
+        // 実行中用に session を clone して持ち出す（実コードは :3261-3264）。
+        let run_lock = {
+            let mut locks = state.prompt_locks.write().await;
+            locks
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let run_guard = run_lock.lock().await;
+        let stale_session = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(&session_id)
+                .cloned()
+                .expect("session must exist")
+        };
+        let baseline = stale_session.messages.len();
+
+        // 実行中に send_message を呼ぶ。ロック待ちで完了しないはず。
+        let send_state = state.clone();
+        let send_session = session_id.clone();
+        let mut handle = tokio::spawn(async move {
+            send_message(
+                State(send_state),
+                Path(send_session),
+                JsonBody(SendMessageRequest {
+                    content: "during-prompt".to_string(),
+                    model: None,
+                    variant: None,
+                    stream: None,
+                }),
+            )
+            .await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "send_message must wait while the prompt lock is held"
+        );
+
+        // prompt 完了処理を模擬: 古い session で全件置換してからロックを解放する
+        // （実コードの sessions.update は _run_guard 解放前に行われる）。
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.update(stale_session);
+        }
+        drop(run_guard);
+
+        let Json(_info) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("send_message must finish after the prompt lock is released")
+            .expect("send_message task must not panic")
+            .expect("send_message must succeed");
+
+        // 置換後に追加された user + assistant の 2 件が残っていること。
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_id).expect("session must exist");
+        assert_eq!(
+            session.messages.len(),
+            baseline + 2,
+            "messages added by send_message after the stale replace must be preserved"
+        );
     }
 }
 
