@@ -133,7 +133,14 @@ fn tolerates_newer_schema_keys() {
     let config = loader.load_all(&dir).unwrap();
 
     assert_eq!(config.model.as_deref(), Some("deepai/deepseek-v4.1-flash"));
-    assert_eq!(config.permissions.as_ref().map(|p| p.len()), Some(2));
+    // `permissions` is input-only and is folded into the runtime `permission`
+    // map by apply_post_load_transforms; it must no longer remain as a second
+    // source of truth.
+    assert!(config.permissions.is_none());
+    assert!(matches!(
+        config.permission,
+        Some(opencode_config::PermissionConfig::Map(ref rules)) if !rules.is_empty()
+    ));
 
     // The current-schema `providers` map is folded into the runtime `provider`
     // map, and the `mcp.servers` wrapper is unwrapped into the runtime `mcp`

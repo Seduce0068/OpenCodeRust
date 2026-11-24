@@ -1,7 +1,7 @@
 use crate::schema::{
     known_config_keys, nested_root_child, nested_schema, AgentConfig, AgentConfigs, AgentMode,
     CommandConfig, McpConfig, McpTimeoutConfig, NestedValueSchema, PermissionAction,
-    PermissionConfig, PermissionRule, ProviderConfig,
+    PermissionConfig, PermissionRule, PermissionsConfig, ProviderConfig,
 };
 use crate::Config;
 use anyhow::{Context, Result};
@@ -2345,6 +2345,86 @@ fn resolve_legacy_tools_actions(
     resolved
 }
 
+/// Converts the input-only top-level `permissions` list into runtime permission
+/// rules consumed through `config.permission`.
+///
+/// Unrecognized legacy names are skipped and unknown/empty effects fail safe to
+/// `Ask`; no name, resource or effect value is emitted to logs or errors.
+fn resolve_permissions_rules(permissions: &PermissionsConfig) -> HashMap<String, PermissionRule> {
+    let mut rules: HashMap<String, PermissionRule> = HashMap::new();
+    match permissions {
+        PermissionsConfig::Names(names) => {
+            for name in names {
+                // Only the three action spellings understood by the runtime
+                // engine are forwarded; anything else is ignored, not an error.
+                let action = match name.as_str() {
+                    "ask" => PermissionAction::Ask,
+                    "allow" => PermissionAction::Allow,
+                    "deny" => PermissionAction::Deny,
+                    _ => continue,
+                };
+                rules.insert(name.clone(), PermissionRule::Action(action));
+            }
+        }
+        PermissionsConfig::Rules(entries) => {
+            for entry in entries {
+                let action = match entry.effect.as_str() {
+                    "allow" => PermissionAction::Allow,
+                    "deny" => PermissionAction::Deny,
+                    // Unknown or empty effect: fail safe to Ask.
+                    _ => PermissionAction::Ask,
+                };
+
+                // Multiple entries may share an action key. Overwriting here used
+                // to drop a resource-specific rule (e.g. `.env` deny) as soon as a
+                // later wildcard rule for the same action arrived, which could
+                // bypass the intended denial. Merge instead: remove the previous
+                // rule, combine it with the new entry, then insert the result.
+                // No action, resource or effect value is logged or embedded in an
+                // error; the map's iteration order is irrelevant to consumers.
+                let merged = match rules.remove(&entry.action) {
+                    None => {
+                        // Not registered yet: keep the original construction.
+                        if entry.resource.is_empty() {
+                            PermissionRule::Action(action)
+                        } else {
+                            let mut nested = HashMap::new();
+                            nested.insert(entry.resource.clone(), action);
+                            PermissionRule::Object(nested)
+                        }
+                    }
+                    Some(PermissionRule::Object(mut nested)) => {
+                        // Keep the existing concrete paths. An entry with an empty
+                        // resource is a global scope; replacing the map with it
+                        // would lose those paths, so leave the map intact.
+                        if !entry.resource.is_empty() {
+                            nested.insert(entry.resource.clone(), action);
+                        }
+                        PermissionRule::Object(nested)
+                    }
+                    Some(PermissionRule::Action(previous)) => {
+                        if entry.resource.is_empty() {
+                            // Same global scope: last wins, as before.
+                            PermissionRule::Action(action)
+                        } else {
+                            // Promote to an Object, preserving the former global
+                            // action under `"*"`. The permission ruleset sorts the
+                            // wildcard before concrete patterns, so the specific
+                            // rule still takes precedence at evaluation time.
+                            let mut nested = HashMap::new();
+                            nested.insert("*".to_string(), previous);
+                            nested.insert(entry.resource.clone(), action);
+                            PermissionRule::Object(nested)
+                        }
+                    }
+                };
+                rules.insert(entry.action.clone(), merged);
+            }
+        }
+    }
+    rules
+}
+
 /// Apply post-load transforms: legacy migrations, plugin dedup, provider normalization.
 ///
 /// Public so the server can normalize PATCH-merged config the same way the
@@ -2383,6 +2463,21 @@ pub fn apply_post_load_transforms(config: &mut Config, inject_environment_defaul
                 agent_configs.entries.insert(name, mode_agent);
             }
         }
+    }
+
+    // Current-schema top-level `permissions` -> runtime `permission`. Run this
+    // before the legacy `tools` migration so the current-schema field wins on
+    // conflict. `permissions` is input-only: consume it so persistence never
+    // leaves a second source of truth. An explicit `permission` is never
+    // overwritten; no action/resource/effect value is logged.
+    if config.permission.is_none() {
+        if let Some(permissions) = config.permissions.take() {
+            let rules = resolve_permissions_rules(&permissions);
+            config.permission = Some(PermissionConfig::Map(rules));
+        }
+    } else {
+        // 明示 permission を優先。入力専用フィールドは消費して二重_SOURCE を防ぐ。
+        let _ = config.permissions.take();
     }
 
     // Backwards compatibility: legacy top-level `tools` config -> permission.
@@ -5231,6 +5326,246 @@ theme = "dark"
             ),
             "conflicting edit aliases must resolve to Deny: {rules:?}"
         );
+    }
+
+    // ── CFGMAP-03 regression tests: top-level permissions -> permission ───
+
+    #[test]
+    fn top_level_permissions_names_fold_into_permission_map() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"permissions":["allow","ask","deny","read"]}"#).unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        assert!(
+            config.permissions.is_none(),
+            "input-only permissions field must be consumed"
+        );
+        let rules = config.permission.expect("permission set").rules();
+        assert_eq!(rules.len(), 3, "unrecognized names must be skipped");
+        assert!(matches!(
+            rules.get("allow"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+        assert!(matches!(
+            rules.get("ask"),
+            Some(PermissionRule::Action(PermissionAction::Ask))
+        ));
+        assert!(matches!(
+            rules.get("deny"),
+            Some(PermissionRule::Action(PermissionAction::Deny))
+        ));
+        assert!(!rules.contains_key("read"));
+    }
+
+    #[test]
+    fn top_level_permissions_rules_fold_into_permission_map() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "permissions": [
+                    {"action":"read","resource":".env","effect":"deny"},
+                    {"action":"edit","effect":"allow"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        assert!(config.permissions.is_none());
+        let rules = config.permission.expect("permission set").rules();
+        assert!(
+            matches!(
+                rules.get("read"),
+                Some(PermissionRule::Object(nested))
+                    if matches!(nested.get(".env"), Some(PermissionAction::Deny))
+            ),
+            "a non-empty resource must produce a nested rule: {rules:?}"
+        );
+        assert!(matches!(
+            rules.get("edit"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+    }
+
+    // ── R4 regression: same-action rules must merge, not overwrite ───
+
+    #[test]
+    fn permissions_rules_same_action_merge_is_order_independent() {
+        // A resource-specific deny for `.env` and a wildcard allow for the
+        // same action must both survive into the nested Object, regardless of
+        // the order the entries appear in the input list.
+        for entries in [
+            r#"[
+                {"action":"read","resource":".env","effect":"deny"},
+                {"action":"read","resource":"*","effect":"allow"}
+            ]"#,
+            r#"[
+                {"action":"read","resource":"*","effect":"allow"},
+                {"action":"read","resource":".env","effect":"deny"}
+            ]"#,
+        ] {
+            let content = format!(r#"{{"permissions": {entries}}}"#);
+            let mut config: Config =
+                serde_json::from_str(&content).expect("permissions config must parse");
+            apply_post_load_transforms(&mut config, true);
+
+            let rules = config.permission.expect("permission set").rules();
+            assert!(
+                matches!(
+                    rules.get("read"),
+                    Some(PermissionRule::Object(nested))
+                        if matches!(nested.get(".env"), Some(PermissionAction::Deny))
+                            && matches!(nested.get("*"), Some(PermissionAction::Allow))
+                            && nested.len() == 2
+                ),
+                "both resource rules must be preserved regardless of order"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_rules_global_action_promotes_to_object_with_wildcard_key() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "permissions": [
+                    {"action":"read","effect":"allow"},
+                    {"action":"read","resource":".env","effect":"deny"}
+                ]
+            }"#,
+        )
+        .expect("permissions config must parse");
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert!(
+            matches!(
+                rules.get("read"),
+                Some(PermissionRule::Object(nested))
+                    if matches!(nested.get("*"), Some(PermissionAction::Allow))
+                        && matches!(nested.get(".env"), Some(PermissionAction::Deny))
+            ),
+            "global action must be retained as wildcard when a specific rule arrives"
+        );
+    }
+
+    #[test]
+    fn permissions_rules_global_entry_does_not_discard_existing_specific_paths() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "permissions": [
+                    {"action":"read","resource":".env","effect":"deny"},
+                    {"action":"read","effect":"allow"}
+                ]
+            }"#,
+        )
+        .expect("permissions config must parse");
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert!(
+            matches!(
+                rules.get("read"),
+                Some(PermissionRule::Object(nested))
+                    if matches!(nested.get(".env"), Some(PermissionAction::Deny))
+                        && nested.len() == 1
+            ),
+            "existing specific paths must survive a later global entry"
+        );
+    }
+
+    #[test]
+    fn permissions_rules_repeated_global_entries_keep_the_last_effect() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "permissions": [
+                    {"action":"read","effect":"allow"},
+                    {"action":"read","effect":"deny"}
+                ]
+            }"#,
+        )
+        .expect("permissions config must parse");
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        assert!(
+            matches!(
+                rules.get("read"),
+                Some(PermissionRule::Action(PermissionAction::Deny))
+            ),
+            "repeated global entries must keep the last effect"
+        );
+    }
+
+    #[test]
+    fn explicit_permission_wins_over_top_level_permissions() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "permission": {"bash": "deny"},
+                "permissions": [
+                    {"action":"bash","effect":"allow"},
+                    {"action":"read","effect":"allow"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        assert!(config.permissions.is_none());
+        let rules = config.permission.expect("permission set").rules();
+        assert!(
+            matches!(
+                rules.get("bash"),
+                Some(PermissionRule::Action(PermissionAction::Deny))
+            ),
+            "explicit permission must not be overwritten: {rules:?}"
+        );
+        assert!(
+            !rules.contains_key("read"),
+            "explicit config.permission must take priority: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_or_empty_permission_effect_fails_safe_to_ask() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "permissions": [
+                    {"action":"future","effect":"some-new-effect"},
+                    {"action":"no-effect"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        let rules = config.permission.expect("permission set").rules();
+        for key in ["future", "no-effect"] {
+            assert!(
+                matches!(
+                    rules.get(key),
+                    Some(PermissionRule::Action(PermissionAction::Ask))
+                ),
+                "unknown/empty effect must fail safe to Ask: {rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_tools_to_permission_transform_is_unchanged() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"tools":{"bash":true,"read":false}}"#).unwrap();
+        apply_post_load_transforms(&mut config, true);
+
+        assert!(config.tools.is_none());
+        let rules = config.permission.expect("permission set").rules();
+        assert_eq!(rules.len(), 2);
+        assert!(matches!(
+            rules.get("bash"),
+            Some(PermissionRule::Action(PermissionAction::Allow))
+        ));
+        assert!(matches!(
+            rules.get("read"),
+            Some(PermissionRule::Action(PermissionAction::Deny))
+        ));
     }
 
     #[test]
