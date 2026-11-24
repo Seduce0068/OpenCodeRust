@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-24T18:06:07+09:00"
+  at: "2026-11-24T18:42:06+09:00"
 ---
 
 # Changelog
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `codemode`: Object 静的メソッドの文言統一と Unicode 文字テスト
+  （swarm-coding R1-R6）
 - `session`: タイトル失敗 warn の実経路回帰テストを追加
   （swarm-coding R1-R6）
 - `session`: warn 捕捉テストが構造化 error の漏洩も検出

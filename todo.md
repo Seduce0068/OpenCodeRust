@@ -170,8 +170,6 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **Object 静的メソッドのエラー文言・マルチバイトテスト不足**
-  — `codemode/interpreter.rs:2606` / COLL-R1-01-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
   — `config/loader.rs:5296` / CFGMAP-03-R4 / 低
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
@@ -271,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[Object 文言/Unicode テスト 1 件]** 4 関数を統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[タイトル warn 実経路テスト 1 件]** Err 分岐を直接検証
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[WarnVisitor 検証精度 1 件]** 構造化 error も検出
@@ -950,6 +950,10 @@ status: current
 
 ## メモ
 
+- 2026-11-24 Object 文言/Unicode: 4 関数の型エラー文言を
+  "expects a data object (including Error), array, or string." へ統一。
+  マルチバイトテストは JS の \\u エスケープで直接リテラルを回避し
+  chars() 単位を検証。R4 の low（Error 型の列挙漏れ）を親が直接修正。
 - 2026-11-24 タイトル warn 実経路テスト: chat() が Err を返す
   FailingProvider を prompt.rs に追加し、generate_session_title_llm の
   Err 分岐（fallback、warn 1回、固定文言、全フィールド非露出）を直接検証。
