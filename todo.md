@@ -170,8 +170,8 @@ status: current
 
 ### 優先度: 低
 
-- [ ] **wellknown レイヤの permissions が事前正規化されない**
-  — `config/loader.rs:364` / CFGMAP-03-R4 / 低
+- [ ] **wellknown 内部マージで permissions が丸ごと置換される**
+  — `config/wellknown.rs:230` / CFGMAP-03-R4 / 低
 - [ ] **permissions 配線の load_all 経路・責務分離テスト不足**
   — `config/loader.rs:5296` / CFGMAP-03-R4 / 低
 - [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
@@ -271,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[wellknown permissions 1 件]** 全レイヤ事前正規化を完了
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[agent 名正規化 1 件]** CLI と server の trim/空値を統一
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI default_agent 1 件]** current_agent へ反映
@@ -932,6 +934,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 wellknown permissions: load_all_with_remote で wellknown も
+  事前正規化するよう修正。R4 が本番呼び出し site のテスト未カバーを medium
+  で指摘、R2 が merge_wellknown_layer ヘルパへ集約し本番とテストの双方から
+  呼ぶ形へ。残存 low（wellknown.rs 内部の複数エンドポイント集約では
+  permissions が丸ごと置換される）は triage。最大2回で停止。
 - 2026-11-24 agent 名正規化: resolve_run_agent_name に registry を追加し
   cli_agent も trim、空値は未設定として config へ委ね、config 未知名は
   build へ graceful fallback（server と揃う）。明示 --agent の未知名は
