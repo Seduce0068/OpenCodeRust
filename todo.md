@@ -67,6 +67,12 @@ status: current
 
 ### 優先度: 中
 
+- [ ] **default_agent が CLI --agent 既定値 'build' にマスクされる**
+  — `cli/main.rs:887` / CFGMAP-01 / 中
+- [ ] **レガシー MCP サーバの disabled が破棄され有効化される**
+  — `config/schema.rs:1222` / CFGMAP-02 / 中
+- [ ] **top-level permissions が権限エンジンへ渡らない**
+  — `config/schema.rs:1802` / CFGMAP-03 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -164,6 +170,10 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **OAuth 失敗時に低レベル CSRF/PKCE 状態が残存**
+  — `mcp_oauth.rs:739` / STATE-R1-01-R4 / 低
+- [ ] **Config.formatter が未配線（MAPPING.md 未記載）**
+  — `config/schema.rs:1706` / CFGMAP-04 / 低
 - [ ] **stream error redact が実 SSE 経路で未検証＋ログ残留**
   — `server/routes.rs:8443` / APICON-01-R4 / 低
 - [ ] **[L-04 残り]** tracing の残課題（observability / 効率のみ）
@@ -259,6 +269,8 @@ status: current
 
 ## 完了
 
+- [x] **[OAuth callback 1 件]** 失敗時に Pending を解除し再認証可能に
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[MCP origin TOCTOU 1 件]** 判定と insert を原子的に
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[replied イベント処理 1 件]** 共有 ID 集合を更新
@@ -902,6 +914,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 cross-skill 集約（swarm314、2 担当・5 件、観点: 設定マッピング /
+  状態遷移）: state から OAuth callback 失敗時の Pending 残存（medium）を
+  coding、configmap 4 件＋R4 残存 1 件を triage。R4 が並行 callback の
+  Authorized 上書きなど 4 件を指摘、親が上書きガードを直接修正し残存記録。
+  最大2回で停止。
 - 2026-11-24 MCP origin TOCTOU: add_server_with_origin の origin 判定と
   insert を単一 servers.write + Entry API で原子的に実行。Disk 由来保持、
   config/enabled 上書き、disk_server_names 条件は不変。並行 disk/CRUD 追加
