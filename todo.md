@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **well-known キャッシュの poison を握りつぶす**
-  — `config/wellknown.rs:292` / ERR-R1-01 / 中
 - [ ] **ls の WalkDir エントリ失敗が黙って除外される**
   — `tool/ls.rs:166` / ERR-R1-04 / 中
 - [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
@@ -279,6 +277,8 @@ status: current
 
 ## 完了
 
+- [x] **[well-known poison 回復 1 件]** キャッシュ操作を黙って捨てない
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[エラー/Object 静的メソッド 2 件]** URI エラー固定化と入力統一
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[wellknown 内部マージ 1 件]** permissions をキー単位集約
@@ -946,6 +946,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 well-known poison: lock_cache ヘルパで PoisonError::into_inner
+  による回復＋固定文言 warn。親が clear_poison の不安定 API 誤用を修正し、
+  warn は回復のたび（poison フラグは残り得る）。R4 が clear_cache の
+  poison 回復漏れとテストの並列順序依存を指摘、親が lock_cache 経由化と
+  直接ロックの poison 許容化で修正。並列実行も green を確認。
 - 2026-11-24 cross-skill 集約（swarm328、2 担当・5 件、観点: エラー伝播 /
   コレクション境界）: medium 2 件（CLI file URI エラー固定化、Object 静的
   メソッドの Array/String 受付統一）を coding、残り 5 件を triage。
