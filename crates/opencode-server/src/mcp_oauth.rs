@@ -4,6 +4,7 @@ use opencode_mcp::client::{
 };
 use opencode_mcp::oauth::{McpOAuthConfig as RealOAuthConfig, McpOAuthManager as RealOAuthManager};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -282,27 +283,33 @@ impl McpOAuthManager {
     ) -> McpServerInfo {
         // 同名エントリが既に disk 由来なら origin を保持する。CRUD 追加が
         // 後から来ても disk 由来として扱い、設定削除時に消せるようにする（R4）。
-        let origin = if origin == ServerOrigin::Crud
-            && self
-                .servers
-                .read()
-                .await
-                .get(&server_name)
-                .is_some_and(|existing| existing.origin == ServerOrigin::Disk)
-        {
-            ServerOrigin::Disk
-        } else {
-            origin
-        };
-        let managed = ManagedServer {
-            config,
-            enabled,
-            origin,
-        };
-        self.servers
-            .write()
-            .await
-            .insert(server_name.clone(), managed.clone());
+        //
+        // 判定と insert を「同じ servers.write ガード内」で行う。旧実装は
+        // servers.read() で判定した後にガードを落としてから servers.write()
+        // を取り直していたため、disk 追加と CRUD 追加が並行すると CRUD 側が
+        // disk 由来を見失い Crud で上書きする TOCTOU があった（CONC-02）。
+        // Entry API で既存 origin を読みながら更新することで二段取得を廃止し、
+        // ガード取得後は判定〜insert が不可分になる。
+        let managed = {
+            let mut servers = self.servers.write().await;
+            let effective_origin = match servers.entry(server_name.clone()) {
+                Entry::Occupied(entry) => {
+                    if origin == ServerOrigin::Crud && entry.get().origin == ServerOrigin::Disk {
+                        ServerOrigin::Disk
+                    } else {
+                        origin
+                    }
+                }
+                Entry::Vacant(_) => origin,
+            };
+            let managed = ManagedServer {
+                config,
+                enabled,
+                origin: effective_origin,
+            };
+            servers.insert(server_name.clone(), managed.clone());
+            managed
+        }; // ここで write ガードを解放し、後続の status 計算では保持しない
 
         let status = self
             .default_status_for(
@@ -2542,5 +2549,71 @@ mod tests {
         assert!(second.authorization_url.contains(&second_state));
 
         let _ = std::fs::remove_file(&auth_file);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_disk_and_crud_add_keeps_disk_origin() {
+        // add_disk_server と add_server を同じサーバ名で Barrier 同期して同時に走らせ、
+        // 最終的に disk 由来が保持され disk_server_names に残ることを検証する（CONC-02 回帰）。
+        // 初期追加（エントリ未存在）の競合ウィンドウを確実に通すため反復する。
+        let manager = Arc::new(McpOAuthManager::new());
+
+        let local_config = || {
+            McpRuntimeConfig::Local(LocalMcpConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                env: None,
+                cwd: None,
+                timeouts: McpTimeouts::default(),
+                protocol: None,
+            })
+        };
+
+        for i in 0..100 {
+            let name = format!("shared-{i}");
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let disk_manager = manager.clone();
+            let disk_name = name.clone();
+            let disk_barrier = barrier.clone();
+            let disk_config = local_config();
+            let disk_task = tokio::spawn(async move {
+                disk_barrier.wait().await;
+                disk_manager
+                    .add_disk_server(disk_name.clone(), disk_config, true)
+                    .await;
+            });
+
+            let crud_manager = manager.clone();
+            let crud_name = name.clone();
+            let crud_barrier = barrier.clone();
+            let crud_config = local_config();
+            let crud_task = tokio::spawn(async move {
+                crud_barrier.wait().await;
+                crud_manager
+                    .add_server(crud_name.clone(), crud_config, true)
+                    .await;
+            });
+
+            disk_task.await.expect("disk add task must not panic");
+            crud_task.await.expect("crud add task must not panic");
+
+            let origin = manager
+                .servers
+                .read()
+                .await
+                .get(&name)
+                .expect("entry must exist after both adds")
+                .origin;
+            assert_eq!(
+                origin,
+                ServerOrigin::Disk,
+                "disk origin must survive a concurrent CRUD add (iteration {i})"
+            );
+            assert!(
+                manager.disk_server_names().await.contains(&name),
+                "server must stay visible to disk reconciliation (iteration {i})"
+            );
+        }
     }
 }
