@@ -67,8 +67,12 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **default_agent が CLI --agent 既定値 'build' にマスクされる**
-  — `cli/main.rs:887` / CFGMAP-01 / 中
+- [ ] **TUI が config.default_agent を読まない（build 固定）**
+  — `tui/app.rs:238` / CFGMAP-01-R4 / 中
+- [ ] **CLI と server で agent 名の正規化が不一致**
+  — `cli/main.rs:139` / CFGMAP-01-R4 / 中
+- [ ] **default_agent 配線の CLI 統合回帰テスト不足**
+  — `cli/main.rs:2978` / CFGMAP-01-R4 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
   - 2026-11-19 対応済み: 外部参照 0 を再確認し、opencode-pty を workspace member から
     外しクレートごと削除（Cargo.lock のエントリも更新）。server 版 PtyManager は
@@ -267,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[default_agent 配線 1 件]** CLI --agent 既定値によるマスクを解消
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[レイヤ間 permissions 1 件]** キー単位マージへ（破棄防止）
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[permissions Names 1 件]** permission 名を実効 Allow へ
@@ -922,6 +928,11 @@ status: current
 
 ## メモ
 
+- 2026-11-24 default_agent: CLI の --agent を Option 化し "build" 強制渡しを
+  停止。ローカル run に --agent > config.default_agent > build の解決を追加、
+  TUI 起動は未指定時に OPENCODE_TUI_AGENT を remove_var（R4）して既定 build を
+  保証。TUI 側には config.default_agent を読む経路が無く未対応（子が申告、
+  R4 も指摘、triage 済み）。R4 の trim 正規化不一致・統合テスト不足も triage。
 - 2026-11-24 レイヤ間 permissions: normalize_permissions_field を抽出し各
   レイヤ merge 直前に呼ぶ（permissions→permission の事前正規化）。上位
   レイヤのルールが permission の DeepMerge でキー単位に勝つ。回帰4件。

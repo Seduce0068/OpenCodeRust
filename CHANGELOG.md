@@ -4,7 +4,7 @@ description: OpenCodeRust の変更履歴 (Keep a Changelog / SemVer 準拠)。
 tags: [changelog, releases]
 generated:
   by: agent
-  at: "2026-11-24T13:28:39+09:00"
+  at: "2026-11-24T13:57:47+09:00"
 ---
 
 # Changelog
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lsp / plan / tool / external_directory / registry / question / task / skill /
   message_v2 / message / schema / transform / bootstrap / responses / openai /
   anthropic / batch / loader / grep / cli / server / lsp / tui / mcp)、
-  テスト総数 594 → 3462 件（all-features は 3461 件）
+  テスト総数 594 → 3469 件（all-features は 3468 件）
 
 ### Changed
 
@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `cli`: config.default_agent をローカル run と TUI 起動へ反映
+  （swarm-coding R1-R6）
 - `config`: 上位レイヤの permissions をキー単位でマージ
   （swarm-coding R1-R6）
 - `config`: permissions の Names 形式を実効 Allow ルールへ変換
