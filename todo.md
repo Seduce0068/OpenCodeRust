@@ -69,8 +69,6 @@ status: current
 
 - [ ] **send_message が prompt_locks を外れて上書きされる**
   — `server/routes.rs:1542` / CONC-01 / 中
-- [ ] **/stream の provider error が生文字列で配信される**
-  — `server/routes.rs:2317` / APICON-01 / 中
 - [ ] **MCP OAuth エラーが 400 ボディへ露出する**
   — `server/routes.rs:5072` / APICON-04 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -170,6 +168,8 @@ status: current
 
 ### 優先度: 低
 
+- [ ] **stream error redact が実 SSE 経路で未検証＋ログ残留**
+  — `server/routes.rs:8443` / APICON-01-R4 / 低
 - [ ] **permission.replied / question.replied が TUI で未処理**
   — `tui/app.rs:4741` / APICON-05 / 低
 - [ ] **add_server_with_origin の origin 判定 TOCTOU**
@@ -267,6 +267,8 @@ status: current
 
 ## 完了
 
+- [x] **[stream error redact 1 件]** provider 生エラーの SSE 露出を防止
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[API 契約 2 件]** 質問 404 冪等化・session.deleted 配信
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[永続化トランザクション 1 件]** session/message を原子保存
@@ -900,6 +902,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 stream error redact: StreamEvent::Error 分岐の SSE error を
+  safe_prompt_failure_client_info 経由の汎用文言へ。stream_failed は生保持
+  （永続化側で redact）。R4 が 4 件（回帰が実 SSE 経路を通らない、
+  ソース検査の脆弱性、相関 ID 二重発火、短いトークンがログに残る）を
+  指摘したが、最大2回に達したため wire 露出防止を達成として停止、
+  残存記録のみ。
 - 2026-11-24 cross-skill 集約（swarm306、2 担当・7 件、観点: 並行/所有権 /
   API 契約）: medium 2 件（質問 404 冪等化、session.deleted 配信）を coding、
   残り 5 件を triage。R4 が低 2 件（200 成功パスのテスト欠落、SSE 統合
