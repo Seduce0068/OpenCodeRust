@@ -307,8 +307,13 @@ impl AppContext {
     /// opencode-config の UI 関連設定を既存状態へ反映する（後方互換）。
     ///
     /// 未設定の項目は `detect_terminal_theme_mode()` 由来の既定値を維持する。
-    /// `theme` と `tui.sidebar` のみをマッピングし、それ以外は既存フィールドが
-    /// 無いため反映しない（詳細は各ブロックのコメントを参照）。
+    /// `theme` / `tui.sidebar` / `default_agent` をマッピングし、それ以外は
+    /// 既存フィールドが無いため反映しない（詳細は各ブロックのコメントを参照）。
+    ///
+    /// `default_agent` は trim 後に非空の場合だけ反映し、空/空白のみなら
+    /// `"build"` 既定を維持する。未知名は検証せずそのまま設定する（env 経路と
+    /// 同じ挙動）。env `OPENCODE_TUI_AGENT` は呼び出し側がこの後に反映するため、
+    /// 明示指定が config より優先される既存の順序は不変である。
     pub fn apply_ui_config(&self, config: &opencode_config::Config) {
         if let Some(name) = config
             .theme
@@ -324,6 +329,17 @@ impl AppContext {
         }
         // tui.mode / scroll_speed / scroll_acceleration / diff_style は
         // AppContext に対応フィールドが無いためマッピングしない。
+
+        if let Some(agent) = config
+            .default_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+        {
+            // env 経路（app.rs の OPENCODE_TUI_AGENT）と同じく未知名は検証しない。
+            // 呼び出し側がこの後に env を反映するため、明示指定が config に優先する。
+            self.set_agent(agent.to_string());
+        }
 
         // config.layout (opencode_config::LayoutMode::Auto / Stretch) は
         // AppContext に対応フィールドが無いためスキップする。
@@ -1009,6 +1025,69 @@ mod tests {
         // set_theme_by_name は未知名で false を返し、状態を変えない。
         assert_eq!(context.current_theme_name(), initial_theme);
         assert!(!context.set_theme_by_name("definitely-unknown-theme"));
+    }
+
+    // --- default_agent の反映（config.default_agent を TUI が読む）---
+
+    #[test]
+    fn apply_ui_config_applies_default_agent() {
+        let context = AppContext::new();
+        assert_eq!(*context.current_agent.read(), "build");
+
+        context.apply_ui_config(&opencode_config::Config {
+            default_agent: Some("general".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(*context.current_agent.read(), "general");
+    }
+
+    #[test]
+    fn apply_ui_config_ignores_blank_default_agent() {
+        for value in [Some(String::new()), Some("   ".to_string()), None] {
+            let context = AppContext::new();
+            context.apply_ui_config(&opencode_config::Config {
+                default_agent: value,
+                ..Default::default()
+            });
+            assert_eq!(
+                *context.current_agent.read(),
+                "build",
+                "blank/unset default_agent must keep the build default"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_ui_config_applies_default_agent_without_changing_theme_and_sidebar() {
+        let context = AppContext::new();
+        context.apply_ui_config(&opencode_config::Config {
+            theme: Some("opencode@light".to_string()),
+            default_agent: Some("  general  ".to_string()),
+            tui: Some(opencode_config::TuiConfig {
+                sidebar: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // trim 後の値が設定され、theme / sidebar の既存反映は不変。
+        assert_eq!(*context.current_agent.read(), "general");
+        assert_eq!(context.current_theme_name(), "opencode@light");
+        assert!(!*context.show_sidebar.read());
+    }
+
+    #[test]
+    fn set_agent_after_apply_ui_config_overrides_config_value() {
+        // app.rs の OPENCODE_TUI_AGENT 経路と同じ順序を模擬する。
+        let context = AppContext::new_with_config(&opencode_config::Config {
+            default_agent: Some("general".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(*context.current_agent.read(), "general");
+
+        context.set_agent("explore".to_string());
+        assert_eq!(*context.current_agent.read(), "explore");
     }
 
     // --- R4: new() の副作用除去と new_with_config の追加 ---
