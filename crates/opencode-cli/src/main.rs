@@ -5238,6 +5238,15 @@ fn resolve_document_input_to_path(input: &str) -> anyhow::Result<PathBuf> {
     Ok(std::env::current_dir()?.join(path))
 }
 
+/// 解決済みドキュメントパスを読み込む。
+///
+/// エラー文言にはパス・ファイル名・OS の生エラーを含めない。
+/// file:// URI のパス部に秘密情報が含まれる場合、読み取り失敗時に
+/// それが CLI エラー出力や上位伝播へ露出することを防ぐ（ERR-R1-03-R4）。
+fn read_document_file(path: impl AsRef<Path>) -> anyhow::Result<String> {
+    fs::read_to_string(path).map_err(|_| anyhow::anyhow!("Failed to read document file"))
+}
+
 fn select_lsp_server(
     config: &opencode_config::Config,
     file_hint: Option<&Path>,
@@ -5422,8 +5431,7 @@ async fn handle_debug_command(action: DebugCommands) -> anyhow::Result<()> {
                 }
             }
             DebugFileCommands::Read { path } => {
-                let content = fs::read_to_string(&path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path, e))?;
+                let content = read_document_file(&path)?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -5504,8 +5512,7 @@ async fn handle_debug_command(action: DebugCommands) -> anyhow::Result<()> {
         DebugCommands::Lsp { action } => match action {
             DebugLspCommands::Diagnostics { file } => {
                 let path = resolve_document_input_to_path(&file)?;
-                let content = fs::read_to_string(&path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+                let content = read_document_file(&path)?;
                 let client = create_lsp_client(Some(&path)).await?;
                 client
                     .open_document(&path, &content, infer_language_id(&path))
@@ -5527,8 +5534,7 @@ async fn handle_debug_command(action: DebugCommands) -> anyhow::Result<()> {
             }
             DebugLspCommands::DocumentSymbols { uri } => {
                 let path = resolve_document_input_to_path(&uri)?;
-                let content = fs::read_to_string(&path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+                let content = read_document_file(&path)?;
                 let client = create_lsp_client(Some(&path)).await?;
                 client
                     .open_document(&path, &content, infer_language_id(&path))
@@ -7602,6 +7608,35 @@ mod tests {
             .expect("test input must map to a path");
         assert_eq!(path, expected);
         assert!(path.ends_with("opencode-cli-file-uri-test.txt"));
+    }
+
+    /// file:// URI 経由で解決した存在しないパスの読み取りエラーが固定文言で、
+    /// 解決後パス（秘密情報相当の文字列を含む）・ファイル名・OS 生エラー本文を
+    /// 露出しないことを検証する（ERR-R1-03-R4 の呼び出し側回帰テスト）。
+    #[test]
+    fn document_read_error_does_not_leak_resolved_path_or_os_error() {
+        let secret = "LEAKME_DOC_TOKEN";
+        let file_name = format!("opencode-cli-{}-missing-file.rs", secret);
+        let input = format!("file:///tmp/{}", file_name);
+        let path = resolve_document_input_to_path(&input).expect("valid file URI must resolve");
+        // 前提確認: 解決後パス側に秘密情報相当の文字列が残っていること。
+        assert!(path.to_string_lossy().contains(secret));
+
+        let err = read_document_file(&path).expect_err("missing file must fail");
+        let msg = err.to_string();
+        assert_eq!(msg, "Failed to read document file");
+        assert!(!msg.contains(secret));
+        assert!(!msg.contains(file_name.as_str()));
+        assert!(!msg.contains("No such file"));
+        assert!(!msg.contains("missing-file"));
+    }
+
+    /// 生エラー本文が OS によって異なる場合（ディレクトリ読み取り）も固定文言であることを検証する。
+    #[test]
+    fn document_read_error_is_fixed_text_for_other_os_error() {
+        let temp_dir = std::env::temp_dir();
+        let err = read_document_file(&temp_dir).expect_err("reading a directory must fail");
+        assert_eq!(err.to_string(), "Failed to read document file");
     }
 
     #[test]
