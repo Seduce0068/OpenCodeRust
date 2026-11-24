@@ -5946,6 +5946,61 @@ mod tests {
         assert!(!title.contains('\u{fffd}'));
     }
 
+    // chat() が Err を返す Provider。エラー本文にダミーの leak-marker を含め、
+    // 実際のトークン値は使わずに warn への漏洩を検証する。
+    struct FailingProvider {
+        model: ModelInfo,
+    }
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        fn id(&self) -> &str {
+            "failing-mock"
+        }
+
+        fn name(&self) -> &str {
+            "Failing Mock"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![self.model.clone()]
+        }
+
+        fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+            if id == self.model.id {
+                Some(&self.model)
+            } else {
+                None
+            }
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            Err(ProviderError::ApiError(
+                "dummy-error-value-leak-marker-77".to_string(),
+            ))
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<StreamResult, ProviderError> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn failing_provider() -> FailingProvider {
+        FailingProvider {
+            model: ModelInfo {
+                id: "mock-model".to_string(),
+                name: "Mock".to_string(),
+                provider: "mock".to_string(),
+                context_window: 8192,
+                max_output_tokens: 1024,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            },
+        }
+    }
+
     #[tokio::test]
     async fn test_generate_session_title_llm_multibyte_boundary() {
         struct LongTitleProvider {
@@ -6013,6 +6068,41 @@ mod tests {
             generate_session_title_llm("test input", Arc::new(provider), "mock-model").await;
         assert_eq!(title, format!("{}...", "あ".repeat(32)));
         assert!(!title.contains('\u{fffd}'));
+    }
+
+    // 回帰テスト: generate_session_title_llm の Err 分岐が固定 warn を 1 回だけ出し、
+    // エラー本文（leak-marker）を event / message / 全フィールドへ漏らさないことを固定する。
+    // これにより error 本文を再びログへ出す実装へ回帰すると red になる。
+    #[tokio::test]
+    async fn test_generate_session_title_llm_failure_warns_once_without_leaking() {
+        let capture = WarnCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let first_user_message = "dummy-prompt-text-leak-marker-31";
+        let title = generate_session_title_llm(
+            first_user_message,
+            Arc::new(failing_provider()),
+            "mock-model",
+        )
+        .await;
+
+        // chat() が Err を返したら generate_session_title の fallback に一致する。
+        assert_eq!(
+            title,
+            generate_session_title(first_user_message),
+            "failed chat must use the deterministic fallback title"
+        );
+
+        let events = capture.events.lock().expect("mutex poisoned");
+        assert_eq!(events.len(), 1, "must warn exactly once per failed call");
+        assert_eq!(events[0].0, "title_generation_failed");
+        assert!(
+            events[0]
+                .1
+                .contains("Failed to generate title via LLM, using fallback"),
+            "warn message must stay fixed and not embed the error body"
+        );
+        assert_no_leak_in_warn(&events[0]);
     }
 
     #[test]
