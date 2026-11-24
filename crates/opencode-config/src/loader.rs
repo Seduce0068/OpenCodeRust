@@ -2486,7 +2486,10 @@ fn resolve_permissions_rules(permissions: &PermissionsConfig) -> HashMap<String,
 /// Idempotent: with no `permissions` this is a no-op; when both fields are set,
 /// the explicit `permission` keeps priority and `permissions` is consumed. No
 /// action, resource, effect or path value is logged.
-fn normalize_permissions_field(config: &mut Config) {
+///
+/// `pub(crate)` so the wellknown loader can normalize every remote entry before
+/// merging it into its multi-endpoint aggregate (CFGMAP-03-R4).
+pub(crate) fn normalize_permissions_field(config: &mut Config) {
     if config.permission.is_none() {
         if let Some(permissions) = config.permissions.take() {
             let rules = resolve_permissions_rules(&permissions);

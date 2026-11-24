@@ -225,8 +225,13 @@ async fn load_wellknown_from_entries(entries: &HashMap<String, WellKnownAuth>) -
 
         // A cache hit still merges the cached config, but only after the
         // token has been refreshed above.
-        if let Some(cached) = get_cached(url) {
+        if let Some(mut cached) = get_cached(url) {
             tracing::debug!(url = %url, "using cached wellknown config");
+            // Normalize this entry before aggregating it into `merged`:
+            // `Config::merge` replaces `permissions` wholesale but deep-merges
+            // `permission` key by key, so without this the rules of an earlier
+            // endpoint would be discarded by a later one (CFGMAP-03-R4).
+            crate::loader::normalize_permissions_field(&mut cached);
             merged.merge(cached);
             continue;
         }
@@ -235,9 +240,13 @@ async fn load_wellknown_from_entries(entries: &HashMap<String, WellKnownAuth>) -
         tracing::debug!(url = %endpoint, "fetching remote wellknown config");
 
         match fetch_wellknown_config(&client, &endpoint).await {
-            Ok(config) => {
+            Ok(mut config) => {
                 set_cached(url.clone(), config.clone());
                 tracing::debug!(url = %url, "loaded remote config from well-known");
+                // Same per-entry normalization as the cache-hit path above, so
+                // freshly fetched endpoints participate in the key-by-key
+                // `permission` DeepMerge instead of replacing each other.
+                crate::loader::normalize_permissions_field(&mut config);
                 merged.merge(config);
             }
             Err(_) => {
@@ -336,6 +345,7 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{PermissionAction, PermissionRule};
     use std::fmt::Write as _;
     use std::sync::Arc;
     use tracing::field::{Field, Visit};
@@ -778,5 +788,72 @@ mod tests {
             std::env::var_os(key).is_none(),
             "unsafe env key must be rejected even on a cache hit"
         );
+    }
+
+    /// 回帰 (CFGMAP-03-R4): 複数の wellknown エントリがそれぞれ異なる
+    /// `permissions` を返しても、集約時に各エントリが `permission` へ正規化され、
+    /// キー単位の DeepMerge で両方のルールが残る。
+    ///
+    /// キャッシュヒット経路を使うため auth.json / ネットワークには依存しない。
+    /// 修正前は各 Config が未正規化のまま `merged.merge()` され、`permissions`
+    /// が丸ごと置換されるため、先にマージされた側のルールが失われていた。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn multiple_wellknown_entries_merge_permissions_by_key() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        clear_cache();
+
+        let urls = [
+            "https://wk-merge-a.example.com",
+            "https://wk-merge-b.example.com",
+        ];
+        let keys = ["OPENCODE_WK_MERGE_A", "OPENCODE_WK_MERGE_B"];
+        let _env_guards: Vec<_> = keys
+            .iter()
+            .map(|key| EnvRestoreGuard {
+                key: key.to_string(),
+                original: std::env::var_os(key),
+            })
+            .collect();
+
+        // 2 つのエンドポイントがそれぞれ別の permissions を返した状況を再現。
+        set_cached(
+            urls[0].to_string(),
+            serde_json::from_str(r#"{"permissions":["read"]}"#).expect("config A"),
+        );
+        set_cached(
+            urls[1].to_string(),
+            serde_json::from_str(r#"{"permissions":["write"]}"#).expect("config B"),
+        );
+
+        let mut entries = HashMap::new();
+        for (url, key) in urls.iter().zip(keys.iter()) {
+            entries.insert(
+                url.to_string(),
+                WellKnownAuth {
+                    key: key.to_string(),
+                    token: "placeholder".to_string(),
+                },
+            );
+        }
+
+        let config = load_wellknown_from_entries(&entries).await;
+
+        assert!(
+            config.permissions.is_none(),
+            "input-only permissions must be consumed by per-entry normalization"
+        );
+        let rules = config.permission.expect("permission populated").rules();
+        for key in ["read", "write"] {
+            assert!(
+                matches!(
+                    rules.get(key),
+                    Some(PermissionRule::Action(PermissionAction::Allow))
+                ),
+                "wellknown entry rule {key} must survive aggregation: {rules:?}"
+            );
+        }
+
+        clear_cache();
     }
 }
