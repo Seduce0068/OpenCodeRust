@@ -2325,6 +2325,9 @@ async fn stream_message(
                         Ok(opencode_provider::StreamEvent::Done) => break,
                         Ok(opencode_provider::StreamEvent::Error(err)) => {
                             stream_failed = Some(err.clone());
+                            // provider 由来の生エラー（上流 message / トークン / パスを含み得る）を
+                            // SSE へ載せず、他 error 分岐と同じ汎用文言へ変換して配信する。
+                            // 永続化向けの stream_failed は上で生のまま保持し、finalize 側で redact する。
                             send_sse_event(
                                 &tx,
                                 "error",
@@ -2338,7 +2341,7 @@ async fn stream_message(
                                     input: None,
                                     prompt_tokens: None,
                                     completion_tokens: None,
-                                    error: Some(err),
+                                    error: Some(safe_prompt_failure_client_info(&err).await.1),
                                 },
                             )
                             .await;
@@ -8433,6 +8436,126 @@ mod stream_message_serialization_tests {
         assert!(helper.contains("add_text(final_text)"), "{helper}");
         assert!(helper.contains("add_tool_call"), "{helper}");
         assert!(helper.contains("persist_sessions_if_enabled"), "{helper}");
+    }
+}
+
+#[cfg(test)]
+mod stream_error_redaction_tests {
+    use super::*;
+
+    /// `Ok(StreamEvent::Error(err))` 分岐のソースを抽出する（既存の
+    /// stream_message_serialization_tests と同じ include_str! パターン）。
+    fn provider_error_branch(source: &str) -> &str {
+        let start = source
+            .find("Ok(opencode_provider::StreamEvent::Error(err)) => {")
+            .expect("stream provider error branch must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("Err(err) => {")
+            .expect("transport error branch must follow the provider error branch");
+        &rest[..end]
+    }
+
+    /// 回帰ガード (APICON-01): provider 由来の生エラーを SSE の error フィールドへ
+    /// 載せず、transport / 初期化エラー分岐と同じ safe envelope へ変換すること。
+    /// 永続化向け stream_failed は生のまま保持し、その他フィールドは不変。
+    #[test]
+    fn provider_error_branch_sends_sanitized_error_and_preserves_envelope() {
+        let source = include_str!("routes.rs");
+        let branch = provider_error_branch(source);
+
+        // 生 err は SSE へ出さず、safe_prompt_failure_client_info の message (.1) を使う。
+        assert!(
+            branch.contains("error: Some(safe_prompt_failure_client_info(&err).await.1),"),
+            "SSE error field must carry the sanitized message (.1): {branch}"
+        );
+        assert!(
+            !branch.contains("error: Some(err),"),
+            "raw provider error must never reach SSE: {branch}"
+        );
+
+        // 永続化側は既存挙動を維持（生 err を保持し finalize で redact）。
+        assert!(
+            branch.contains("stream_failed = Some(err.clone());"),
+            "raw error must still be retained for persistence-side redaction: {branch}"
+        );
+
+        // event 名・type・その他のフィールドは不変。
+        for invariant in [
+            "\"error\",",
+            "event_type: \"error\".to_string(),",
+            "content: None,",
+            "message_id: Some(stream_msg_id.clone()),",
+            "done: None,",
+            "tool_call_id: None,",
+            "tool_name: None,",
+            "input: None,",
+            "prompt_tokens: None,",
+            "completion_tokens: None,",
+            "break;",
+        ] {
+            assert!(
+                branch.contains(invariant),
+                "stream error envelope field changed: {invariant}: {branch}"
+            );
+        }
+    }
+
+    /// 回帰ガード (APICON-01): SENTINEL_SECRET を含む provider エラーを
+    /// safe envelope へ通したとき、SSE の error 値が汎用文言になり、
+    /// 他のフィールド（type / message_id 等）が保たれることを検証する。
+    #[tokio::test]
+    async fn provider_sentinel_is_redacted_in_sse_error_payload() {
+        let sentinel = "SENTINEL_SECRET";
+        let detail = format!("provider error: upstream message={sentinel}");
+        let (correlation_id, safe_error) = safe_prompt_failure_client_info(&detail).await;
+
+        assert!(
+            !safe_error.contains(sentinel),
+            "SSE error leaked the provider sentinel: {safe_error}"
+        );
+        assert_eq!(safe_error, "Internal server error");
+        assert!(
+            !correlation_id.contains(sentinel),
+            "correlation id leaked the sentinel: {correlation_id}"
+        );
+
+        // ルートが組み立てるのと同じ StreamEvent をシリアライズし、
+        // error だけが汎用化され他フィールドが不変であることを確認する。
+        let payload = StreamEvent {
+            event_type: "error".to_string(),
+            content: None,
+            message_id: Some("msg-sentinel".to_string()),
+            done: None,
+            tool_call_id: None,
+            tool_name: None,
+            input: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            error: Some(safe_error),
+        };
+        let json = serde_json::to_value(&payload).expect("StreamEvent must serialize");
+        let serialized = json.to_string();
+
+        assert!(
+            !serialized.contains(sentinel),
+            "SSE data leaked the sentinel: {serialized}"
+        );
+        assert_eq!(
+            json.get("error").and_then(|v| v.as_str()),
+            Some("Internal server error")
+        );
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(
+            json.get("message_id").and_then(|v| v.as_str()),
+            Some("msg-sentinel")
+        );
+        assert!(json.get("done").is_none());
+        assert!(json.get("tool_call_id").is_none());
+        assert!(json.get("tool_name").is_none());
+        assert!(json.get("input").is_none());
+        assert!(json.get("prompt_tokens").is_none());
+        assert!(json.get("completion_tokens").is_none());
     }
 }
 
