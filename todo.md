@@ -67,8 +67,10 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **CLI と server で agent 名の正規化が不一致**
-  — `cli/main.rs:139` / CFGMAP-01-R4 / 中
+- [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
+  — `cli/main.rs:147` / CFGMAP-01-R4 / 中
+- [ ] **CLIARG-05 が attach/TUI 経路に適用されない**
+  — `cli/main.rs:2940` / CFGMAP-01-R4 / 中
 - [ ] **default_agent 配線の CLI 統合回帰テスト不足**
   — `cli/main.rs:2978` / CFGMAP-01-R4 / 中
 - [ ] **[M-03]** 未接続クレートと責務重複（PTY）による責務分離の形骸化
@@ -269,6 +271,8 @@ status: current
 
 ## 完了
 
+- [x] **[agent 名正規化 1 件]** CLI と server の trim/空値を統一
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[TUI default_agent 1 件]** current_agent へ反映
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[default_agent 配線 1 件]** CLI --agent 既定値によるマスクを解消
@@ -928,6 +932,12 @@ status: current
 
 ## メモ
 
+- 2026-11-24 agent 名正規化: resolve_run_agent_name に registry を追加し
+  cli_agent も trim、空値は未設定として config へ委ね、config 未知名は
+  build へ graceful fallback（server と揃う）。明示 --agent の未知名は
+  CLIARG-05 でエラー維持。R4 が明示空文字の非対称を medium で指摘、
+  親が直接修正＋回帰追加。残存 low（attach/TUI の CLIARG-05 範囲、
+  共有ヘルパのドリフトリスク）は triage。
 - 2026-11-24 TUI default_agent: apply_ui_config に config.default_agent を
   反映（trim 非空なら set_agent）。env OPENCODE_TUI_AGENT は app.rs 側で
   後に set_agent されるため明示指定が優先される順序は不変。回帰4件。
