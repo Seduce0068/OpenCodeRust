@@ -134,15 +134,35 @@ fn resolve_agent_from(found: Option<AgentInfo>, agent_name: &str) -> anyhow::Res
 /// CFGMAP-01: ローカル run で使うエージェント名を解決する。
 ///
 /// 優先順は `--agent` 明示 > `config.default_agent` > `build`（後方互換）。
-/// config 側の空文字・空白のみは未設定として扱う。ここで返した名前だけを
-/// 後段の `resolve_agent` / バナーへ渡し、設定値そのものはエラーへ出さない。
-fn resolve_run_agent_name(cli_agent: Option<&str>, config_default_agent: Option<&str>) -> String {
+/// 両方とも trim し、空文字・空白のみは未設定として扱う（server と揃う）。
+///
+/// - 明示 `--agent`: trim した名前を返す。空文字・空白のみなら未設定として
+///   config 側へ委ねる。未知名でも `build` へ化けさせず、後段の
+///   `resolve_agent_from` が `unknown agent` エラーにする（CLIARG-05 を維持）。
+/// - `config.default_agent`: trim 後にレジストリ未登録なら `build` へ
+///   graceful fallback する（server の `resolve_prompt_agent_name` と同じ）。
+///
+/// ここで返した名前だけを後段の `resolve_agent` / バナーへ渡し、設定値そのものは
+/// エラー・ログへ出さない。
+fn resolve_run_agent_name(
+    registry: &AgentRegistry,
+    cli_agent: Option<&str>,
+    config_default_agent: Option<&str>,
+) -> String {
     if let Some(name) = cli_agent {
-        return name.to_string();
+        let name = name.trim();
+        // 空文字・空白のみの明示指定は未設定として扱い config 側へ委ねる
+        // （server と揃う、R4）。それ以外は未知名でも build へ化けさせず、
+        // 後段の resolve_agent_from がエラーにする（CLIARG-05）。
+        if !name.is_empty() {
+            return name.to_string();
+        }
     }
     config_default_agent
         .map(str::trim)
         .filter(|name| !name.is_empty())
+        // config 由来の未知名は build へ落とす（server と同じ graceful fallback）。
+        .filter(|name| registry.get(name).is_some())
         .map(str::to_string)
         .unwrap_or_else(|| "build".to_string())
 }
@@ -197,29 +217,107 @@ mod resolve_run_agent_name_tests {
     /// CFGMAP-01 回帰: --agent 未指定なら config.default_agent が使われること。
     #[test]
     fn config_default_agent_is_used_when_cli_agent_absent() {
-        assert_eq!(resolve_run_agent_name(None, Some("general")), "general");
+        let registry = AgentRegistry::new();
+        assert_eq!(
+            resolve_run_agent_name(&registry, None, Some("general")),
+            "general"
+        );
     }
 
     /// --agent 明示時は config.default_agent より優先されること。
     #[test]
     fn explicit_cli_agent_takes_precedence_over_config_default() {
+        let registry = AgentRegistry::new();
         assert_eq!(
-            resolve_run_agent_name(Some("plan"), Some("general")),
+            resolve_run_agent_name(&registry, Some("plan"), Some("general")),
             "plan"
+        );
+    }
+
+    /// 空文字・空白のみの明示 --agent は未設定として config へ委ねる（R4）。
+    #[test]
+    fn explicit_blank_cli_agent_defers_to_config_default() {
+        let registry = AgentRegistry::new();
+        assert_eq!(
+            resolve_run_agent_name(&registry, Some(""), Some("general")),
+            "general"
+        );
+        assert_eq!(
+            resolve_run_agent_name(&registry, Some("   "), Some("general")),
+            "general"
+        );
+        assert_eq!(
+            resolve_run_agent_name(&registry, Some("   "), None),
+            "build"
         );
     }
 
     /// config も未指定なら従来どおり build にフォールバックすること。
     #[test]
     fn build_is_fallback_when_both_absent() {
-        assert_eq!(resolve_run_agent_name(None, None), "build");
+        let registry = AgentRegistry::new();
+        assert_eq!(resolve_run_agent_name(&registry, None, None), "build");
     }
 
     /// config.default_agent が空・空白のみなら未設定として扱うこと。
     #[test]
     fn blank_config_default_is_treated_as_absent() {
-        assert_eq!(resolve_run_agent_name(None, Some("")), "build");
-        assert_eq!(resolve_run_agent_name(None, Some("   ")), "build");
+        let registry = AgentRegistry::new();
+        assert_eq!(resolve_run_agent_name(&registry, None, Some("")), "build");
+        assert_eq!(
+            resolve_run_agent_name(&registry, None, Some("   ")),
+            "build"
+        );
+    }
+
+    /// CFGMAP-01-R4 回帰: 明示 --agent の前後空白を trim して有効名を尊重すること。
+    #[test]
+    fn explicit_cli_agent_is_trimmed() {
+        let registry = AgentRegistry::new();
+        assert_eq!(
+            resolve_run_agent_name(&registry, Some(" general "), None),
+            "general"
+        );
+        // trim 後の名前はレジストリから実際に解決できること。
+        let resolved = resolve_run_agent_name(&registry, Some(" plan "), None);
+        let agent = resolve_agent(&registry, &resolved).expect("trimmed name must resolve");
+        assert_eq!(agent.name, "plan");
+    }
+
+    /// CFGMAP-01-R4 回帰: config.default_agent が未知名なら build へ落とすこと。
+    #[test]
+    fn unknown_config_default_agent_falls_back_to_build() {
+        let registry = AgentRegistry::new();
+        assert_eq!(
+            resolve_run_agent_name(&registry, None, Some("does-not-exist")),
+            "build"
+        );
+        // 前後空白付き未知名も trim 後に未登録と判定され build へ落ちること。
+        assert_eq!(
+            resolve_run_agent_name(&registry, None, Some("  does-not-exist  ")),
+            "build"
+        );
+    }
+
+    /// CFGMAP-01-R4 回帰: config.default_agent の有効名（空白付き）は trim して使うこと。
+    #[test]
+    fn valid_config_default_agent_is_used_after_trim() {
+        let registry = AgentRegistry::new();
+        assert_eq!(
+            resolve_run_agent_name(&registry, None, Some("  general  ")),
+            "general"
+        );
+    }
+
+    /// CFGMAP-01-R4 / CLIARG-05 回帰: 明示 --agent の未知名は trim しても
+    /// build へフォールバックせず、resolve_agent でエラーになること。
+    #[test]
+    fn explicit_unknown_cli_agent_still_errors() {
+        let registry = AgentRegistry::new();
+        let resolved = resolve_run_agent_name(&registry, Some(" does-not-exist "), None);
+        assert_eq!(resolved, "does-not-exist");
+        let err = resolve_agent(&registry, &resolved).expect_err("unknown must fail");
+        assert_eq!(err.to_string(), "unknown agent");
     }
 }
 
@@ -2980,9 +3078,13 @@ async fn run_chat_session(
     let tool_registry = Arc::new(create_default_registry().await);
 
     let agent_registry = AgentRegistry::from_config(&config);
-    // CFGMAP-01: --agent 未指定なら config.default_agent、それも無ければ build。
-    let resolved_agent_name =
-        resolve_run_agent_name(agent_name.as_deref(), config.default_agent.as_deref());
+    // CFGMAP-01: --agent 明示 > config.default_agent > build。trim と config 由来の
+    // 未知名フォールバックは server と同じ（明示 --agent の未知名はエラー維持）。
+    let resolved_agent_name = resolve_run_agent_name(
+        &agent_registry,
+        agent_name.as_deref(),
+        config.default_agent.as_deref(),
+    );
     // CLIARG-05: 未知名を黙って build に化けさせない（resolve_agent 内で明示エラー）。
     let mut agent_info = resolve_agent(&agent_registry, &resolved_agent_name)?;
 
