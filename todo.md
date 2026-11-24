@@ -67,8 +67,6 @@ status: current
 
 ### 優先度: 中
 
-- [ ] **ls の WalkDir エントリ失敗が黙って除外される**
-  — `tool/ls.rs:166` / ERR-R1-04 / 中
 - [ ] **CLI/server の agent 解決ロジック重複（ドリフトリスク）**
   — `cli/main.rs:147` / CFGMAP-01-R4 / 中
 - [ ] **CLIARG-05 が attach/TUI 経路に適用されない**
@@ -277,6 +275,8 @@ status: current
 
 ## 完了
 
+- [x] **[ls 走査エラー 1 件]** 件数付き warn で通知
+  （2026-11-21、swarm-coding R1-R6）
 - [x] **[well-known poison 回復 1 件]** キャッシュ操作を黙って捨てない
   （2026-11-21、swarm-coding R1-R6）
 - [x] **[エラー/Object 静的メソッド 2 件]** URI エラー固定化と入力統一
@@ -946,6 +946,9 @@ status: current
 
 ## メモ
 
+- 2026-11-24 ls 走査エラー: filter_map(|e| e.ok()) を廃止し Err を数えて
+  走査完了後に固定 warn（件数のみ、パス・ファイル名・本文非露出）を1回。
+  注入テスト2件、R4 指摘なし。
 - 2026-11-24 well-known poison: lock_cache ヘルパで PoisonError::into_inner
   による回復＋固定文言 warn。親が clear_poison の不安定 API 誤用を修正し、
   warn は回復のたび（poison フラグは残り得る）。R4 が clear_cache の
